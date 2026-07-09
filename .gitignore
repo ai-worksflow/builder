@@ -1,0 +1,39 @@
+# macOS
+.DS_Store
+
+# Dependencies
+node_modules/
+frontend/node_modules/
+
+# Next.js build output
+.next/
+frontend/.next/
+out/
+frontend/out/
+
+# TypeScript cache
+tsconfig.tsbuildinfo
+frontend/tsconfig.tsbuildinfo
+
+# Environment variables
+.env
+.env.*
+!.env.example
+!.env*.example
+
+# Logs
+*.log
+npm-debug.log*
+pnpm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Test artifacts
+test-results/
+frontend/test-results/
+playwright-report/
+frontend/playwright-report/
+
+# Codex / generated runtime clutter
+.vercel/
+frontend/.vercel/
