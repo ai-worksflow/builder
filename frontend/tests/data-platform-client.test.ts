@@ -5,6 +5,7 @@ import {
   HttpClient,
   PlatformHttpError,
   PlatformNetworkError,
+  PlatformProtocolError,
   type FetchLike,
 } from '../lib/platform/http'
 
@@ -211,6 +212,180 @@ test('data mutations share the authenticated PlatformClient CSRF store', async (
 
   assert.equal(mutationHeaders[0].get('x-csrf-token'), 'csrf-from-session')
   assert.ok(mutationHeaders[0].get('idempotency-key'))
+})
+
+test('public data management uses canonical routes, exact policy bodies and idempotency', async () => {
+  const requests: Array<{
+    readonly path: string
+    readonly method: string
+    readonly headers: Headers
+    readonly body?: string
+  }> = []
+  const now = '2026-07-10T08:00:00.000Z'
+  const policy = {
+    projectId: 'project-1',
+    tableId: 'table-1',
+    tableName: 'tasks',
+    allowRead: true,
+    allowCreate: true,
+    allowUpdate: false,
+    allowDelete: false,
+    readableFields: ['done', 'title'],
+    writableFields: ['title'],
+    version: 3,
+    etag: '"public-data-policy:project-1:table-1:3"',
+    createdAt: now,
+    updatedAt: now,
+  }
+  const runtime = {
+    apiBasePath: '/v1/public/data/deployments',
+    projectId: 'project-1',
+    deploymentId: 'deployment-1',
+    deploymentVersionId: 'deployment-version-1',
+    capabilityId: 'capability-1',
+    allowedOrigins: ['https://app.example.test'],
+    expiresAt: '2026-07-17T08:00:00.000Z',
+    activatedAt: now,
+  }
+  const http = new HttpClient({
+    baseUrl: 'https://platform.example.test',
+    fetch: (async (input, init) => {
+      const url = new URL(input.toString())
+      const method = init?.method ?? 'GET'
+      requests.push({
+        path: url.pathname,
+        method,
+        headers: new Headers(init?.headers),
+        body: typeof init?.body === 'string' ? init.body : undefined,
+      })
+      if (url.pathname.endsWith('/policies') && method === 'GET') {
+        return json({ policies: [policy] })
+      }
+      if (url.pathname.endsWith('/policies/table-1') && method === 'PUT') {
+        return json({ policy })
+      }
+      if (url.pathname.endsWith('/policies/table-1')) {
+        return json({ deleted: true, tableId: 'table-1' })
+      }
+      if (method === 'GET') return json({ runtime })
+      return json({ revoked: true, deploymentId: 'deployment-1' })
+    }) as FetchLike,
+  })
+  const publicData = new DataRuntimeClient(http).publicRuntime
+
+  assert.deepEqual(await publicData.listPolicies('project-1'), [policy])
+  await assert.rejects(
+    publicData.putPolicy('project-1', 'table-1', {
+      allowRead: false,
+      allowCreate: false,
+      allowUpdate: false,
+      allowDelete: false,
+      readableFields: [],
+      writableFields: [],
+    }),
+    PlatformProtocolError,
+  )
+  await assert.rejects(
+    publicData.deletePolicy('project-1', 'table-1'),
+    PlatformProtocolError,
+  )
+  assert.deepEqual(await publicData.putPolicy('project-1', 'table-1', {
+    allowRead: true,
+    allowCreate: true,
+    allowUpdate: false,
+    allowDelete: false,
+    readableFields: ['done', 'title'],
+    writableFields: ['title'],
+  }, { ifMatch: policy.etag }), policy)
+  assert.deepEqual(await publicData.deletePolicy(
+    'project-1',
+    'table-1',
+    { ifMatch: policy.etag },
+  ), {
+    deleted: true,
+    tableId: 'table-1',
+  })
+  assert.deepEqual(
+    await publicData.activeDeploymentRuntime('project-1', 'deployment-1'),
+    runtime,
+  )
+  assert.deepEqual(
+    await publicData.revokeDeploymentRuntime('project-1', 'deployment-1'),
+    { revoked: true, deploymentId: 'deployment-1' },
+  )
+
+  assert.deepEqual(requests.map(({ method, path }) => [method, path]), [
+    ['GET', '/v1/data/projects/project-1/public-runtime/policies'],
+    ['PUT', '/v1/data/projects/project-1/public-runtime/policies/table-1'],
+    ['DELETE', '/v1/data/projects/project-1/public-runtime/policies/table-1'],
+    ['GET', '/v1/data/projects/project-1/public-runtime/deployments/deployment-1'],
+    ['DELETE', '/v1/data/projects/project-1/public-runtime/deployments/deployment-1'],
+  ])
+  assert.deepEqual(JSON.parse(requests[1].body ?? '{}'), {
+    allowRead: true,
+    allowCreate: true,
+    allowUpdate: false,
+    allowDelete: false,
+    readableFields: ['done', 'title'],
+    writableFields: ['title'],
+  })
+  for (const request of requests.filter(({ method }) => method !== 'GET')) {
+    assert.ok(request.headers.get('idempotency-key'), `${request.method} ${request.path}`)
+  }
+  assert.equal(requests[1].headers.get('if-match'), policy.etag)
+  assert.equal(requests[2].headers.get('if-match'), policy.etag)
+})
+
+test('public data management rejects cross-project DTOs and leaked capability tokens', async () => {
+  const now = '2026-07-10T08:00:00.000Z'
+  let call = 0
+  const publicData = new DataRuntimeClient(new HttpClient({
+    baseUrl: 'https://platform.example.test',
+    fetch: (async () => {
+      call += 1
+      if (call === 1) {
+        return json({
+          policies: [{
+            projectId: 'another-project',
+            tableId: 'table-1',
+            tableName: 'tasks',
+            allowRead: false,
+            allowCreate: false,
+            allowUpdate: false,
+            allowDelete: false,
+            readableFields: [],
+            writableFields: [],
+            version: 1,
+            etag: '"public-data-policy:another-project:table-1:1"',
+            createdAt: now,
+            updatedAt: now,
+          }],
+        })
+      }
+      return json({
+        runtime: {
+          apiBasePath: '/v1/public/data/deployments',
+          projectId: 'project-1',
+          deploymentId: 'deployment-1',
+          deploymentVersionId: 'deployment-version-1',
+          capabilityId: 'capability-1',
+          capabilityToken: 'wfpub_must-never-reach-builder-clients',
+          allowedOrigins: ['https://app.example.test'],
+          expiresAt: '2026-07-17T08:00:00.000Z',
+          activatedAt: now,
+        },
+      })
+    }) as FetchLike,
+  })).publicRuntime
+
+  await assert.rejects(
+    publicData.listPolicies('project-1'),
+    PlatformProtocolError,
+  )
+  await assert.rejects(
+    publicData.activeDeploymentRuntime('project-1', 'deployment-1'),
+    PlatformProtocolError,
+  )
 })
 
 test('RFC 9457 data failures stay structured and network failure has no fallback request', async () => {

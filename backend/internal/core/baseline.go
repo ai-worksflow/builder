@@ -74,7 +74,7 @@ func (s *BaselineService) Compile(ctx context.Context, projectID, actorID string
 		if err := s.database.WithContext(ctx).Where("id = ?", artifactID).Take(&artifact).Error; err != nil {
 			return ArtifactRevision{}, err
 		}
-		if artifact.Kind != "project_brief" && artifact.Kind != "product_requirements" && artifact.Kind != "decision_record" && artifact.Kind != "glossary_policy" {
+		if artifact.Kind != "project_brief" && artifact.Kind != "product_requirements" && artifact.Kind != "decision_record" && artifact.Kind != "glossary_policy" && artifact.Kind != "requirement_baseline" {
 			return ArtifactRevision{}, fmt.Errorf("%w: unsupported baseline source %s", ErrInvalidInput, artifact.Kind)
 		}
 		var revision storage.ArtifactRevisionModel
@@ -88,6 +88,15 @@ func (s *BaselineService) Compile(ctx context.Context, projectID, actorID string
 		if err != nil {
 			return ArtifactRevision{}, err
 		}
+		if artifact.Kind == "requirement_baseline" {
+			if len(sources) != 1 {
+				return ArtifactRevision{}, fmt.Errorf("%w: an existing Requirement Baseline cannot be mixed with document sources", ErrInvalidInput)
+			}
+			if report := ValidateArtifactContent(artifact.Kind, stored.Payload); !report.Valid {
+				return ArtifactRevision{}, fmt.Errorf("%w: existing Requirement Baseline is invalid", ErrBlockingGate)
+			}
+			return revisionFromModel(revision, stored.Payload, nil), nil
+		}
 		if report := ValidateArtifactContent(artifact.Kind, stored.Payload); !report.Valid && (artifact.Kind == "project_brief" || artifact.Kind == "product_requirements") {
 			return ArtifactRevision{}, fmt.Errorf("%w: source validation failed", ErrBlockingGate)
 		}
@@ -95,47 +104,12 @@ func (s *BaselineService) Compile(ctx context.Context, projectID, actorID string
 		if err := json.Unmarshal(stored.Payload, &content); err != nil {
 			return ArtifactRevision{}, err
 		}
-		for _, block := range objectSlice(content["blocks"]) {
-			encoded, _ := json.Marshal(block)
-			blockType := firstString(block, "type")
-			switch blockType {
-			case "actor":
-				baseline.Actors = append(baseline.Actors, encoded)
-			case "userJourney":
-				baseline.Journeys = append(baseline.Journeys, encoded)
-			case "requirement", "acceptanceCriterion":
-				baseline.Requirements = append(baseline.Requirements, encoded)
-			case "businessRule":
-				baseline.BusinessRules = append(baseline.BusinessRules, encoded)
-			case "nonFunctionalRequirement":
-				baseline.NonFunctionalRequirements = append(baseline.NonFunctionalRequirements, encoded)
-			case "constraint":
-				baseline.Constraints = append(baseline.Constraints, encoded)
-			case "decision":
-				baseline.Decisions = append(baseline.Decisions, encoded)
-			case "sourceReference":
-				baseline.References = append(baseline.References, encoded)
-			case "openQuestion":
-				if !boolean(block["blocking"]) {
-					baseline.NonBlockingOpenQuestions = append(baseline.NonBlockingOpenQuestions, encoded)
-				}
-			}
-			if anchor := firstString(block, "requirementId", "acceptanceCriterionId", "key", "id"); anchor != "" {
-				anchorsBySource[revision.ID] = append(anchorsBySource[revision.ID], anchor)
-			}
-		}
+		anchorsBySource[revision.ID] = append(anchorsBySource[revision.ID], appendBaselineContent(&baseline, content)...)
 		baseline.SourceVersions = appendUniqueRef(baseline.SourceVersions, source)
 		sourceModels = append(sourceModels, revision)
 	}
 	sortVersionRefs(baseline.SourceVersions)
-	hashPayload := baseline
-	hashPayload.BaselineHash = ""
-	baselineHash, err := domain.CanonicalHash(hashPayload)
-	if err != nil {
-		return ArtifactRevision{}, err
-	}
-	baseline.BaselineHash = baselineHash
-	payload, err := json.Marshal(baseline)
+	payload, err := finalizeRequirementBaselinePayload(baseline)
 	if err != nil {
 		return ArtifactRevision{}, err
 	}
@@ -152,6 +126,7 @@ func (s *BaselineService) Compile(ctx context.Context, projectID, actorID string
 	}()
 	now := s.now().UTC()
 	var revision storage.ArtifactRevisionModel
+	reusedRevision := false
 	err = s.database.WithContext(ctx).Transaction(func(transaction *gorm.DB) error {
 		var artifact storage.ArtifactModel
 		err := transaction.Clauses(clause.Locking{Strength: "UPDATE"}).
@@ -166,6 +141,19 @@ func (s *BaselineService) Compile(ctx context.Context, projectID, actorID string
 				return err
 			}
 		} else if err != nil {
+			return err
+		}
+		var existing storage.ArtifactRevisionModel
+		err = transaction.Where(
+			"artifact_id = ? AND content_hash = ? AND workflow_status = 'approved'",
+			artifact.ID, contentRef.ContentHash,
+		).Order("revision_number DESC").Take(&existing).Error
+		if err == nil {
+			revision = existing
+			reusedRevision = true
+			return nil
+		}
+		if !errors.Is(err, gorm.ErrRecordNotFound) {
 			return err
 		}
 		var latest uint64
@@ -243,9 +231,108 @@ func (s *BaselineService) Compile(ctx context.Context, projectID, actorID string
 	if err != nil {
 		return ArtifactRevision{}, err
 	}
+	if reusedRevision {
+		return revisionFromModel(revision, payload, nil), nil
+	}
 	abortPending = false
 	if err := s.contents.Finalize(ctx, contentRef.ID); err != nil {
 		return ArtifactRevision{}, fmt.Errorf("%w: %v", ErrContentNotReady, err)
 	}
-	return revisionFromModel(revision, payload), nil
+	return revisionFromModel(revision, payload, nil), nil
+}
+
+func finalizeRequirementBaselinePayload(baseline RequirementBaseline) (json.RawMessage, error) {
+	hashPayload := baseline
+	hashPayload.BaselineHash = ""
+	baselineHash, err := domain.CanonicalHash(hashPayload)
+	if err != nil {
+		return nil, err
+	}
+	baseline.BaselineHash = baselineHash
+	payload, err := json.Marshal(baseline)
+	if err != nil {
+		return nil, err
+	}
+	report := ValidateArtifactContent("requirement_baseline", payload)
+	if !report.Valid {
+		message := "compiled Requirement Baseline is invalid"
+		if len(report.Findings) > 0 {
+			message = report.Findings[0].Code + ": " + report.Findings[0].Message
+		}
+		return nil, fmt.Errorf("%w: %s", ErrBlockingGate, message)
+	}
+	return payload, nil
+}
+
+func appendBaselineContent(baseline *RequirementBaseline, content map[string]any) []string {
+	anchors := make([]string, 0)
+	seenAnchors := map[string]struct{}{}
+	appendAnchor := func(anchor string) bool {
+		if anchor == "" {
+			return true
+		}
+		if _, duplicate := seenAnchors[anchor]; duplicate {
+			return false
+		}
+		seenAnchors[anchor] = struct{}{}
+		anchors = append(anchors, anchor)
+		return true
+	}
+	for _, block := range objectSlice(content["blocks"]) {
+		encoded, _ := json.Marshal(block)
+		blockType := firstString(block, "type")
+		anchor := firstString(block, "requirementId", "acceptanceCriterionId", "key", "id")
+		switch blockType {
+		case "actor":
+			baseline.Actors = append(baseline.Actors, encoded)
+		case "userJourney":
+			baseline.Journeys = append(baseline.Journeys, encoded)
+		case "requirement", "acceptanceCriterion":
+			if appendAnchor(anchor) {
+				baseline.Requirements = append(baseline.Requirements, encoded)
+			}
+			continue
+		case "businessRule":
+			baseline.BusinessRules = append(baseline.BusinessRules, encoded)
+		case "nonFunctionalRequirement":
+			baseline.NonFunctionalRequirements = append(baseline.NonFunctionalRequirements, encoded)
+		case "constraint":
+			baseline.Constraints = append(baseline.Constraints, encoded)
+		case "decision":
+			baseline.Decisions = append(baseline.Decisions, encoded)
+		case "sourceReference":
+			baseline.References = append(baseline.References, encoded)
+		case "openQuestion":
+			if !boolean(block["blocking"]) {
+				baseline.NonBlockingOpenQuestions = append(baseline.NonBlockingOpenQuestions, encoded)
+			}
+		}
+		appendAnchor(anchor)
+	}
+	for _, requirement := range objectSlice(content["requirements"]) {
+		anchor := firstString(requirement, "requirementId", "key", "id")
+		if !appendAnchor(anchor) {
+			continue
+		}
+		baseline.Requirements = append(baseline.Requirements, canonicalBaselineRequirement(requirement, "requirement", "requirementId", anchor))
+	}
+	for _, criterion := range objectSlice(content["acceptanceCriteria"]) {
+		anchor := firstString(criterion, "acceptanceCriterionId", "key", "id")
+		if !appendAnchor(anchor) {
+			continue
+		}
+		baseline.Requirements = append(baseline.Requirements, canonicalBaselineRequirement(criterion, "acceptanceCriterion", "acceptanceCriterionId", anchor))
+	}
+	return anchors
+}
+
+func canonicalBaselineRequirement(value map[string]any, blockType, key, anchor string) json.RawMessage {
+	canonical := make(map[string]any, len(value)+2)
+	for field, fieldValue := range value {
+		canonical[field] = fieldValue
+	}
+	canonical["type"] = blockType
+	canonical[key] = anchor
+	encoded, _ := json.Marshal(canonical)
+	return encoded
 }

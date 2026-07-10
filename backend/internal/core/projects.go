@@ -307,13 +307,17 @@ func initialProjectBrief(name, description string) map[string]any {
 		background = "Describe the problem, target users, constraints, and desired outcome with the AI interviewer."
 	}
 	return map[string]any{
-		"schemaVersion": 1,
-		"kind":          "projectBrief",
-		"summary":       background,
+		"schemaVersion":      1,
+		"kind":               "projectBrief",
+		"summary":            background,
+		"requirements":       []any{},
+		"acceptanceCriteria": []any{},
+		"openQuestions":      []any{},
+		"assumptions":        []any{},
 		"blocks": []map[string]any{
-			{"id": "goal-1", "type": "goal", "order": 1, "title": name, "description": background, "provenance": "human"},
-			{"id": "question-1", "type": "openQuestion", "order": 2, "question": "Who is the primary user?", "blocking": true, "status": "open", "provenance": "system"},
-			{"id": "question-2", "type": "openQuestion", "order": 3, "question": "What measurable outcome defines success?", "blocking": true, "status": "open", "provenance": "system"},
+			{"id": "goal-1", "type": "goal", "text": name + ": " + background, "data": map[string]any{"provenance": "human"}},
+			{"id": "question-1", "type": "openQuestion", "text": "Who is the primary user?", "blocking": true, "status": "open", "data": map[string]any{"provenance": "system"}},
+			{"id": "question-2", "type": "openQuestion", "text": "What measurable outcome defines success?", "blocking": true, "status": "open", "data": map[string]any{"provenance": "system"}},
 		},
 	}
 }

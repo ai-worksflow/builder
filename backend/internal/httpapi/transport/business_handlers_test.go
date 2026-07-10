@@ -27,6 +27,7 @@ func TestBusinessRouteRegistrationCoversCoreResources(t *testing.T) {
 	for _, expected := range []string{
 		"POST /v1/projects/:projectId/artifacts",
 		"GET /v1/artifacts/:artifactId/draft",
+		"GET /v1/artifacts/:artifactId/review-gate",
 		"PATCH /v1/drafts/:draftId",
 		"POST /v1/revisions/:revisionId/reviews",
 		"GET /v1/reviews/:reviewId",
@@ -46,6 +47,35 @@ func TestBusinessRouteRegistrationCoversCoreResources(t *testing.T) {
 		if !routes[expected] {
 			t.Errorf("missing route %s", expected)
 		}
+	}
+}
+
+func TestArtifactReviewGateReturnsServerEvidenceForAuthenticatedActor(t *testing.T) {
+	artifactID := uuid.NewString()
+	commentID := uuid.NewString()
+	artifacts := &fakeArtifactService{reviewGate: core.ArtifactReviewGate{
+		Passed: false,
+		Checks: []core.ReviewGateCheck{{
+			Code: "blocking_comments_resolved", Severity: "error",
+			Message: "Resolve one blocking comment.", Path: "comments", SourceID: artifactID,
+		}},
+		UnresolvedBlockingCommentIDs: []string{commentID}, TraceCoverage: 0.5,
+	}}
+	router := newBusinessRouter(t, transport.Services{Artifacts: artifacts})
+	response := performRequest(router, http.MethodGet, "/v1/artifacts/"+artifactID+"/review-gate", nil, authenticatedHeaders(false))
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+	}
+	var gate core.ArtifactReviewGate
+	decodeResponse(t, response, &gate)
+	if gate.Passed || gate.TraceCoverage != 0.5 || len(gate.Checks) != 1 || len(gate.UnresolvedBlockingCommentIDs) != 1 {
+		t.Fatalf("gate = %#v", gate)
+	}
+	if artifacts.reviewGateCalls != 1 || artifacts.reviewGateArtifactID != artifactID || artifacts.reviewGateActorID != testUserID {
+		t.Fatalf("review gate call = %d artifact=%q actor=%q", artifacts.reviewGateCalls, artifacts.reviewGateArtifactID, artifacts.reviewGateActorID)
+	}
+	if response.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("Cache-Control = %q", response.Header().Get("Cache-Control"))
 	}
 }
 
@@ -113,6 +143,67 @@ func TestDraftUpdateRequiresIfMatchAndMapsConflictTo412(t *testing.T) {
 	assertProblem(t, response, http.StatusPreconditionFailed, "etag_mismatch")
 	if artifacts.expectedETag != headers.Get("If-Match") || artifacts.draftID != draftID {
 		t.Fatalf("etag = %q, draft = %q", artifacts.expectedETag, artifacts.draftID)
+	}
+}
+
+func TestCollectionDraftSourceOmissionPreservesWhileExplicitEmptyRemainsExplicit(t *testing.T) {
+	artifactID := uuid.NewString()
+	draftID := uuid.NewString()
+	artifacts := &fakeArtifactService{getArtifact: core.VersionedArtifact{
+		Artifact: core.Artifact{ID: artifactID, ProjectID: testProjectID, Kind: "page_spec"},
+		Draft:    &core.ArtifactDraft{ID: draftID, ArtifactID: artifactID, ETag: `"draft:1"`},
+	}}
+	router := newBusinessRouter(t, transport.Services{Artifacts: artifacts})
+	headers := authenticatedHeaders(true)
+	headers.Set("Content-Type", "application/json")
+	headers.Set("If-Match", `"draft:1"`)
+	path := "/v1/page-specs/" + artifactID + "/draft"
+
+	omitted := performRequest(router, http.MethodPatch, path, []byte(`{
+		"content":{"blueprintPageNodeId":"page-orders","title":"Orders"}
+	}`), headers)
+	if omitted.Code != http.StatusOK {
+		t.Fatalf("omitted status = %d, body = %s", omitted.Code, omitted.Body.String())
+	}
+	if len(artifacts.updateInputs) != 1 || artifacts.updateInputs[0].SourceVersions != nil {
+		t.Fatalf("omitted sourceVersions became an explicit replacement: %#v", artifacts.updateInputs)
+	}
+
+	explicit := performRequest(router, http.MethodPatch, path, []byte(`{
+		"content":{"blueprintPageNodeId":"page-orders","title":"Orders"},
+		"sourceVersions":[]
+	}`), headers)
+	if explicit.Code != http.StatusOK {
+		t.Fatalf("explicit status = %d, body = %s", explicit.Code, explicit.Body.String())
+	}
+	if len(artifacts.updateInputs) != 2 || artifacts.updateInputs[1].SourceVersions == nil || len(artifacts.updateInputs[1].SourceVersions) != 0 {
+		t.Fatalf("explicit empty sourceVersions lost omission semantics: %#v", artifacts.updateInputs)
+	}
+}
+
+func TestGenericAndCollectionArtifactRoutesShareTheServiceLineageGate(t *testing.T) {
+	artifacts := &fakeArtifactService{createErr: core.ErrBlockingGate}
+	router := newBusinessRouter(t, transport.Services{Artifacts: artifacts})
+	headers := authenticatedHeaders(true)
+	headers.Set("Content-Type", "application/json")
+	headers.Set("Idempotency-Key", "generic-page-spec-lineage")
+
+	generic := performRequest(router, http.MethodPost, "/v1/projects/"+testProjectID+"/artifacts", []byte(`{
+		"kind":"page_spec","title":"Generic PageSpec",
+		"content":{"blueprintPageNodeId":"page-orders"}
+	}`), headers)
+	assertProblem(t, generic, http.StatusConflict, "blocking_gate")
+
+	headers.Set("Idempotency-Key", "collection-page-spec-lineage")
+	collection := performRequest(router, http.MethodPost, "/v1/projects/"+testProjectID+"/page-specs", []byte(`{
+		"title":"Collection PageSpec","blueprintPageNodeId":"page-orders",
+		"content":{"blueprintPageNodeId":"page-orders"}
+	}`), headers)
+	assertProblem(t, collection, http.StatusConflict, "blocking_gate")
+
+	if artifacts.createCalls != 2 || len(artifacts.createInputs) != 2 ||
+		artifacts.createInputs[0].Kind != "page_spec" || artifacts.createInputs[1].Kind != "page_spec" {
+		t.Fatalf("generic and collection routes did not share ArtifactService.Create: calls=%d inputs=%#v", artifacts.createCalls, artifacts.createInputs)
 	}
 }
 
@@ -242,23 +333,31 @@ func newBusinessRouter(t *testing.T, services transport.Services, persistence ..
 }
 
 type fakeArtifactService struct {
-	created      core.VersionedArtifact
-	listed       []core.Artifact
-	getArtifact  core.VersionedArtifact
-	getRevision  core.ArtifactRevision
-	updateErr    error
-	createCalls  int
-	projectID    string
-	actor        string
-	draftID      string
-	expectedETag string
+	created              core.VersionedArtifact
+	createErr            error
+	createInputs         []core.CreateArtifactInput
+	listed               []core.Artifact
+	getArtifact          core.VersionedArtifact
+	getRevision          core.ArtifactRevision
+	updateErr            error
+	createCalls          int
+	projectID            string
+	actor                string
+	draftID              string
+	expectedETag         string
+	reviewGate           core.ArtifactReviewGate
+	reviewGateCalls      int
+	reviewGateArtifactID string
+	reviewGateActorID    string
+	updateInputs         []core.UpdateDraftInput
 }
 
-func (f *fakeArtifactService) Create(_ context.Context, projectID, actor string, _ core.CreateArtifactInput) (core.VersionedArtifact, error) {
+func (f *fakeArtifactService) Create(_ context.Context, projectID, actor string, input core.CreateArtifactInput) (core.VersionedArtifact, error) {
 	f.createCalls++
 	f.projectID = projectID
 	f.actor = actor
-	return f.created, nil
+	f.createInputs = append(f.createInputs, input)
+	return f.created, f.createErr
 }
 
 func (f *fakeArtifactService) List(context.Context, string, string, string, string) ([]core.Artifact, error) {
@@ -269,10 +368,11 @@ func (f *fakeArtifactService) Get(context.Context, string, string, bool) (core.V
 	return f.getArtifact, nil
 }
 
-func (f *fakeArtifactService) UpdateDraft(_ context.Context, draftID, _ string, expectedETag string, _ core.UpdateDraftInput) (core.ArtifactDraft, error) {
+func (f *fakeArtifactService) UpdateDraft(_ context.Context, draftID, _ string, expectedETag string, input core.UpdateDraftInput) (core.ArtifactDraft, error) {
 	f.draftID = draftID
 	f.expectedETag = expectedETag
-	return core.ArtifactDraft{}, f.updateErr
+	f.updateInputs = append(f.updateInputs, input)
+	return core.ArtifactDraft{ID: draftID, ETag: expectedETag}, f.updateErr
 }
 
 func (*fakeArtifactService) CreateRevision(context.Context, string, string, string, core.CreateRevisionInput) (core.ArtifactRevision, error) {
@@ -285,6 +385,13 @@ func (*fakeArtifactService) ListRevisions(context.Context, string, string) ([]co
 
 func (f *fakeArtifactService) GetRevision(context.Context, string, string) (core.ArtifactRevision, error) {
 	return f.getRevision, nil
+}
+
+func (f *fakeArtifactService) ReviewGate(_ context.Context, artifactID, actorID string) (core.ArtifactReviewGate, error) {
+	f.reviewGateCalls++
+	f.reviewGateArtifactID = artifactID
+	f.reviewGateActorID = actorID
+	return f.reviewGate, nil
 }
 
 type fakeReviewService struct {

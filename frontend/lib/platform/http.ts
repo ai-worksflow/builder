@@ -116,7 +116,8 @@ function configuredBaseUrl() {
   ) {
     return `http://${window.location.hostname}:8080`
   }
-  return '/api/platform'
+  if (typeof window !== 'undefined') return window.location.origin
+  return 'http://127.0.0.1:8080'
 }
 
 class MemoryCsrfTokenStore implements CsrfTokenStore {

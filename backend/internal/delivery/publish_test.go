@@ -48,10 +48,14 @@ func (s *publishAccessStub) Authorize(_ context.Context, _, _ string, action cor
 }
 
 type publishLoaderStub struct {
-	workspace WorkspaceSnapshot
-	bundle    core.WorkbenchBundle
-	err       error
-	manifest  string
+	workspace       WorkspaceSnapshot
+	bundle          core.WorkbenchBundle
+	err             error
+	manifest        string
+	lineageErr      error
+	lineageCalled   bool
+	lineageRevision core.VersionRef
+	lineageManifest string
 }
 
 func (s *publishLoaderStub) LoadFrozenWorkspace(_ context.Context, _, _ string, reference core.VersionRef, _ core.Action) (WorkspaceSnapshot, error) {
@@ -70,16 +74,32 @@ func (s *publishLoaderStub) LoadBuildManifest(_ context.Context, _, _, manifestI
 	return s.bundle, s.err
 }
 
+func (s *publishLoaderStub) ValidateWorkspaceManifestLineage(_ context.Context, _, _ string, revision core.VersionRef, manifestID string, _ core.Action) error {
+	s.lineageCalled = true
+	s.lineageRevision = revision
+	s.lineageManifest = manifestID
+	return s.lineageErr
+}
+
 type publishQualityStub struct {
-	report     QualityReport
-	artifact   BuildArtifact
-	err        error
-	called     bool
-	loadCalled bool
+	report       QualityReport
+	artifact     BuildArtifact
+	err          error
+	called       bool
+	latestCalled bool
+	getID        string
+	loadCalled   bool
 }
 
 func (s *publishQualityStub) LatestPassingForRevision(context.Context, string, string, string) (QualityReport, error) {
 	s.called = true
+	s.latestCalled = true
+	return s.report, s.err
+}
+
+func (s *publishQualityStub) Get(_ context.Context, qualityRunID, _ string) (QualityReport, error) {
+	s.called = true
+	s.getID = qualityRunID
 	return s.report, s.err
 }
 
@@ -109,38 +129,49 @@ func newPublishServiceForBoundaryTest(t *testing.T, access AccessControl, loader
 func TestPublishProductionRequiresPassingReportForExactWorkspace(t *testing.T) {
 	requested := publishExactRef()
 	different := publishExactRef()
+	projectID, manifestID, qualityRunID := uuid.NewString(), uuid.NewString(), uuid.NewString()
 	access := &publishAccessStub{}
 	loader := &publishLoaderStub{workspace: WorkspaceSnapshot{
-		ProjectID: uuid.NewString(), Revision: requested,
+		ProjectID: projectID, Revision: requested,
 		Files: []WorkspaceFile{{Path: "index.html", Content: "<h1>ready</h1>"}},
+	}, bundle: core.WorkbenchBundle{ID: manifestID, ProjectID: projectID}}
+	quality := &publishQualityStub{report: QualityReport{
+		ID: qualityRunID, ProjectID: projectID, Passed: true, WorkspaceRevision: different,
 	}}
-	quality := &publishQualityStub{report: QualityReport{Passed: true, WorkspaceRevision: different}}
 	environments := &environmentResolverStub{}
 	service := newPublishServiceForBoundaryTest(t, access, loader, quality, environments)
-	_, err := service.Publish(context.Background(), uuid.NewString(), uuid.NewString(), "", PublishInput{
+	_, err := service.Publish(context.Background(), projectID, uuid.NewString(), "", PublishInput{
 		Environment: EnvironmentProduction, WorkspaceRevision: &requested,
+		BuildManifestID: manifestID, QualityRunID: qualityRunID,
 	})
 	typed, ok := AsError(err)
 	if !ok || typed.Code != CodeConflict {
 		t.Fatalf("mismatched production quality report was accepted: %v", err)
 	}
-	if access.action != core.ActionPublish || !quality.called || environments.called {
-		t.Fatalf("production boundary ordering is incorrect: action=%s quality=%v environment=%v", access.action, quality.called, environments.called)
+	if access.action != core.ActionPublish || !quality.called || quality.getID != qualityRunID || quality.latestCalled || environments.called {
+		t.Fatalf("production boundary ordering is incorrect: action=%s quality=%v get=%q latest=%v environment=%v", access.action, quality.called, quality.getID, quality.latestCalled, environments.called)
+	}
+	if !loader.lineageCalled || loader.lineageManifest != manifestID || !exactVersionRefEqual(loader.lineageRevision, requested) {
+		t.Fatalf("publish did not validate the exact workspace/manifest lineage: %+v", loader)
 	}
 }
 
 func TestPublishPreviewAlsoRequiresPassingImmutableBuildArtifact(t *testing.T) {
 	requested := publishExactRef()
+	projectID, manifestID, qualityRunID := uuid.NewString(), uuid.NewString(), uuid.NewString()
 	access := &publishAccessStub{}
 	loader := &publishLoaderStub{workspace: WorkspaceSnapshot{
-		ProjectID: uuid.NewString(), Revision: requested,
+		ProjectID: projectID, Revision: requested,
 		Files: []WorkspaceFile{{Path: "index.html", Content: "<h1>ready</h1>"}},
+	}, bundle: core.WorkbenchBundle{ID: manifestID, ProjectID: projectID}}
+	quality := &publishQualityStub{report: QualityReport{
+		ID: qualityRunID, ProjectID: projectID, Passed: true, WorkspaceRevision: requested,
 	}}
-	quality := &publishQualityStub{report: QualityReport{ID: uuid.NewString(), Passed: true, WorkspaceRevision: requested}}
 	environments := &environmentResolverStub{}
 	service := newPublishServiceForBoundaryTest(t, access, loader, quality, environments)
-	_, err := service.Publish(context.Background(), uuid.NewString(), uuid.NewString(), "", PublishInput{
+	_, err := service.Publish(context.Background(), projectID, uuid.NewString(), "", PublishInput{
 		Environment: EnvironmentPreview, WorkspaceRevision: &requested,
+		BuildManifestID: manifestID, QualityRunID: qualityRunID,
 	})
 	typed, ok := AsError(err)
 	if !ok || typed.Code != CodeConflict {
@@ -153,16 +184,18 @@ func TestPublishPreviewAlsoRequiresPassingImmutableBuildArtifact(t *testing.T) {
 
 func TestPublishRejectsSensitiveWorkspaceBeforeEnvironmentOrProvider(t *testing.T) {
 	requested := publishExactRef()
+	projectID, manifestID, qualityRunID := uuid.NewString(), uuid.NewString(), uuid.NewString()
 	access := &publishAccessStub{}
 	loader := &publishLoaderStub{workspace: WorkspaceSnapshot{
 		Revision: requested,
 		Files:    []WorkspaceFile{{Path: ".env.production", Content: "TOKEN=secret"}},
-	}}
+	}, bundle: core.WorkbenchBundle{ID: manifestID, ProjectID: projectID}}
 	quality := &publishQualityStub{}
 	environments := &environmentResolverStub{}
 	service := newPublishServiceForBoundaryTest(t, access, loader, quality, environments)
-	_, err := service.Publish(context.Background(), uuid.NewString(), uuid.NewString(), "", PublishInput{
+	_, err := service.Publish(context.Background(), projectID, uuid.NewString(), "", PublishInput{
 		Environment: EnvironmentPreview, WorkspaceRevision: &requested,
+		BuildManifestID: manifestID, QualityRunID: qualityRunID,
 	})
 	typed, ok := AsError(err)
 	if !ok || typed.Code != CodeSensitiveContent {
@@ -173,27 +206,85 @@ func TestPublishRejectsSensitiveWorkspaceBeforeEnvironmentOrProvider(t *testing.
 	}
 }
 
-func TestPublishBuildManifestMustPinWorkspace(t *testing.T) {
-	access := &publishAccessStub{}
-	loader := &publishLoaderStub{bundle: core.WorkbenchBundle{ID: uuid.NewString(), ProjectID: uuid.NewString()}}
+func TestPublishRequiresExplicitQualityWorkspaceAndManifestProvenance(t *testing.T) {
+	reference := publishExactRef()
+	manifestID, qualityRunID := uuid.NewString(), uuid.NewString()
+	tests := []struct {
+		name  string
+		input PublishInput
+		field string
+	}{
+		{name: "quality run", input: PublishInput{
+			Environment: EnvironmentPreview, WorkspaceRevision: &reference, BuildManifestID: manifestID,
+		}, field: "qualityRunId"},
+		{name: "workspace revision", input: PublishInput{
+			Environment: EnvironmentPreview, BuildManifestID: manifestID, QualityRunID: qualityRunID,
+		}, field: "workspaceRevision"},
+		{name: "build manifest", input: PublishInput{
+			Environment: EnvironmentPreview, WorkspaceRevision: &reference, QualityRunID: qualityRunID,
+		}, field: "buildManifestId"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			access := &publishAccessStub{}
+			loader := &publishLoaderStub{}
+			quality := &publishQualityStub{}
+			service := newPublishServiceForBoundaryTest(t, access, loader, quality, EmptyEnvironmentResolver{})
+			_, err := service.Publish(context.Background(), uuid.NewString(), uuid.NewString(), "", test.input)
+			typed, ok := AsError(err)
+			if !ok || typed.Code != CodeInvalidInput || len(typed.Fields[test.field]) == 0 {
+				t.Fatalf("missing %s was accepted: %v", test.field, err)
+			}
+			if access.action != "" || loader.manifest != "" || quality.called {
+				t.Fatalf("invalid provenance crossed the publish boundary: access=%s loader=%+v quality=%+v", access.action, loader, quality)
+			}
+		})
+	}
+}
+
+func TestPublishRejectsUntrustedWorkspaceManifestPairBeforeQuality(t *testing.T) {
+	reference := publishExactRef()
+	projectID, manifestID, qualityRunID := uuid.NewString(), uuid.NewString(), uuid.NewString()
+	loader := &publishLoaderStub{
+		workspace:  WorkspaceSnapshot{ProjectID: projectID, Revision: reference, Files: []WorkspaceFile{{Path: "index.html", Content: "ready"}}},
+		bundle:     core.WorkbenchBundle{ID: manifestID, ProjectID: projectID},
+		lineageErr: conflict("workspaceRevision was not produced by the selected buildManifestId"),
+	}
 	quality := &publishQualityStub{}
-	service := newPublishServiceForBoundaryTest(t, access, loader, quality, EmptyEnvironmentResolver{})
-	_, err := service.Publish(context.Background(), uuid.NewString(), uuid.NewString(), "", PublishInput{
-		Environment: EnvironmentPreview, BuildManifestID: loader.bundle.ID,
+	service := newPublishServiceForBoundaryTest(t, &publishAccessStub{}, loader, quality, EmptyEnvironmentResolver{})
+	_, err := service.Publish(context.Background(), projectID, uuid.NewString(), "", PublishInput{
+		Environment: EnvironmentPreview, WorkspaceRevision: &reference,
+		BuildManifestID: manifestID, QualityRunID: qualityRunID,
 	})
-	typed, ok := AsError(err)
-	if !ok || typed.Code != CodeConflict || loader.manifest != loader.bundle.ID {
-		t.Fatalf("unpinned build manifest was accepted: err=%v loader=%+v", err, loader)
+	if typed, ok := AsError(err); !ok || typed.Code != CodeConflict {
+		t.Fatalf("forged workspace/manifest provenance was accepted: %v", err)
+	}
+	if !loader.lineageCalled || quality.called {
+		t.Fatalf("lineage was not fail-closed before quality: loader=%+v quality=%+v", loader, quality)
+	}
+}
+
+func TestPublishRejectsConflictingHTTPAndWorkflowQualityPins(t *testing.T) {
+	reference := publishExactRef()
+	service := newPublishServiceForBoundaryTest(t, &publishAccessStub{}, &publishLoaderStub{}, &publishQualityStub{}, EmptyEnvironmentResolver{})
+	_, err := service.Publish(context.Background(), uuid.NewString(), uuid.NewString(), "", PublishInput{
+		Environment: EnvironmentPreview, WorkspaceRevision: &reference,
+		BuildManifestID: uuid.NewString(), QualityRunID: uuid.NewString(), WorkflowQualityRunID: uuid.NewString(),
+	})
+	if typed, ok := AsError(err); !ok || typed.Code != CodeInvalidInput {
+		t.Fatalf("conflicting selected quality runs were accepted: %v", err)
 	}
 }
 
 func TestPublishAuthorizationFailsBeforeLoadingFrozenContent(t *testing.T) {
 	requested := publishExactRef()
+	manifestID := uuid.NewString()
 	access := &publishAccessStub{err: core.ErrForbidden}
-	loader := &publishLoaderStub{err: errors.New("must not load")}
+	loader := &publishLoaderStub{err: errors.New("must not load"), bundle: core.WorkbenchBundle{ID: manifestID}}
 	service := newPublishServiceForBoundaryTest(t, access, loader, &publishQualityStub{}, EmptyEnvironmentResolver{})
 	_, err := service.Publish(context.Background(), uuid.NewString(), uuid.NewString(), "", PublishInput{
 		Environment: EnvironmentProduction, WorkspaceRevision: &requested,
+		BuildManifestID: manifestID, QualityRunID: uuid.NewString(),
 	})
 	if !errors.Is(err, core.ErrForbidden) {
 		t.Fatalf("authorization error was not preserved: %v", err)

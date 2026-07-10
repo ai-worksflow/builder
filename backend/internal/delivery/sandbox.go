@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -181,6 +182,47 @@ func (*ContainerSandbox) Kind() string { return "container" }
 
 func (s *ContainerSandbox) DependencyPolicy() DependencyPolicy { return s.resolverPolicy }
 
+func (s *ContainerSandbox) ImagesDigestPinned() bool {
+	return digestPinnedContainerImage(s.nodeImage) && digestPinnedContainerImage(s.goImage)
+}
+
+func digestPinnedContainerImage(value string) bool {
+	parts := strings.Split(value, "@sha256:")
+	if len(parts) != 2 || parts[0] == "" || len(parts[1]) != 64 {
+		return false
+	}
+	for _, character := range parts[1] {
+		if (character < '0' || character > '9') && (character < 'a' || character > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+// Readiness verifies both daemon reachability and the immutable image pins.
+// It never pulls images; a missing pre-provisioned image keeps the API out of
+// rotation instead of failing the first quality run.
+func (s *ContainerSandbox) Readiness(ctx context.Context) error {
+	configDirectory, err := os.MkdirTemp("", "worksflow-readiness-config-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(configDirectory)
+	for _, args := range [][]string{
+		{"version"},
+		{"image", "inspect", s.nodeImage, s.goImage},
+	} {
+		command := exec.CommandContext(ctx, s.runtimePath, args...)
+		command.Env = sandboxClientEnvironment(configDirectory, s.daemonHost)
+		command.Stdout = io.Discard
+		command.Stderr = io.Discard
+		if err := command.Run(); err != nil {
+			return fmt.Errorf("quality sandbox readiness failed: %w", err)
+		}
+	}
+	return nil
+}
+
 func (s *ContainerSandbox) Run(ctx context.Context, workspaceDirectory string, request SandboxRequest) (SandboxResult, error) {
 	image, command, err := s.fixedCommand(request)
 	if err != nil {
@@ -219,7 +261,7 @@ func (s *ContainerSandbox) qualityRunArgs(name, workspace string, request Sandbo
 		switch request.Ecosystem {
 		case "node":
 			nodeModules := filepath.Join(dependencies, "node_modules")
-			if info, statErr := os.Stat(nodeModules); statErr != nil || !info.IsDir() {
+			if info, statErr := os.Lstat(nodeModules); statErr != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
 				return nil, Invalid("dependencies", "prepared node_modules directory does not exist")
 			}
 			args = append(args,
@@ -228,13 +270,15 @@ func (s *ContainerSandbox) qualityRunArgs(name, workspace string, request Sandbo
 			)
 		case "go":
 			moduleCache := filepath.Join(dependencies, "pkg", "mod")
-			if info, statErr := os.Stat(moduleCache); statErr != nil || !info.IsDir() {
+			if info, statErr := os.Lstat(moduleCache); statErr != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
 				return nil, Invalid("dependencies", "prepared Go module cache does not exist")
 			}
 			args = append(args,
 				"--mount", "type=bind,src="+moduleCache+",dst=/go/pkg/mod,readonly",
 				"--env", "GOMODCACHE=/go/pkg/mod", "--env", "GOPROXY=off",
 				"--env", "GOSUMDB="+s.resolverPolicy.GoSumDB, "--env", "GOTOOLCHAIN=local",
+				"--env", "GONOSUMDB=", "--env", "GONOPROXY=", "--env", "GOPRIVATE=",
+				"--env", "GOFLAGS=-mod=readonly", "--env", "GOCACHE=/tmp/go-build",
 			)
 		default:
 			return nil, Invalid("dependencies", "dependency cache ecosystem is unsupported")
@@ -353,7 +397,7 @@ func (s *ContainerSandbox) fixedCommand(request SandboxRequest) (string, []strin
 			CheckBuild: {"npm", "run", "build", "--if-present"},
 			CheckType:  {"npx", "--no-install", "tsc", "--noEmit", "--pretty", "false"},
 			CheckLint:  {"npm", "run", "lint", "--if-present"},
-			CheckTest:  {"npm", "test", "--", "--runInBand"},
+			CheckTest:  {"npm", "test", "--if-present"},
 		},
 		"go": {
 			CheckBuild: {"go", "build", "./..."},
@@ -433,7 +477,7 @@ func validateWorkspaceRoot(value, daemonHost string) (string, error) {
 	if err != nil || !filepath.IsAbs(absolute) || filepath.Clean(absolute) != absolute {
 		return "", errors.New("quality shared workspace root must be an absolute normalized path")
 	}
-	info, err := os.Stat(absolute)
+	info, err := os.Lstat(absolute)
 	if err != nil || !info.IsDir() {
 		return "", errors.New("quality shared workspace root must already exist")
 	}

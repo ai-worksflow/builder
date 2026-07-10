@@ -97,12 +97,14 @@ services:
     image: docker:27-cli
     environment:
       DOCKER_HOST: tcp://sandbox:2375
+      NODE_IMAGE: ${DELIVERY_SANDBOX_NODE_IMAGE:-node:22-alpine}
+      GO_IMAGE: ${DELIVERY_SANDBOX_GO_IMAGE:-golang:1.22-alpine}
     command:
       - /bin/sh
       - -ec
       - |
-        docker pull node:22-alpine
-        docker pull golang:1.22-alpine
+        docker pull "$$NODE_IMAGE"
+        docker pull "$$GO_IMAGE"
     depends_on:
       sandbox:
         condition: service_healthy
@@ -137,8 +139,8 @@ services:
       WS_ALLOW_ANONYMOUS: "false"
       DELIVERY_SANDBOX_RUNTIME: docker
       DELIVERY_SANDBOX_HOST: tcp://sandbox:2375
-      DELIVERY_SANDBOX_NODE_IMAGE: node:22-alpine
-      DELIVERY_SANDBOX_GO_IMAGE: golang:1.22-alpine
+      DELIVERY_SANDBOX_NODE_IMAGE: ${DELIVERY_SANDBOX_NODE_IMAGE:-node:22-alpine}
+      DELIVERY_SANDBOX_GO_IMAGE: ${DELIVERY_SANDBOX_GO_IMAGE:-golang:1.22-alpine}
       # Only dependency preparation uses this explicit network. Build, type,
       # lint and test containers are always forced to network=none.
       DELIVERY_RESOLVER_NETWORK: bridge

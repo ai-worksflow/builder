@@ -47,6 +47,7 @@ func (s *Server) RegisterBusinessRoutes(group *gin.RouterGroup, persistence ...g
 	command(http.MethodPost, "/projects/:projectId/artifacts", s.CreateArtifact)
 	group.GET("/artifacts/:artifactId", s.GetArtifact)
 	group.GET("/artifacts/:artifactId/draft", s.GetArtifactDraft)
+	group.GET("/artifacts/:artifactId/review-gate", s.GetArtifactReviewGate)
 	conditionalMutation(http.MethodPatch, "/drafts/:draftId", s.UpdateArtifactDraft)
 	conditionalMutation(http.MethodPatch, "/artifacts/:artifactId/drafts/:draftId", s.UpdateArtifactDraft)
 	group.GET("/artifacts/:artifactId/revisions", s.ListArtifactRevisions)

@@ -18,7 +18,7 @@ export interface PageDto<T> {
 export interface VersionRefDto {
   readonly artifactId: EntityId
   readonly revisionId: EntityId
-  readonly revisionNumber: number
+  readonly revisionNumber?: number
   readonly contentHash: ContentHash
   readonly anchorId?: EntityId
 }
@@ -126,13 +126,27 @@ export interface CreateProjectInvitationInputDto {
 }
 
 export type ArtifactKind =
-  | 'document'
+  | 'project_brief'
+  | 'product_requirements'
+  | 'decision_record'
+  | 'glossary_policy'
+  | 'reference_source'
+  | 'change_request'
+  | 'requirement_baseline'
   | 'blueprint'
-  | 'pageSpec'
+  | 'page_spec'
   | 'prototype'
-  | 'workflow'
-  | 'workbenchBundle'
-  | 'traceMatrix'
+  | 'prototype_flow'
+  | 'fixture_bundle'
+  | 'design_system'
+  | 'token_set'
+  | 'component_registry'
+  | 'api_contract'
+  | 'data_contract'
+  | 'permission_contract'
+  | 'workspace'
+  | 'test_report'
+  | 'quality_report'
 
 export type ArtifactStatus =
   | 'draft'
@@ -146,30 +160,47 @@ export interface ArtifactDto {
   readonly id: EntityId
   readonly projectId: EntityId
   readonly kind: ArtifactKind
+  readonly artifactKey: string
   readonly title: string
+  readonly lifecycle: ProjectLifecycle
   readonly status: ArtifactStatus
+  readonly syncStatus: 'current' | 'needs_sync' | 'blocked' | string
+  readonly deliveryStatus: string
   readonly activeDraftId?: EntityId
   readonly latestRevisionId?: EntityId
   readonly approvedRevisionId?: EntityId
-  readonly latestRevision?: VersionRefDto
-  readonly approvedRevision?: VersionRefDto
+  readonly version: number
   readonly createdBy: EntityId
   readonly createdAt: IsoDateTime
   readonly updatedAt: IsoDateTime
   readonly etag: string
 }
 
-export interface CreateArtifactInputDto {
+export interface ArtifactSourceInputDto {
+  readonly version: VersionRefDto
+  readonly purpose: string
+  readonly required: boolean
+}
+
+export interface ArtifactSourceDto extends VersionRefDto {
+  readonly purpose: string
+  readonly required: boolean
+}
+
+export interface CreateArtifactInputDto<TContent = JsonValue> {
   readonly kind: ArtifactKind
+  readonly artifactKey?: string
   readonly title: string
-  readonly sourceVersions?: readonly VersionRefDto[]
+  readonly schemaVersion?: number
+  readonly content?: TContent
+  readonly sourceVersions?: readonly ArtifactSourceInputDto[]
 }
 
 export interface ArtifactDraftDto<TContent> {
   readonly id: EntityId
   readonly artifactId: EntityId
   readonly baseRevisionId?: EntityId
-  readonly sourceVersions: readonly VersionRefDto[]
+  readonly sourceVersions: readonly ArtifactSourceDto[]
   readonly revision: number
   readonly content: TContent
   readonly contentHash: ContentHash
@@ -183,7 +214,7 @@ export interface ArtifactRevisionDto<TContent> {
   readonly artifactId: EntityId
   readonly revisionNumber: number
   readonly basedOnRevisionId?: EntityId
-  readonly sourceVersions?: readonly VersionRefDto[]
+  readonly sourceVersions?: readonly ArtifactSourceDto[]
   readonly content: TContent
   readonly contentHash: ContentHash
   readonly createdBy: EntityId
@@ -198,14 +229,19 @@ export interface VersionedArtifactDto<TContent> {
 }
 
 export type DependencyRelation =
-  | 'dependsOn'
-  | 'derivesFrom'
-  | 'implements'
-  | 'renders'
+  | 'drives'
+  | 'satisfied_by'
+  | 'contains'
+  | 'navigates_to'
   | 'uses'
   | 'calls'
+  | 'reads'
+  | 'writes'
   | 'requires'
-  | 'generatedBy'
+  | 'realized_by'
+  | 'implemented_by'
+  | 'verified_by'
+  | 'derives_from'
 
 export interface ArtifactDependencyDto {
   readonly id: EntityId
@@ -213,8 +249,16 @@ export interface ArtifactDependencyDto {
   readonly source: VersionRefDto
   readonly target: VersionRefDto
   readonly relation: DependencyRelation
-  readonly blocking: boolean
+  readonly required: boolean
+  readonly createdBy: EntityId
   readonly createdAt: IsoDateTime
+}
+
+export interface CreateDependencyInputDto {
+  readonly source: VersionRefDto
+  readonly target: VersionRefDto
+  readonly relation: DependencyRelation
+  readonly required: boolean
 }
 
 export interface CreateRevisionInputDto {
@@ -227,7 +271,14 @@ export interface UpdateDraftInputDto<TContent> {
   readonly sourceVersions?: readonly VersionRefDto[]
 }
 
+export interface UpdateArtifactDraftInputDto<TContent> {
+  readonly schemaVersion?: number
+  readonly content: TContent
+  readonly sourceVersions?: readonly ArtifactSourceInputDto[]
+}
+
 export type DocumentKind =
+  | 'projectBrief'
   | 'requirement'
   | 'pageSplit'
   | 'featureList'
@@ -239,8 +290,29 @@ export type DocumentKind =
 
 export interface DocumentBlockDto {
   readonly id: EntityId
-  readonly type: 'heading' | 'paragraph' | 'list' | 'table' | 'code' | 'callout'
+  readonly type:
+    | 'richText'
+    | 'goal'
+    | 'actor'
+    | 'userJourney'
+    | 'requirement'
+    | 'acceptanceCriterion'
+    | 'businessRule'
+    | 'constraint'
+    | 'nonFunctionalRequirement'
+    | 'metric'
+    | 'openQuestion'
+    | 'decision'
+    | 'sourceReference'
+    | 'heading'
+    | 'paragraph'
+    | 'list'
+    | 'table'
+    | 'code'
+    | 'callout'
   readonly text?: string
+  readonly blocking?: boolean
+  readonly status?: 'open' | 'answered' | 'resolved' | 'waived'
   readonly data?: JsonObject
   readonly children?: readonly DocumentBlockDto[]
   readonly requirementIds?: readonly EntityId[]
@@ -283,26 +355,41 @@ export type BlueprintNodeKind =
   | 'feature'
   | 'page'
   | 'component'
+  | 'apiOperation'
+  | 'dataEntity'
+  | 'permission'
+  // Read compatibility for drafts created before the canonical Blueprint IR.
   | 'api'
   | 'dataModel'
-  | 'permission'
   | 'workbenchTarget'
 
 export type BlueprintEdgeKind =
+  | 'drives'
+  | 'satisfied_by'
   | 'contains'
+  | 'navigates_to'
   | 'uses'
   | 'calls'
   | 'reads'
   | 'writes'
   | 'requires'
+  | 'realized_by'
+  | 'implemented_by'
+  | 'verified_by'
+  // Read compatibility for drafts created before the canonical Blueprint IR.
   | 'renders'
   | 'implements'
 
 export interface BlueprintNodeDto {
   readonly id: EntityId
+  readonly key: string
   readonly kind: BlueprintNodeKind
   readonly title: string
   readonly description?: string
+  readonly route?: string
+  readonly userGoal?: string
+  readonly method?: string
+  readonly path?: string
   readonly position: { readonly x: number; readonly y: number }
   readonly requirementIds: readonly EntityId[]
   readonly pageSpecArtifactId?: EntityId
@@ -553,7 +640,7 @@ export interface PrototypeContentDto {
   readonly tokenBindings: readonly PrototypeTokenBindingDto[]
   readonly componentBindings: readonly PrototypeComponentBindingDto[]
   readonly assets: readonly AssetRefDto[]
-  readonly traceLinks: readonly TraceLinkDto[]
+  readonly traceLinks: readonly PrototypeTraceLinkDto[]
 }
 
 export interface CreatePrototypeInputDto {
@@ -563,21 +650,33 @@ export interface CreatePrototypeInputDto {
   readonly content?: PrototypeContentDto
 }
 
-export type ReviewDecision = 'pending' | 'approved' | 'changesRequested'
+export type ReviewDecision = 'open' | 'approved' | 'changes_requested'
+
+export interface ReviewDecisionDto {
+  readonly id: EntityId
+  readonly reviewerId: EntityId
+  readonly decision: 'approve' | 'request_changes'
+  readonly summary: string
+  readonly createdAt: IsoDateTime
+}
 
 export interface ReviewDto {
   readonly id: EntityId
   readonly projectId: EntityId
-  readonly target: VersionRefDto
-  readonly decision: ReviewDecision
-  readonly summary: string
-  readonly requiredReviewerIds: readonly EntityId[]
-  readonly decidedBy?: EntityId
-  readonly createdByUser?: UserDto
-  readonly decidedByUser?: UserDto
-  readonly createdBy: EntityId
-  readonly createdAt: IsoDateTime
-  readonly decidedAt?: IsoDateTime
+  readonly artifactId: EntityId
+  readonly revisionId: EntityId
+  readonly contentHash: ContentHash
+  readonly status: ReviewDecision
+  readonly policy: {
+    readonly reviewerIds: readonly EntityId[]
+    readonly minimumApprovals: number
+    readonly prohibitSelfReview: boolean
+  }
+  readonly requestedBy: EntityId
+  readonly requestedAt: IsoDateTime
+  readonly closedAt?: IsoDateTime
+  readonly decisions: readonly ReviewDecisionDto[]
+  readonly etag: string
 }
 
 export interface CreateReviewInputDto {
@@ -587,7 +686,7 @@ export interface CreateReviewInputDto {
 }
 
 export interface DecideReviewInputDto {
-  readonly decision: Exclude<ReviewDecision, 'pending'>
+  readonly decision: 'approved' | 'changesRequested'
   readonly summary: string
 }
 
@@ -607,16 +706,26 @@ export interface CommentAnchorDto {
 export interface CommentDto {
   readonly id: EntityId
   readonly projectId: EntityId
-  readonly artifactId?: EntityId
-  readonly parentId?: EntityId
-  readonly target?: VersionRefDto
-  readonly body: string
-  readonly anchor?: CommentAnchorDto
-  readonly resolved: boolean
+  readonly artifactId: EntityId
+  readonly revisionId?: EntityId
+  readonly anchor: CommentAnchorDto
+  readonly severity: string
+  readonly assignedTo?: EntityId
   readonly createdBy: EntityId
-  readonly author?: UserDto
   readonly createdAt: IsoDateTime
-  readonly updatedAt: IsoDateTime
+  readonly resolvedBy?: EntityId
+  readonly resolvedAt?: IsoDateTime
+  readonly outdatedAt?: IsoDateTime
+  readonly messages: readonly {
+    readonly id: EntityId
+    readonly parentId?: EntityId
+    readonly body: string
+    readonly mentions: readonly EntityId[]
+    readonly createdBy: EntityId
+    readonly createdAt: IsoDateTime
+    readonly editedAt?: IsoDateTime
+  }[]
+  readonly etag: string
 }
 
 export interface CreateCommentInputDto {
@@ -679,48 +788,74 @@ export type JsonPatchOperationDto =
   | { readonly op: 'remove'; readonly path: string }
   | { readonly op: 'move' | 'copy'; readonly from: string; readonly path: string }
 
-export type ProposalOperationDto =
-  | { readonly type: 'artifact.patch'; readonly artifactId: EntityId; readonly patch: readonly JsonPatchOperationDto[] }
-  | { readonly type: 'artifact.create'; readonly artifact: CreateArtifactInputDto; readonly content: JsonValue }
-  | { readonly type: 'artifact.archive'; readonly artifactId: EntityId }
-  | { readonly type: 'dependency.upsert'; readonly dependency: ArtifactDependencyDto }
-  | { readonly type: 'prototype.layer.add'; readonly layer: PrototypeLayerDto }
-  | { readonly type: 'prototype.layer.patch'; readonly layerId: EntityId; readonly patch: readonly JsonPatchOperationDto[] }
-  | { readonly type: 'prototype.layer.delete'; readonly layerId: EntityId }
-  | { readonly type: 'prototype.state.add'; readonly state: PrototypeStateDto }
-  | { readonly type: 'prototype.interaction.add'; readonly interaction: PrototypeInteractionDto }
+export type ProposalDecision = 'pending' | 'accepted' | 'rejected' | 'applied'
 
-export type ProposalStatus = 'pending' | 'partiallyApplied' | 'applied' | 'rejected' | 'superseded'
+export interface ProposalOperationDto {
+  readonly id: EntityId
+  readonly kind: 'add' | 'replace' | 'remove'
+  readonly path: string
+  readonly value?: JsonValue
+  readonly dependsOn?: readonly EntityId[]
+  readonly rationale?: string
+  readonly decision: ProposalDecision
+  readonly decidedBy?: EntityId
+  readonly reason?: string
+}
+
+export type ProposalStatus =
+  | 'open'
+  | 'reviewing'
+  | 'ready'
+  | 'rejected'
+  | 'applied'
+  | 'partially_applied'
+  | 'stale'
 
 export interface ProposalDto {
   readonly id: EntityId
   readonly projectId: EntityId
-  readonly kind: string
+  readonly artifactId: EntityId
+  readonly manifest: { readonly id: EntityId; readonly hash: ContentHash }
+  readonly baseRevision: VersionRefDto
+  readonly payloadHash: ContentHash
   readonly status: ProposalStatus
-  readonly inputManifestId: EntityId
-  readonly targetArtifactId?: EntityId
-  readonly baseDraftHash?: ContentHash
   readonly operations: readonly ProposalOperationDto[]
   readonly assumptions: readonly string[]
-  readonly openQuestions: readonly string[]
-  readonly diagnostics: readonly ValidationResultDto[]
-  readonly createdByRunId?: EntityId
+  readonly questions: readonly string[]
+  readonly version: number
+  readonly createdBy: EntityId
   readonly createdAt: IsoDateTime
-  readonly updatedAt: IsoDateTime
+  readonly appliedAt?: IsoDateTime
 }
 
 export interface ApplyProposalInputDto {
-  readonly operationIndexes?: readonly number[]
-  readonly conflictResolutions?: Readonly<Record<string, 'current' | 'proposal'>>
+  readonly version: number
+}
+
+export interface DecideProposalInputDto {
+  readonly operationId: EntityId
+  readonly decision: 'accepted' | 'rejected'
+  readonly reason?: string
+  readonly version: number
 }
 
 export interface CreateProposalInputDto {
-  readonly kind: string
-  readonly targetArtifactId: EntityId
-  readonly baseDraftHash: ContentHash
-  readonly instruction: string
-  readonly inputVersions: readonly VersionRefDto[]
-  readonly outputSchemaVersion: string
+  readonly inputManifestId: EntityId
+  readonly artifactId: EntityId
+  readonly operations: readonly Omit<ProposalOperationDto, 'decision' | 'decidedBy' | 'reason'>[]
+  readonly assumptions?: readonly string[]
+  readonly questions?: readonly string[]
+}
+
+export interface ArtifactGenerationResultDto {
+  readonly proposal: ProposalDto
+  readonly provider: string
+  readonly model: string
+  readonly usage?: {
+    readonly inputTokens: number
+    readonly outputTokens: number
+    readonly totalTokens: number
+  }
 }
 
 export type WorkflowStepKind =
@@ -892,9 +1027,8 @@ export interface TraceEndpointDto {
   readonly path?: string
 }
 
-export interface TraceLinkDto {
+export interface PrototypeTraceLinkDto {
   readonly id: EntityId
-  readonly projectId: EntityId
   readonly source: TraceEndpointDto
   readonly target: TraceEndpointDto
   readonly relation: 'derivesFrom' | 'satisfies' | 'implements' | 'verifies' | 'renders'
@@ -902,12 +1036,24 @@ export interface TraceLinkDto {
   readonly createdAt?: IsoDateTime
 }
 
-export interface TraceMatrixDto {
+export interface CreateTraceLinkInputDto {
+  readonly source: VersionRefDto
+  readonly target: VersionRefDto
+  readonly relation: DependencyRelation
+  readonly metadata?: JsonObject
+}
+
+export interface TraceLinkDto extends CreateTraceLinkInputDto {
   readonly id: EntityId
   readonly projectId: EntityId
+  readonly metadata: JsonObject
+  readonly createdBy: EntityId
+  readonly createdAt: IsoDateTime
+}
+
+export interface TraceMatrixDto {
+  readonly projectId: EntityId
   readonly links: readonly TraceLinkDto[]
-  readonly uncoveredRequirementIds: readonly EntityId[]
-  readonly generatedAt: IsoDateTime
 }
 
 export interface ValidationResultDto {

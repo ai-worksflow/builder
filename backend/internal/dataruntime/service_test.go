@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"sync"
 	"testing"
 
 	"github.com/google/uuid"
@@ -11,11 +12,14 @@ import (
 )
 
 type accessStub struct {
+	mu      sync.Mutex
 	err     error
 	actions []core.Action
 }
 
 func (a *accessStub) Authorize(_ context.Context, _, _ string, action core.Action) (core.Role, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
 	a.actions = append(a.actions, action)
 	return core.RoleOwner, a.err
 }

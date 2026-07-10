@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"time"
 
 	"github.com/google/uuid"
@@ -70,24 +71,35 @@ func (s *GORMStore) ListPublicTablePolicies(ctx context.Context, projectID strin
 	if err != nil {
 		return nil, Invalid("projectId", "projectId must be a UUID")
 	}
-	type policyWithTable struct {
-		dataPublicTablePolicyModel
-		TableName string
-	}
-	var models []policyWithTable
+	var models []dataPublicTablePolicyModel
 	err = s.database.WithContext(ctx).
 		Table("data_public_table_policies AS policies").
-		Select("policies.*, tables.name AS table_name").
+		Select("policies.*").
 		Joins("JOIN data_tables AS tables ON tables.project_id = policies.project_id AND tables.id = policies.table_id").
 		Where("policies.project_id = ?", projectUUID).
 		Order("tables.name ASC, policies.table_id ASC").
-		Scan(&models).Error
+		Find(&models).Error
 	if err != nil {
 		return nil, fmt.Errorf("list public data policies: %w", err)
 	}
+	tableIDs := make([]uuid.UUID, 0, len(models))
+	for _, model := range models {
+		tableIDs = append(tableIDs, model.TableID)
+	}
+	var tables []dataTableModel
+	if len(tableIDs) > 0 {
+		if err := s.database.WithContext(ctx).Select("id", "name").
+			Where("project_id = ? AND id IN ?", projectUUID, tableIDs).Find(&tables).Error; err != nil {
+			return nil, fmt.Errorf("load public policy table names: %w", err)
+		}
+	}
+	tableNames := make(map[uuid.UUID]string, len(tables))
+	for _, table := range tables {
+		tableNames[table.ID] = table.Name
+	}
 	result := make([]PublicTablePolicy, 0, len(models))
 	for _, model := range models {
-		policy, err := publicPolicyFromModel(model.dataPublicTablePolicyModel, model.TableName)
+		policy, err := publicPolicyFromModel(model, tableNames[model.TableID])
 		if err != nil {
 			return nil, err
 		}
@@ -113,15 +125,14 @@ func (s *GORMStore) GetPublicTablePolicy(ctx context.Context, projectID, tableID
 	return publicPolicyFromModel(model, table.Name)
 }
 
-func (s *GORMStore) PutPublicTablePolicy(ctx context.Context, projectID, tableID, actorID string, input PublicTablePolicyInput) (PublicTablePolicy, error) {
+func (s *GORMStore) PutPublicTablePolicy(ctx context.Context, projectID, tableID, actorID string, expectedVersion uint64, input PublicTablePolicyInput) (PublicTablePolicy, error) {
 	projectUUID, _ := uuid.Parse(projectID)
 	tableUUID, _ := uuid.Parse(tableID)
 	actorUUID, err := uuid.Parse(actorID)
 	if err != nil {
 		return PublicTablePolicy{}, Invalid("actorId", "actorId must be a UUID")
 	}
-	readable, _ := json.Marshal(input.ReadableFields)
-	writable, _ := json.Marshal(input.WritableFields)
+	var readable, writable json.RawMessage
 	now := s.now().UTC()
 	var saved dataPublicTablePolicyModel
 	err = s.database.WithContext(ctx).Transaction(func(transaction *gorm.DB) error {
@@ -129,14 +140,27 @@ func (s *GORMStore) PutPublicTablePolicy(ctx context.Context, projectID, tableID
 		if err != nil {
 			return err
 		}
-		if _, err := s.loadTable(transaction, projectUUID, tableUUID); err != nil {
+		tableModel, err := s.loadTable(transaction, projectUUID, tableUUID)
+		if err != nil {
 			return err
 		}
+		table, err := s.tableFromModel(ctx, transaction, tableModel)
+		if err != nil {
+			return err
+		}
+		if err := ValidatePublicTablePolicy(&input, table); err != nil {
+			return err
+		}
+		readable, _ = json.Marshal(input.ReadableFields)
+		writable, _ = json.Marshal(input.WritableFields)
 		var existing dataPublicTablePolicyModel
 		err = transaction.Clauses(clause.Locking{Strength: "UPDATE"}).
 			Where("project_id = ? AND table_id = ?", projectUUID, tableUUID).Take(&existing).Error
 		switch {
 		case errors.Is(err, gorm.ErrRecordNotFound):
+			if expectedVersion != 0 {
+				return PreconditionFailed("The public table policy changed since it was loaded")
+			}
 			saved = dataPublicTablePolicyModel{
 				ProjectID: projectUUID, TableID: tableUUID,
 				AllowRead: input.AllowRead, AllowCreate: input.AllowCreate,
@@ -150,6 +174,9 @@ func (s *GORMStore) PutPublicTablePolicy(ctx context.Context, projectID, tableID
 		case err != nil:
 			return fmt.Errorf("load public data policy: %w", err)
 		default:
+			if existing.Version != expectedVersion {
+				return PreconditionFailed("The public table policy changed since it was loaded")
+			}
 			saved = existing
 			saved.AllowRead = input.AllowRead
 			saved.AllowCreate = input.AllowCreate
@@ -160,15 +187,19 @@ func (s *GORMStore) PutPublicTablePolicy(ctx context.Context, projectID, tableID
 			saved.Version++
 			saved.UpdatedBy = actorUUID
 			saved.UpdatedAt = now
-			if err := transaction.Model(&dataPublicTablePolicyModel{}).
+			updated := transaction.Model(&dataPublicTablePolicyModel{}).
 				Where("project_id = ? AND table_id = ? AND version = ?", projectUUID, tableUUID, existing.Version).
 				Updates(map[string]any{
 					"allow_read": saved.AllowRead, "allow_create": saved.AllowCreate,
 					"allow_update": saved.AllowUpdate, "allow_delete": saved.AllowDelete,
 					"readable_fields": readable, "writable_fields": writable,
 					"version": saved.Version, "updated_by": actorUUID, "updated_at": now,
-				}).Error; err != nil {
-				return fmt.Errorf("update public data policy: %w", err)
+				})
+			if updated.Error != nil {
+				return fmt.Errorf("update public data policy: %w", updated.Error)
+			}
+			if updated.RowsAffected != 1 {
+				return PreconditionFailed("The public table policy changed since it was loaded")
 			}
 		}
 		return s.recordMutation(transaction, state, MutationContext{ActorID: actorID}, "configure", "public-policy", tableID, map[string]any{
@@ -183,7 +214,7 @@ func (s *GORMStore) PutPublicTablePolicy(ctx context.Context, projectID, tableID
 	return s.GetPublicTablePolicy(ctx, projectID, tableID)
 }
 
-func (s *GORMStore) DeletePublicTablePolicy(ctx context.Context, projectID, tableID, actorID string) error {
+func (s *GORMStore) DeletePublicTablePolicy(ctx context.Context, projectID, tableID, actorID string, expectedVersion uint64) error {
 	projectUUID, _ := uuid.Parse(projectID)
 	tableUUID, _ := uuid.Parse(tableID)
 	return s.database.WithContext(ctx).Transaction(func(transaction *gorm.DB) error {
@@ -191,12 +222,23 @@ func (s *GORMStore) DeletePublicTablePolicy(ctx context.Context, projectID, tabl
 		if err != nil {
 			return err
 		}
-		result := transaction.Where("project_id = ? AND table_id = ?", projectUUID, tableUUID).Delete(&dataPublicTablePolicyModel{})
+		var existing dataPublicTablePolicyModel
+		if err := transaction.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("project_id = ? AND table_id = ?", projectUUID, tableUUID).Take(&existing).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return PreconditionFailed("The public table policy changed since it was loaded")
+			}
+			return fmt.Errorf("load public data policy: %w", err)
+		}
+		if existing.Version != expectedVersion {
+			return PreconditionFailed("The public table policy changed since it was loaded")
+		}
+		result := transaction.Where("project_id = ? AND table_id = ? AND version = ?", projectUUID, tableUUID, expectedVersion).Delete(&dataPublicTablePolicyModel{})
 		if result.Error != nil {
 			return fmt.Errorf("delete public data policy: %w", result.Error)
 		}
 		if result.RowsAffected != 1 {
-			return NotFound("Public table policy")
+			return PreconditionFailed("The public table policy changed since it was loaded")
 		}
 		return s.recordMutation(transaction, state, MutationContext{ActorID: actorID}, "delete", "public-policy", tableID, nil, true)
 	})
@@ -219,6 +261,9 @@ func (s *GORMStore) PreparePublicCapability(
 	}
 	encodedOrigins, _ := json.Marshal(origins)
 	now := s.now().UTC()
+	if !expiresAt.After(now) || expiresAt.After(now.Add(MaxPublicCapabilityTTL)) {
+		return publicCapabilityRecord{}, Invalid("expiresAt", "expiresAt must be in the future and no more than 366 days away")
+	}
 	model := dataPublicCapabilityModel{
 		ID: capabilityUUID, ProjectID: projectUUID, DeploymentID: deploymentUUID,
 		DeploymentVersionID: versionUUID, TokenDigest: append([]byte(nil), tokenDigest...),
@@ -231,9 +276,12 @@ func (s *GORMStore) PreparePublicCapability(
 			return err
 		}
 		var deployment publicDeploymentModel
-		if err := transaction.Clauses(clause.Locking{Strength: "SHARE"}).
+		if err := transaction.Clauses(clause.Locking{Strength: "UPDATE"}).
 			Where("id = ? AND project_id = ?", deploymentUUID, projectUUID).Take(&deployment).Error; err != nil {
 			return mapStorageError(err, "Deployment")
+		}
+		if deployment.Environment != string(input.Environment) {
+			return Conflict("The public data capability environment does not match its deployment")
 		}
 		var version publicDeploymentVersionModel
 		if err := transaction.Where("id = ? AND deployment_id = ?", versionUUID, deploymentUUID).Take(&version).Error; err != nil {
@@ -242,10 +290,24 @@ func (s *GORMStore) PreparePublicCapability(
 		if version.Status == "failed" {
 			return Conflict("A failed deployment version cannot receive a public data capability")
 		}
+		if err := transaction.Model(&dataPublicCapabilityModel{}).
+			Where("project_id = ? AND deployment_id = ? AND status = ? AND expires_at <= ?", projectUUID, deploymentUUID, "pending", now).
+			Updates(map[string]any{"status": "revoked", "revoked_at": now, "updated_at": now}).Error; err != nil {
+			return fmt.Errorf("expire pending public data capabilities: %w", err)
+		}
+		var pending int64
+		if err := transaction.Model(&dataPublicCapabilityModel{}).
+			Where("project_id = ? AND deployment_id = ? AND status = ?", projectUUID, deploymentUUID, "pending").
+			Count(&pending).Error; err != nil {
+			return fmt.Errorf("count pending public data capabilities: %w", err)
+		}
+		if pending >= MaxPendingPublicCapabilitiesPerDeployment {
+			return Conflict("Too many public data capabilities are awaiting deployment; revoke or activate one before preparing another")
+		}
 		if err := transaction.Create(&model).Error; err != nil {
 			return fmt.Errorf("prepare public data capability: %w", err)
 		}
-		return s.recordMutation(transaction, state, MutationContext{PublicDeploymentID: input.DeploymentID}, "prepare", "public-capability", capabilityID, map[string]any{
+		return s.recordMutation(transaction, state, MutationContext{PublicDeploymentID: input.DeploymentID, PublicCapabilityID: capabilityID}, "prepare", "public-capability", capabilityID, map[string]any{
 			"deploymentId": input.DeploymentID, "deploymentVersionId": input.DeploymentVersionID,
 			"expiresAt": expiresAt.UTC(),
 		}, true)
@@ -299,7 +361,7 @@ func (s *GORMStore) ActivatePublicCapability(ctx context.Context, projectID, dep
 		activated.Status = "active"
 		activated.ActivatedAt = &now
 		activated.UpdatedAt = now
-		return s.recordMutation(transaction, state, MutationContext{PublicDeploymentID: deploymentID}, "activate", "public-capability", capabilityID, map[string]any{
+		return s.recordMutation(transaction, state, MutationContext{PublicDeploymentID: deploymentID, PublicCapabilityID: capabilityID}, "activate", "public-capability", capabilityID, map[string]any{
 			"deploymentId": deploymentID, "deploymentVersionId": activated.DeploymentVersionID.String(),
 		}, true)
 	})
@@ -336,7 +398,7 @@ func (s *GORMStore) RevokePublicCapability(ctx context.Context, projectID, deplo
 			}
 			return nil
 		}
-		return s.recordMutation(transaction, state, MutationContext{PublicDeploymentID: deploymentID}, "revoke", "public-capability", capabilityID, map[string]any{
+		return s.recordMutation(transaction, state, MutationContext{PublicDeploymentID: deploymentID, PublicCapabilityID: capabilityID}, "revoke", "public-capability", capabilityID, map[string]any{
 			"deploymentId": deploymentID,
 		}, true)
 	})
@@ -444,6 +506,7 @@ func publicPolicyFromModel(model dataPublicTablePolicyModel, tableName string) (
 		AllowRead: model.AllowRead, AllowCreate: model.AllowCreate,
 		AllowUpdate: model.AllowUpdate, AllowDelete: model.AllowDelete,
 		ReadableFields: readable, WritableFields: writable, Version: model.Version,
+		ETag:      PublicTablePolicyETag(model.ProjectID.String(), model.TableID.String(), model.Version),
 		CreatedAt: model.CreatedAt.UTC(), UpdatedAt: model.UpdatedAt.UTC(),
 	}, nil
 }
@@ -458,6 +521,51 @@ func publicCapabilityFromModel(model dataPublicCapabilityModel) (publicCapabilit
 		DeploymentVersionID: model.DeploymentVersionID.String(), TokenDigest: append([]byte(nil), model.TokenDigest...),
 		AllowedOrigins: origins, Status: model.Status, ExpiresAt: model.ExpiresAt.UTC(), ActivatedAt: model.ActivatedAt,
 	}, nil
+}
+
+func rewritePublicPolicyColumn(transaction *gorm.DB, projectID, tableID uuid.UUID, oldName, newName string, now time.Time) error {
+	var model dataPublicTablePolicyModel
+	err := transaction.Where("project_id = ? AND table_id = ?", projectID, tableID).Take(&model).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("load public data policy for schema migration: %w", err)
+	}
+	var readable, writable []string
+	if err := json.Unmarshal(model.ReadableFields, &readable); err != nil {
+		return fmt.Errorf("decode readable public fields for schema migration: %w", err)
+	}
+	if err := json.Unmarshal(model.WritableFields, &writable); err != nil {
+		return fmt.Errorf("decode writable public fields for schema migration: %w", err)
+	}
+	rewrite := func(fields []string) []string {
+		result := make([]string, 0, len(fields))
+		for _, field := range fields {
+			if field != oldName {
+				result = append(result, field)
+			} else if newName != "" {
+				result = append(result, newName)
+			}
+		}
+		sort.Strings(result)
+		return result
+	}
+	readableJSON, _ := json.Marshal(rewrite(readable))
+	writableJSON, _ := json.Marshal(rewrite(writable))
+	result := transaction.Model(&dataPublicTablePolicyModel{}).
+		Where("project_id = ? AND table_id = ? AND version = ?", projectID, tableID, model.Version).
+		Updates(map[string]any{
+			"readable_fields": readableJSON, "writable_fields": writableJSON,
+			"version": model.Version + 1, "updated_at": now,
+		})
+	if result.Error != nil {
+		return fmt.Errorf("rewrite public data policy for schema migration: %w", result.Error)
+	}
+	if result.RowsAffected != 1 {
+		return Conflict("Public data policy changed while applying the schema migration")
+	}
+	return nil
 }
 
 const sha256DigestBytes = 32

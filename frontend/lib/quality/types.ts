@@ -32,6 +32,16 @@ export interface QualityVersionRef {
   readonly revisionNumber?: number
 }
 
+export interface QualityBuildArtifactRef {
+  readonly id: string
+  readonly contentRef: string
+  readonly contentHash: string
+  readonly buildHash: string
+  readonly entryPath: string
+  readonly fileCount: number
+  readonly totalBytes: number
+}
+
 export interface QualityRunInput {
   readonly workspaceRevision: QualityVersionRef
 }
@@ -95,6 +105,7 @@ export interface QualityRunResult {
   readonly checks: readonly QualityCheckResult[]
   readonly diagnostics: readonly QualityDiagnostic[]
   readonly durationMs: number
+  readonly buildArtifact?: QualityBuildArtifactRef
 }
 
 export interface QualityReportDto {
@@ -111,6 +122,7 @@ export interface QualityReportDto {
   readonly diagnostics: readonly QualityDiagnostic[]
   readonly reportArtifactId?: string
   readonly reportRevisionId?: string
+  readonly buildArtifact?: QualityBuildArtifactRef
   readonly createdBy: string
   readonly startedAt: string
   readonly completedAt?: string
@@ -127,4 +139,3 @@ export interface QualityCheckDto {
   readonly truncated?: boolean
   readonly diagnostics: readonly QualityDiagnostic[]
 }
-

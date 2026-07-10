@@ -1,6 +1,7 @@
 package middleware
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/sha256"
@@ -9,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"sort"
 	"strings"
@@ -53,6 +55,21 @@ type IdempotencyRepository struct {
 	database *gorm.DB
 	config   IdempotencyConfig
 }
+
+// IdempotencyStore is shared by authenticated builder mutations and public
+// capability mutations. Implementations must durably preserve completed
+// responses and fail closed when a claim cannot be proven safe.
+type IdempotencyStore interface {
+	Claim(context.Context, string, string, string) (ClaimResult, error)
+	Complete(context.Context, string, string, string, StoredResponse) error
+	Release(context.Context, string, string, string) error
+	Seal(context.Context, string, string, string) error
+	MaxRequestBytes() int64
+	MaxResponseBytes() int
+}
+
+func (r *IdempotencyRepository) MaxRequestBytes() int64 { return r.config.MaxRequestBytes }
+func (r *IdempotencyRepository) MaxResponseBytes() int  { return r.config.MaxResponseBytes }
 
 func NewIdempotencyRepository(database *gorm.DB, config IdempotencyConfig) (*IdempotencyRepository, error) {
 	if database == nil {
@@ -148,7 +165,7 @@ func (r *IdempotencyRepository) Complete(ctx context.Context, scope, key, reques
 	updated := r.database.WithContext(ctx).Model(&storage.IdempotencyRecordModel{}).
 		Where("scope = ? AND idempotency_key = ? AND request_hash = ? AND completed_at IS NULL", scope, key, requestHash).
 		Updates(map[string]any{
-			"response_status": response.Status, "response_headers": headers,
+			"response_status": response.Status, "response_headers": gorm.Expr("?::jsonb", string(headers)),
 			"response_body": response.Body, "locked_until": nil,
 			"completed_at": now, "expires_at": now.Add(r.config.TTL),
 		})
@@ -167,28 +184,99 @@ func (r *IdempotencyRepository) Release(ctx context.Context, scope, key, request
 		Delete(&storage.IdempotencyRecordModel{}).Error
 }
 
+// Seal leaves an uncertain mutation fail-closed until its claim expires. It is
+// used only when the business handler finished but persisting the replay
+// response failed; recovering the short processing lease in that state could
+// execute the same mutation twice.
+func (r *IdempotencyRepository) Seal(ctx context.Context, scope, key, requestHash string) error {
+	return r.database.WithContext(ctx).Model(&storage.IdempotencyRecordModel{}).
+		Where("scope = ? AND idempotency_key = ? AND request_hash = ? AND completed_at IS NULL", scope, key, requestHash).
+		Update("locked_until", gorm.Expr("expires_at")).Error
+}
+
 // PersistIdempotency must run after authentication and CaptureIdempotencyKey.
 // Requests without a key pass through. The scope includes the authenticated
 // user and canonical route so the same client key can safely be reused elsewhere.
-func PersistIdempotency(repository *IdempotencyRepository) gin.HandlerFunc {
+func PersistIdempotency(repository IdempotencyStore) gin.HandlerFunc {
+	return persistIdempotency(repository, func(ginContext *gin.Context) (idempotencyIdentity, bool) {
+		identity, ok := GetIdentity(ginContext)
+		if !ok || identity.Session.User.ID == "" {
+			problem.Write(ginContext, problem.New(http.StatusUnauthorized, "authentication_required", "Authentication required", "An authenticated user is required for idempotent mutations."))
+			return idempotencyIdentity{}, false
+		}
+		return authenticatedIdempotencyIdentity(ginContext, identity.Session.User.ID), true
+	})
+}
+
+type idempotencyIdentity struct {
+	scope        string
+	hashIdentity string
+}
+
+type publicIdempotencyIdentity struct {
+	capabilityID string
+	deploymentID string
+}
+
+const publicIdempotencyIdentityKey = "public_idempotency_identity"
+
+// SetPublicIdempotencyIdentity must be called only after the bearer capability
+// has been authenticated and bound to the deployment in the request path. It
+// stores opaque IDs, never the bearer token.
+func SetPublicIdempotencyIdentity(ginContext *gin.Context, capabilityID, deploymentID string) bool {
+	capabilityID = strings.TrimSpace(capabilityID)
+	deploymentID = strings.TrimSpace(deploymentID)
+	if ginContext == nil || capabilityID == "" || deploymentID == "" {
+		return false
+	}
+	ginContext.Set(publicIdempotencyIdentityKey, publicIdempotencyIdentity{
+		capabilityID: capabilityID,
+		deploymentID: deploymentID,
+	})
+	return true
+}
+
+// PersistPublicIdempotency applies the same durable response state machine as
+// authenticated mutations without depending on a builder session. Its scope
+// is derived from a digest of capability/deployment IDs plus the canonical
+// route; the bearer token is never read or persisted by this middleware.
+func PersistPublicIdempotency(repository IdempotencyStore) gin.HandlerFunc {
+	return persistIdempotency(repository, func(ginContext *gin.Context) (idempotencyIdentity, bool) {
+		value, exists := ginContext.Get(publicIdempotencyIdentityKey)
+		identity, ok := value.(publicIdempotencyIdentity)
+		if !exists || !ok || identity.capabilityID == "" || identity.deploymentID == "" {
+			problem.Write(ginContext, problem.New(http.StatusUnauthorized, "public_capability_invalid", "Public capability required", "An authenticated deployment capability is required for this mutation."))
+			return idempotencyIdentity{}, false
+		}
+		return publicMutationIdempotencyIdentity(ginContext, identity), true
+	})
+}
+
+func persistIdempotency(
+	repository IdempotencyStore,
+	resolveIdentity func(*gin.Context) (idempotencyIdentity, bool),
+) gin.HandlerFunc {
 	return func(ginContext *gin.Context) {
 		key := IdempotencyKey(ginContext)
 		if key == "" {
 			ginContext.Next()
 			return
 		}
-		identity, ok := GetIdentity(ginContext)
-		if !ok || identity.Session.User.ID == "" {
-			problem.Write(ginContext, problem.New(http.StatusUnauthorized, "authentication_required", "Authentication required", "An authenticated user is required for idempotent mutations."))
+		if repository == nil {
+			problem.Write(ginContext, problem.New(http.StatusServiceUnavailable, "idempotency_unavailable", "Request protection unavailable", "The request could not be safely claimed. Retry later with the same key."))
 			return
 		}
-		body, err := readRequestBody(ginContext, repository.config.MaxRequestBytes)
+		identity, ok := resolveIdentity(ginContext)
+		if !ok {
+			return
+		}
+		body, err := readRequestBody(ginContext, repository.MaxRequestBytes())
 		if err != nil {
 			problem.Write(ginContext, problem.New(http.StatusRequestEntityTooLarge, "request_too_large", "Request is too large", "The request body exceeds the idempotency limit."))
 			return
 		}
-		scope := idempotencyScope(ginContext, identity.Session.User.ID)
-		requestHash := hashIdempotentRequest(ginContext.Request, identity.Session.User.ID, body)
+		scope := identity.scope
+		requestHash := hashIdempotentRequest(ginContext.Request, identity.hashIdentity, body)
 		claim, err := repository.Claim(ginContext.Request.Context(), scope, key, requestHash)
 		if err != nil {
 			switch {
@@ -211,19 +299,55 @@ func PersistIdempotency(repository *IdempotencyRepository) gin.HandlerFunc {
 			return
 		}
 
-		capture := newCaptureWriter(ginContext.Writer, repository.config.MaxResponseBytes)
+		capture := newCaptureWriter(ginContext.Writer, repository.MaxResponseBytes())
 		ginContext.Writer = capture
 		ginContext.Next()
-		status := ginContext.Writer.Status()
+		status := capture.Status()
 		if status >= http.StatusInternalServerError {
 			_ = repository.Release(context.WithoutCancel(ginContext.Request.Context()), scope, key, requestHash)
+			if capture.Overflowed() {
+				capture.WriteProblem(ginContext, problem.New(http.StatusInternalServerError, "response_too_large", "Response is too large", "The mutation response exceeded the safe buffering limit."))
+				return
+			}
+			capture.Commit(capture.Response())
 			return
 		}
-		stored := StoredResponse{Status: status, Headers: capture.Header().Clone(), Body: capture.Bytes()}
+		stored := capture.Response()
 		if capture.Overflowed() {
 			stored = replayUnavailableResponse()
 		}
-		_ = repository.Complete(context.WithoutCancel(ginContext.Request.Context()), scope, key, requestHash, stored)
+		completionContext := context.WithoutCancel(ginContext.Request.Context())
+		if err := repository.Complete(completionContext, scope, key, requestHash, stored); err != nil {
+			_ = repository.Seal(completionContext, scope, key, requestHash)
+			capture.WriteProblem(ginContext, problem.New(http.StatusServiceUnavailable, "idempotency_completion_failed", "Mutation result unavailable", "The operation may have completed, but its durable replay response could not be stored. Refresh the resource before retrying with a new key."))
+			return
+		}
+		capture.Commit(stored)
+	}
+}
+
+func authenticatedIdempotencyIdentity(ginContext *gin.Context, userID string) idempotencyIdentity {
+	return idempotencyIdentity{
+		scope:        idempotencyScope(ginContext, userID),
+		hashIdentity: userID,
+	}
+}
+
+func publicMutationIdempotencyIdentity(
+	ginContext *gin.Context,
+	identity publicIdempotencyIdentity,
+) idempotencyIdentity {
+	principalDigest := sha256.Sum256([]byte("capability:" + identity.capabilityID + "\ndeployment:" + identity.deploymentID))
+	principal := hex.EncodeToString(principalDigest[:])
+	route := ginContext.FullPath()
+	if route == "" {
+		route = ginContext.Request.URL.Path
+	}
+	actualPath := ginContext.Request.URL.EscapedPath()
+	routeDigest := sha256.Sum256([]byte(ginContext.Request.Method + "\n" + route + "\n" + actualPath))
+	return idempotencyIdentity{
+		scope:        "public:" + principal + ":" + hex.EncodeToString(routeDigest[:]),
+		hashIdentity: "public:" + principal,
 	}
 }
 
@@ -282,7 +406,7 @@ func readRequestBody(ginContext *gin.Context, limit int64) ([]byte, error) {
 
 func safeReplayHeaders(source http.Header) http.Header {
 	result := http.Header{}
-	for _, name := range []string{"Content-Type", "Cache-Control", "ETag", "Location", "Retry-After", "Content-Language"} {
+	for _, name := range []string{"Content-Type", "Cache-Control", "ETag", "Location", "Retry-After", "Content-Language", "X-Command-ETag", "X-Command-Location"} {
 		for _, value := range source.Values(name) {
 			result.Add(name, value)
 		}
@@ -291,6 +415,7 @@ func safeReplayHeaders(source http.Header) http.Header {
 }
 
 func writeStoredResponse(ginContext *gin.Context, response StoredResponse) {
+	ginContext.Abort()
 	for name, values := range safeReplayHeaders(response.Headers) {
 		for _, value := range values {
 			ginContext.Writer.Header().Add(name, value)
@@ -307,24 +432,70 @@ func replayUnavailableResponse() StoredResponse {
 }
 
 type captureWriter struct {
-	gin.ResponseWriter
-	body     bytes.Buffer
-	limit    int
-	overflow bool
+	underlying gin.ResponseWriter
+	header     http.Header
+	body       bytes.Buffer
+	limit      int
+	overflow   bool
+	status     int
+	size       int
+	written    bool
 }
 
 func newCaptureWriter(writer gin.ResponseWriter, limit int) *captureWriter {
-	return &captureWriter{ResponseWriter: writer, limit: limit}
+	return &captureWriter{
+		underlying: writer,
+		header:     writer.Header().Clone(),
+		limit:      limit,
+		status:     http.StatusOK,
+		size:       -1,
+	}
 }
 
 func (w *captureWriter) Write(data []byte) (int, error) {
+	if !w.written {
+		w.WriteHeader(http.StatusOK)
+	}
 	w.capture(data)
-	return w.ResponseWriter.Write(data)
+	w.size += len(data)
+	return len(data), nil
 }
 
 func (w *captureWriter) WriteString(value string) (int, error) {
-	w.capture([]byte(value))
-	return w.ResponseWriter.WriteString(value)
+	return w.Write([]byte(value))
+}
+
+func (w *captureWriter) Header() http.Header { return w.header }
+
+func (w *captureWriter) WriteHeader(status int) {
+	if w.written {
+		return
+	}
+	w.status = status
+	w.written = true
+	w.size = 0
+}
+
+func (w *captureWriter) WriteHeaderNow() {
+	if !w.written {
+		w.WriteHeader(http.StatusOK)
+	}
+}
+
+func (w *captureWriter) Status() int { return w.status }
+
+func (w *captureWriter) Size() int { return w.size }
+
+func (w *captureWriter) Written() bool { return w.written }
+
+func (w *captureWriter) Flush() { w.WriteHeaderNow() }
+
+func (w *captureWriter) CloseNotify() <-chan bool { return w.underlying.CloseNotify() }
+
+func (w *captureWriter) Pusher() http.Pusher { return w.underlying.Pusher() }
+
+func (w *captureWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	return nil, nil, errors.New("hijacking is unavailable for idempotent mutations")
 }
 
 func (w *captureWriter) capture(data []byte) {
@@ -345,3 +516,31 @@ func (w *captureWriter) capture(data []byte) {
 func (w *captureWriter) Bytes() []byte { return append([]byte(nil), w.body.Bytes()...) }
 
 func (w *captureWriter) Overflowed() bool { return w.overflow }
+
+func (w *captureWriter) Response() StoredResponse {
+	return StoredResponse{Status: w.status, Headers: w.header.Clone(), Body: w.Bytes()}
+}
+
+func (w *captureWriter) Commit(response StoredResponse) {
+	replaceHeaders(w.underlying.Header(), response.Headers)
+	w.underlying.WriteHeader(response.Status)
+	if len(response.Body) > 0 {
+		_, _ = w.underlying.Write(response.Body)
+	}
+}
+
+func (w *captureWriter) WriteProblem(ginContext *gin.Context, details problem.Details) {
+	ginContext.Writer = w.underlying
+	problem.Write(ginContext, details)
+}
+
+func replaceHeaders(target, source http.Header) {
+	for name := range target {
+		target.Del(name)
+	}
+	for name, values := range source {
+		for _, value := range values {
+			target.Add(name, value)
+		}
+	}
+}

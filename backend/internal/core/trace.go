@@ -168,6 +168,27 @@ func (s *TraceService) CreateDependency(ctx context.Context, projectID, actorID 
 			}
 			return err
 		}
+		if input.Required {
+			var existing int64
+			if err := transaction.Model(&storage.TraceLinkModel{}).Where(
+				"project_id = ? AND source_artifact_id = ? AND source_revision_id = ? AND source_anchor_id IS NULL AND target_artifact_id = ? AND target_revision_id = ? AND target_anchor_id IS NULL AND relation = ?",
+				projectUUID, sourceArtifact, sourceRevision, targetArtifact, targetRevision, input.Relation,
+			).Count(&existing).Error; err != nil {
+				return err
+			}
+			if existing == 0 {
+				trace := storage.TraceLinkModel{
+					ID: uuid.New(), ProjectID: projectUUID,
+					SourceArtifactID: sourceArtifact, SourceRevisionID: sourceRevision,
+					TargetArtifactID: targetArtifact, TargetRevisionID: &targetRevision,
+					Relation: input.Relation, Metadata: json.RawMessage(`{"origin":"required_dependency"}`),
+					CreatedBy: actorUUID, CreatedAt: now,
+				}
+				if err := transaction.Create(&trace).Error; err != nil {
+					return err
+				}
+			}
+		}
 		if err := insertAudit(transaction, projectUUID, actorUUID, "dependency.created", "artifact_dependency", model.ID.String(), map[string]any{"relation": input.Relation}); err != nil {
 			return err
 		}

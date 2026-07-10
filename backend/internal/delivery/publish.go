@@ -13,6 +13,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/worksflow/builder/backend/internal/core"
+	"github.com/worksflow/builder/backend/internal/dataruntime"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
@@ -28,21 +29,23 @@ var (
 type publishRevisionLoader interface {
 	LoadFrozenWorkspace(context.Context, string, string, core.VersionRef, core.Action) (WorkspaceSnapshot, error)
 	LoadBuildManifest(context.Context, string, string, string, core.Action) (core.WorkbenchBundle, error)
+	ValidateWorkspaceManifestLineage(context.Context, string, string, core.VersionRef, string, core.Action) error
 }
 
 type publishQualityReader interface {
-	LatestPassingForRevision(context.Context, string, string, string) (QualityReport, error)
+	Get(context.Context, string, string) (QualityReport, error)
 	LoadBuildArtifact(context.Context, string, BuildArtifactReference) (BuildArtifact, error)
 }
 
 type PublishService struct {
-	database     *gorm.DB
-	access       AccessControl
-	loader       publishRevisionLoader
-	quality      publishQualityReader
-	provider     PublishProvider
-	environments EnvironmentResolver
-	now          func() time.Time
+	database      *gorm.DB
+	access        AccessControl
+	loader        publishRevisionLoader
+	quality       publishQualityReader
+	provider      PublishProvider
+	environments  EnvironmentResolver
+	publicRuntime dataruntime.DeploymentPublicRuntimeProvisioner
+	now           func() time.Time
 }
 
 func NewPublishService(
@@ -52,6 +55,7 @@ func NewPublishService(
 	quality publishQualityReader,
 	provider PublishProvider,
 	environments EnvironmentResolver,
+	publicRuntimes ...dataruntime.DeploymentPublicRuntimeProvisioner,
 ) (*PublishService, error) {
 	if database == nil || access == nil || loader == nil || quality == nil || provider == nil {
 		return nil, errors.New("publish database, access control, revision loader, quality service and provider are required")
@@ -62,9 +66,16 @@ func NewPublishService(
 	if !providerNamePattern.MatchString(provider.Name()) {
 		return nil, errors.New("publish provider name must be a stable lowercase identifier")
 	}
+	if len(publicRuntimes) > 1 {
+		return nil, errors.New("publish accepts at most one public data runtime provisioner")
+	}
+	var publicRuntime dataruntime.DeploymentPublicRuntimeProvisioner
+	if len(publicRuntimes) == 1 {
+		publicRuntime = publicRuntimes[0]
+	}
 	return &PublishService{
 		database: database, access: access, loader: loader, quality: quality,
-		provider: provider, environments: environments, now: time.Now,
+		provider: provider, environments: environments, publicRuntime: publicRuntime, now: time.Now,
 	}, nil
 }
 
@@ -89,8 +100,15 @@ func (s *PublishService) Publish(ctx context.Context, projectID, actorID, expect
 	if !input.Environment.Valid() {
 		return Deployment{}, Invalid("environment", "environment must be preview or production")
 	}
-	if (input.WorkspaceRevision == nil) == (strings.TrimSpace(input.BuildManifestID) == "") {
-		return Deployment{}, Invalid("workspaceRevision", "provide exactly one exact workspaceRevision or buildManifestId")
+	qualityRunID, err := requestedPublishQualityRunID(input)
+	if err != nil {
+		return Deployment{}, err
+	}
+	if input.WorkspaceRevision == nil {
+		return Deployment{}, Invalid("workspaceRevision", "an exact workspaceRevision is required for publish provenance")
+	}
+	if strings.TrimSpace(input.BuildManifestID) == "" {
+		return Deployment{}, Invalid("buildManifestId", "the BuildManifest that produced the workspaceRevision is required")
 	}
 	if err := validatePublishText(input.EnvironmentRef, input.Message); err != nil {
 		return Deployment{}, err
@@ -99,22 +117,29 @@ func (s *PublishService) Publish(ctx context.Context, projectID, actorID, expect
 	if _, err := s.access.Authorize(ctx, projectID, actorID, action); err != nil {
 		return Deployment{}, err
 	}
-	source, err := s.resolvePublishSource(ctx, projectID, actorID, action, input.WorkspaceRevision, input.BuildManifestID)
+	source, err := s.resolvePublishSource(ctx, projectID, actorID, action, *input.WorkspaceRevision, input.BuildManifestID)
 	if err != nil {
 		return Deployment{}, err
 	}
 	if err := validatePublishableWorkspace(source.workspace); err != nil {
 		return Deployment{}, err
 	}
-	report, err := s.quality.LatestPassingForRevision(ctx, projectID, source.workspace.Revision.RevisionID, actorID)
+	report, err := s.quality.Get(ctx, qualityRunID.String(), actorID)
 	if err != nil {
 		if deliveryError, ok := AsError(err); ok && deliveryError.Code == CodeNotFound {
-			return Deployment{}, conflict("publishing requires a passing quality report and immutable build artifact for the exact frozen WorkspaceRevision")
+			return Deployment{}, conflict("publishing requires the selected passing quality report and immutable build artifact for the exact frozen WorkspaceRevision")
 		}
 		return Deployment{}, err
 	}
+	reportQualityRunID, err := uuid.Parse(report.ID)
+	if err != nil || reportQualityRunID != qualityRunID {
+		return Deployment{}, conflict("the quality service did not return the exact selected quality run")
+	}
+	if report.ProjectID != projectID {
+		return Deployment{}, conflict("the selected quality report does not belong to the publish project")
+	}
 	if !exactVersionRefEqual(report.WorkspaceRevision, source.workspace.Revision) || !report.Passed || report.BuildArtifact == nil {
-		return Deployment{}, conflict("the passing quality report and build artifact do not match the exact frozen WorkspaceRevision")
+		return Deployment{}, conflict("the selected passing quality report and build artifact do not match the exact frozen WorkspaceRevision")
 	}
 	buildArtifact, err := s.quality.LoadBuildArtifact(ctx, projectID, *report.BuildArtifact)
 	if err != nil {
@@ -123,7 +148,6 @@ func (s *PublishService) Publish(ctx context.Context, projectID, actorID, expect
 	if !exactVersionRefEqual(buildArtifact.WorkspaceRevision, source.workspace.Revision) {
 		return Deployment{}, conflict("immutable quality build artifact does not match the publish workspace")
 	}
-	qualityRunID, _ := uuid.Parse(report.ID)
 	source.qualityRunID = &qualityRunID
 	source.buildReference = report.BuildArtifact
 	source.buildArtifact = buildArtifact
@@ -229,24 +253,47 @@ func (s *PublishService) Rollback(ctx context.Context, deploymentID, actorID, ex
 	return s.deployReservation(ctx, actorUUID, reservation)
 }
 
-func (s *PublishService) resolvePublishSource(ctx context.Context, projectID, actorID string, action core.Action, revision *core.VersionRef, manifestID string) (publishSource, error) {
-	if revision != nil {
-		workspace, err := s.loader.LoadFrozenWorkspace(ctx, projectID, actorID, *revision, action)
-		return publishSource{workspace: workspace}, err
+func requestedPublishQualityRunID(input PublishInput) (uuid.UUID, error) {
+	external := strings.TrimSpace(input.QualityRunID)
+	workflow := strings.TrimSpace(input.WorkflowQualityRunID)
+	if external != "" && workflow != "" {
+		return uuid.Nil, Invalid("qualityRunId", "provide exactly one selected qualityRunId")
 	}
-	bundle, err := s.loader.LoadBuildManifest(ctx, projectID, actorID, strings.TrimSpace(manifestID), action)
+	selected := external
+	if selected == "" {
+		selected = workflow
+	}
+	if selected == "" {
+		return uuid.Nil, Invalid("qualityRunId", "an explicit passing qualityRunId is required")
+	}
+	parsed, err := uuid.Parse(selected)
+	if err != nil {
+		return uuid.Nil, Invalid("qualityRunId", "qualityRunId must be a UUID")
+	}
+	return parsed, nil
+}
+
+func (s *PublishService) resolvePublishSource(ctx context.Context, projectID, actorID string, action core.Action, revision core.VersionRef, manifestID string) (publishSource, error) {
+	workspace, err := s.loader.LoadFrozenWorkspace(ctx, projectID, actorID, revision, action)
 	if err != nil {
 		return publishSource{}, err
 	}
-	if bundle.CurrentWorkspaceRevision == nil {
-		return publishSource{}, conflict("build manifest does not pin a current WorkspaceRevision")
-	}
-	workspace, err := s.loader.LoadFrozenWorkspace(ctx, projectID, actorID, *bundle.CurrentWorkspaceRevision, action)
+	manifestID = strings.TrimSpace(manifestID)
+	bundle, err := s.loader.LoadBuildManifest(ctx, projectID, actorID, manifestID, action)
 	if err != nil {
 		return publishSource{}, err
 	}
-	parsed, _ := uuid.Parse(bundle.ID)
-	return publishSource{workspace: workspace, buildManifestID: &parsed}, nil
+	manifestUUID, err := uuid.Parse(manifestID)
+	if err != nil {
+		return publishSource{}, Invalid("buildManifestId", "buildManifestId must be a UUID")
+	}
+	if bundle.ID != manifestUUID.String() || bundle.ProjectID != projectID {
+		return publishSource{}, conflict("build manifest does not belong to the publish project")
+	}
+	if err := s.loader.ValidateWorkspaceManifestLineage(ctx, projectID, actorID, revision, manifestID, action); err != nil {
+		return publishSource{}, err
+	}
+	return publishSource{workspace: workspace, buildManifestID: &manifestUUID}, nil
 }
 
 func (s *PublishService) reserve(
@@ -370,9 +417,27 @@ func (s *PublishService) deployReservation(ctx context.Context, actorID uuid.UUI
 		Environment: Environment(reservation.deployment.Environment), EnvironmentRef: reservation.version.EnvironmentRef,
 		BuildArtifact: reservation.artifact, PublicEnvironment: cloneStringMap(reservation.public),
 	}
+	prepared, err := s.preparePublicRuntime(ctx, reservation, &request)
+	if err != nil {
+		message := "The deployment-specific public data capability could not be prepared."
+		if finalizeErr := s.completeFailure(context.WithoutCancel(ctx), actorID, reservation, message); finalizeErr != nil {
+			return Deployment{}, finalizeErr
+		}
+		return Deployment{}, &DeliveryError{Code: CodeProviderFailure, Status: http.StatusFailedDependency, Detail: message, Cause: err}
+	}
+	cleanupPrepared := func() {
+		if prepared == nil || s.publicRuntime == nil {
+			return
+		}
+		_ = s.publicRuntime.RevokeDeploymentCapability(
+			context.WithoutCancel(ctx), reservation.deployment.ProjectID.String(),
+			reservation.deployment.ID.String(), prepared.CapabilityID,
+		)
+	}
 	result, providerErr := s.provider.Deploy(ctx, request)
 	finalizeContext := context.WithoutCancel(ctx)
 	if providerErr != nil {
+		cleanupPrepared()
 		message := "The configured publish provider could not deploy the immutable workspace."
 		if err := s.completeFailure(finalizeContext, actorID, reservation, message); err != nil {
 			return Deployment{}, err
@@ -380,16 +445,88 @@ func (s *PublishService) deployReservation(ctx context.Context, actorID uuid.UUI
 		return Deployment{}, &DeliveryError{Code: CodeProviderFailure, Status: http.StatusFailedDependency, Detail: message, Cause: providerErr}
 	}
 	if err := validateProviderResult(result); err != nil {
+		cleanupPrepared()
 		message := "The publish provider returned an invalid deployment result."
 		if finalizeErr := s.completeFailure(finalizeContext, actorID, reservation, message); finalizeErr != nil {
 			return Deployment{}, finalizeErr
 		}
 		return Deployment{}, &DeliveryError{Code: CodeProviderFailure, Status: http.StatusFailedDependency, Detail: message, Cause: err}
 	}
+	if result.EntryPath != reservation.artifact.EntryPath || result.FileCount != reservation.artifact.FileCount {
+		cleanupPrepared()
+		message := "The publish provider result does not match the immutable build artifact."
+		if finalizeErr := s.completeFailure(finalizeContext, actorID, reservation, message); finalizeErr != nil {
+			return Deployment{}, finalizeErr
+		}
+		return Deployment{}, &DeliveryError{Code: CodeProviderFailure, Status: http.StatusFailedDependency, Detail: message}
+	}
 	if err := s.completeSuccess(finalizeContext, actorID, reservation, result); err != nil {
+		cleanupPrepared()
 		return Deployment{}, err
 	}
+	if prepared != nil && s.publicRuntime != nil {
+		if _, err := s.publicRuntime.ActivateDeploymentCapability(
+			finalizeContext, reservation.deployment.ProjectID.String(),
+			reservation.deployment.ID.String(), prepared.CapabilityID,
+		); err != nil {
+			cleanupPrepared()
+			message := "The deployment was disabled because its public data capability could not be activated."
+			if finalizeErr := s.completeRuntimeFailure(finalizeContext, actorID, reservation, message); finalizeErr != nil {
+				return Deployment{}, finalizeErr
+			}
+			return Deployment{}, &DeliveryError{Code: CodeProviderFailure, Status: http.StatusFailedDependency, Detail: message, Cause: err}
+		}
+	}
 	return s.Get(finalizeContext, reservation.deployment.ID.String(), actorID.String())
+}
+
+func (s *PublishService) preparePublicRuntime(ctx context.Context, reservation publishReservation, request *ProviderRequest) (*dataruntime.PreparedPublicRuntimeConfig, error) {
+	if s.publicRuntime == nil {
+		return nil, nil
+	}
+	originProvider, ok := s.provider.(PublicDeploymentOriginProvider)
+	if !ok {
+		return nil, errors.New("publish provider cannot declare deployment browser origins")
+	}
+	origins, err := originProvider.PublicDeploymentOrigins(*request)
+	if err != nil {
+		return nil, err
+	}
+	scope := dataruntime.ScopePreview
+	if request.Environment == EnvironmentProduction {
+		scope = dataruntime.ScopeProduction
+	}
+	prepared, err := s.publicRuntime.PrepareDeploymentCapability(ctx, dataruntime.PreparePublicCapabilityInput{
+		ProjectID: reservation.deployment.ProjectID.String(), DeploymentID: request.DeploymentID,
+		DeploymentVersionID: request.VersionID, Environment: scope, AllowedOrigins: origins,
+	})
+	if err != nil {
+		return nil, err
+	}
+	request.PublicEnvironment = cloneStringMap(request.PublicEnvironment)
+	request.PublicEnvironment["PUBLIC_WORKSFLOW_DATA_API_BASE"] = strings.TrimRight(prepared.APIBasePath, "/") + "/" + request.DeploymentID
+	request.PublicEnvironment["PUBLIC_WORKSFLOW_DATA_CAPABILITY"] = prepared.CapabilityToken
+	request.PublicEnvironment["PUBLIC_WORKSFLOW_DEPLOYMENT_ID"] = request.DeploymentID
+	if err := validateResolvedEnvironment(ResolvedEnvironment{Reference: request.EnvironmentRef, Public: request.PublicEnvironment}); err != nil {
+		_ = s.publicRuntime.RevokeDeploymentCapability(context.WithoutCancel(ctx), reservation.deployment.ProjectID.String(), request.DeploymentID, prepared.CapabilityID)
+		return nil, err
+	}
+	names, err := json.Marshal(sortedStrings(request.PublicEnvironment))
+	if err != nil {
+		_ = s.publicRuntime.RevokeDeploymentCapability(context.WithoutCancel(ctx), reservation.deployment.ProjectID.String(), request.DeploymentID, prepared.CapabilityID)
+		return nil, err
+	}
+	updated := s.database.WithContext(ctx).Model(&deploymentVersionModel{}).
+		Where("id = ? AND deployment_id = ? AND status = 'deploying'", reservation.version.ID, reservation.deployment.ID).
+		Update("environment_variable_names", names)
+	if updated.Error != nil || updated.RowsAffected != 1 {
+		_ = s.publicRuntime.RevokeDeploymentCapability(context.WithoutCancel(ctx), reservation.deployment.ProjectID.String(), request.DeploymentID, prepared.CapabilityID)
+		if updated.Error != nil {
+			return nil, updated.Error
+		}
+		return nil, errors.New("deployment version changed before its runtime overlay was recorded")
+	}
+	return &prepared, nil
 }
 
 func (s *PublishService) completeSuccess(ctx context.Context, actorID uuid.UUID, reservation publishReservation, result ProviderResult) error {
@@ -462,6 +599,55 @@ func (s *PublishService) completeFailure(ctx context.Context, actorID uuid.UUID,
 			map[string]any{
 				"projectId": reservation.deployment.ProjectID.String(), "deploymentId": reservation.deployment.ID.String(),
 				"deploymentVersionId": reservation.version.ID.String(), "environment": reservation.deployment.Environment,
+			},
+		)
+	})
+}
+
+// completeRuntimeFailure disables a provider output that was written and
+// marked ready but whose deployment-scoped data capability could not be
+// activated. A prior ready version is restored without reusing the failed
+// version's token or mutable files.
+func (s *PublishService) completeRuntimeFailure(ctx context.Context, actorID uuid.UUID, reservation publishReservation, message string) error {
+	now := s.now().UTC()
+	return s.database.WithContext(ctx).Transaction(func(transaction *gorm.DB) error {
+		version := transaction.Model(&deploymentVersionModel{}).
+			Where("id = ? AND deployment_id = ? AND status = 'ready'", reservation.version.ID, reservation.deployment.ID).
+			Update("status", "failed")
+		if version.Error != nil {
+			return version.Error
+		}
+		if version.RowsAffected != 1 {
+			return conflict("deployment version changed while public data activation was failing")
+		}
+		restoredStatus := "failed"
+		if reservation.deployment.ActiveVersionID != nil {
+			restoredStatus = "ready"
+		}
+		currentVersion := reservation.deployment.Version + 1
+		deployment := transaction.Model(&deploymentModel{}).
+			Where("id = ? AND version = ? AND status = 'ready' AND active_version_id = ?", reservation.deployment.ID, currentVersion, reservation.version.ID).
+			Updates(map[string]any{
+				"status": restoredStatus, "active_version_id": reservation.deployment.ActiveVersionID,
+				"public_url": reservation.deployment.PublicURL, "last_error": message,
+				"version": currentVersion + 1, "updated_at": now,
+			})
+		if deployment.Error != nil {
+			return deployment.Error
+		}
+		if deployment.RowsAffected != 1 {
+			return conflict("deployment changed while public data activation was failing")
+		}
+		if err := createDeploymentLog(transaction, reservation.deployment.ID, &reservation.version.ID, "error", message, now); err != nil {
+			return err
+		}
+		return recordAuditAndOutbox(ctx, transaction, reservation.deployment.ProjectID, actorID,
+			"deployment.runtime_activation_failed", "deployment", reservation.deployment.ID.String(),
+			"deployment.runtime_activation_failed", "worksflow.deployment.runtime_activation_failed",
+			map[string]any{
+				"projectId":           reservation.deployment.ProjectID.String(),
+				"deploymentId":        reservation.deployment.ID.String(),
+				"deploymentVersionId": reservation.version.ID.String(),
 			},
 		)
 	})

@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/worksflow/builder/backend/internal/core"
 	"github.com/worksflow/builder/backend/internal/domain"
 )
 
@@ -98,7 +99,12 @@ func (e *Engine) Start(ctx context.Context, request StartRequest) (*RunRecord, e
 		}
 		status := NodePending
 		if nodeDefinition.ID == entry {
-			status = NodeReady
+			if _, _, required := nodeExecutionPolicy(nodeDefinition); required {
+				status = NodeWaitingInput
+				run.Status = RunWaitingInput
+			} else {
+				status = NodeReady
+			}
 		}
 		attempts, timeout := nodeLimits(nodeDefinition)
 		node := &NodeRecord{ID: e.id(), RunID: run.ID, Key: nodeDefinition.ID, DefinitionNodeID: nodeDefinition.ID, Type: nodeDefinition.Type, Status: status, AvailableAt: now, CreatedAt: now, UpdatedAt: now}
@@ -108,8 +114,11 @@ func (e *Engine) Start(ctx context.Context, request StartRequest) (*RunRecord, e
 	if err := run.Validate(); err != nil {
 		return nil, err
 	}
-	event := Event{ID: e.id(), RunID: run.ID, Type: "run.started", Payload: mustJSON(map[string]any{"definitionVersionId": request.DefinitionVersionID, "manifestId": request.InputManifest.ID}), ActorID: request.StartedBy, CreatedAt: now}
-	if err := e.Store.CreateRun(ctx, run, []Event{event}); err != nil {
+	events := []Event{{ID: e.id(), RunID: run.ID, Type: "run.started", Payload: mustJSON(map[string]any{"definitionVersionId": request.DefinitionVersionID, "manifestId": request.InputManifest.ID}), ActorID: request.StartedBy, CreatedAt: now}}
+	if entryNode := run.Nodes[entry]; entryNode != nil && entryNode.Status == NodeWaitingInput {
+		events = append(events, Event{ID: e.id(), RunID: run.ID, Type: "node.execution_authorization_required", NodeKey: entry, Payload: json.RawMessage(`{}`), CreatedAt: now})
+	}
+	if err := e.Store.CreateRun(ctx, run, events); err != nil {
 		return nil, err
 	}
 	return e.Store.GetRun(ctx, run.ID)
@@ -136,6 +145,9 @@ func (e *Engine) ExecuteLease(ctx context.Context, lease Lease) error {
 		return e.handleFailure(ctx, run, definitionRecord.Definition, node, lease, err)
 	}
 	execution := Execution{Run: *run, Node: *node, Definition: definition, Lease: lease, Inputs: inputs}
+	if _, _, required := nodeExecutionPolicy(definition); required && run.Context.Nodes[node.Key].ExecutionActor == nil {
+		return e.applyResult(ctx, run, definitionRecord.Definition, node, lease, execution, WorkerResult{Disposition: ResultWaitInput})
+	}
 	result, runErr := e.executeNode(ctx, execution)
 	if runErr != nil {
 		return e.handleFailure(ctx, run, definitionRecord.Definition, node, lease, runErr)
@@ -268,7 +280,15 @@ func (e *Engine) applyResult(ctx context.Context, run *RunRecord, definition dom
 	}
 	run.Context.Nodes[node.Key] = metadata
 	builder.mark(node, expected, lease.WorkerID)
-	builder.event("node."+string(node.Status), node.Key, map[string]any{"attempt": node.Attempt}, "")
+	eventActorID := ""
+	eventPayload := map[string]any{"attempt": node.Attempt}
+	if metadata.ExecutionActor != nil {
+		eventActorID = metadata.ExecutionActor.ActorID
+		for key, value := range provenanceEventPayload(*metadata.ExecutionActor) {
+			eventPayload[key] = value
+		}
+	}
+	builder.event("node."+string(node.Status), node.Key, eventPayload, eventActorID)
 	if node.Status == NodeCompleted {
 		definitionNode, _ := definition.FindNode(node.DefinitionNodeID)
 		if definitionNode.Type == domain.NodeCondition {
@@ -385,7 +405,7 @@ func (e *Engine) validateResult(ctx context.Context, run *RunRecord, definition 
 		}
 	case domain.NodeFanOut:
 		if len(result.FanOutItems) == 0 {
-			return fmt.Errorf("fan-out produced no delivery slices")
+			return fmt.Errorf("fan-out produced no items")
 		}
 	case domain.NodeManifestCompiler:
 		if result.BuildManifest == nil {
@@ -434,6 +454,50 @@ func (e *Engine) handleFailure(ctx context.Context, run *RunRecord, definition d
 		return err
 	}
 	return failure
+}
+
+// AuthorizeNodeExecution records an actor minted by the authenticated Facade
+// and schedules a privileged automated node. No request payload is accepted,
+// which keeps actor identity outside user-controlled workflow output JSON.
+func (e *Engine) AuthorizeNodeExecution(ctx context.Context, runID, nodeKey string, actor ActorProvenance) error {
+	if err := actor.Validate(); err != nil {
+		return err
+	}
+	if actor.Source != ActorSourceAuthenticatedCommand {
+		return core.ErrForbidden
+	}
+	run, record, node, definitionNode, err := e.loadExecution(ctx, runID, nodeKey)
+	if err != nil {
+		return err
+	}
+	action, requiredRole, required := nodeExecutionPolicy(definitionNode)
+	if !required || node.Status != NodeWaitingInput {
+		return &domain.DomainError{Kind: domain.ErrInvalidTransition, Field: "node", Message: "node is not waiting for privileged execution authorization"}
+	}
+	if actor.Action != action || !workflowRoleSatisfies(actor.Role, requiredRole) {
+		return core.ErrForbidden
+	}
+	now := e.now()
+	if actor.AuthorizedAt.After(now.Add(time.Minute)) {
+		return &domain.DomainError{Kind: domain.ErrValidation, Field: "authorizedAt", Message: "execution authorization time is in the future"}
+	}
+	builder := newMutationBuilder(e, run, now)
+	expected := node.Status
+	metadata := run.Context.Nodes[node.Key]
+	actorCopy := actor
+	actorCopy.AuthorizedAt = actor.AuthorizedAt.UTC()
+	metadata.ExecutionActor = &actorCopy
+	run.Context.Nodes[node.Key] = metadata
+	node.Status = NodeReady
+	node.Failure = nil
+	node.CompletedAt = nil
+	node.AvailableAt = now
+	node.UpdatedAt = now
+	builder.mark(node, expected, "")
+	builder.event("node.execution_authorized", node.Key, provenanceEventPayload(actorCopy), actorCopy.ActorID)
+	e.reconcile(run, record.Definition, builder)
+	e.refreshRunStatus(run, record.Definition, now)
+	return e.Store.Commit(ctx, builder.build())
 }
 
 func (e *Engine) RecordProposal(ctx context.Context, runID, nodeKey string, proposalRef domain.ProposalRef, actorID string) error {
@@ -538,7 +602,7 @@ func (e *Engine) SubmitHumanInput(ctx context.Context, runID, nodeKey string, ou
 			if strings.TrimSpace(key) == "" || len(key) > 128 {
 				return domain.ErrInvalidArgument
 			}
-			if key == "buildManifest" || key == "workspaceRevision" || strings.HasPrefix(key, "system.") {
+			if key == "buildManifest" || key == "workspaceRevision" || key == "executionActor" || key == "reviewDecisionActor" || strings.HasPrefix(key, "system.") {
 				return &domain.DomainError{Kind: domain.ErrValidation, Field: "workflowContext." + key, Message: "workflow context key is reserved for a trusted runner"}
 			}
 			normalized, err := domain.CanonicalJSON(value)
@@ -569,7 +633,18 @@ const (
 	ReviewWaive   ReviewResolution = "waive"
 )
 
-func (e *Engine) ResolveReview(ctx context.Context, runID, nodeKey, actorID string, resolution ReviewResolution, reason string) error {
+func (e *Engine) ResolveReview(ctx context.Context, runID, nodeKey string, decision ReviewDecision) error {
+	if err := decision.Actor.Validate(); err != nil {
+		return err
+	}
+	expectedAction := core.ActionReview
+	if decision.Resolution == ReviewApprove || decision.Resolution == ReviewWaive {
+		expectedAction = core.ActionApprove
+	}
+	if decision.Actor.Action != expectedAction || decision.Actor.Source != ActorSourceAuthenticatedCommand {
+		return core.ErrForbidden
+	}
+	resolution, reason, actorID := decision.Resolution, decision.Reason, decision.Actor.ActorID
 	run, record, node, definitionNode, err := e.loadExecution(ctx, runID, nodeKey)
 	if err != nil {
 		return err
@@ -623,9 +698,15 @@ func (e *Engine) ResolveReview(ctx context.Context, runID, nodeKey, actorID stri
 		return &domain.DomainError{Kind: domain.ErrInvalidTransition, Field: "review", Message: "review gate does not allow waiver"}
 	}
 	now := e.now()
+	if decision.Actor.AuthorizedAt.After(now.Add(time.Minute)) {
+		return &domain.DomainError{Kind: domain.ErrValidation, Field: "authorizedAt", Message: "review authorization time is in the future"}
+	}
 	builder := newMutationBuilder(e, run, now)
 	expected := node.Status
 	metadata := run.Context.Nodes[node.Key]
+	reviewActor := decision.Actor
+	reviewActor.AuthorizedAt = reviewActor.AuthorizedAt.UTC()
+	metadata.ReviewDecisionActor = &reviewActor
 	switch resolution {
 	case ReviewApprove:
 		node.Status = NodeCompleted
@@ -670,16 +751,66 @@ func (e *Engine) ResolveReview(ctx context.Context, runID, nodeKey, actorID stri
 	default:
 		return &domain.DomainError{Kind: domain.ErrInvalidArgument, Field: "resolution", Message: "unknown review resolution"}
 	}
+	if resolution == ReviewApprove || resolution == ReviewWaive {
+		for successorKey, grant := range decision.ExecutionAuthorizations {
+			if err := grant.Validate(); err != nil {
+				return err
+			}
+			expectedSource := ActorSourceReviewApproval
+			if resolution == ReviewWaive {
+				expectedSource = ActorSourceReviewWaiver
+			}
+			if grant.ActorID != actorID || grant.Role != reviewActor.Role || grant.Source != expectedSource || !grant.AuthorizedAt.Equal(reviewActor.AuthorizedAt) {
+				return core.ErrForbidden
+			}
+			successor := run.Nodes[successorKey]
+			if successor == nil || successor.Status != NodePending {
+				return &domain.DomainError{Kind: domain.ErrInvalidTransition, Field: "executionAuthorizations", Message: "review handoff target is not pending"}
+			}
+			directSuccessor := false
+			for _, edge := range record.Definition.Outgoing(node.DefinitionNodeID) {
+				if edge.To == successor.DefinitionNodeID && !run.Context.DisabledEdges[disabledEdgeKey(edge.ID, node.SliceID)] {
+					directSuccessor = true
+					break
+				}
+			}
+			if !directSuccessor {
+				return &domain.DomainError{Kind: domain.ErrValidation, Field: "executionAuthorizations", Message: "review handoff must target a direct enabled successor"}
+			}
+			successorDefinition, exists := record.Definition.FindNode(successor.DefinitionNodeID)
+			if !exists {
+				return domain.ErrNotFound
+			}
+			action, role, required := nodeExecutionPolicy(successorDefinition)
+			if !required || grant.Action != action || !workflowRoleSatisfies(grant.Role, role) {
+				return core.ErrForbidden
+			}
+			grantCopy := grant
+			grantCopy.AuthorizedAt = grantCopy.AuthorizedAt.UTC()
+			successorMetadata := run.Context.Nodes[successorKey]
+			successorMetadata.ExecutionActor = &grantCopy
+			run.Context.Nodes[successorKey] = successorMetadata
+			builder.event("node.execution_authorized", successorKey, provenanceEventPayload(grantCopy), actorID)
+		}
+	}
 	node.UpdatedAt = now
 	run.Context.Nodes[node.Key] = metadata
 	builder.mark(node, expected, "")
-	builder.event("node.review_"+string(resolution), node.Key, map[string]any{"reason": reason}, actorID)
+	reviewPayload := provenanceEventPayload(reviewActor)
+	reviewPayload["reason"] = reason
+	builder.event("node.review_"+string(resolution), node.Key, reviewPayload, actorID)
 	e.reconcile(run, record.Definition, builder)
 	e.refreshRunStatus(run, record.Definition, now)
 	return e.Store.Commit(ctx, builder.build())
 }
 
-func (e *Engine) WaiveNode(ctx context.Context, runID, nodeKey, actorID, reason string) error {
+func (e *Engine) WaiveNode(ctx context.Context, runID, nodeKey string, actor ActorProvenance, reason string) error {
+	if err := actor.Validate(); err != nil {
+		return err
+	}
+	if actor.Action != core.ActionApprove || actor.Source != ActorSourceAuthenticatedCommand {
+		return core.ErrForbidden
+	}
 	if strings.TrimSpace(reason) == "" {
 		return &domain.DomainError{Kind: domain.ErrInvalidArgument, Field: "reason", Message: "waiver reason is required"}
 	}
@@ -695,17 +826,25 @@ func (e *Engine) WaiveNode(ctx context.Context, runID, nodeKey, actorID, reason 
 		return &domain.DomainError{Kind: domain.ErrInvalidTransition, Field: "node", Message: "node state cannot be waived"}
 	}
 	now := e.now()
+	if actor.AuthorizedAt.After(now.Add(time.Minute)) {
+		return &domain.DomainError{Kind: domain.ErrValidation, Field: "authorizedAt", Message: "waiver authorization time is in the future"}
+	}
 	builder := newMutationBuilder(e, run, now)
 	expected := node.Status
 	metadata := run.Context.Nodes[node.Key]
 	metadata.Waived = true
 	metadata.WaiverReason = reason
+	actorCopy := actor
+	actorCopy.AuthorizedAt = actorCopy.AuthorizedAt.UTC()
+	metadata.ReviewDecisionActor = &actorCopy
 	run.Context.Nodes[node.Key] = metadata
 	node.Status = NodeCompleted
 	node.CompletedAt = timePointer(now)
 	node.UpdatedAt = now
 	builder.mark(node, expected, "")
-	builder.event("node.waived", node.Key, map[string]any{"reason": reason}, actorID)
+	payload := provenanceEventPayload(actorCopy)
+	payload["reason"] = reason
+	builder.event("node.waived", node.Key, payload, actorCopy.ActorID)
 	e.reconcile(run, record.Definition, builder)
 	e.refreshRunStatus(run, record.Definition, now)
 	return e.Store.Commit(ctx, builder.build())
@@ -715,7 +854,7 @@ func (e *Engine) RetryNode(ctx context.Context, runID, nodeKey, actorID, reason 
 	if strings.TrimSpace(reason) == "" {
 		return &domain.DomainError{Kind: domain.ErrInvalidArgument, Field: "reason", Message: "retry reason is required"}
 	}
-	run, record, node, _, err := e.loadExecution(ctx, runID, nodeKey)
+	run, record, node, definitionNode, err := e.loadExecution(ctx, runID, nodeKey)
 	if err != nil {
 		return err
 	}
@@ -727,8 +866,16 @@ func (e *Engine) RetryNode(ctx context.Context, runID, nodeKey, actorID, reason 
 	expected := node.Status
 	metadata := run.Context.Nodes[node.Key]
 	metadata.MaxAttempts = max(metadata.MaxAttempts, node.Attempt+1)
+	_, _, requiresActor := nodeExecutionPolicy(definitionNode)
+	if requiresActor {
+		metadata.ExecutionActor = nil
+	}
 	run.Context.Nodes[node.Key] = metadata
-	node.Status = NodeReady
+	if requiresActor {
+		node.Status = NodeWaitingInput
+	} else {
+		node.Status = NodeReady
+	}
 	node.Attempt = 0
 	node.Failure = nil
 	node.CompletedAt = nil
@@ -738,6 +885,9 @@ func (e *Engine) RetryNode(ctx context.Context, runID, nodeKey, actorID, reason 
 	run.CompletedAt = nil
 	builder.mark(node, expected, "")
 	builder.event("node.manual_retry", node.Key, map[string]any{"reason": reason}, actorID)
+	if requiresActor {
+		builder.event("node.execution_authorization_required", node.Key, nil, "")
+	}
 	e.reconcile(run, record.Definition, builder)
 	e.refreshRunStatus(run, record.Definition, now)
 	return e.Store.Commit(ctx, builder.build())
@@ -825,8 +975,14 @@ func (e *Engine) instantiateFanOut(run *RunRecord, definition domain.WorkflowDef
 		if strings.TrimSpace(item.Key) == "" || strings.TrimSpace(item.Title) == "" {
 			return fmt.Errorf("fan-out item key and title are required")
 		}
-		if err := item.Blueprint.Validate(); err != nil {
-			return fmt.Errorf("fan-out blueprint ref: %w", err)
+		deliverySlice := definitionNode.FanOut != nil && definitionNode.FanOut.ItemKind == "delivery_slice"
+		if deliverySlice || item.Blueprint.ArtifactID != "" || item.Blueprint.RevisionID != "" || item.Blueprint.ContentHash != "" {
+			if err := item.Blueprint.Validate(); err != nil {
+				return fmt.Errorf("fan-out blueprint ref: %w", err)
+			}
+		}
+		if deliverySlice && item.PageSpec == nil {
+			return fmt.Errorf("delivery fan-out item requires an exact PageSpec ref")
 		}
 		if item.PageSpec != nil {
 			if err := item.PageSpec.Validate(); err != nil {
@@ -843,12 +999,15 @@ func (e *Engine) instantiateFanOut(run *RunRecord, definition domain.WorkflowDef
 		}
 		seen[item.Key] = struct{}{}
 		sliceID := e.id()
-		itemOutput, err := domain.CanonicalJSON(item)
-		if err != nil {
-			return err
+		itemOutput := append(json.RawMessage(nil), item.Payload...)
+		if len(itemOutput) == 0 {
+			itemOutput, err = domain.CanonicalJSON(item)
+			if err != nil {
+				return err
+			}
 		}
 		fanOutMetadata.FanOutOutputs[sliceID] = itemOutput
-		sliceContext := SliceContext{ID: sliceID, Key: item.Key, Title: item.Title, FanOutNodeID: definitionNode.ID, Blueprint: item.Blueprint, OwnerID: item.OwnerID}
+		sliceContext := SliceContext{ID: sliceID, Key: item.Key, Title: item.Title, FanOutNodeID: definitionNode.ID, Payload: itemOutput, Blueprint: item.Blueprint, OwnerID: item.OwnerID}
 		if item.PageSpec != nil {
 			ref := *item.PageSpec
 			sliceContext.PageSpec = &ref
@@ -858,7 +1017,9 @@ func (e *Engine) instantiateFanOut(run *RunRecord, definition domain.WorkflowDef
 			sliceContext.Prototype = &ref
 		}
 		run.Context.Slices[sliceID] = sliceContext
-		builder.slices = append(builder.slices, sliceRecordFromContext(run.ProjectID, sliceContext, builder.now))
+		if item.Blueprint.Validate() == nil {
+			builder.slices = append(builder.slices, sliceRecordFromContext(run.ProjectID, sliceContext, builder.now))
+		}
 		for _, definitionNodeID := range region {
 			nodeDefinition, _ := definition.FindNode(definitionNodeID)
 			key := instanceKey(definitionNodeID, sliceID)
@@ -936,10 +1097,16 @@ func (e *Engine) reconcile(run *RunRecord, definition domain.WorkflowDefinition,
 			}
 			if allComplete {
 				expected := node.Status
-				node.Status = NodeReady
+				metadata := run.Context.Nodes[node.Key]
+				if _, _, required := nodeExecutionPolicy(definitionNode); required && metadata.ExecutionActor == nil {
+					node.Status = NodeWaitingInput
+					builder.event("node.execution_authorization_required", node.Key, nil, "")
+				} else {
+					node.Status = NodeReady
+					builder.event("node.ready", node.Key, nil, "")
+				}
 				node.UpdatedAt = builder.now
 				builder.mark(node, expected, "")
-				builder.event("node.ready", node.Key, nil, "")
 				changed = true
 			}
 		}
@@ -976,10 +1143,17 @@ func (e *Engine) reconcileFanOutConcurrency(run *RunRecord, definition domain.Wo
 					continue
 				}
 				expected := node.Status
-				node.Status = NodeReady
+				definitionNode, _ := definition.FindNode(node.DefinitionNodeID)
+				metadata := run.Context.Nodes[node.Key]
+				if _, _, required := nodeExecutionPolicy(definitionNode); required && metadata.ExecutionActor == nil {
+					node.Status = NodeWaitingInput
+					builder.event("node.execution_authorization_required", node.Key, map[string]any{"sliceId": slice.ID}, "")
+				} else {
+					node.Status = NodeReady
+					builder.event("node.ready", node.Key, map[string]any{"sliceId": slice.ID}, "")
+				}
 				node.UpdatedAt = builder.now
 				builder.mark(node, expected, "")
-				builder.event("node.ready", node.Key, map[string]any{"sliceId": slice.ID}, "")
 				changed = true
 			}
 			active++
@@ -990,6 +1164,9 @@ func (e *Engine) reconcileFanOutConcurrency(run *RunRecord, definition domain.Wo
 
 func (e *Engine) updateSliceStates(run *RunRecord, definition domain.WorkflowDefinition, builder *mutationBuilder) {
 	for _, slice := range run.Context.Slices {
+		if slice.Blueprint.Validate() != nil {
+			continue
+		}
 		fanOut, _ := definition.FindNode(slice.FanOutNodeID)
 		region, _ := definition.FanOutRegion(fanOut.ID)
 		status := sliceWorkflowStatus(run, definition, region, slice.ID)

@@ -4,6 +4,10 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { cn } from '@/lib/utils'
 import { useI18n } from '@/lib/i18n'
 import { useCollaboration } from '@/lib/collaboration/provider'
+import {
+  DeliveryClient,
+  type DeploymentMetadata,
+} from '@/lib/delivery/client'
 import type {
   DataColumnType,
   DataMetadataKind,
@@ -15,6 +19,9 @@ import type {
   EnvironmentScope,
   EnvironmentVariableKind,
   JsonValue,
+  PublicDeploymentRuntime,
+  PublicTablePolicy,
+  PublicTablePolicyInput,
   SupabaseConnectionResult,
 } from '@/lib/data-runtime/types'
 import {
@@ -28,6 +35,7 @@ import {
   Database,
   FileKey2,
   FunctionSquare,
+  Globe2,
   HardDrive,
   KeyRound,
   Loader2,
@@ -35,7 +43,9 @@ import {
   Plus,
   RefreshCw,
   ScrollText,
+  Save,
   ShieldCheck,
+  ShieldOff,
   Table2,
   Trash2,
   Users,
@@ -45,6 +55,7 @@ type DataTab =
   | 'overview'
   | 'tables'
   | 'records'
+  | 'public'
   | 'auth'
   | 'storage'
   | 'functions'
@@ -57,6 +68,7 @@ const TABS: Array<{ id: DataTab; label: string; icon: typeof Database }> = [
   { id: 'overview', label: 'Overview', icon: Database },
   { id: 'tables', label: 'Tables', icon: Table2 },
   { id: 'records', label: 'Records', icon: Braces },
+  { id: 'public', label: 'Public API', icon: Globe2 },
   { id: 'auth', label: 'Auth', icon: Users },
   { id: 'storage', label: 'Storage', icon: HardDrive },
   { id: 'functions', label: 'Functions', icon: FunctionSquare },
@@ -71,9 +83,15 @@ export function DatabasePanel() {
   const { session, project, platformClient, can } = useCollaboration()
   const projectId = project?.id ?? ''
   const data = platformClient.data
+  const publicData = data.publicRuntime
+  const delivery = useMemo(
+    () => new DeliveryClient(platformClient.http),
+    [platformClient.http],
+  )
   const canView = session.signedIn && Boolean(project) && can('view')
   const canEdit = session.signedIn && can('edit')
   const canAdmin = session.signedIn && can('admin')
+  const canPublish = session.signedIn && can('publish')
   const [tab, setTab] = useState<DataTab>('overview')
   const [snapshot, setSnapshot] = useState<DataProjectSnapshot | null>(null)
   const [loading, setLoading] = useState(true)
@@ -101,8 +119,29 @@ export function DatabasePanel() {
   const [supabaseEndpoint, setSupabaseEndpoint] = useState('')
   const [supabaseKey, setSupabaseKey] = useState('')
   const [connection, setConnection] = useState<SupabaseConnectionResult | null>(null)
+  const [publicPolicies, setPublicPolicies] = useState<readonly PublicTablePolicy[]>([])
+  const [publicPolicyDrafts, setPublicPolicyDrafts] = useState<
+    Readonly<Record<string, PublicTablePolicyInput>>
+  >({})
+  const [publicPoliciesLoading, setPublicPoliciesLoading] = useState(false)
+  const [publicPolicyMutating, setPublicPolicyMutating] = useState<string | null>(null)
+  const [publicError, setPublicError] = useState<string | null>(null)
+  const [deployments, setDeployments] = useState<readonly DeploymentMetadata[]>([])
+  const [deploymentsLoading, setDeploymentsLoading] = useState(false)
+  const [deploymentError, setDeploymentError] = useState<string | null>(null)
+  const [selectedDeploymentId, setSelectedDeploymentId] = useState('')
+  const [publicDeploymentRuntime, setPublicDeploymentRuntime] =
+    useState<PublicDeploymentRuntime | null>(null)
+  const [runtimeLoading, setRuntimeLoading] = useState(false)
+  const [runtimeChecked, setRuntimeChecked] = useState(false)
+  const [runtimeError, setRuntimeError] = useState<string | null>(null)
+  const [runtimeRevoking, setRuntimeRevoking] = useState(false)
+  const [runtimeReload, setRuntimeReload] = useState(0)
   const refreshSequence = useRef(0)
   const recordsSequence = useRef(0)
+  const publicPoliciesSequence = useRef(0)
+  const deploymentsSequence = useRef(0)
+  const runtimeSequence = useRef(0)
 
   const selectedTable = useMemo(
     () => snapshot?.tables.find((table) => table.id === selectedTableId),
@@ -168,9 +207,75 @@ export function DatabasePanel() {
     }
   }, [data, projectId, selectedTableId])
 
+  const refreshPublicPolicies = useCallback(async () => {
+    if (!canView || !snapshot) {
+      publicPoliciesSequence.current += 1
+      setPublicPolicies([])
+      setPublicPolicyDrafts({})
+      setPublicPoliciesLoading(false)
+      return
+    }
+    const sequence = ++publicPoliciesSequence.current
+    setPublicPoliciesLoading(true)
+    setPublicError(null)
+    try {
+      const policies = await publicData.listPolicies(projectId)
+      if (sequence !== publicPoliciesSequence.current) return
+      setPublicPolicies(policies)
+      setPublicPolicyDrafts(Object.fromEntries(snapshot.tables.map((table) => [
+        table.id,
+        publicPolicyInput(policies.find((policy) => policy.tableId === table.id)),
+      ])))
+    } catch (cause) {
+      if (sequence !== publicPoliciesSequence.current) return
+      setPublicError(dataErrorMessage(cause, 'Unable to load anonymous access policies.'))
+    } finally {
+      if (sequence === publicPoliciesSequence.current) setPublicPoliciesLoading(false)
+    }
+  }, [canView, projectId, publicData, snapshot])
+
+  const refreshDeployments = useCallback(async () => {
+    if (!canView) {
+      deploymentsSequence.current += 1
+      setDeployments([])
+      setSelectedDeploymentId('')
+      setDeploymentsLoading(false)
+      return
+    }
+    const sequence = ++deploymentsSequence.current
+    setDeploymentsLoading(true)
+    setDeploymentError(null)
+    try {
+      const next = await delivery.list(projectId)
+      if (sequence !== deploymentsSequence.current) return
+      if (next.some((deployment) => deployment.projectId !== projectId)) {
+        throw new Error('The delivery service returned a deployment from another project.')
+      }
+      const sorted = [...next].sort((left, right) =>
+        Date.parse(right.updatedAt) - Date.parse(left.updatedAt),
+      )
+      setDeployments(sorted)
+      setSelectedDeploymentId((current) =>
+        sorted.some((deployment) => deployment.deploymentId === current)
+          ? current
+          : sorted.find((deployment) => deployment.activeVersionId)?.deploymentId
+            ?? sorted[0]?.deploymentId
+            ?? '',
+      )
+    } catch (cause) {
+      if (sequence !== deploymentsSequence.current) return
+      setDeploymentError(dataErrorMessage(cause, 'Unable to load server deployments.'))
+    } finally {
+      if (sequence === deploymentsSequence.current) setDeploymentsLoading(false)
+    }
+  }, [canView, delivery, projectId])
+
   useEffect(() => {
     refreshSequence.current += 1
     recordsSequence.current += 1
+    publicPoliciesSequence.current += 1
+    deploymentsSequence.current += 1
+    runtimeSequence.current += 1
     setSnapshot(null)
     setSelectedTableId('')
     setRecords([])
@@ -178,6 +283,21 @@ export function DatabasePanel() {
     setRecordsOffset(0)
     setMigrationPreview(null)
     setConnection(null)
+    setPublicPolicies([])
+    setPublicPolicyDrafts({})
+    setPublicPoliciesLoading(false)
+    setPublicPolicyMutating(null)
+    setPublicError(null)
+    setDeployments([])
+    setDeploymentsLoading(false)
+    setDeploymentError(null)
+    setSelectedDeploymentId('')
+    setPublicDeploymentRuntime(null)
+    setRuntimeLoading(false)
+    setRuntimeChecked(false)
+    setRuntimeError(null)
+    setRuntimeRevoking(false)
+    setRuntimeReload(0)
     setNotice(null)
   }, [projectId])
 
@@ -188,6 +308,39 @@ export function DatabasePanel() {
   useEffect(() => {
     if (tab === 'records' && canView) void refreshRecords(0)
   }, [canView, refreshRecords, tab])
+
+  useEffect(() => {
+    if (tab !== 'public' || !canView || !snapshot) return
+    void refreshPublicPolicies()
+    void refreshDeployments()
+  }, [canView, refreshDeployments, refreshPublicPolicies, snapshot, tab])
+
+  useEffect(() => {
+    const sequence = ++runtimeSequence.current
+    setPublicDeploymentRuntime(null)
+    setRuntimeError(null)
+    setRuntimeChecked(false)
+    if (tab !== 'public' || !canView || !selectedDeploymentId) {
+      setRuntimeLoading(false)
+      return
+    }
+    setRuntimeLoading(true)
+    void publicData.activeDeploymentRuntime(projectId, selectedDeploymentId)
+      .then((runtime) => {
+        if (sequence !== runtimeSequence.current) return
+        setPublicDeploymentRuntime(runtime)
+      })
+      .catch((cause: unknown) => {
+        if (sequence !== runtimeSequence.current) return
+        if (cause instanceof PlatformHttpError && cause.status === 404) return
+        setRuntimeError(dataErrorMessage(cause, 'Unable to load the active public runtime.'))
+      })
+      .finally(() => {
+        if (sequence !== runtimeSequence.current) return
+        setRuntimeLoading(false)
+        setRuntimeChecked(true)
+      })
+  }, [canView, projectId, publicData, runtimeReload, selectedDeploymentId, tab])
 
   async function perform(action: () => Promise<unknown>, success: string) {
     if (mutating) return false
@@ -257,6 +410,123 @@ export function DatabasePanel() {
       setMigrationPreview((await data.previewMigration(projectId, operations)).data.preview)
     } catch (cause) {
       setError(dataErrorMessage(cause, 'Migration preview failed.'))
+    }
+  }
+
+  function updatePublicPolicyDraft(
+    tableId: string,
+    update: (current: PublicTablePolicyInput) => PublicTablePolicyInput,
+  ) {
+    setPublicPolicyDrafts((current) => ({
+      ...current,
+      [tableId]: update(
+        current[tableId]
+          ?? publicPolicyInput(publicPolicies.find((policy) => policy.tableId === tableId)),
+      ),
+    }))
+  }
+
+  async function savePublicPolicy(tableId: string) {
+    if (!canAdmin || publicPolicyMutating) {
+      if (!canAdmin) setPublicError('An owner or administrator is required to change anonymous access.')
+      return
+    }
+    const table = snapshot?.tables.find((candidate) => candidate.id === tableId)
+    if (!table) {
+      setPublicError('Refresh the data project before saving this table policy.')
+      return
+    }
+    const currentPolicy = publicPolicies.find((policy) => policy.tableId === tableId)
+    if (!currentPolicy?.etag) {
+      setPublicError('Refresh public policies before saving so the current ETag can be verified.')
+      return
+    }
+    const draft = publicPolicyDrafts[tableId] ?? publicPolicyInput()
+    const knownFields = new Set(table.columns.map((column) => column.name))
+    const input: PublicTablePolicyInput = {
+      ...draft,
+      readableFields: draft.allowRead
+        ? [...new Set(draft.readableFields.filter((field) => knownFields.has(field)))].sort()
+        : [],
+      writableFields: draft.allowCreate || draft.allowUpdate
+        ? [...new Set(draft.writableFields.filter((field) => knownFields.has(field)))].sort()
+        : [],
+    }
+    publicPoliciesSequence.current += 1
+    setPublicPolicyMutating(tableId)
+    setPublicError(null)
+    setNotice(null)
+    try {
+      const policy = await publicData.putPolicy(projectId, tableId, input, {
+        ifMatch: currentPolicy.etag,
+      })
+      setPublicPolicies((current) => [
+        ...current.filter((candidate) => candidate.tableId !== tableId),
+        policy,
+      ])
+      setPublicPolicyDrafts((current) => ({
+        ...current,
+        [tableId]: publicPolicyInput(policy),
+      }))
+      setNotice(`Anonymous policy for ${table.name} saved as version ${policy.version}.`)
+    } catch (cause) {
+      setPublicError(dataErrorMessage(
+        cause,
+        'Unable to save the anonymous access policy. Refresh if another collaborator changed it.',
+      ))
+    } finally {
+      setPublicPolicyMutating(null)
+    }
+  }
+
+  async function deletePublicPolicy(tableId: string) {
+    if (!canAdmin || publicPolicyMutating) {
+      if (!canAdmin) setPublicError('An owner or administrator is required to remove a policy.')
+      return
+    }
+    const table = snapshot?.tables.find((candidate) => candidate.id === tableId)
+    if (!table) return
+    const currentPolicy = publicPolicies.find((policy) => policy.tableId === tableId)
+    if (!currentPolicy?.etag || currentPolicy.version === 0) {
+      setPublicError('There is no saved policy to remove, or its current ETag is unavailable.')
+      return
+    }
+    publicPoliciesSequence.current += 1
+    setPublicPolicyMutating(tableId)
+    setPublicError(null)
+    setNotice(null)
+    try {
+      await publicData.deletePolicy(projectId, tableId, { ifMatch: currentPolicy.etag })
+      await refreshPublicPolicies()
+      setNotice(`Policy removed from ${table.name}; anonymous access is default-deny again.`)
+    } catch (cause) {
+      setPublicError(dataErrorMessage(
+        cause,
+        'Unable to remove the anonymous access policy. Refresh if another collaborator changed it.',
+      ))
+    } finally {
+      setPublicPolicyMutating(null)
+    }
+  }
+
+  async function revokePublicRuntime() {
+    if (!canPublish || !selectedDeploymentId || runtimeRevoking) {
+      if (!canPublish) setRuntimeError('An owner or administrator with publish access is required to revoke a runtime.')
+      return
+    }
+    runtimeSequence.current += 1
+    setRuntimeRevoking(true)
+    setRuntimeError(null)
+    setNotice(null)
+    try {
+      await publicData.revokeDeploymentRuntime(projectId, selectedDeploymentId)
+      setPublicDeploymentRuntime(null)
+      setRuntimeChecked(true)
+      setNotice('The deployment public data capability was revoked. Publish again to issue a new capability.')
+    } catch (cause) {
+      setRuntimeError(dataErrorMessage(cause, 'Unable to revoke the public data runtime.'))
+    } finally {
+      setRuntimeRevoking(false)
     }
   }
 
@@ -340,6 +610,8 @@ export function DatabasePanel() {
                 <p className="mb-3 text-[10px] text-faint-foreground">
                   {tab === 'audit'
                     ? 'Read-only audit events are loaded from the Go data runtime.'
+                    : tab === 'public'
+                    ? 'Policies require an administrator. Revoking a deployment capability requires publish access.'
                     : tab === 'tables' || tab === 'records' || tab === 'migrations'
                     ? 'Editing this area requires an editor role. Applying a migration still requires an administrator.'
                     : 'Changing this area requires an administrator role.'}
@@ -402,6 +674,37 @@ export function DatabasePanel() {
                   })()}
                   onPrevious={() => void refreshRecords(Math.max(0, recordsOffset - 100))}
                   onNext={() => void refreshRecords(recordsOffset + 100)}
+                />
+              )}
+              {tab === 'public' && (
+                <PublicRuntimeView
+                  tables={snapshot.tables}
+                  policies={publicPolicies}
+                  drafts={publicPolicyDrafts}
+                  policiesLoading={publicPoliciesLoading}
+                  mutatingTableId={publicPolicyMutating}
+                  policyError={publicError}
+                  canAdmin={canAdmin}
+                  onChangeDraft={updatePublicPolicyDraft}
+                  onSave={(tableId) => void savePublicPolicy(tableId)}
+                  onDelete={(tableId) => void deletePublicPolicy(tableId)}
+                  deployments={deployments}
+                  deploymentsLoading={deploymentsLoading}
+                  deploymentError={deploymentError}
+                  selectedDeploymentId={selectedDeploymentId}
+                  onSelectDeployment={setSelectedDeploymentId}
+                  runtime={publicDeploymentRuntime}
+                  runtimeLoading={runtimeLoading}
+                  runtimeChecked={runtimeChecked}
+                  runtimeError={runtimeError}
+                  runtimeRevoking={runtimeRevoking}
+                  canPublish={canPublish}
+                  onRevoke={() => void revokePublicRuntime()}
+                  onRefresh={() => {
+                    void refreshPublicPolicies()
+                    void refreshDeployments()
+                    setRuntimeReload((current) => current + 1)
+                  }}
                 />
               )}
               {tab === 'auth' && (
@@ -730,6 +1033,435 @@ function RecordsView({
   )
 }
 
+function PublicRuntimeView({
+  tables,
+  policies,
+  drafts,
+  policiesLoading,
+  mutatingTableId,
+  policyError,
+  canAdmin,
+  onChangeDraft,
+  onSave,
+  onDelete,
+  deployments,
+  deploymentsLoading,
+  deploymentError,
+  selectedDeploymentId,
+  onSelectDeployment,
+  runtime,
+  runtimeLoading,
+  runtimeChecked,
+  runtimeError,
+  runtimeRevoking,
+  canPublish,
+  onRevoke,
+  onRefresh,
+}: {
+  tables: DataProjectSnapshot['tables']
+  policies: readonly PublicTablePolicy[]
+  drafts: Readonly<Record<string, PublicTablePolicyInput>>
+  policiesLoading: boolean
+  mutatingTableId: string | null
+  policyError: string | null
+  canAdmin: boolean
+  onChangeDraft: (
+    tableId: string,
+    update: (current: PublicTablePolicyInput) => PublicTablePolicyInput,
+  ) => void
+  onSave: (tableId: string) => void
+  onDelete: (tableId: string) => void
+  deployments: readonly DeploymentMetadata[]
+  deploymentsLoading: boolean
+  deploymentError: string | null
+  selectedDeploymentId: string
+  onSelectDeployment: (deploymentId: string) => void
+  runtime: PublicDeploymentRuntime | null
+  runtimeLoading: boolean
+  runtimeChecked: boolean
+  runtimeError: string | null
+  runtimeRevoking: boolean
+  canPublish: boolean
+  onRevoke: () => void
+  onRefresh: () => void
+}) {
+  const selectedDeployment = deployments.find(
+    (deployment) => deployment.deploymentId === selectedDeploymentId,
+  )
+
+  return (
+    <div className="space-y-4">
+      <div className="flex items-start gap-3 rounded-lg border border-primary/25 bg-primary/5 p-3">
+        <ShieldCheck className="mt-0.5 h-4 w-4 shrink-0 text-primary-bright" />
+        <div className="min-w-0 flex-1">
+          <h3 className="text-[12px] font-medium text-foreground">Deployment-scoped public data</h3>
+          <p className="mt-1 text-[10px] leading-relaxed text-faint-foreground">
+            Every table is anonymous-deny until an administrator saves a policy. Published apps receive a short-lived deployment capability directly from the server; its token is never returned to this browser.
+          </p>
+        </div>
+        <button
+          type="button"
+          onClick={onRefresh}
+          disabled={policiesLoading || deploymentsLoading || runtimeLoading}
+          className="rounded border border-border p-1.5 text-muted-foreground hover:bg-white/5 hover:text-foreground disabled:opacity-40"
+          aria-label="Refresh public data settings"
+        >
+          <RefreshCw className={cn(
+            'h-3.5 w-3.5',
+            (policiesLoading || deploymentsLoading || runtimeLoading) && 'animate-spin',
+          )} />
+        </button>
+      </div>
+
+      <section className="rounded-lg border border-border bg-card p-3">
+        <div className="flex flex-wrap items-center gap-2">
+          <Globe2 className="h-4 w-4 text-primary-bright" />
+          <div className="min-w-0 flex-1">
+            <h3 className="text-[12px] font-medium text-foreground">Active deployment runtime</h3>
+            <p className="text-[10px] text-faint-foreground">
+              Capabilities are issued by publish and isolated to one deployment version and its allowed origins.
+            </p>
+          </div>
+          <select
+            value={selectedDeploymentId}
+            onChange={(event) => onSelectDeployment(event.target.value)}
+            disabled={deploymentsLoading || deployments.length === 0}
+            className="h-8 max-w-full rounded-md border border-border bg-background px-2 text-[10px] text-foreground disabled:opacity-50"
+            aria-label="Selected deployment"
+          >
+            <option value="">Select deployment</option>
+            {deployments.map((deployment) => (
+              <option key={deployment.deploymentId} value={deployment.deploymentId}>
+                {deployment.environment} · {deployment.status} · {shortId(deployment.deploymentId)}
+              </option>
+            ))}
+          </select>
+        </div>
+
+        {deploymentError && <InlineError message={deploymentError} />}
+        {runtimeError && <InlineError message={runtimeError} />}
+        {deploymentsLoading && deployments.length === 0 ? (
+          <div className="flex h-24 items-center justify-center">
+            <Loader2 className="h-4 w-4 animate-spin text-primary-bright" />
+          </div>
+        ) : deployments.length === 0 ? (
+          <div className="mt-3 rounded-md border border-dashed border-border p-4 text-center text-[10px] text-faint-foreground">
+            No server deployment is available. Publish a reviewed build before a public capability can exist.
+          </div>
+        ) : !selectedDeployment ? (
+          <p className="mt-3 text-[10px] text-faint-foreground">Select a deployment to inspect its active capability.</p>
+        ) : runtimeLoading ? (
+          <div className="flex h-24 items-center justify-center">
+            <Loader2 className="h-4 w-4 animate-spin text-primary-bright" />
+          </div>
+        ) : runtime ? (
+          <div className="mt-3 grid gap-3 lg:grid-cols-[1fr_auto]">
+            <div className="min-w-0 rounded-md border border-success/25 bg-success/5 p-3">
+              <div className="flex flex-wrap items-center gap-2 text-[10px]">
+                <span className="rounded-full bg-success/15 px-2 py-0.5 font-medium text-success">active</span>
+                <span className="font-mono text-faint-foreground">capability {shortId(runtime.capabilityId)}</span>
+                <span className="font-mono text-faint-foreground">version {shortId(runtime.deploymentVersionId)}</span>
+              </div>
+              <dl className="mt-3 grid gap-2 text-[10px] sm:grid-cols-2">
+                <RuntimeDetail
+                  label="Public endpoint"
+                  value={`${runtime.apiBasePath}/${runtime.deploymentId}`}
+                />
+                <RuntimeDetail label="Expires" value={formatDate(runtime.expiresAt)} />
+                <RuntimeDetail
+                  label="Activated"
+                  value={runtime.activatedAt ? formatDate(runtime.activatedAt) : 'activation pending'}
+                />
+                <RuntimeDetail
+                  label="Deployment"
+                  value={`${selectedDeployment.environment} · ${selectedDeployment.status}`}
+                />
+              </dl>
+              <div className="mt-3">
+                <div className="text-[9px] uppercase tracking-wide text-faint-foreground">Allowed origins</div>
+                <div className="mt-1 flex flex-wrap gap-1">
+                  {runtime.allowedOrigins.map((origin) => (
+                    <span key={origin} className="rounded bg-background px-2 py-1 font-mono text-[9px] text-muted-foreground">
+                      {origin}
+                    </span>
+                  ))}
+                </div>
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={() => window.confirm(
+                'Revoke anonymous data access for this deployment? The published app will lose public data access until it is published again.',
+              ) && onRevoke()}
+              disabled={!canPublish || runtimeRevoking}
+              className="inline-flex h-9 items-center justify-center gap-1.5 rounded-md border border-destructive/40 px-3 text-[10px] font-medium text-destructive hover:bg-destructive/10 disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              {runtimeRevoking
+                ? <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                : <ShieldOff className="h-3.5 w-3.5" />}
+              Revoke capability
+            </button>
+          </div>
+        ) : runtimeChecked && !runtimeError ? (
+          <div className="mt-3 rounded-md border border-warning/25 bg-warning/5 p-3 text-[10px] text-warning">
+            This deployment has no active public data capability. Its app cannot call the anonymous data plane until a successful publish issues and activates one.
+          </div>
+        ) : null}
+        {!canPublish && selectedDeployment && (
+          <p className="mt-2 text-[9px] text-faint-foreground">
+            Your role can inspect the runtime but cannot revoke it. Publish access is required.
+          </p>
+        )}
+      </section>
+
+      <section>
+        <div className="mb-2 flex items-center gap-2">
+          <Table2 className="h-4 w-4 text-primary-bright" />
+          <div className="min-w-0 flex-1">
+            <h3 className="text-[12px] font-medium text-foreground">Anonymous table policies</h3>
+            <p className="text-[10px] text-faint-foreground">
+              Operations and field allowlists are independent for each table. Unsaved changes never affect a published app.
+            </p>
+          </div>
+        </div>
+        {policyError && <InlineError message={policyError} />}
+        {!canAdmin && (
+          <div className="mb-2 rounded-md border border-border bg-card px-3 py-2 text-[10px] text-faint-foreground">
+            Read-only policy view. An owner or administrator is required to save or remove anonymous access.
+          </div>
+        )}
+        {policiesLoading && tables.length > 0 && policies.length === 0 ? (
+          <div className="flex h-28 items-center justify-center rounded-lg border border-border bg-card">
+            <Loader2 className="h-4 w-4 animate-spin text-primary-bright" />
+          </div>
+        ) : tables.length === 0 ? (
+          <EmptyState title="No tables" copy="Create a typed table before configuring anonymous access." />
+        ) : (
+          <div className="space-y-3">
+            {tables.map((table) => {
+              const policy = policies.find((candidate) => candidate.tableId === table.id)
+              const draft = drafts[table.id] ?? publicPolicyInput(policy)
+              const writeEnabled = draft.allowCreate || draft.allowUpdate
+              const saving = mutatingTableId === table.id
+              const dirty = !samePublicPolicyInput(draft, publicPolicyInput(policy))
+              return (
+                <article key={table.id} className="rounded-lg border border-border bg-card p-3">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="font-mono text-[12px] font-medium text-foreground">{table.name}</span>
+                    {policy && policy.version > 0 ? (
+                      <span className="rounded-full bg-primary/10 px-2 py-0.5 text-[9px] text-primary-bright">
+                        saved v{policy.version}
+                      </span>
+                    ) : (
+                      <span className="rounded-full bg-warning/10 px-2 py-0.5 text-[9px] text-warning">
+                        default deny · no policy
+                      </span>
+                    )}
+                    {dirty && <span className="text-[9px] text-warning">unsaved changes</span>}
+                    <span className="ml-auto font-mono text-[8px] text-faint-foreground">{shortId(table.id)}</span>
+                  </div>
+
+                  <div className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-4">
+                    <PolicyToggle
+                      label="Read"
+                      checked={draft.allowRead}
+                      disabled={!canAdmin || saving}
+                      onChange={(checked) => onChangeDraft(table.id, (current) => ({
+                        ...current,
+                        allowRead: checked,
+                        readableFields: checked ? current.readableFields : [],
+                      }))}
+                    />
+                    <PolicyToggle
+                      label="Create"
+                      checked={draft.allowCreate}
+                      disabled={!canAdmin || saving}
+                      onChange={(checked) => onChangeDraft(table.id, (current) => ({
+                        ...current,
+                        allowCreate: checked,
+                        writableFields: checked || current.allowUpdate
+                          ? current.writableFields
+                          : [],
+                      }))}
+                    />
+                    <PolicyToggle
+                      label="Update"
+                      checked={draft.allowUpdate}
+                      disabled={!canAdmin || saving}
+                      onChange={(checked) => onChangeDraft(table.id, (current) => ({
+                        ...current,
+                        allowUpdate: checked,
+                        writableFields: checked || current.allowCreate
+                          ? current.writableFields
+                          : [],
+                      }))}
+                    />
+                    <PolicyToggle
+                      label="Delete"
+                      checked={draft.allowDelete}
+                      disabled={!canAdmin || saving}
+                      onChange={(checked) => onChangeDraft(table.id, (current) => ({
+                        ...current,
+                        allowDelete: checked,
+                      }))}
+                    />
+                  </div>
+
+                  <div className="mt-3 grid gap-3 md:grid-cols-2">
+                    <FieldAllowlist
+                      title="Readable fields"
+                      description="Returned inside record values"
+                      columns={table.columns.map((column) => column.name)}
+                      selected={draft.readableFields}
+                      disabled={!canAdmin || !draft.allowRead || saving}
+                      disabledReason={!draft.allowRead ? 'Enable anonymous read first.' : undefined}
+                      onToggle={(field) => onChangeDraft(table.id, (current) => ({
+                        ...current,
+                        readableFields: toggleField(current.readableFields, field),
+                      }))}
+                    />
+                    <FieldAllowlist
+                      title="Writable fields"
+                      description="Accepted for create and update"
+                      columns={table.columns.map((column) => column.name)}
+                      selected={draft.writableFields}
+                      disabled={!canAdmin || !writeEnabled || saving}
+                      disabledReason={!writeEnabled ? 'Enable anonymous create or update first.' : undefined}
+                      onToggle={(field) => onChangeDraft(table.id, (current) => ({
+                        ...current,
+                        writableFields: toggleField(current.writableFields, field),
+                      }))}
+                    />
+                  </div>
+
+                  <div className="mt-3 flex flex-wrap items-center justify-end gap-2 border-t border-border pt-3">
+                    <button
+                      type="button"
+                      onClick={() => window.confirm(
+                        `Remove the saved policy for ${table.name}? Anonymous access will return to default-deny.`,
+                      ) && onDelete(table.id)}
+                      disabled={!canAdmin || !policy || policy.version === 0 || saving}
+                      className="inline-flex h-8 items-center gap-1.5 rounded-md border border-border px-2.5 text-[10px] text-muted-foreground hover:border-destructive/40 hover:text-destructive disabled:cursor-not-allowed disabled:opacity-40"
+                    >
+                      <Trash2 className="h-3.5 w-3.5" />Remove policy
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => onSave(table.id)}
+                      disabled={!canAdmin || !dirty || saving}
+                      className="inline-flex h-8 items-center gap-1.5 rounded-md bg-primary px-3 text-[10px] font-semibold text-primary-foreground hover:bg-primary-bright disabled:cursor-not-allowed disabled:opacity-40"
+                    >
+                      {saving
+                        ? <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                        : <Save className="h-3.5 w-3.5" />}
+                      Save policy
+                    </button>
+                  </div>
+                </article>
+              )
+            })}
+          </div>
+        )}
+      </section>
+    </div>
+  )
+}
+
+function PolicyToggle({
+  label,
+  checked,
+  disabled,
+  onChange,
+}: {
+  label: string
+  checked: boolean
+  disabled: boolean
+  onChange: (checked: boolean) => void
+}) {
+  return (
+    <label className={cn(
+      'flex items-center gap-2 rounded-md border px-2.5 py-2 text-[10px]',
+      checked ? 'border-primary/35 bg-primary/10 text-primary-bright' : 'border-border bg-background text-muted-foreground',
+      disabled && 'cursor-not-allowed opacity-55',
+    )}>
+      <input
+        type="checkbox"
+        checked={checked}
+        disabled={disabled}
+        onChange={(event) => onChange(event.target.checked)}
+        className="accent-primary"
+      />
+      Anonymous {label.toLowerCase()}
+    </label>
+  )
+}
+
+function FieldAllowlist({
+  title,
+  description,
+  columns,
+  selected,
+  disabled,
+  disabledReason,
+  onToggle,
+}: {
+  title: string
+  description: string
+  columns: readonly string[]
+  selected: readonly string[]
+  disabled: boolean
+  disabledReason?: string
+  onToggle: (field: string) => void
+}) {
+  return (
+    <fieldset disabled={disabled} className="rounded-md border border-border bg-background p-2.5">
+      <legend className="sr-only">{title}</legend>
+      <div className="text-[10px] font-medium text-foreground">{title}</div>
+      <p className="text-[9px] text-faint-foreground">{disabledReason ?? description}</p>
+      <div className="mt-2 flex flex-wrap gap-1.5">
+        {columns.map((column) => {
+          const checked = selected.includes(column)
+          return (
+            <label key={column} className={cn(
+              'inline-flex items-center gap-1.5 rounded border px-2 py-1 font-mono text-[9px]',
+              checked ? 'border-primary/35 bg-primary/10 text-primary-bright' : 'border-border text-muted-foreground',
+              disabled && 'cursor-not-allowed opacity-50',
+            )}>
+              <input
+                type="checkbox"
+                checked={checked}
+                onChange={() => onToggle(column)}
+                className="accent-primary"
+              />
+              {column}
+            </label>
+          )
+        })}
+        {columns.length === 0 && (
+          <span className="text-[9px] text-faint-foreground">This table has no value fields.</span>
+        )}
+      </div>
+    </fieldset>
+  )
+}
+
+function RuntimeDetail({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="min-w-0">
+      <dt className="text-[9px] uppercase tracking-wide text-faint-foreground">{label}</dt>
+      <dd className="mt-0.5 break-all font-mono text-[9px] text-muted-foreground">{value}</dd>
+    </div>
+  )
+}
+
+function InlineError({ message }: { message: string }) {
+  return (
+    <div role="alert" className="mt-3 rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-[10px] text-destructive">
+      {message}
+    </div>
+  )
+}
+
 function MetadataView({
   kind,
   items,
@@ -974,6 +1706,48 @@ function PrimaryButton({ children, onClick, disabled = false }: { children: Reac
 
 function EmptyState({ title, copy }: { title: string; copy: string }) {
   return <div className="rounded-lg border border-dashed border-border p-8 text-center"><div className="text-[12px] font-medium text-foreground">{title}</div><div className="mt-1 text-[10px] text-faint-foreground">{copy}</div></div>
+}
+
+function publicPolicyInput(policy?: PublicTablePolicy): PublicTablePolicyInput {
+  return {
+    allowRead: policy?.allowRead ?? false,
+    allowCreate: policy?.allowCreate ?? false,
+    allowUpdate: policy?.allowUpdate ?? false,
+    allowDelete: policy?.allowDelete ?? false,
+    readableFields: [...(policy?.readableFields ?? [])],
+    writableFields: [...(policy?.writableFields ?? [])],
+  }
+}
+
+function samePublicPolicyInput(
+  left: PublicTablePolicyInput,
+  right: PublicTablePolicyInput,
+) {
+  return (
+    left.allowRead === right.allowRead &&
+    left.allowCreate === right.allowCreate &&
+    left.allowUpdate === right.allowUpdate &&
+    left.allowDelete === right.allowDelete &&
+    [...left.readableFields].sort().join('\u0000') ===
+      [...right.readableFields].sort().join('\u0000') &&
+    [...left.writableFields].sort().join('\u0000') ===
+      [...right.writableFields].sort().join('\u0000')
+  )
+}
+
+function toggleField(fields: readonly string[], field: string) {
+  return fields.includes(field)
+    ? fields.filter((candidate) => candidate !== field)
+    : [...fields, field].sort()
+}
+
+function shortId(value: string) {
+  return value.length > 12 ? `${value.slice(0, 8)}…${value.slice(-4)}` : value
+}
+
+function formatDate(value: string) {
+  const date = new Date(value)
+  return Number.isFinite(date.getTime()) ? date.toLocaleString() : value
 }
 
 function jsonObject(value: unknown): Readonly<Record<string, JsonValue>> {

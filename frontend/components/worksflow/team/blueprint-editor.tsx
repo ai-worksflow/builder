@@ -4,6 +4,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { useCollaboration } from '@/lib/collaboration/provider'
 import {
   ArtifactWorkspaceConflictError,
+  reviewGateReadyForRequest,
   type ArtifactDetails,
 } from '@/lib/platform/artifact-workspace'
 import {
@@ -11,6 +12,7 @@ import {
   useArtifactWorkspace,
 } from '@/lib/platform/artifact-provider'
 import {
+  blueprintGate,
   emptyBlueprintLayout,
   materializeBlueprintContent,
   normalizeBlueprintContent,
@@ -30,6 +32,7 @@ import type {
 } from '@/lib/platform/dto'
 import { cn } from '@/lib/utils'
 import { useWorksflow } from '@/lib/worksflow/store'
+import { PageSpecEditor } from './page-spec-editor'
 import {
   AlertTriangle,
   Bot,
@@ -57,30 +60,37 @@ const NODE_KINDS: readonly BlueprintNodeKind[] = [
   'feature',
   'page',
   'component',
-  'api',
-  'dataModel',
+  'apiOperation',
+  'dataEntity',
   'permission',
-  'workbenchTarget',
 ]
 
 const EDGE_KINDS: readonly BlueprintEdgeKind[] = [
+  'drives',
+  'satisfied_by',
   'contains',
+  'navigates_to',
   'uses',
   'calls',
   'reads',
   'writes',
   'requires',
-  'renders',
-  'implements',
+  'realized_by',
+  'implemented_by',
+  'verified_by',
 ]
+
+const HTTP_METHODS = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS'] as const
 
 const NODE_COLORS: Record<BlueprintNodeKind, string> = {
   feature: 'border-violet-400/50 bg-violet-400/10',
   page: 'border-sky-400/50 bg-sky-400/10',
   component: 'border-cyan-400/50 bg-cyan-400/10',
+  apiOperation: 'border-amber-400/50 bg-amber-400/10',
+  dataEntity: 'border-emerald-400/50 bg-emerald-400/10',
+  permission: 'border-rose-400/50 bg-rose-400/10',
   api: 'border-amber-400/50 bg-amber-400/10',
   dataModel: 'border-emerald-400/50 bg-emerald-400/10',
-  permission: 'border-rose-400/50 bg-rose-400/10',
   workbenchTarget: 'border-indigo-400/50 bg-indigo-400/10',
 }
 
@@ -94,6 +104,7 @@ export function BlueprintEditor() {
   const collaboration = useCollaboration()
   const { selectedBlueprintNodeId, setSelectedBlueprintNodeId } = useWorksflow()
   const [selectedBlueprintId, setSelectedBlueprintId] = useState('')
+  const [selectedPageSpecId, setSelectedPageSpecId] = useState('')
   const [tab, setTab] = useState<EditorTab>('canvas')
   const [content, setContent] = useState<BlueprintContentDto | null>(null)
   const [details, setDetails] = useState<ArtifactDetails<BlueprintContentDto> | null>(null)
@@ -106,7 +117,7 @@ export function BlueprintEditor() {
   const [edgeTargetId, setEdgeTargetId] = useState('')
   const [edgeKind, setEdgeKind] = useState<BlueprintEdgeKind>('contains')
   const [proposalInstruction, setProposalInstruction] = useState('Decompose approved requirements into pages, components and implementation boundaries.')
-  const [selectedOperations, setSelectedOperations] = useState<Record<string, number[]>>({})
+  const [selectedOperations, setSelectedOperations] = useState<Record<string, string[]>>({})
   const [comment, setComment] = useState('')
   const [reviewSummary, setReviewSummary] = useState('Blueprint is ready for version-level review.')
   const [reviewerId, setReviewerId] = useState('')
@@ -123,7 +134,7 @@ export function BlueprintEditor() {
   const layout = normalized?.layout ?? emptyBlueprintLayout()
   const selectedNode = nodes.find((node) => node.id === selectedBlueprintNodeId) ?? null
   const dirty = Boolean(content && serverContent && JSON.stringify(content) !== JSON.stringify(normalizeBlueprintContent(serverContent)))
-  const proposals = workspace.proposals.filter((proposal) => proposal.targetArtifactId === resource?.artifact.id)
+  const proposals = workspace.proposals.filter((proposal) => proposal.artifactId === resource?.artifact.id)
   const pageSpecs = workspace.pageSpecs.filter((pageSpec) =>
     nodes.some((node) => node.id === (pageSpec.draft?.content ?? pageSpec.latestRevision?.content)?.blueprintPageNodeId),
   )
@@ -133,7 +144,27 @@ export function BlueprintEditor() {
   const currentUserId = collaboration.session.signedIn ? collaboration.session.user.id : null
   const clientGate = normalized ? blueprintGate(normalized) : []
   const revisionReady = clientGate.length === 0
-  const gatePassed = revisionReady && Boolean(details?.reviewGate.passed)
+  const gatePassed = revisionReady && reviewGateReadyForRequest(details?.reviewGate)
+
+  useEffect(() => {
+    const artifactId = artifactReference()
+    if (!artifactId) return
+    const blueprint = workspace.blueprints.find((item) => item.artifact.id === artifactId)
+    if (blueprint) {
+      setSelectedBlueprintId(blueprint.artifact.id)
+      return
+    }
+    const pageSpec = workspace.pageSpecs.find((item) => item.artifact.id === artifactId)
+    if (!pageSpec) return
+    const pageNodeId = (pageSpec.draft?.content ?? pageSpec.latestRevision?.content)?.blueprintPageNodeId
+    const owner = workspace.blueprints.find((item) => {
+      const value = normalizeBlueprintContent(item.draft?.content ?? item.latestRevision?.content ?? createEmptyBlueprintContent())
+      return value.semantic?.nodes.some((node) => node.id === pageNodeId)
+    })
+    if (owner) setSelectedBlueprintId(owner.artifact.id)
+    setSelectedPageSpecId(pageSpec.artifact.id)
+    setTab('pages')
+  }, [workspace.blueprints, workspace.pageSpecs])
 
   useEffect(() => {
     if (!resource) {
@@ -225,12 +256,16 @@ export function BlueprintEditor() {
 
   function addNode(kind: BlueprintNodeKind = 'feature') {
     const id = stableId('node')
+    const key = `${kind.replace(/([a-z])([A-Z])/g, '$1_$2').toUpperCase()}-${id.slice(-8).toUpperCase()}`
     mutateBlueprint((currentNodes, currentEdges, currentLayout) => ({
       nodes: [...currentNodes, {
         id,
+        key,
         kind,
         title: `New ${kind}`,
         description: '',
+        ...(kind === 'page' ? { route: `/${slug(key)}`, userGoal: '' } : {}),
+        ...(kind === 'apiOperation' ? { method: 'GET', path: '' } : {}),
         requirementIds: [],
         assignedMemberIds: [],
       }],
@@ -425,22 +460,24 @@ export function BlueprintEditor() {
             </div>
           )}
 
-          {tab === 'pages' && <PageSpecsPanel resourceId={resource.artifact.id} nodes={nodes} pageSpecs={workspace.pageSpecs} hasRevision={Boolean(resource.latestRevision)} readOnly={readOnly} onCreate={async (node, route) => {
+          {tab === 'pages' && <PageSpecsPanel selectedPageSpecId={selectedPageSpecId} onSelectedPageSpecId={setSelectedPageSpecId} nodes={nodes} pageSpecs={workspace.pageSpecs} hasRevision={Boolean(resource.approvedRevision)} readOnly={readOnly} onCreate={async (node, route, userGoal) => {
             try {
-              const artifactId = await workspace.createPageSpec(resource.artifact.id, node.id, `${node.title} PageSpec`, route)
+              const artifactId = await workspace.createPageSpec(resource.artifact.id, node.id, `${node.title} PageSpec`, route, userGoal)
               if (artifactId) updateNode(node.id, { pageSpecArtifactId: artifactId })
+              return artifactId
             } catch (error) {
               setLocalError(errorMessage(error))
+              return null
             }
           }} />}
 
           {tab === 'versions' && <section className="mx-auto max-w-4xl space-y-3 p-5"><GatePanel clientIssues={clientGate} serverGate={details?.reviewGate} /><button type="button" onClick={() => void createRevision()} disabled={readOnly || !revisionReady || saving} className="inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-2 text-[11px] font-semibold text-primary-foreground disabled:opacity-50"><GitBranch className="size-3.5" />Create immutable revision</button>{details?.versions.map((version) => <div key={version.id} className="rounded-lg border border-border bg-panel p-3"><div className="flex items-center gap-2"><FileClock className="size-4 text-primary-bright" /><span className="text-[11px] font-medium text-foreground">Revision {version.revisionNumber}</span><code className="ml-auto text-[9px] text-faint-foreground">{version.contentHash.slice(0, 16)}</code></div><p className="mt-1 text-[10px] text-muted-foreground">{new Date(version.createdAt).toLocaleString()} · {version.sourceVersions?.length ?? 0} pinned requirement revisions</p></div>)}</section>}
 
-          {tab === 'proposal' && <ProposalPanel proposals={proposals} selected={selectedOperations} onSelected={setSelectedOperations} instruction={proposalInstruction} onInstruction={setProposalInstruction} canEdit={!readOnly} canCreate={Boolean(resource.draft?.contentHash)} onCreate={() => void workspace.createProposal({ kind: 'blueprint.patch', targetArtifactId: resource.artifact.id, baseDraftHash: resource.draft?.contentHash ?? '', instruction: proposalInstruction, inputVersions: resource.draft?.sourceVersions ?? [], outputSchemaVersion: 'blueprint.patch.v1' }).catch((error) => setLocalError(errorMessage(error)))} onApply={(proposal) => void workspace.applyProposal(proposal.id, selectedOperations[proposal.id] ?? [], serverEtag ?? '').catch((error) => setLocalError(errorMessage(error)))} />}
+          {tab === 'proposal' && <ProposalPanel proposals={proposals} selected={selectedOperations} onSelected={setSelectedOperations} instruction={proposalInstruction} onInstruction={setProposalInstruction} canEdit={!readOnly} canCreate={Boolean(latestVersion) && !dirty} onCreate={() => void workspace.createProposal({ jobType: 'blueprint.patch', targetRevision: latestVersion!, instruction: proposalInstruction, inputVersions: resource.draft?.sourceVersions ?? [], outputSchemaVersion: 'blueprint.patch.v1' }).catch((error) => setLocalError(errorMessage(error)))} onApply={(proposal) => void workspace.applyProposal(proposal.id, selectedOperations[proposal.id] ?? []).catch((error) => setLocalError(errorMessage(error)))} />}
 
           {tab === 'impact' && <section className="mx-auto max-w-4xl space-y-3 p-5"><div className="flex items-center justify-between gap-3"><div><h2 className="text-sm font-semibold text-foreground">Downstream impact lens</h2><p className="mt-1 text-[10px] text-muted-foreground">Compares pinned blueprint versions with PageSpecs, prototypes and workbench outputs.</p></div><button type="button" onClick={() => void loadImpact()} className="rounded-md bg-primary px-3 py-2 text-[10px] font-semibold text-primary-foreground"><RefreshCw className="mr-1 inline size-3" />Analyze impact</button></div>{resource.artifact.status === 'needsSync' && <div className="rounded-md border border-warning/30 bg-warning/10 p-3 text-[10px] text-warning"><AlertTriangle className="mr-1 inline size-3" />The server marked this blueprint or a dependent artifact as needs_sync.</div>}{impact?.items.length === 0 && <p className="rounded border border-dashed border-border p-4 text-[10px] text-faint-foreground">No downstream impact was reported.</p>}{impact?.items.map((item, index) => <div key={`${item.targetArtifactId}-${index}`} className={cn('rounded-md border bg-panel p-3 text-[10px]', item.needsSync ? 'border-warning/40' : 'border-border')}><div className="flex items-center gap-2"><code className="text-primary-bright">{item.targetKind}:{item.targetArtifactId}</code><span className="ml-auto rounded bg-white/5 px-1.5 py-0.5">{item.severity}</span>{item.needsSync && <span className="rounded bg-warning/10 px-1.5 py-0.5 text-warning">needs_sync</span>}</div><p className="mt-1 text-muted-foreground">{item.reason}</p><p className="mt-1 text-faint-foreground">source {item.source.artifactId}@{item.source.revisionNumber} · {item.source.contentHash.slice(0, 12)}</p></div>)}</section>}
 
-          {tab === 'trace' && <section className="mx-auto max-w-4xl space-y-2 p-5">{details?.dependencies.map((dependency) => <div key={dependency.id} className="rounded-md border border-border bg-panel p-3 text-[10px]"><Link2 className="mr-2 inline size-3.5 text-primary-bright" />{dependency.source.artifactId}@{dependency.source.revisionNumber} <b>{dependency.relation}</b> {dependency.target.artifactId}@{dependency.target.revisionNumber}{dependency.blocking && <span className="ml-2 text-warning">blocking</span>}</div>)}{workspace.traces.filter((trace) => trace.source.id === resource.artifact.id || trace.target.id === resource.artifact.id).map((trace) => <div key={trace.id} className="rounded-md border border-border bg-panel p-3 text-[10px]"><code>{trace.source.kind}:{trace.source.id}</code> → {trace.relation} → <code>{trace.target.kind}:{trace.target.id}</code></div>)}</section>}
+          {tab === 'trace' && <section className="mx-auto max-w-4xl space-y-2 p-5">{details?.dependencies.map((dependency) => <div key={dependency.id} className="rounded-md border border-border bg-panel p-3 text-[10px]"><Link2 className="mr-2 inline size-3.5 text-primary-bright" />{dependency.source.artifactId}{dependency.source.revisionNumber ? `@${dependency.source.revisionNumber}` : ''} <b>{dependency.relation}</b> {dependency.target.artifactId}{dependency.target.revisionNumber ? `@${dependency.target.revisionNumber}` : ''}{dependency.required && <span className="ml-2 text-warning">required</span>}</div>)}{workspace.traces.filter((trace) => trace.source.artifactId === resource.artifact.id || trace.target.artifactId === resource.artifact.id).map((trace) => <div key={trace.id} className="rounded-md border border-border bg-panel p-3 text-[10px]"><code>{trace.source.artifactId}:{trace.source.revisionId}</code> → {trace.relation} → <code>{trace.target.artifactId}:{trace.target.revisionId}</code></div>)}</section>}
 
           {tab === 'review' && <section className="mx-auto max-w-4xl space-y-3 p-5"><GatePanel clientIssues={clientGate} serverGate={details?.reviewGate} />{!latestVersion && <p className="rounded-md border border-dashed border-border p-4 text-[10px] text-faint-foreground">Create a revision before commenting or requesting review.</p>}{latestVersion && <div className="grid gap-2 sm:grid-cols-[1fr_auto]"><input value={comment} onChange={(event) => setComment(event.target.value)} placeholder="Comment on this exact blueprint revision" className="h-9 rounded-md border border-border bg-background px-2 text-[10px] text-foreground" /><button type="button" onClick={() => void collaboration.addComment(comment, undefined, latestVersion).then((ok) => ok && setComment(''))} disabled={!comment.trim() || !collaboration.can('comment')} className="rounded-md bg-primary px-3 text-[10px] font-semibold text-primary-foreground disabled:opacity-50"><MessageSquare className="mr-1 inline size-3" />Comment</button></div>}{latestVersion && <div className="grid gap-2 sm:grid-cols-[1fr_180px_auto]"><input value={reviewSummary} onChange={(event) => setReviewSummary(event.target.value)} className="h-9 rounded-md border border-border bg-background px-2 text-[10px] text-foreground" /><select value={reviewerId} onChange={(event) => setReviewerId(event.target.value)} className="h-9 rounded-md border border-border bg-background px-2 text-[10px] text-foreground"><option value="">Reviewer</option>{collaboration.members.filter((member) => member.user.id !== currentUserId && ['owner', 'admin', 'editor'].includes(member.role)).map((member) => <option key={member.user.id} value={member.user.id}>{member.user.name}</option>)}</select><button type="button" onClick={() => void collaboration.requestReview(reviewSummary, latestVersion, [reviewerId])} disabled={!gatePassed || !reviewerId || !reviewSummary.trim()} className="rounded-md bg-primary px-3 text-[10px] font-semibold text-primary-foreground disabled:opacity-50"><Send className="mr-1 inline size-3" />Request review</button></div>}{comments.map((thread) => <div key={thread.id} className="rounded-md border border-border bg-panel p-3"><span className="text-[10px] font-medium text-foreground">{thread.author.name}</span><p className="mt-1 text-[10px] text-muted-foreground">{thread.body}</p><p className="mt-1 text-[9px] text-faint-foreground">Pinned to revision {thread.target?.revisionNumber}</p></div>)}{reviews.map((review) => <div key={review.id} className="rounded-md border border-border bg-panel p-3 text-[10px]"><span className="font-medium text-foreground">{review.state}</span><span className="ml-2 text-muted-foreground">{review.summary}</span><span className="ml-2 text-faint-foreground">revision {review.target?.revisionNumber ?? 'unknown'}</span></div>)}</section>}
         </div>
@@ -450,43 +487,69 @@ export function BlueprintEditor() {
 }
 
 function NodeInspector({ node, position, readOnly, onChange, onMove, onDelete }: { node: SemanticNode; position: { readonly x: number; readonly y: number }; readOnly: boolean; onChange: (patch: Partial<SemanticNode>) => void; onMove: (x: number, y: number) => void; onDelete: () => void }) {
-  return <div className="space-y-3"><div className="flex items-center gap-2"><Move className="size-4 text-primary-bright" /><h2 className="text-xs font-semibold text-foreground">Semantic node</h2><button type="button" onClick={onDelete} disabled={readOnly} className="ml-auto text-destructive disabled:opacity-40"><Trash2 className="size-4" /></button></div><code className="block truncate text-[9px] text-faint-foreground">{node.id}</code><label className="block text-[10px] text-muted-foreground">Kind<select value={node.kind} disabled={readOnly} onChange={(event) => onChange({ kind: event.target.value as BlueprintNodeKind })} className="mt-1 h-8 w-full rounded border border-border bg-background px-2 text-[10px] text-foreground">{NODE_KINDS.map((kind) => <option key={kind}>{kind}</option>)}</select></label><label className="block text-[10px] text-muted-foreground">Title<input value={node.title} readOnly={readOnly} onChange={(event) => onChange({ title: event.target.value })} className="mt-1 h-8 w-full rounded border border-border bg-background px-2 text-[10px] text-foreground" /></label><label className="block text-[10px] text-muted-foreground">Description<textarea value={node.description ?? ''} readOnly={readOnly} onChange={(event) => onChange({ description: event.target.value })} rows={4} className="mt-1 w-full rounded border border-border bg-background p-2 text-[10px] text-foreground" /></label><label className="block text-[10px] text-muted-foreground">Stable requirement IDs<input value={node.requirementIds.join(', ')} readOnly={readOnly} onChange={(event) => onChange({ requirementIds: commaList(event.target.value) })} className="mt-1 h-8 w-full rounded border border-border bg-background px-2 text-[10px] text-foreground" /></label><label className="block text-[10px] text-muted-foreground">Assigned member IDs<input value={node.assignedMemberIds.join(', ')} readOnly={readOnly} onChange={(event) => onChange({ assignedMemberIds: commaList(event.target.value) })} className="mt-1 h-8 w-full rounded border border-border bg-background px-2 text-[10px] text-foreground" /></label><div className="rounded border border-border bg-background p-2"><span className="text-[9px] font-medium uppercase text-faint-foreground">Layout only</span><div className="mt-2 grid grid-cols-2 gap-2"><label className="text-[9px] text-muted-foreground">X<input type="number" value={position.x} disabled={readOnly} onChange={(event) => onMove(Number(event.target.value), position.y)} className="mt-1 h-8 w-full rounded border border-border bg-panel px-2 text-[10px] text-foreground" /></label><label className="text-[9px] text-muted-foreground">Y<input type="number" value={position.y} disabled={readOnly} onChange={(event) => onMove(position.x, Number(event.target.value))} className="mt-1 h-8 w-full rounded border border-border bg-panel px-2 text-[10px] text-foreground" /></label></div></div>{node.pageSpecArtifactId && <p className="rounded border border-success/30 bg-success/10 p-2 text-[9px] text-success">PageSpec {node.pageSpecArtifactId}</p>}</div>
+  return (
+    <div className="space-y-3">
+      <div className="flex items-center gap-2">
+        <Move className="size-4 text-primary-bright" />
+        <h2 className="text-xs font-semibold text-foreground">Semantic node</h2>
+        <button type="button" onClick={onDelete} disabled={readOnly} className="ml-auto text-destructive disabled:opacity-40"><Trash2 className="size-4" /></button>
+      </div>
+      <code className="block truncate text-[9px] text-faint-foreground">{node.id}</code>
+      <label className="block text-[10px] text-muted-foreground">Stable business key<input value={node.key} readOnly={readOnly} onChange={(event) => onChange({ key: event.target.value })} className="mt-1 h-8 w-full rounded border border-border bg-background px-2 font-mono text-[10px] text-foreground" /></label>
+      <label className="block text-[10px] text-muted-foreground">Kind<select value={node.kind} disabled={readOnly} onChange={(event) => onChange({ kind: event.target.value as BlueprintNodeKind })} className="mt-1 h-8 w-full rounded border border-border bg-background px-2 text-[10px] text-foreground">{!NODE_KINDS.includes(node.kind) && <option value={node.kind}>{node.kind} (legacy; migrate before review)</option>}{NODE_KINDS.map((kind) => <option key={kind}>{kind}</option>)}</select></label>
+      <label className="block text-[10px] text-muted-foreground">Title<input value={node.title} readOnly={readOnly} onChange={(event) => onChange({ title: event.target.value })} className="mt-1 h-8 w-full rounded border border-border bg-background px-2 text-[10px] text-foreground" /></label>
+      <label className="block text-[10px] text-muted-foreground">Description<textarea value={node.description ?? ''} readOnly={readOnly} onChange={(event) => onChange({ description: event.target.value })} rows={4} className="mt-1 w-full rounded border border-border bg-background p-2 text-[10px] text-foreground" /></label>
+      {node.kind === 'page' && <>
+        <label className="block text-[10px] text-muted-foreground">Route<input value={node.route ?? ''} readOnly={readOnly} onChange={(event) => onChange({ route: event.target.value })} placeholder="/orders" className="mt-1 h-8 w-full rounded border border-border bg-background px-2 font-mono text-[10px] text-foreground" /></label>
+        <label className="block text-[10px] text-muted-foreground">User goal<textarea value={node.userGoal ?? ''} readOnly={readOnly} onChange={(event) => onChange({ userGoal: event.target.value })} rows={3} className="mt-1 w-full rounded border border-border bg-background p-2 text-[10px] text-foreground" /></label>
+      </>}
+      {(node.kind === 'apiOperation' || node.kind === 'api') && <>
+        <label className="block text-[10px] text-muted-foreground">HTTP method<select value={node.method?.toUpperCase() ?? ''} disabled={readOnly} onChange={(event) => onChange({ method: event.target.value })} className="mt-1 h-8 w-full rounded border border-border bg-background px-2 font-mono text-[10px] text-foreground"><option value="">Select method</option>{HTTP_METHODS.map((method) => <option key={method} value={method}>{method}</option>)}</select></label>
+        <label className="block text-[10px] text-muted-foreground">API path<input value={node.path ?? ''} readOnly={readOnly} onChange={(event) => onChange({ path: event.target.value })} placeholder="/orders" className="mt-1 h-8 w-full rounded border border-border bg-background px-2 font-mono text-[10px] text-foreground" /></label>
+      </>}
+      <label className="block text-[10px] text-muted-foreground">Stable requirement IDs<input value={node.requirementIds.join(', ')} readOnly={readOnly} onChange={(event) => onChange({ requirementIds: commaList(event.target.value) })} className="mt-1 h-8 w-full rounded border border-border bg-background px-2 text-[10px] text-foreground" /></label>
+      <label className="block text-[10px] text-muted-foreground">Assigned member IDs<input value={node.assignedMemberIds.join(', ')} readOnly={readOnly} onChange={(event) => onChange({ assignedMemberIds: commaList(event.target.value) })} className="mt-1 h-8 w-full rounded border border-border bg-background px-2 text-[10px] text-foreground" /></label>
+      <div className="rounded border border-border bg-background p-2">
+        <span className="text-[9px] font-medium uppercase text-faint-foreground">Layout only</span>
+        <div className="mt-2 grid grid-cols-2 gap-2">
+          <label className="text-[9px] text-muted-foreground">X<input type="number" value={position.x} disabled={readOnly} onChange={(event) => onMove(Number(event.target.value), position.y)} className="mt-1 h-8 w-full rounded border border-border bg-panel px-2 text-[10px] text-foreground" /></label>
+          <label className="text-[9px] text-muted-foreground">Y<input type="number" value={position.y} disabled={readOnly} onChange={(event) => onMove(position.x, Number(event.target.value))} className="mt-1 h-8 w-full rounded border border-border bg-panel px-2 text-[10px] text-foreground" /></label>
+        </div>
+      </div>
+      {node.pageSpecArtifactId && <p className="rounded border border-success/30 bg-success/10 p-2 text-[9px] text-success">PageSpec {node.pageSpecArtifactId}</p>}
+    </div>
+  )
 }
 
-function PageSpecsPanel({ nodes, pageSpecs, hasRevision, readOnly, onCreate }: { resourceId: string; nodes: readonly SemanticNode[]; pageSpecs: ReturnType<typeof useArtifactWorkspace>['pageSpecs']; hasRevision: boolean; readOnly: boolean; onCreate: (node: SemanticNode, route: string) => Promise<void> }) {
+function PageSpecsPanel({ selectedPageSpecId, onSelectedPageSpecId, nodes, pageSpecs, hasRevision, readOnly, onCreate }: { selectedPageSpecId: string; onSelectedPageSpecId: (artifactId: string) => void; nodes: readonly SemanticNode[]; pageSpecs: ReturnType<typeof useArtifactWorkspace>['pageSpecs']; hasRevision: boolean; readOnly: boolean; onCreate: (node: SemanticNode, route: string, userGoal: string) => Promise<string | null> }) {
   const pages = nodes.filter((node) => node.kind === 'page')
-  return <section className="mx-auto max-w-4xl space-y-3 p-5"><div><h2 className="text-sm font-semibold text-foreground">PageSpec outputs</h2><p className="mt-1 text-[10px] text-muted-foreground">Every PageSpec pins an immutable blueprint revision and a stable page node ID.</p></div>{!hasRevision && <p className="rounded-md border border-warning/30 bg-warning/10 p-3 text-[10px] text-warning">Create a blueprint revision before creating PageSpecs.</p>}{pages.length === 0 && <p className="rounded border border-dashed border-border p-4 text-[10px] text-faint-foreground">Add at least one page node to split the product into functional pages.</p>}{pages.map((node) => {
+  if (selectedPageSpecId && pageSpecs.some((item) => item.artifact.id === selectedPageSpecId)) {
+    return <section className="p-5"><PageSpecEditor artifactId={selectedPageSpecId} onBack={() => onSelectedPageSpecId('')} /></section>
+  }
+  return <section className="mx-auto max-w-4xl space-y-3 p-5"><div><h2 className="text-sm font-semibold text-foreground">PageSpec outputs</h2><p className="mt-1 text-[10px] text-muted-foreground">Every PageSpec pins an approved Blueprint revision and its stable page-node anchor. Open one here to edit, version, review, and approve it before formal prototyping.</p></div>{!hasRevision && <p className="rounded-md border border-warning/30 bg-warning/10 p-3 text-[10px] text-warning">Approve a Blueprint revision before creating formal PageSpecs.</p>}{pages.length === 0 && <p className="rounded border border-dashed border-border p-4 text-[10px] text-faint-foreground">Add at least one page node to split the product into functional pages.</p>}{pages.map((node) => {
     const existing = pageSpecs.find((item) => (item.draft?.content ?? item.latestRevision?.content)?.blueprintPageNodeId === node.id)
-    const route = `/${slug(node.title)}`
-    return <div key={node.id} className="rounded-lg border border-border bg-panel p-3"><div className="flex flex-wrap items-center gap-2"><span className="text-[11px] font-semibold text-foreground">{node.title}</span><code className="text-[9px] text-faint-foreground">{node.id}</code>{existing ? <span className="ml-auto rounded bg-success/10 px-2 py-1 text-[9px] text-success"><CheckCircle2 className="mr-1 inline size-3" />{existing.artifact.id}</span> : <button type="button" onClick={() => void onCreate(node, route)} disabled={readOnly || !hasRevision} className="ml-auto rounded bg-primary px-2.5 py-1.5 text-[9px] font-semibold text-primary-foreground disabled:opacity-40"><Plus className="mr-1 inline size-3" />Create {route}</button>}</div><p className="mt-2 text-[10px] text-muted-foreground">{node.description || 'Define goal, states, data bindings and interactions in the PageSpec.'}</p></div>
+    const route = node.route?.trim() || `/${slug(node.title)}`
+    const userGoal = node.userGoal?.trim() || node.description?.trim() || `Complete ${node.title}`
+    return <div key={node.id} className="rounded-lg border border-border bg-panel p-3"><div className="flex flex-wrap items-center gap-2"><span className="text-[11px] font-semibold text-foreground">{node.title}</span><code className="text-[9px] text-faint-foreground">{node.id}</code>{existing ? <><span className={cn('ml-auto rounded px-2 py-1 text-[9px]', existing.artifact.status === 'approved' ? 'bg-success/10 text-success' : 'bg-primary/10 text-primary-bright')}><CheckCircle2 className="mr-1 inline size-3" />{existing.artifact.status} · r{existing.latestRevision?.revisionNumber ?? 0}</span><button type="button" onClick={() => onSelectedPageSpecId(existing.artifact.id)} className="rounded border border-primary/40 px-2.5 py-1.5 text-[9px] font-semibold text-primary-bright">Open editor</button></> : <button type="button" onClick={() => void onCreate(node, route, userGoal).then((artifactId) => artifactId && onSelectedPageSpecId(artifactId))} disabled={readOnly || !hasRevision} className="ml-auto rounded bg-primary px-2.5 py-1.5 text-[9px] font-semibold text-primary-foreground disabled:opacity-40"><Plus className="mr-1 inline size-3" />Create {route}</button>}</div><p className="mt-2 text-[10px] text-muted-foreground">{userGoal}</p></div>
   })}</section>
 }
 
 function GatePanel({ clientIssues, serverGate }: { clientIssues: string[]; serverGate?: ArtifactReviewGateDto }) {
-  const serverErrors = serverGate?.checks.filter((check) => check.severity === 'error').map((check) => check.message) ?? []
+  const serverErrors = serverGate?.checks
+    .filter((check) => check.severity === 'error' && check.code !== 'canonical_review_approved')
+    .map((check) => check.message) ?? []
   const issues = [...clientIssues, ...serverErrors]
-  return <div className={cn('rounded-lg border p-3', issues.length === 0 && serverGate?.passed ? 'border-success/30 bg-success/10' : 'border-warning/30 bg-warning/10')}><div className="flex items-center gap-2 text-[11px] font-semibold text-foreground">{issues.length === 0 && serverGate?.passed ? <CheckCircle2 className="size-4 text-success" /> : <AlertTriangle className="size-4 text-warning" />}Review gate {issues.length === 0 && serverGate?.passed ? 'passed' : 'blocked'}</div>{issues.map((issue) => <p key={issue} className="mt-1 text-[10px] text-muted-foreground">• {issue}</p>)}{serverGate && <p className="mt-2 text-[9px] text-faint-foreground">Trace coverage {Math.round(serverGate.traceCoverage * 100)}% · {serverGate.unresolvedBlockingCommentIds.length} unresolved blocking comments</p>}</div>
+  const requestReady = issues.length === 0 && reviewGateReadyForRequest(serverGate)
+  const approved = Boolean(serverGate?.passed)
+  return <div className={cn('rounded-lg border p-3', approved || requestReady ? 'border-success/30 bg-success/10' : 'border-warning/30 bg-warning/10')}><div className="flex items-center gap-2 text-[11px] font-semibold text-foreground">{approved || requestReady ? <CheckCircle2 className="size-4 text-success" /> : <AlertTriangle className="size-4 text-warning" />}Review gate {approved ? 'approved' : requestReady ? 'ready to request' : 'blocked'}</div>{issues.map((issue) => <p key={issue} className="mt-1 text-[10px] text-muted-foreground">• {issue}</p>)}{requestReady && !approved && <p className="mt-1 text-[10px] text-success">Pre-review checks passed; canonical reviewer approval is pending.</p>}{serverGate && <p className="mt-2 text-[9px] text-faint-foreground">Trace coverage {Math.round(serverGate.traceCoverage * 100)}% · {serverGate.unresolvedBlockingCommentIds.length} unresolved blocking comments</p>}</div>
 }
 
-function ProposalPanel({ proposals, selected, onSelected, instruction, onInstruction, canEdit, canCreate, onCreate, onApply }: { proposals: readonly ProposalDto[]; selected: Record<string, number[]>; onSelected: (next: Record<string, number[]>) => void; instruction: string; onInstruction: (value: string) => void; canEdit: boolean; canCreate: boolean; onCreate: () => void; onApply: (proposal: ProposalDto) => void }) {
-  return <section className="mx-auto max-w-4xl space-y-3 p-5"><div className="rounded-lg border border-border bg-panel p-3"><textarea value={instruction} onChange={(event) => onInstruction(event.target.value)} rows={3} className="w-full rounded border border-border bg-background p-2 text-[11px] text-foreground" /><button type="button" onClick={onCreate} disabled={!canEdit || !canCreate || !instruction.trim()} className="mt-2 rounded bg-primary px-3 py-2 text-[10px] font-semibold text-primary-foreground disabled:opacity-50"><Bot className="mr-1 inline size-3" />Ask AI for proposal</button>{!canCreate && <p className="mt-2 text-[9px] text-warning">Save a server draft before creating a hash-pinned proposal.</p>}</div>{proposals.map((proposal) => <div key={proposal.id} className="rounded-lg border border-border bg-panel p-3"><div className="flex items-center gap-2"><span className="text-[11px] font-semibold text-foreground">{proposal.kind}</span><span className="rounded bg-primary/10 px-1.5 py-0.5 text-[9px] text-primary-bright">{proposal.status}</span><code className="ml-auto text-[9px] text-faint-foreground">base {proposal.baseDraftHash?.slice(0, 12) ?? 'none'}</code></div><div className="mt-2 space-y-1">{proposal.operations.map((operation, index) => <label key={index} className="flex gap-2 rounded border border-border bg-background p-2 text-[9px] text-muted-foreground"><input type="checkbox" checked={(selected[proposal.id] ?? []).includes(index)} onChange={(event) => onSelected({ ...selected, [proposal.id]: event.target.checked ? [...(selected[proposal.id] ?? []), index] : (selected[proposal.id] ?? []).filter((item) => item !== index) })} /><pre className="overflow-auto whitespace-pre-wrap">{JSON.stringify(operation, null, 2)}</pre></label>)}</div><button type="button" onClick={() => onApply(proposal)} disabled={!canEdit || (selected[proposal.id]?.length ?? 0) === 0 || proposal.status === 'applied' || proposal.status === 'rejected'} className="mt-2 rounded bg-primary px-2.5 py-1.5 text-[9px] font-semibold text-primary-foreground disabled:opacity-50">Apply selected operations</button></div>)}</section>
+function ProposalPanel({ proposals, selected, onSelected, instruction, onInstruction, canEdit, canCreate, onCreate, onApply }: { proposals: readonly ProposalDto[]; selected: Record<string, string[]>; onSelected: (next: Record<string, string[]>) => void; instruction: string; onInstruction: (value: string) => void; canEdit: boolean; canCreate: boolean; onCreate: () => void; onApply: (proposal: ProposalDto) => void }) {
+  return <section className="mx-auto max-w-4xl space-y-3 p-5"><div className="rounded-lg border border-border bg-panel p-3"><textarea value={instruction} onChange={(event) => onInstruction(event.target.value)} rows={3} className="w-full rounded border border-border bg-background p-2 text-[11px] text-foreground" /><button type="button" onClick={onCreate} disabled={!canEdit || !canCreate || !instruction.trim()} className="mt-2 rounded bg-primary px-3 py-2 text-[10px] font-semibold text-primary-foreground disabled:opacity-50"><Bot className="mr-1 inline size-3" />Ask AI for proposal</button>{!canCreate && <p className="mt-2 text-[9px] text-warning">Save and create an immutable blueprint revision first. AI never consumes mutable draft bytes.</p>}</div>{proposals.map((proposal) => { const selectedIds = selected[proposal.id] ?? []; const hasAccepted = proposal.operations.some((operation) => operation.decision === 'accepted' || selectedIds.includes(operation.id)); return <div key={proposal.id} className="rounded-lg border border-border bg-panel p-3"><div className="flex items-center gap-2"><span className="text-[11px] font-semibold text-foreground">Manifest {proposal.manifest.id.slice(0, 12)}</span><span className="rounded bg-primary/10 px-1.5 py-0.5 text-[9px] text-primary-bright">{proposal.status}</span><code className="ml-auto text-[9px] text-faint-foreground">base {proposal.baseRevision.contentHash.slice(0, 12)}</code></div><div className="mt-2 space-y-1">{proposal.operations.map((operation) => <label key={operation.id} className="flex gap-2 rounded border border-border bg-background p-2 text-[9px] text-muted-foreground"><input type="checkbox" disabled={operation.decision !== 'pending'} checked={operation.decision === 'accepted' || operation.decision === 'applied' || selectedIds.includes(operation.id)} onChange={(event) => onSelected({ ...selected, [proposal.id]: event.target.checked ? [...selectedIds, operation.id] : selectedIds.filter((item) => item !== operation.id) })} /><span className="min-w-0 flex-1"><code>{operation.kind} {operation.path || '/'}</code><span className="ml-2 text-faint-foreground">{operation.decision}</span>{operation.rationale && <span className="mt-1 block">{operation.rationale}</span>}</span></label>)}</div><button type="button" onClick={() => onApply(proposal)} disabled={!canEdit || !hasAccepted || !['open', 'reviewing', 'ready'].includes(proposal.status)} className="mt-2 rounded bg-primary px-2.5 py-1.5 text-[9px] font-semibold text-primary-foreground disabled:opacity-50">Decide all and apply accepted operations</button></div>})}</section>
 }
 
 function Unavailable({ title, detail, loading, action, onAction, onRetry }: { title: string; detail: string; loading?: boolean; action?: string; onAction?: () => void; onRetry?: () => Promise<void> }) {
   return <div className="flex h-full items-center justify-center bg-canvas p-6 text-center"><div className="max-w-md rounded-lg border border-dashed border-border bg-panel p-6">{loading ? <Loader2 className="mx-auto size-7 animate-spin text-primary-bright" /> : <AlertTriangle className="mx-auto size-7 text-warning" />}<h1 className="mt-3 text-base font-semibold text-foreground">{title}</h1><p className="mt-2 text-sm text-muted-foreground">{detail}</p>{action && onAction && <button type="button" onClick={onAction} className="mt-4 rounded-md bg-primary px-3 py-2 text-sm font-medium text-primary-foreground">{action}</button>}{onRetry && <button type="button" onClick={() => void onRetry()} className="mt-4 rounded-md bg-primary px-3 py-2 text-sm font-medium text-primary-foreground"><RefreshCw className="mr-1 inline size-4" />Retry</button>}</div></div>
-}
-
-function blueprintGate(content: BlueprintContentDto) {
-  const nodes = content.semantic?.nodes ?? []
-  const edges = content.semantic?.edges ?? []
-  const issues: string[] = []
-  if (nodes.length === 0) issues.push('At least one semantic node is required.')
-  if (nodes.some((node) => !node.id || !node.title.trim())) issues.push('Every node needs a stable ID and title.')
-  if (nodes.some((node) => !content.layout?.nodePositions[node.id])) issues.push('Every semantic node needs a separate layout position.')
-  const ids = new Set(nodes.map((node) => node.id))
-  if (edges.some((edge) => !ids.has(edge.sourceNodeId) || !ids.has(edge.targetNodeId))) issues.push('Every edge must reference existing semantic nodes.')
-  if (nodes.filter((node) => node.kind === 'page').some((node) => node.requirementIds.length === 0)) issues.push('Every page node must trace to at least one stable requirement ID.')
-  return issues
 }
 
 function versionRef(revision: ArtifactRevisionDto<BlueprintContentDto>): VersionRefDto {
@@ -508,4 +571,9 @@ function slug(value: string) {
 
 function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : 'Blueprint operation failed.'
+}
+
+function artifactReference() {
+  if (typeof window === 'undefined') return ''
+  return new URLSearchParams(window.location.search).get('artifactId') ?? ''
 }

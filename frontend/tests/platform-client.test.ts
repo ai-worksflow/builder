@@ -101,6 +101,99 @@ test('domain clients encode identifiers and add idempotency keys to create reque
   assert.equal(capturedUrl, 'https://platform.example.test/v1/projects/project%2Fa')
 })
 
+test('dependency commands pin exact immutable refs without display-only revision numbers', async () => {
+  let capturedUrl = ''
+  let capturedBody: unknown
+  let capturedHeaders = new Headers()
+  const http = new HttpClient({
+    baseUrl: 'https://platform.example.test',
+    fetch: (async (input, init) => {
+      capturedUrl = input.toString()
+      capturedBody = typeof init?.body === 'string' ? JSON.parse(init.body) as unknown : undefined
+      capturedHeaders = new Headers(init?.headers)
+      return json({ id: 'dependency-1' }, 201)
+    }) as FetchLike,
+  })
+
+  await createPlatformDomainClients(http).artifacts.createDependency('project/alpha', {
+    source: {
+      artifactId: 'document-1',
+      revisionId: 'revision-7',
+      revisionNumber: 7,
+      contentHash: 'sha256:source',
+    },
+    target: {
+      artifactId: 'blueprint-1',
+      revisionId: 'revision-3',
+      revisionNumber: 3,
+      contentHash: 'sha256:target',
+    },
+    relation: 'drives',
+    required: true,
+  }, { idempotencyKey: 'dependency-command-1' })
+
+  assert.equal(capturedUrl, 'https://platform.example.test/v1/projects/project%2Falpha/dependencies')
+  assert.equal(capturedHeaders.get('idempotency-key'), 'dependency-command-1')
+  assert.deepEqual(capturedBody, {
+    source: {
+      artifactId: 'document-1',
+      revisionId: 'revision-7',
+      contentHash: 'sha256:source',
+    },
+    target: {
+      artifactId: 'blueprint-1',
+      revisionId: 'revision-3',
+      contentHash: 'sha256:target',
+    },
+    relation: 'drives',
+    required: true,
+  })
+})
+
+test('Requirement Baseline compilation freezes exact approved refs before Blueprint creation', async () => {
+  let capturedUrl = ''
+  let capturedBody: unknown
+  let capturedHeaders = new Headers()
+  const http = new HttpClient({
+    baseUrl: 'https://platform.example.test',
+    fetch: (async (input, init) => {
+      capturedUrl = input.toString()
+      capturedBody = typeof init?.body === 'string' ? JSON.parse(init.body) as unknown : undefined
+      capturedHeaders = new Headers(init?.headers)
+      return json({
+        id: 'baseline-revision-1',
+        artifactId: 'baseline-1',
+        revisionNumber: 1,
+        content: {},
+        contentHash: 'sha256:baseline',
+        createdBy: 'user-1',
+        createdAt: '2026-07-10T00:00:00Z',
+      }, 201)
+    }) as FetchLike,
+  })
+
+  await createPlatformDomainClients(http).artifacts.compileRequirementBaseline(
+    'project/alpha',
+    [{
+      artifactId: 'requirements-1',
+      revisionId: 'requirements-revision-4',
+      revisionNumber: 4,
+      contentHash: 'sha256:requirements',
+    }],
+    { idempotencyKey: 'compile-baseline-1' },
+  )
+
+  assert.equal(capturedUrl, 'https://platform.example.test/v1/projects/project%2Falpha/requirement-baselines')
+  assert.equal(capturedHeaders.get('idempotency-key'), 'compile-baseline-1')
+  assert.deepEqual(capturedBody, {
+    sources: [{
+      artifactId: 'requirements-1',
+      revisionId: 'requirements-revision-4',
+      contentHash: 'sha256:requirements',
+    }],
+  })
+})
+
 test('problem+json responses become structured PlatformHttpError values', async () => {
   const client = new HttpClient({
     baseUrl: 'https://platform.example.test',

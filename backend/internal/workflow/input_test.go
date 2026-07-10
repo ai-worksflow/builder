@@ -130,6 +130,20 @@ func TestTwoFanOutRegionsKeepManifestInputsIsolated(t *testing.T) {
 	run.Context.Slices[sliceA.ID], run.Context.Slices[sliceB.ID] = sliceA, sliceB
 	prepareFanOutRegion(t, run, definition, "fan-a", "work-a", "merge-a", sliceA)
 	prepareFanOutRegion(t, run, definition, "fan-b", "work-b", "merge-b", sliceB)
+	otherA := syntheticSlice("a-other", "fan-a")
+	run.Context.Slices[otherA.ID] = otherA
+	fanAMetadata := run.Context.Nodes["fan-a"]
+	fanAMetadata.FanOutOutputs[otherA.ID] = mustJSON(FanOutItem{Key: otherA.Key, Title: otherA.Title, Blueprint: otherA.Blueprint, PageSpec: otherA.PageSpec, Prototype: otherA.Prototype})
+	run.Context.Nodes["fan-a"] = fanAMetadata
+	workA := run.Nodes[instanceKey("work-a", sliceA.ID)]
+	isolationInputs, err := buildNodeInputEnvelope(run, definition, workA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	isolated, _, ok := isolationInputs.FirstValue("default")
+	if !ok || strings.Contains(string(isolated), otherA.Key) || !strings.Contains(string(isolated), sliceA.Key) {
+		t.Fatalf("fan-out root input was not slice-isolated: %s", isolated)
+	}
 
 	compileA := addSyntheticNode(run, "compile-a", "compile-a", "", NodeRunning)
 	inputsA, err := buildNodeInputEnvelope(run, definition, compileA)
@@ -143,6 +157,10 @@ func TestTwoFanOutRegionsKeepManifestInputsIsolated(t *testing.T) {
 	}
 	assertOnlySlice(t, inputsA.SliceRefs(), sliceA)
 	assertOnlySlice(t, inputsB.SliceRefs(), sliceB)
+	mutatedA := run.Context.Slices[sliceA.ID]
+	mutatedPrototype := platformRef("mutated-prototype-a")
+	mutatedA.Prototype = &mutatedPrototype
+	run.Context.Slices[sliceA.ID] = mutatedA
 
 	service := &fakeWorkbench{}
 	definitionA, _ := definition.FindNode("compile-a")
@@ -157,6 +175,9 @@ func TestTwoFanOutRegionsKeepManifestInputsIsolated(t *testing.T) {
 	}
 	if len(manifestA.SliceIDs) != 1 || manifestA.SliceIDs[0] != sliceA.ID || len(manifestB.SliceIDs) != 1 || manifestB.SliceIDs[0] != sliceB.ID || service.calls != 2 {
 		t.Fatalf("fan-out manifests leaked slices: A=%v B=%v calls=%d", manifestA.SliceIDs, manifestB.SliceIDs, service.calls)
+	}
+	if len(service.prototypes) != 2 || service.prototypes[0].RevisionID != sliceA.Prototype.RevisionID {
+		t.Fatalf("manifest compiler did not use the immutable incoming prototype pin: %+v", service.prototypes)
 	}
 }
 

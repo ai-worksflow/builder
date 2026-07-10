@@ -152,9 +152,10 @@ func (h *Hub) Run(ctx context.Context) {
 			}
 			command.result <- exists
 		case event := <-h.events:
-			if event.Cursor > h.lastCursor.Load() {
-				h.lastCursor.Store(event.Cursor)
+			if event.Cursor <= h.lastCursor.Load() {
+				continue
 			}
+			h.lastCursor.Store(event.Cursor)
 			h.publish(event)
 		}
 	}

@@ -44,8 +44,12 @@ import {
 } from 'lucide-react'
 import { useCollaboration } from '@/lib/collaboration/provider'
 import { useArtifactWorkspace } from '@/lib/platform/artifact-provider'
-import { ArtifactWorkspaceConflictError } from '@/lib/platform/artifact-workspace'
+import {
+  ArtifactWorkspaceConflictError,
+  reviewGateReadyForRequest,
+} from '@/lib/platform/artifact-workspace'
 import type {
+  ArtifactReviewGateDto,
   JsonObject,
   JsonValue,
   PrototypeContentDto,
@@ -54,11 +58,24 @@ import type {
   PrototypeLayerKind,
   VersionedArtifactDto,
 } from '@/lib/platform/dto'
+import {
+  PrototypeContentMutationError,
+  addPrototypeBreakpoint,
+  addPrototypeState,
+  isRequiredPrototypeBreakpoint,
+  prototypeFrameCoverageGaps,
+  prototypeReviewIssues,
+  removePrototypeBreakpoint,
+  removePrototypeState,
+  repairPrototypeFrameCoverage,
+  updatePrototypeBreakpoint,
+  updatePrototypeState,
+} from '@/lib/platform/prototype-content'
 import { useWorksflow } from '@/lib/worksflow/store'
 import { cn } from '@/lib/utils'
 
 type PrototypeMode = 'wireframe' | 'design' | 'component' | 'handoff'
-type Panel = 'properties' | 'data' | 'trace'
+type Panel = 'properties' | 'variants' | 'data' | 'trace'
 type SaveState = 'idle' | 'dirty' | 'saving' | 'saved' | 'conflict' | 'error'
 
 const MODES: readonly { id: PrototypeMode; label: string; icon: typeof Frame }[] = [
@@ -133,8 +150,11 @@ export function PrototypeStudio() {
   const canReview = collaboration.session.signedIn && collaboration.can('publish')
 
   useEffect(() => {
-    if (!activeArtifactId && activeId) setActiveArtifactId(activeId)
-  }, [activeArtifactId, activeId])
+    const referenced = artifactReference()
+    const next = workspace.prototypes.find((item) => item.artifact.id === referenced)?.artifact.id
+      ?? activeId
+    if (!activeArtifactId && next) setActiveArtifactId(next)
+  }, [activeArtifactId, activeId, workspace.prototypes])
 
   const serverContent = activeResource?.draft?.content
     ?? activeResource?.latestRevision?.content
@@ -179,6 +199,16 @@ export function PrototypeStudio() {
       const nextEtag = result.data.draft?.etag ?? result.etag
       if (nextEtag) setDraftEtag(nextEtag)
       setSaveState('saved')
+      try {
+        const nextDetails = await workspace.loadDetails<PrototypeContentDto>(activeResource.artifact.id)
+        if (sequence !== saveSequence.current) return result
+        setDetails(nextDetails)
+      } catch (cause) {
+        if (sequence === saveSequence.current) {
+          setDetails(null)
+          setError(`Draft saved, but the review gate could not be refreshed: ${message(cause)}`)
+        }
+      }
       return result
     } catch (cause) {
       if (sequence !== saveSequence.current) return null
@@ -213,13 +243,23 @@ export function PrototypeStudio() {
     ?? content?.states[0]
   const frame = content?.frames.find((item) =>
     item.stateId === state?.id && item.breakpointId === breakpoint?.id,
-  ) ?? content?.frames[0]
+  )
   const visibleLayers = useMemo(
     () => content ? layerTree(content.layers, frame?.rootLayerId) : [],
     [content, frame?.rootLayerId],
   )
-  const proposals = workspace.proposals.filter((item) => item.targetArtifactId === activeId)
+  const proposals = workspace.proposals.filter((item) => item.artifactId === activeId)
   const review = collaboration.reviews.find((item) => item.target?.artifactId === activeId)
+  const clientIssues = useMemo(
+    () => content ? prototypeReviewIssues(content) : [],
+    [content],
+  )
+  const serverGateIssues = useMemo(
+    () => reviewGateIssues(details?.reviewGate),
+    [details?.reviewGate],
+  )
+  const revisionReady = clientIssues.length === 0
+  const requestReady = reviewGateReadyForRequest(details?.reviewGate)
 
   function updateLayer(updates: Partial<PrototypeLayerDto>) {
     if (!selectedLayer) return
@@ -381,19 +421,48 @@ export function PrototypeStudio() {
   }
 
   async function createRevisionAndRequestReview() {
-    if (!activeResource || !content || !draftEtag || !canEdit) return
+    if (!activeResource || !content || !canEdit) return
+    const issues = prototypeReviewIssues(content)
+    if (issues.length > 0) {
+      setError(`Prototype revision gate is blocked: ${issues.join(' ')}`)
+      return
+    }
+    if (!draftEtag) {
+      setError('The exact server draft ETag is missing. Reload the prototype before creating a revision.')
+      return
+    }
+    if (saveState === 'conflict') {
+      setError('Resolve the draft ETag conflict before creating a revision.')
+      return
+    }
+    if (saveState === 'dirty' || saveState === 'saving') {
+      setError('Wait for the current draft autosave before creating a revision.')
+      return
+    }
     setSaveState('saving')
     setError(null)
+    let createdRevisionNumber: number | null = null
     try {
       const saved = await workspace.savePrototypeDraft(activeResource.artifact.id, content, draftEtag)
       const etag = saved.data.draft?.etag ?? saved.etag
       if (!etag) throw new Error('The Go service did not return a draft ETag.')
+      setDraftEtag(etag)
       const revisionResult = await collaboration.platformClient.prototypes.createRevision(
         activeResource.artifact.id,
         { changeSummary: 'Prototype checkpoint for review', changeSource: 'human' },
         { ifMatch: etag, idempotencyKey: true },
       )
       const revision = revisionResult.data
+      createdRevisionNumber = revision.revisionNumber
+      await workspace.refresh()
+      const currentDetails = await workspace.loadDetails<PrototypeContentDto>(activeResource.artifact.id)
+      setDetails(currentDetails)
+      if (!reviewGateReadyForRequest(currentDetails.reviewGate)) {
+        const blockers = reviewGateIssues(currentDetails.reviewGate)
+        setSaveState('saved')
+        setError(`Revision ${revision.revisionNumber} was created, but review was not requested: ${blockers.join(' ') || 'refresh the server gate and resolve its blocking checks.'}`)
+        return
+      }
       const currentUserId = collaboration.session.signedIn ? collaboration.session.user.id : ''
       const reviewerIds = collaboration.members
         .filter((member) => member.user.id !== currentUserId && ['owner', 'admin', 'editor'].includes(member.role))
@@ -416,8 +485,10 @@ export function PrototypeStudio() {
       await workspace.refresh()
       setSaveState('saved')
     } catch (cause) {
-      setSaveState('error')
-      setError(message(cause))
+      setSaveState(createdRevisionNumber === null ? 'error' : 'saved')
+      setError(createdRevisionNumber === null
+        ? message(cause)
+        : `Revision ${createdRevisionNumber} was created, but review was not requested: ${message(cause)}`)
     }
   }
 
@@ -509,6 +580,7 @@ export function PrototypeStudio() {
               </div>
               <select value={selectedStateId} onChange={(event) => setSelectedStateId(event.target.value)} className="h-7 rounded border border-border bg-background px-2 text-[9px] text-foreground outline-none" aria-label="Prototype state">{content.states.map((item) => <option key={item.id} value={item.id}>{item.title}{item.required ? ' · required' : ''}</option>)}</select>
               <select value={selectedBreakpointId} onChange={(event) => setSelectedBreakpointId(event.target.value)} className="h-7 rounded border border-border bg-background px-2 text-[9px] text-foreground outline-none" aria-label="Prototype breakpoint">{content.breakpoints.map((item) => <option key={item.id} value={item.id}>{item.name} · {item.viewportWidth}×{item.viewportHeight}</option>)}</select>
+              <button type="button" onClick={() => setPanel('variants')} className="inline-flex h-7 items-center gap-1 rounded border border-border px-2 text-[9px] text-faint-foreground hover:text-foreground"><MonitorSmartphone className="size-3" />Manage states &amp; breakpoints</button>
               <div className="ml-auto flex items-center gap-1">
                 <button type="button" onClick={() => setShowGrid((value) => !value)} className={cn('rounded p-1.5 text-faint-foreground hover:text-foreground', showGrid && 'bg-primary/10 text-primary-bright')} aria-label="Toggle grid"><Braces className="size-3.5" /></button>
                 <button type="button" onClick={() => setZoom((value) => Math.max(25, value - 10))} className="rounded p-1.5 text-faint-foreground hover:text-foreground" aria-label="Zoom out"><ZoomOut className="size-3.5" /></button>
@@ -530,32 +602,171 @@ export function PrototypeStudio() {
                   {state && state.key !== 'ready' && <div className="pointer-events-none absolute inset-0 z-50 flex items-center justify-center bg-black/35"><div className="rounded-lg border border-border bg-panel/95 px-5 py-3 text-center shadow-xl"><p className="text-xs font-semibold text-foreground">{state.title}</p><p className="mt-1 text-[9px] text-faint-foreground">Fixture state · {state.fixtureIds.length} pinned fixture(s)</p></div></div>}
                 </div>
               )}
+              {state && breakpoint && !frame && (
+                <div className="mx-auto flex max-w-sm flex-col items-center rounded-xl border border-warning/30 bg-warning/10 p-6 text-center text-warning">
+                  <CircleAlert className="size-6" />
+                  <p className="mt-2 text-xs font-semibold">Missing {state.title} · {breakpoint.name} frame</p>
+                  <p className="mt-1 text-[9px] leading-relaxed opacity-80">Complete frame coverage before creating an immutable revision.</p>
+                  {canEdit && <button type="button" onClick={() => updateContent((current) => repairPrototypeFrameCoverage(current, stableId))} className="mt-3 rounded bg-warning px-3 py-1.5 text-[9px] font-semibold text-black">Repair all frame coverage</button>}
+                </div>
+              )}
             </div>
 
+            {(clientIssues.length > 0 || !requestReady) && (
+              <div className="border-t border-warning/30 bg-warning/10 px-3 py-2 text-[8px] text-warning">
+                <span className="font-semibold">{clientIssues.length > 0 ? 'Revision gate blocked.' : 'Current review-request gate is blocked.'}</span>{' '}
+                {clientIssues[0] ?? serverGateIssues[0] ?? 'A revision can still be created; the server gate will be refreshed before review is requested.'}
+                {(clientIssues.length > 1 || (clientIssues.length === 0 && serverGateIssues.length > 1)) && ` +${(clientIssues.length || serverGateIssues.length) - 1} more`}
+              </div>
+            )}
             <footer className="flex min-h-11 shrink-0 flex-wrap items-center gap-2 border-t border-border bg-panel px-3 py-2">
               <div className="flex items-center gap-2 text-[9px] text-faint-foreground"><ShieldCheck className="size-3 text-success" />PageSpec {shortRef(content.pageSpecRevision)} · {content.exploratory ? 'exploratory' : 'formal'}</div>
               <div className="ml-auto flex items-center gap-1.5">
                 <button type="button" onClick={() => void saveDraft()} disabled={!canEdit || saveState === 'saving'} className="inline-flex h-7 items-center gap-1 rounded border border-border px-2 text-[9px] text-muted-foreground hover:text-foreground disabled:opacity-35"><Save className="size-3" />Save draft</button>
-                <button type="button" onClick={() => void createRevisionAndRequestReview()} disabled={!canEdit || saveState === 'saving'} className="inline-flex h-7 items-center gap-1 rounded border border-primary/35 bg-primary/10 px-2 text-[9px] text-primary-bright disabled:opacity-35"><Send className="size-3" />Revision + review</button>
+                <button type="button" onClick={() => void createRevisionAndRequestReview()} disabled={!canEdit || !draftEtag || (saveState !== 'saved' && saveState !== 'idle') || !revisionReady} title={revisionReady ? 'Create an immutable revision, then refresh the server gate before requesting review' : clientIssues[0]} className="inline-flex h-7 items-center gap-1 rounded border border-primary/35 bg-primary/10 px-2 text-[9px] text-primary-bright disabled:opacity-35"><Send className="size-3" />Revision + review</button>
                 <button type="button" onClick={() => setSurface('workbench')} disabled={!activeResource.approvedRevision} className="inline-flex h-7 items-center gap-1 rounded bg-primary px-2 text-[9px] font-semibold text-primary-foreground disabled:opacity-35" title="Only approved prototype revisions can become build input"><PackageCheck className="size-3" />Open Workbench</button>
               </div>
             </footer>
           </main>
 
           <aside className="flex w-72 shrink-0 flex-col border-l border-border bg-panel max-xl:w-64 max-lg:max-h-[440px] max-lg:w-full max-lg:border-l-0 max-lg:border-t">
-            <div className="grid grid-cols-3 border-b border-border p-1">
-              {(['properties', 'data', 'trace'] as Panel[]).map((item) => <button key={item} type="button" onClick={() => setPanel(item)} className={cn('rounded px-2 py-1.5 text-[9px] capitalize', panel === item ? 'bg-primary/10 text-primary-bright' : 'text-faint-foreground hover:text-foreground')}>{item}</button>)}
+            <div className="grid grid-cols-4 border-b border-border p-1">
+              {(['properties', 'variants', 'data', 'trace'] as Panel[]).map((item) => <button key={item} type="button" onClick={() => setPanel(item)} className={cn('rounded px-1 py-1.5 text-[8px] capitalize', panel === item ? 'bg-primary/10 text-primary-bright' : 'text-faint-foreground hover:text-foreground')}>{item}</button>)}
             </div>
             <div className="min-h-0 flex-1 overflow-y-auto p-3 scrollbar-thin">
               {panel === 'properties' && <PropertiesPanel layer={selectedLayer} rootLayerId={frame?.rootLayerId} canEdit={canEdit} onUpdate={updateLayer} onLayout={updateLayerLayout} onStyle={updateLayerStyle} onDuplicate={duplicateLayer} onDelete={deleteLayer} />}
+              {panel === 'variants' && <VariantsPanel content={content} selectedStateId={state?.id} selectedBreakpointId={breakpoint?.id} canEdit={canEdit} onChange={updateContent} onSelectState={setSelectedStateId} onSelectBreakpoint={setSelectedBreakpointId} onError={setError} />}
               {panel === 'data' && <DataPanel content={content} stateId={state?.id} canEdit={canEdit} onChange={updateContent} />}
-              {panel === 'trace' && <TracePanel resource={activeResource} content={content} details={details} proposals={proposals} review={review} canReview={canReview} onRefresh={() => void workspace.refresh()} />}
+              {panel === 'trace' && <TracePanel resource={activeResource} content={content} details={details} proposals={proposals} review={review} clientIssues={clientIssues} canReview={canReview} onRefresh={() => void workspace.refresh()} />}
             </div>
           </aside>
         </>
       )}
     </div>
   )
+}
+
+function VariantsPanel({
+  content,
+  selectedStateId,
+  selectedBreakpointId,
+  canEdit,
+  onChange,
+  onSelectState,
+  onSelectBreakpoint,
+  onError,
+}: {
+  content: PrototypeContentDto
+  selectedStateId?: string
+  selectedBreakpointId?: string
+  canEdit: boolean
+  onChange: (updater: (content: PrototypeContentDto) => PrototypeContentDto) => void
+  onSelectState: (id: string) => void
+  onSelectBreakpoint: (id: string) => void
+  onError: (error: string | null) => void
+}) {
+  const [newStateKey, setNewStateKey] = useState('alternate')
+  const [newStateTitle, setNewStateTitle] = useState('Alternate')
+  const [newBreakpointName, setNewBreakpointName] = useState('Wide')
+  const [newViewportWidth, setNewViewportWidth] = useState(1920)
+  const [newViewportHeight, setNewViewportHeight] = useState(1080)
+  const gaps = prototypeFrameCoverageGaps(content)
+
+  function mutate(operation: (current: PrototypeContentDto) => PrototypeContentDto) {
+    try {
+      const next = operation(content)
+      onChange(() => next)
+      onError(null)
+      return true
+    } catch (cause) {
+      onError(cause instanceof PrototypeContentMutationError ? cause.message : message(cause))
+      return false
+    }
+  }
+
+  function createState() {
+    const id = stableId('state')
+    if (mutate((current) => addPrototypeState(current, {
+      id,
+      key: newStateKey.trim(),
+      title: newStateTitle.trim(),
+      required: true,
+      fixtureIds: [],
+    }, stableId))) {
+      onSelectState(id)
+      setNewStateKey('alternate')
+      setNewStateTitle('Alternate')
+    }
+  }
+
+  function deleteState(stateId: string) {
+    const nextSelection = content.states.find((state) => state.id !== stateId)?.id ?? ''
+    if (mutate((current) => removePrototypeState(current, stateId))) onSelectState(nextSelection)
+  }
+
+  function createBreakpoint() {
+    const id = stableId('breakpoint')
+    if (mutate((current) => addPrototypeBreakpoint(current, {
+      id,
+      name: newBreakpointName.trim(),
+      minWidth: Math.max(0, newViewportWidth),
+      viewportWidth: Math.max(1, newViewportWidth),
+      viewportHeight: Math.max(1, newViewportHeight),
+    }, stableId))) {
+      onSelectBreakpoint(id)
+      setNewBreakpointName('Wide')
+    }
+  }
+
+  function deleteBreakpoint(breakpointId: string) {
+    const nextSelection = content.breakpoints.find((breakpoint) => breakpoint.id !== breakpointId)?.id ?? ''
+    if (mutate((current) => removePrototypeBreakpoint(current, breakpointId))) onSelectBreakpoint(nextSelection)
+  }
+
+  return (
+    <div className="space-y-5">
+      <section>
+        <div className="flex items-center justify-between"><PanelLabel>States</PanelLabel><span className="font-mono text-[8px] text-faint-foreground">{content.states.length}</span></div>
+        <div className="mt-2 space-y-2">
+          {content.states.map((state) => (
+            <div key={state.id} className={cn('rounded border p-2', selectedStateId === state.id ? 'border-primary/40 bg-primary/5' : 'border-border bg-background')}>
+              <div className="flex items-center gap-1"><button type="button" onClick={() => onSelectState(state.id)} className="min-w-0 flex-1 truncate text-left font-mono text-[8px] text-faint-foreground">{state.id}</button><button type="button" onClick={() => deleteState(state.id)} disabled={!canEdit || content.states.length <= 1} className="rounded p-1 text-faint-foreground hover:text-destructive disabled:opacity-25" aria-label={`Delete state ${state.title}`} title={content.states.length <= 1 ? 'A prototype must keep at least one state.' : 'Delete state and dependent frames, overrides, fixtures, and actions'}><Trash2 className="size-3" /></button></div>
+              <div className="mt-1 grid grid-cols-2 gap-1"><input value={state.key} onFocus={() => onSelectState(state.id)} onChange={(event) => mutate((current) => updatePrototypeState(current, state.id, { key: event.target.value }))} disabled={!canEdit} className="h-7 rounded border border-border bg-panel px-1.5 font-mono text-[8px] text-foreground outline-none disabled:opacity-50" aria-label={`State key ${state.title}`} /><input value={state.title} onFocus={() => onSelectState(state.id)} onChange={(event) => mutate((current) => updatePrototypeState(current, state.id, { title: event.target.value }))} disabled={!canEdit} className="h-7 rounded border border-border bg-panel px-1.5 text-[8px] text-foreground outline-none disabled:opacity-50" aria-label={`State title ${state.key}`} /></div>
+              <label className="mt-1.5 flex items-center gap-1.5 text-[8px] text-faint-foreground"><input type="checkbox" checked={state.required} onChange={(event) => mutate((current) => updatePrototypeState(current, state.id, { required: event.target.checked }))} disabled={!canEdit} />Required coverage · {state.fixtureIds.length} fixture(s)</label>
+            </div>
+          ))}
+        </div>
+        {canEdit && <div className="mt-2 rounded border border-dashed border-border p-2"><div className="grid grid-cols-2 gap-1"><input value={newStateKey} onChange={(event) => setNewStateKey(event.target.value)} className="h-7 rounded border border-border bg-background px-1.5 font-mono text-[8px] text-foreground outline-none" placeholder="stable-key" aria-label="New state key" /><input value={newStateTitle} onChange={(event) => setNewStateTitle(event.target.value)} className="h-7 rounded border border-border bg-background px-1.5 text-[8px] text-foreground outline-none" placeholder="State title" aria-label="New state title" /></div><button type="button" onClick={createState} disabled={!newStateKey.trim() || !newStateTitle.trim()} className="mt-1.5 inline-flex h-7 w-full items-center justify-center gap-1 rounded bg-primary text-[8px] font-semibold text-primary-foreground disabled:opacity-35"><Plus className="size-3" />Add state with all frames</button></div>}
+      </section>
+
+      <section>
+        <div className="flex items-center justify-between"><PanelLabel>Breakpoints</PanelLabel><span className="font-mono text-[8px] text-faint-foreground">{content.breakpoints.length}</span></div>
+        <div className="mt-2 space-y-2">
+          {content.breakpoints.map((breakpoint) => {
+            const required = isRequiredPrototypeBreakpoint(breakpoint)
+            return (
+              <div key={breakpoint.id} className={cn('rounded border p-2', selectedBreakpointId === breakpoint.id ? 'border-primary/40 bg-primary/5' : 'border-border bg-background')}>
+                <div className="flex items-center gap-1"><button type="button" onClick={() => onSelectBreakpoint(breakpoint.id)} className="min-w-0 flex-1 truncate text-left font-mono text-[8px] text-faint-foreground">{breakpoint.id}</button>{required && <span className="rounded bg-success/10 px-1 text-[7px] text-success">required</span>}<button type="button" onClick={() => deleteBreakpoint(breakpoint.id)} disabled={!canEdit || required} className="rounded p-1 text-faint-foreground hover:text-destructive disabled:opacity-25" aria-label={`Delete breakpoint ${breakpoint.name}`} title={required ? 'Desktop, Tablet, and Mobile cannot be deleted.' : 'Delete breakpoint and dependent frames and overrides'}><Trash2 className="size-3" /></button></div>
+                <input value={breakpoint.name} onFocus={() => onSelectBreakpoint(breakpoint.id)} onChange={(event) => mutate((current) => updatePrototypeBreakpoint(current, breakpoint.id, { name: event.target.value }))} disabled={!canEdit || required} className="mt-1 h-7 w-full rounded border border-border bg-panel px-1.5 text-[8px] text-foreground outline-none disabled:opacity-50" aria-label={`Breakpoint name ${breakpoint.id}`} />
+                <div className="mt-1 grid grid-cols-2 gap-1"><SmallNumber label="Viewport width" value={breakpoint.viewportWidth} disabled={!canEdit} onChange={(value) => mutate((current) => updatePrototypeBreakpoint(current, breakpoint.id, { viewportWidth: value }))} /><SmallNumber label="Viewport height" value={breakpoint.viewportHeight} disabled={!canEdit} onChange={(value) => mutate((current) => updatePrototypeBreakpoint(current, breakpoint.id, { viewportHeight: value }))} /><SmallNumber label="Min width" value={breakpoint.minWidth} disabled={!canEdit} onChange={(value) => mutate((current) => updatePrototypeBreakpoint(current, breakpoint.id, { minWidth: value }))} /><label className="text-[7px] text-faint-foreground">Max width<input type="number" value={breakpoint.maxWidth ?? ''} onChange={(event) => mutate((current) => updatePrototypeBreakpoint(current, breakpoint.id, { maxWidth: event.target.value === '' ? undefined : Number(event.target.value) }))} disabled={!canEdit} className="mt-0.5 h-7 w-full rounded border border-border bg-panel px-1 font-mono text-[8px] text-foreground outline-none disabled:opacity-50" /></label></div>
+              </div>
+            )
+          })}
+        </div>
+        {canEdit && <div className="mt-2 rounded border border-dashed border-border p-2"><input value={newBreakpointName} onChange={(event) => setNewBreakpointName(event.target.value)} className="h-7 w-full rounded border border-border bg-background px-1.5 text-[8px] text-foreground outline-none" placeholder="Custom breakpoint name" aria-label="New breakpoint name" /><div className="mt-1 grid grid-cols-2 gap-1"><SmallNumber label="Viewport width" value={newViewportWidth} onChange={setNewViewportWidth} /><SmallNumber label="Viewport height" value={newViewportHeight} onChange={setNewViewportHeight} /></div><button type="button" onClick={createBreakpoint} disabled={!newBreakpointName.trim()} className="mt-1.5 inline-flex h-7 w-full items-center justify-center gap-1 rounded bg-primary text-[8px] font-semibold text-primary-foreground disabled:opacity-35"><Plus className="size-3" />Add breakpoint with all frames</button></div>}
+      </section>
+
+      <section>
+        <PanelLabel>Frame coverage</PanelLabel>
+        <div className={cn('mt-2 rounded border p-2 text-[8px]', gaps.length === 0 ? 'border-success/30 bg-success/10 text-success' : 'border-warning/30 bg-warning/10 text-warning')}>{gaps.length === 0 ? `${content.states.length} × ${content.breakpoints.length} selectable frames are complete.` : `${gaps.length} state × breakpoint frame(s) are missing.`}</div>
+        {canEdit && gaps.length > 0 && <button type="button" onClick={() => mutate((current) => repairPrototypeFrameCoverage(current, stableId))} className="mt-2 inline-flex h-7 w-full items-center justify-center gap-1 rounded bg-warning text-[8px] font-semibold text-black"><RefreshCw className="size-3" />Repair frame coverage</button>}
+      </section>
+    </div>
+  )
+}
+
+function SmallNumber({ label, value, disabled, onChange }: { label: string; value: number; disabled?: boolean; onChange: (value: number) => void }) {
+  return <label className="text-[7px] text-faint-foreground">{label}<input type="number" value={value} onChange={(event) => onChange(Number(event.target.value) || 0)} disabled={disabled} className="mt-0.5 h-7 w-full rounded border border-border bg-panel px-1 font-mono text-[8px] text-foreground outline-none disabled:opacity-50" /></label>
 }
 
 function CanvasLayer({ layer, selected, onSelect, onPointerDown }: { layer: PrototypeLayerDto; selected: boolean; onSelect: () => void; onPointerDown: (event: ReactPointerEvent<HTMLButtonElement>) => void }) {
@@ -614,14 +825,45 @@ function DataPanel({ content, stateId, canEdit, onChange }: { content: Prototype
   </div>
 }
 
-function TracePanel({ resource, content, details, proposals, review, canReview, onRefresh }: { resource: VersionedArtifactDto<PrototypeContentDto>; content: PrototypeContentDto; details: Awaited<ReturnType<ReturnType<typeof useArtifactWorkspace>['loadDetails']>> | null; proposals: ReturnType<typeof useArtifactWorkspace>['proposals']; review?: ReturnType<typeof useCollaboration>['reviews'][number]; canReview: boolean; onRefresh: () => void }) {
+function TracePanel({ resource, content, details, proposals, review, clientIssues, canReview, onRefresh }: { resource: VersionedArtifactDto<PrototypeContentDto>; content: PrototypeContentDto; details: Awaited<ReturnType<ReturnType<typeof useArtifactWorkspace>['loadDetails']>> | null; proposals: ReturnType<typeof useArtifactWorkspace>['proposals']; review?: ReturnType<typeof useCollaboration>['reviews'][number]; clientIssues: readonly string[]; canReview: boolean; onRefresh: () => void }) {
   return <div className="space-y-4">
     <section><div className="flex items-center justify-between"><PanelLabel>Exact source</PanelLabel><button type="button" onClick={onRefresh} className="rounded p-1 text-faint-foreground hover:text-foreground" aria-label="Refresh trace"><RefreshCw className="size-3" /></button></div><div className="mt-2 rounded border border-border bg-background p-2 font-mono text-[8px] leading-relaxed text-faint-foreground">PageSpec<br />{content.pageSpecRevision.artifactId}<br />{content.pageSpecRevision.revisionId}<br />{content.pageSpecRevision.contentHash}</div></section>
     <section><PanelLabel>Revision and dependency evidence</PanelLabel><div className="mt-2 grid grid-cols-2 gap-2"><Info label="Revisions" value={details?.versions.length ?? 0} /><Info label="Dependencies" value={details?.dependencies.length ?? 0} /><Info label="Trace links" value={content.traceLinks.length} /><Info label="Coverage" value={`${Math.round((details?.reviewGate.traceCoverage ?? 0) * 100)}%`} /></div></section>
+    <PrototypeReviewGatePanel clientIssues={clientIssues} gate={details?.reviewGate} />
     <section><PanelLabel>Review gate</PanelLabel><div className={cn('mt-2 rounded border p-2 text-[9px]', review?.decision === 'approve' ? 'border-success/30 bg-success/10 text-success' : review?.decision === 'request_changes' ? 'border-destructive/30 bg-destructive/10 text-destructive' : 'border-warning/30 bg-warning/10 text-warning')}><div className="flex items-center gap-2"><CheckCircle2 className="size-3" /><span className="flex-1">{review?.decision ?? resource.artifact.status}</span></div><p className="mt-1 text-[8px] leading-relaxed opacity-80">{review?.summary ?? 'Create an immutable revision and request another project member to review it.'}</p></div>{canReview && <p className="mt-1 text-[8px] text-faint-foreground">Use Review Center for canonical reviewer decisions and blocking comment resolution.</p>}</section>
     <section><PanelLabel>AI output proposals</PanelLabel><div className="mt-2 space-y-1.5">{proposals.map((proposal) => <div key={proposal.id} className="rounded border border-border bg-background p-2"><div className="flex items-center gap-2"><Wand2 className="size-3 text-primary-bright" /><span className="min-w-0 flex-1 truncate font-mono text-[8px] text-foreground">{proposal.id}</span><span className="text-[8px] text-faint-foreground">{proposal.status}</span></div><p className="mt-1 text-[8px] text-faint-foreground">{proposal.operations.length} reviewable operation(s); apply through the proposal decision flow.</p></div>)}{proposals.length === 0 && <PanelEmpty text="No AI proposal targets this prototype." />}</div></section>
     <section><PanelLabel>Formal delivery readiness</PanelLabel><div className="mt-2 space-y-1"><Readiness passed={Boolean(resource.approvedRevision)} label="Approved immutable revision" /><Readiness passed={!content.exploratory} label="Formal, non-exploratory prototype" /><Readiness passed={content.states.some((item) => item.required)} label="Required state coverage" /><Readiness passed={content.breakpoints.length > 0} label="Responsive breakpoint" /><Readiness passed={content.fixtures.every((item) => item.sanitized)} label="Sanitized fixtures" /></div></section>
   </div>
+}
+
+function PrototypeReviewGatePanel({ clientIssues, gate }: { clientIssues: readonly string[]; gate?: ArtifactReviewGateDto }) {
+  const serverIssues = reviewGateIssues(gate)
+  const issues = [...clientIssues, ...serverIssues]
+  const ready = clientIssues.length === 0 && reviewGateReadyForRequest(gate)
+  return (
+    <section>
+      <PanelLabel>Revision request checks</PanelLabel>
+      <div className={cn('mt-2 rounded border p-2', ready ? 'border-success/30 bg-success/10' : 'border-warning/30 bg-warning/10')}>
+        <div className={cn('flex items-center gap-2 text-[9px] font-semibold', ready ? 'text-success' : 'text-warning')}>
+          {ready ? <CheckCircle2 className="size-3" /> : <CircleAlert className="size-3" />}
+          <span>{ready ? 'Current exact revision is ready for review request' : 'Current review request is blocked'}</span>
+        </div>
+        <p className="mt-1.5 text-[8px] leading-relaxed text-muted-foreground">A structurally valid draft can create its next immutable revision. These server checks are refreshed after creation and must pass before the review request is sent.</p>
+        {!gate && <p className="mt-1.5 text-[8px] leading-relaxed text-warning">Waiting for the server review gate. Refresh the trace before requesting review.</p>}
+        {issues.length > 0 && (
+          <ol className="mt-2 space-y-1 text-[8px] leading-relaxed text-muted-foreground">
+            {issues.map((issue, index) => <li key={`${issue}-${index}`} className="rounded border border-border/70 bg-background/70 px-2 py-1.5">{issue}</li>)}
+          </ol>
+        )}
+        {gate && (
+          <div className="mt-2 grid grid-cols-2 gap-1.5">
+            <Info label="Trace coverage" value={`${Math.round(gate.traceCoverage * 100)}%`} />
+            <Info label="Blocking comments" value={gate.unresolvedBlockingCommentIds.length} />
+          </div>
+        )}
+      </div>
+    </section>
+  )
 }
 
 function StudioGate({ title, description, loading, onRetry }: { title: string; description: string; loading?: boolean; onRetry?: () => Promise<void> }) { return <div className="flex h-full items-center justify-center bg-canvas p-6"><div className="max-w-md rounded-xl border border-dashed border-border bg-panel p-7 text-center">{loading ? <LoaderCircle className="mx-auto mb-3 size-6 animate-spin text-primary-bright" /> : <MonitorSmartphone className="mx-auto mb-3 size-6 text-faint-foreground" />}<h2 className="text-sm font-semibold text-foreground">{title}</h2><p className="mt-2 text-[10px] leading-relaxed text-faint-foreground">{description}</p>{onRetry && <button type="button" onClick={() => void onRetry()} className="mt-4 inline-flex items-center gap-1 rounded bg-primary px-3 py-2 text-[10px] font-semibold text-primary-foreground"><RefreshCw className="size-3" />Retry</button>}</div></div> }
@@ -643,5 +885,7 @@ function stringValue(value: JsonValue | undefined, fallback: string) { return ty
 function booleanValue(value: JsonValue | undefined) { return value === true }
 function normalizeColor(value: string) { return /^#[0-9a-f]{6}$/i.test(value) ? value : '#1e1e21' }
 function shortRef(ref: { artifactId: string; revisionId: string }) { return `${ref.artifactId.slice(0, 8)}:${ref.revisionId.slice(0, 8)}` }
+function reviewGateIssues(gate?: ArtifactReviewGateDto) { return gate?.checks.filter((check) => check.severity === 'error' && check.code !== 'canonical_review_approved').map((check) => check.message) ?? [] }
 function stableId(prefix: string) { const id = typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function' ? crypto.randomUUID() : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`; return `${prefix}-${id}` }
 function message(cause: unknown) { return cause instanceof Error ? cause.message : 'Prototype service request failed.' }
+function artifactReference() { if (typeof window === 'undefined') return ''; return new URLSearchParams(window.location.search).get('artifactId') ?? '' }

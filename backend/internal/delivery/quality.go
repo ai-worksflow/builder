@@ -129,6 +129,9 @@ func (s *QualityService) runChecksAndCapture(ctx context.Context, workspace Work
 		defer cleanup()
 	}
 	ecosystem, applicable := detectCommandChecks(workspace.Files)
+	if materializeErr == nil && applicable[CheckBuild] {
+		materializeErr = clearStaticBuildOutputs(directory)
+	}
 	policy := secureDependencyPolicy(s.sandbox)
 	plan, dependencyDiagnostics := validateDependencyWorkspace(workspace.Files, policy)
 	dependencyResult := staticCheckResult(CheckDependency, dependencyDiagnostics)
@@ -162,6 +165,9 @@ func (s *QualityService) runChecksAndCapture(ctx context.Context, workspace Work
 				}
 				dependencyResult.Status = CheckFailed
 				dependencyResult.Diagnostics = append(dependencyResult.Diagnostics, Diagnostic{CheckID: CheckDependency, Code: code, Severity: SeverityError, Message: message})
+			} else if layoutErr := ensurePreparedDependencyLayout(preparedDirectory, plan.ecosystem); layoutErr != nil {
+				dependencyResult.Status = CheckFailed
+				dependencyResult.Diagnostics = append(dependencyResult.Diagnostics, Diagnostic{CheckID: CheckDependency, Code: "dependency_layout_invalid", Severity: SeverityError, Message: layoutErr.Error()})
 			} else {
 				dependencyDirectory = preparedDirectory
 			}
@@ -174,11 +180,15 @@ func (s *QualityService) runChecksAndCapture(ctx context.Context, workspace Work
 		}
 	}
 	results := make([]CheckResult, 0, len(RequiredChecks))
+	var buildArtifact *BuildArtifact
 	for _, checkID := range RequiredChecks {
 		started := time.Now()
 		var result CheckResult
 		switch checkID {
 		case CheckBuild, CheckType, CheckLint, CheckTest:
+			if checkID != CheckBuild && materializeErr == nil && applicable[checkID] && dependencyResult.Status != CheckFailed {
+				materializeErr = resetMaterializedWorkspace(directory, safeFiles)
+			}
 			if materializeErr != nil {
 				result = failedCheck(checkID, "sandbox_workspace_failed", materializeErr.Error())
 			} else if !applicable[checkID] {
@@ -195,6 +205,18 @@ func (s *QualityService) runChecksAndCapture(ctx context.Context, workspace Work
 		case CheckSecret:
 			result = secretCheck(workspace.Files)
 		}
+		if checkID == CheckBuild && materializeErr == nil && dependencyResult.Status != CheckFailed && result.Status != CheckFailed {
+			artifact, err := captureBuildArtifact(directory, workspace.Revision, !applicable[CheckBuild])
+			if err != nil {
+				result.Status = CheckFailed
+				result.Diagnostics = append(result.Diagnostics, Diagnostic{
+					CheckID: CheckBuild, Code: "static_build_artifact_missing", Severity: SeverityError,
+					Message: err.Error(), Suggestion: "Produce a static index.html under dist, out, or build, or provide a root static index.html.",
+				})
+			} else {
+				buildArtifact = &artifact
+			}
+		}
 		if result.Diagnostics == nil {
 			result.Diagnostics = []Diagnostic{}
 		}
@@ -203,26 +225,7 @@ func (s *QualityService) runChecksAndCapture(ctx context.Context, workspace Work
 		}
 		results = append(results, result)
 	}
-	buildIndex := -1
-	for index := range results {
-		if results[index].ID == CheckBuild {
-			buildIndex = index
-			break
-		}
-	}
-	if materializeErr != nil || buildIndex < 0 || results[buildIndex].Status == CheckFailed {
-		return results, nil
-	}
-	artifact, err := captureBuildArtifact(directory, workspace.Revision, !applicable[CheckBuild])
-	if err != nil {
-		results[buildIndex].Status = CheckFailed
-		results[buildIndex].Diagnostics = append(results[buildIndex].Diagnostics, Diagnostic{
-			CheckID: CheckBuild, Code: "static_build_artifact_missing", Severity: SeverityError,
-			Message: err.Error(), Suggestion: "Produce a static index.html under dist, out, or build, or provide a root static index.html.",
-		})
-		return results, nil
-	}
-	return results, &artifact
+	return results, buildArtifact
 }
 
 func (s *QualityService) runSandboxCheck(ctx context.Context, directory, dependencyDirectory, ecosystem string, checkID CheckID) CheckResult {
@@ -617,7 +620,7 @@ func (s *QualityService) LatestPassingForWorkflow(ctx context.Context, projectID
 		return QualityReport{}, Invalid("workflowRunId", "workflowRunId must be a UUID")
 	}
 	var model qualityRunModel
-	if err := s.database.WithContext(ctx).Where("project_id = ? AND workflow_run_id = ? AND status = 'passed'", projectUUID, runUUID).Order("created_at DESC").Take(&model).Error; err != nil {
+	if err := s.database.WithContext(ctx).Where("project_id = ? AND workflow_run_id = ? AND status = 'passed' AND build_artifact_id IS NOT NULL", projectUUID, runUUID).Order("created_at DESC").Take(&model).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return QualityReport{}, notFound("a passing quality report was not found for the workflow run")
 		}
@@ -639,7 +642,7 @@ func (s *QualityService) LatestPassingForRevision(ctx context.Context, projectID
 		return QualityReport{}, Invalid("workspaceRevisionId", "workspaceRevisionId must be a UUID")
 	}
 	var model qualityRunModel
-	if err := s.database.WithContext(ctx).Where("project_id = ? AND workspace_revision_id = ? AND status = 'passed'", projectUUID, revisionUUID).Order("created_at DESC").Take(&model).Error; err != nil {
+	if err := s.database.WithContext(ctx).Where("project_id = ? AND workspace_revision_id = ? AND status = 'passed' AND build_artifact_id IS NOT NULL", projectUUID, revisionUUID).Order("created_at DESC").Take(&model).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return QualityReport{}, notFound("a passing quality report was not found for the workspace revision")
 		}

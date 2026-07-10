@@ -1,853 +1,655 @@
 'use client'
 
-import { useRef, useState } from 'react'
-import { useI18n, type MessageKey } from '@/lib/i18n'
-import { cn } from '@/lib/utils'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { collaborationErrorMessage } from '@/lib/collaboration/platform-adapter'
+import { useCollaboration } from '@/lib/collaboration/provider'
+import { useI18n } from '@/lib/i18n'
+import { useArtifactWorkspace } from '@/lib/platform/artifact-provider'
 import { useWorksflow } from '@/lib/worksflow/store'
-import { MEMBERS, VERSIONS } from '@/lib/worksflow/mock-data'
-import { DOC_STATUS_CLASS } from '@/lib/worksflow/labels'
 import type {
-  BindingTargetKind,
-  Blueprint,
-  BlueprintNodeType,
-  BlueprintEdgeType,
-  DependencyType,
-  DocMemberRole,
-  ImportAsset,
-  TeamDocument,
-} from '@/lib/worksflow/types'
-import { useLocalizedLabels } from '../use-localized-labels'
-import { Avatar, StatusPill, memberById } from '../shared'
+  ArtifactDependencyDto,
+  ArtifactStatus,
+  DependencyRelation,
+  VersionRefDto,
+  VersionedArtifactDto,
+} from '@/lib/platform/dto'
+import { cn } from '@/lib/utils'
 import {
   ArrowRight,
+  Boxes,
+  FileText,
   GitFork,
   Layers,
   Link2,
-  Maximize2,
-  Move,
-  PenLine,
-  TriangleAlert,
+  MonitorPlay,
+  PanelsTopLeft,
+  PencilLine,
+  RefreshCw,
+  ShieldAlert,
   Workflow,
 } from 'lucide-react'
 
-const NODE_W = 210
-const NODE_H = 96
-const OFFSET_X = 24
-const OFFSET_Y = 64
-const MIN_DOC_Y = -40
-const RELATION_TYPES: DependencyType[] = [
-  'references',
-  'depends_on',
-  'generates',
-  'blocks',
-  'implements',
-  'reviews',
-  'composes',
+const NODE_WIDTH = 220
+const NODE_HEIGHT = 112
+const COLUMN_WIDTH = 286
+const ROW_HEIGHT = 148
+const CANVAS_PADDING_X = 40
+const CANVAS_PADDING_TOP = 84
+
+const RELATIONS: readonly DependencyRelation[] = [
+  'drives',
+  'satisfied_by',
+  'contains',
+  'navigates_to',
+  'uses',
+  'calls',
+  'reads',
+  'writes',
+  'requires',
+  'realized_by',
+  'implemented_by',
+  'verified_by',
   'derives_from',
-  'syncs_with',
-]
-const MEMBER_ROLES: DocMemberRole[] = ['owner', 'assignee', 'downstreamOwner', 'reviewer', 'watcher']
-type RelationFilter = 'all' | 'blocking' | 'review' | 'implementation' | 'prototype'
-const RELATION_FILTERS: { id: RelationFilter; labelKey: MessageKey }[] = [
-  { id: 'all', labelKey: 'graph.filter.all' },
-  { id: 'blocking', labelKey: 'graph.filter.blocking' },
-  { id: 'review', labelKey: 'graph.filter.review' },
-  { id: 'implementation', labelKey: 'graph.filter.implementation' },
-  { id: 'prototype', labelKey: 'graph.filter.prototype' },
 ]
 
-function bindingRelationLabel(
-  relation: DependencyType | BlueprintEdgeType,
-  labels: LocalizedLabels,
-) {
-  if (RELATION_TYPES.includes(relation as DependencyType)) {
-    return labels.dependency(relation as DependencyType)
-  }
-  return labels.blueprintEdge(relation as BlueprintEdgeType)
+type GraphNodeKind = 'document' | 'blueprint' | 'pageSpec' | 'prototype'
+type EdgeFilter = 'all' | 'required' | 'dependencies' | 'traces'
+
+interface GraphNode {
+  readonly id: string
+  readonly title: string
+  readonly kind: GraphNodeKind
+  readonly status: ArtifactStatus
+  readonly summary: string
+  readonly updatedAt: string
+  readonly createdBy: string
+  readonly hasDraft: boolean
+  readonly revisionNumber?: number
+  readonly revision?: VersionRefDto
+  readonly x: number
+  readonly y: number
 }
 
-type BindingOption = {
-  kind: BindingTargetKind
-  id: string
-  label: string
-  meta: string
-}
-
-type LocalizedLabels = ReturnType<typeof useLocalizedLabels>
-
-function statusDot(status: TeamDocument['status']) {
-  switch (status) {
-    case 'approved':
-      return 'bg-success'
-    case 'readyForReview':
-      return 'bg-primary-bright'
-    case 'changesRequested':
-    case 'needsSync':
-      return 'bg-warning'
-    case 'draft':
-      return 'bg-faint-foreground'
-    default:
-      return 'bg-faint-foreground'
-  }
+interface GraphEdge {
+  readonly id: string
+  readonly sourceId: string
+  readonly targetId: string
+  readonly relation: string
+  readonly required: boolean
+  readonly kind: 'dependency' | 'trace'
 }
 
 export function DocumentGraph() {
   const { t } = useI18n()
-  const labels = useLocalizedLabels()
+  const { setSelectedDocId, setTeamView } = useWorksflow()
+  const workspace = useArtifactWorkspace()
   const {
-    activeTeamProject,
-    selectedDocId,
-    setSelectedDocId,
-    openDoc,
-    documents,
-    moveDocumentNode,
-    dependencies,
-    importAssets,
-    blueprint,
-    nodeBindings,
-    addDocumentDependency,
-    addNodeBinding,
-    addDocumentMember,
-    useDocInWorkbench,
-    createBlankDocumentGraph,
-    createDocumentGraphFromTemplate,
-    createDocumentGraphFromBlueprint,
-  } = useWorksflow()
-  const [hoverEdge, setHoverEdge] = useState<string | null>(null)
-  const [connectFrom, setConnectFrom] = useState<string | null>(null)
-  const connectFromRef = useRef<string | null>(null)
-  const [relationType, setRelationType] = useState<DependencyType>('references')
-  const [blocking, setBlocking] = useState(false)
-  const [requiredForReview, setRequiredForReview] = useState(false)
-  const [notifyOnChange, setNotifyOnChange] = useState(true)
-  const [memberRole, setMemberRole] = useState<DocMemberRole>('watcher')
-  const [targetValue, setTargetValue] = useState('')
-  const [relationFilter, setRelationFilter] = useState<RelationFilter>('all')
-  const [notice, setNotice] = useState<string | null>(null)
-  const [draggingDocId, setDraggingDocId] = useState<string | null>(null)
-  const dragSessionRef = useRef<{
-    id: string
-    pointerId: number
-    offsetX: number
-    offsetY: number
-    canvasLeft: number
-    canvasTop: number
-    lastX: number
-    lastY: number
-    moved: boolean
-  } | null>(null)
-  const scrollLockRef = useRef<
-    Array<{
-      element: HTMLElement
-      overflow: string
-      overflowX: string
-      overflowY: string
-      scrollLeft: number
-      scrollTop: number
-    }>
-  >([])
-  const suppressNodeClickRef = useRef(false)
+    project,
+    members,
+    platformClient,
+    session,
+    can,
+    authorize,
+  } = useCollaboration()
+  const [dependencies, setDependencies] = useState<readonly ArtifactDependencyDto[]>([])
+  const [dependencyError, setDependencyError] = useState<string | null>(null)
+  const [loadingDependencies, setLoadingDependencies] = useState(false)
+  const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null)
+  const [targetNodeId, setTargetNodeId] = useState('')
+  const [relation, setRelation] = useState<DependencyRelation>('drives')
+  const [required, setRequired] = useState(true)
+  const [edgeFilter, setEdgeFilter] = useState<EdgeFilter>('all')
+  const [hoveredEdgeId, setHoveredEdgeId] = useState<string | null>(null)
+  const [notice, setNotice] = useState<{ kind: 'success' | 'error'; message: string } | null>(null)
+  const [saving, setSaving] = useState(false)
+  const requestSequence = useRef(0)
   const scrollFrameRef = useRef<HTMLDivElement | null>(null)
-  const canvasRef = useRef<HTMLDivElement | null>(null)
 
-  const selected = documents.find((d) => d.id === selectedDocId) ?? null
+  const nodes = useMemo(() => {
+    const collections: Array<{
+      kind: GraphNodeKind
+      resources: readonly VersionedArtifactDto<unknown>[]
+      summaries: readonly string[]
+    }> = [
+      {
+        kind: 'document',
+        resources: workspace.documents,
+        summaries: workspace.documents.map((item) =>
+          item.draft?.content.summary ?? item.latestRevision?.content.summary ?? '',
+        ),
+      },
+      {
+        kind: 'blueprint',
+        resources: workspace.blueprints,
+        summaries: workspace.blueprints.map((item) => {
+          const content = item.draft?.content ?? item.latestRevision?.content
+          return content
+            ? `${content.semantic?.nodes.length ?? content.nodes.length} semantic nodes`
+            : 'No Blueprint content yet'
+        }),
+      },
+      {
+        kind: 'pageSpec',
+        resources: workspace.pageSpecs,
+        summaries: workspace.pageSpecs.map((item) => {
+          const content = item.draft?.content ?? item.latestRevision?.content
+          return content ? `${content.route} · ${content.userGoal || 'No user goal'}` : 'No PageSpec content yet'
+        }),
+      },
+      {
+        kind: 'prototype',
+        resources: workspace.prototypes,
+        summaries: workspace.prototypes.map((item) => {
+          const content = item.draft?.content ?? item.latestRevision?.content
+          return content
+            ? `${content.frames.length} frames · ${content.states.length} states`
+            : 'No prototype content yet'
+        }),
+      },
+    ]
 
-  const canvasWidth = 1560
-  const canvasHeight = 420
+    return collections.flatMap((collection, column) =>
+      collection.resources.map((resource, row) =>
+        graphNode(resource, collection.kind, collection.summaries[row] ?? '', column, row),
+      ),
+    )
+  }, [workspace.blueprints, workspace.documents, workspace.pageSpecs, workspace.prototypes])
 
-  const nodeCenter = (doc: TeamDocument) => ({
-    x: doc.position.x + OFFSET_X + NODE_W / 2,
-    y: doc.position.y + OFFSET_Y + NODE_H / 2,
+  const artifactIds = useMemo(() => nodes.map((node) => node.id), [nodes])
+  const artifactKey = artifactIds.join(':')
+
+  const loadDependencies = useCallback(async () => {
+    const sequence = ++requestSequence.current
+    if (!session.signedIn || !project || artifactIds.length === 0) {
+      setDependencies([])
+      setDependencyError(null)
+      setLoadingDependencies(false)
+      return
+    }
+    setLoadingDependencies(true)
+    setDependencyError(null)
+    try {
+      const pages = await Promise.all(
+        artifactIds.map((artifactId) =>
+          platformClient.artifacts.listDependencies(artifactId, { limit: 500 }),
+        ),
+      )
+      if (sequence !== requestSequence.current) return
+      const unique = new Map<string, ArtifactDependencyDto>()
+      pages.forEach((page) => page.data.items.forEach((item) => unique.set(item.id, item)))
+      setDependencies([...unique.values()])
+    } catch (cause) {
+      if (sequence !== requestSequence.current) return
+      setDependencies([])
+      setDependencyError(collaborationErrorMessage(cause, 'Unable to load artifact dependencies.'))
+    } finally {
+      if (sequence === requestSequence.current) setLoadingDependencies(false)
+    }
+  }, [artifactKey, platformClient.artifacts, project, session.signedIn])
+
+  useEffect(() => {
+    void loadDependencies()
+    return () => {
+      requestSequence.current += 1
+    }
+  }, [loadDependencies])
+
+  useEffect(() => {
+    if (nodes.length === 0) {
+      setSelectedNodeId(null)
+      return
+    }
+    if (!selectedNodeId || !nodes.some((node) => node.id === selectedNodeId)) {
+      setSelectedNodeId(nodes[0].id)
+    }
+  }, [nodes, selectedNodeId])
+
+  useEffect(() => {
+    if (targetNodeId && !nodes.some((node) => node.id === targetNodeId)) {
+      setTargetNodeId('')
+    }
+  }, [nodes, targetNodeId])
+
+  const nodeById = useMemo(
+    () => new Map(nodes.map((node) => [node.id, node])),
+    [nodes],
+  )
+  const dependencyEdges = useMemo<readonly GraphEdge[]>(() =>
+    dependencies.flatMap((dependency) =>
+      nodeById.has(dependency.source.artifactId) && nodeById.has(dependency.target.artifactId)
+        ? [{
+            id: dependency.id,
+            sourceId: dependency.source.artifactId,
+            targetId: dependency.target.artifactId,
+            relation: dependency.relation,
+            required: dependency.required,
+            kind: 'dependency' as const,
+          }]
+        : [],
+    ), [dependencies, nodeById])
+  const traceEdges = useMemo<readonly GraphEdge[]>(() =>
+    workspace.traces.flatMap((trace) =>
+      nodeById.has(trace.source.artifactId) && nodeById.has(trace.target.artifactId)
+        ? [{
+            id: `trace:${trace.id}`,
+            sourceId: trace.source.artifactId,
+            targetId: trace.target.artifactId,
+            relation: trace.relation,
+            required: false,
+            kind: 'trace' as const,
+          }]
+        : [],
+    ), [nodeById, workspace.traces])
+  const allEdges = useMemo(
+    () => [...dependencyEdges, ...traceEdges],
+    [dependencyEdges, traceEdges],
+  )
+  const visibleEdges = allEdges.filter((edge) => {
+    if (edgeFilter === 'required') return edge.kind === 'dependency' && edge.required
+    if (edgeFilter === 'dependencies') return edge.kind === 'dependency'
+    if (edgeFilter === 'traces') return edge.kind === 'trace'
+    return true
   })
 
-  const visibleDependencies = dependencies.filter((edge) =>
-    relationFilter === 'all'
-      ? true
-      : relationFilter === 'blocking'
-        ? edge.isBlocking || edge.type === 'blocks'
-        : relationFilter === 'review'
-          ? edge.type === 'reviews'
-          : relationFilter === 'implementation'
-            ? edge.type === 'implements'
-            : edge.type === 'syncs_with' ||
-              documents.find((doc) => doc.id === edge.targetDocId)?.type === 'uiPrototype',
+  const selectedNode = nodes.find((node) => node.id === selectedNodeId) ?? null
+  const selectedEdges = allEdges.filter(
+    (edge) => edge.sourceId === selectedNodeId || edge.targetId === selectedNodeId,
+  )
+  const availableTargets = nodes.filter((node) => node.id !== selectedNodeId)
+  const canCreateDependency = Boolean(
+    project &&
+    session.signedIn &&
+    can('edit') &&
+    selectedNode?.revision &&
+    targetNodeId &&
+    nodeById.get(targetNodeId)?.revision &&
+    !saving,
   )
 
-  const relatedEdges = visibleDependencies.filter(
-    (e) => e.sourceDocId === selectedDocId || e.targetDocId === selectedDocId,
+  const openArtifactWorkspace = useCallback((node: GraphNode) => {
+    setArtifactReference(node.id)
+    switch (node.kind) {
+      case 'document':
+        setSelectedDocId(node.id)
+        setTeamView('editor')
+        break
+      case 'blueprint':
+      case 'pageSpec':
+        setTeamView('blueprint')
+        break
+      case 'prototype':
+        setTeamView('prototype')
+        break
+    }
+  }, [setSelectedDocId, setTeamView])
+  const maxRows = Math.max(
+    workspace.documents.length,
+    workspace.blueprints.length,
+    workspace.pageSpecs.length,
+    workspace.prototypes.length,
+    3,
   )
-  const relatedBindings = nodeBindings.filter(
-    (binding) =>
-      (binding.sourceKind === 'document' && binding.sourceId === selectedDocId) ||
-      (binding.targetKind === 'document' && binding.targetId === selectedDocId),
-  )
-  const bindingOptions = buildBindingOptions(documents, blueprint, importAssets, labels, t)
-  const selectedTarget = bindingOptions.find((option) => optionKey(option) === targetValue)
-  const targetKind = selectedTarget?.kind
+  const canvasWidth = CANVAS_PADDING_X * 2 + COLUMN_WIDTH * 3 + NODE_WIDTH
+  const canvasHeight = Math.max(520, CANVAS_PADDING_TOP + maxRows * ROW_HEIGHT + 40)
 
-  function setPendingConnection(id: string | null) {
-    connectFromRef.current = id
-    setConnectFrom(id)
-  }
-
-  function createBinding(sourceDocId: string, targetDocId: string) {
-    if (sourceDocId === targetDocId) return
-    addDocumentDependency(
-      sourceDocId,
-      targetDocId,
-      relationType,
-      blocking || relationType === 'blocks',
-    )
-    setNotice(
-      `${documents.find((d) => d.id === sourceDocId)?.title ?? t('common.source')} ${
-        labels.dependency(relationType)
-      } ${documents.find((d) => d.id === targetDocId)?.title ?? t('common.target')}`,
-    )
-    setPendingConnection(null)
-    setSelectedDocId(targetDocId)
-  }
-
-  function selectNode(doc: TeamDocument) {
-    const pendingConnection = connectFromRef.current
-    if (pendingConnection && pendingConnection !== doc.id) {
-      createBinding(pendingConnection, doc.id)
+  async function createDependency() {
+    const targetNode = nodeById.get(targetNodeId)
+    if (!project || !selectedNode?.revision || !targetNode?.revision) {
+      setNotice({
+        kind: 'error',
+        message: 'Both artifacts need an immutable revision before a dependency can be created.',
+      })
       return
     }
-    setSelectedDocId(doc.id)
-  }
-
-  function beginDocumentDrag(event: React.PointerEvent<HTMLElement>, doc: TeamDocument) {
-    if ((event.target as HTMLElement).closest('[data-doc-connect-handle]')) return
-    if (event.button !== 0) return
-    const canvas = canvasRef.current
-    if (!canvas) return
-    event.preventDefault()
-    event.currentTarget.setPointerCapture(event.pointerId)
-    lockDragScroll()
-    const rect = event.currentTarget.getBoundingClientRect()
-    const canvasRect = canvas.getBoundingClientRect()
-    dragSessionRef.current = {
-      id: doc.id,
-      pointerId: event.pointerId,
-      offsetX: event.clientX - rect.left,
-      offsetY: event.clientY - rect.top,
-      canvasLeft: canvasRect.left,
-      canvasTop: canvasRect.top,
-      lastX: doc.position.x,
-      lastY: doc.position.y,
-      moved: false,
-    }
-    setDraggingDocId(doc.id)
-  }
-
-  function moveDocumentWithPointer(event: React.PointerEvent<HTMLElement>, docId: string) {
-    const session = dragSessionRef.current
-    const canvas = canvasRef.current
-    if (!session || session.id !== docId || !canvas) return
-    event.preventDefault()
-    const x = Math.max(
-      0,
-      Math.min(
-        canvasWidth - NODE_W - OFFSET_X * 2,
-        event.clientX - session.canvasLeft - session.offsetX - OFFSET_X,
-      ),
-    )
-    const y = Math.max(
-      MIN_DOC_Y,
-      Math.min(
-        canvasHeight - NODE_H - OFFSET_Y,
-        event.clientY - session.canvasTop - session.offsetY - OFFSET_Y,
-      ),
-    )
-    if (Math.abs(session.lastX - x) < 0.5 && Math.abs(session.lastY - y) < 0.5) return
-    session.lastX = x
-    session.lastY = y
-    session.moved = true
-    moveDocumentNode(session.id, { x, y })
-  }
-
-  function finishDocumentDrag(event: React.PointerEvent<HTMLElement>, docId: string) {
-    const session = dragSessionRef.current
-    if (!session || session.id !== docId) return
-    const moved = session.moved
-    const movedDocId = session.id
-    if (event.currentTarget.hasPointerCapture(session.pointerId)) {
-      event.currentTarget.releasePointerCapture(session.pointerId)
-    }
-    if (moved) {
-      suppressNodeClickRef.current = true
-      setNotice(t('graph.nodePositionUpdated'))
-    }
-    dragSessionRef.current = null
-    setDraggingDocId(null)
-    unlockDragScroll()
-    if (moved) setSelectedDocId(movedDocId)
-  }
-
-  function lockDragScroll() {
-    unlockDragScroll()
-    const locks: typeof scrollLockRef.current = []
-    let element: HTMLElement | null = scrollFrameRef.current
-    while (element && element !== document.body) {
-      const style = window.getComputedStyle(element)
-      const scrollsY = /(auto|scroll)/.test(style.overflowY) && element.scrollHeight > element.clientHeight
-      const scrollsX = /(auto|scroll)/.test(style.overflowX) && element.scrollWidth > element.clientWidth
-      if (scrollsY || scrollsX) {
-        locks.push({
-          element,
-          overflow: element.style.overflow,
-          overflowX: element.style.overflowX,
-          overflowY: element.style.overflowY,
-          scrollLeft: element.scrollLeft,
-          scrollTop: element.scrollTop,
-        })
-        element.style.overflow = 'hidden'
+    setSaving(true)
+    setNotice(null)
+    try {
+      if (!(await authorize('edit'))) {
+        setNotice({ kind: 'error', message: 'Your current project role cannot create dependencies.' })
+        return
       }
-      element = element.parentElement
+      await platformClient.artifacts.createDependency(project.id, {
+        source: exactVersionRef(selectedNode.revision),
+        target: exactVersionRef(targetNode.revision),
+        relation,
+        required,
+      }, { idempotencyKey: true })
+      await loadDependencies()
+      setTargetNodeId('')
+      setNotice({
+        kind: 'success',
+        message: `${selectedNode.title} ${relationLabel(relation)} ${targetNode.title}`,
+      })
+    } catch (cause) {
+      setNotice({
+        kind: 'error',
+        message: collaborationErrorMessage(cause, 'The dependency was not created.'),
+      })
+    } finally {
+      setSaving(false)
     }
-    scrollLockRef.current = locks
-  }
-
-  function unlockDragScroll() {
-    scrollLockRef.current.forEach((lock) => {
-      lock.element.style.overflow = lock.overflow
-      lock.element.style.overflowX = lock.overflowX
-      lock.element.style.overflowY = lock.overflowY
-      lock.element.scrollLeft = lock.scrollLeft
-      lock.element.scrollTop = lock.scrollTop
-    })
-    scrollLockRef.current = []
-  }
-
-  function addSelectedTargetBinding() {
-    if (!selected || !selectedTarget) return
-    if (selectedTarget.kind === 'document' && selectedTarget.id === selected.id) {
-      setNotice(t('graph.chooseOtherTarget'))
-      return
-    }
-    addNodeBinding({
-      sourceId: selected.id,
-      targetKind: selectedTarget.kind,
-      targetId: selectedTarget.id,
-      label: selectedTarget.label,
-      relation: relationType,
-      isBlocking: blocking || relationType === 'blocks',
-      requiredForReview,
-      notifyOnChange,
-    })
-    if (selectedTarget.kind === 'member') {
-      addDocumentMember(selected.id, selectedTarget.id, memberRole)
-    }
-    setNotice(
-      `${selected.title} ${labels.dependency(relationType)} ${selectedTarget.label} (${bindingKindLabel(
-        selectedTarget.kind,
-        t,
-      )})`,
-    )
   }
 
   return (
     <div className="flex h-full max-lg:flex-col max-lg:overflow-y-auto">
-      {/* Canvas */}
       <div
         ref={scrollFrameRef}
-        className="relative flex-1 overflow-auto scrollbar-thin bg-canvas max-lg:min-h-[520px] max-lg:flex-none"
+        className="relative flex-1 overflow-auto bg-canvas scrollbar-thin max-lg:min-h-[560px] max-lg:flex-none"
       >
-        {/* Toolbar */}
-        <div className="sticky top-0 z-20 flex items-center justify-between gap-3 border-b border-border bg-surface/80 px-5 py-3 backdrop-blur max-md:flex-wrap max-md:px-4">
-          <div className="flex items-center gap-2">
-            <Workflow className="size-4 text-primary-bright" />
+        <div className="sticky top-0 z-20 flex items-center justify-between gap-3 border-b border-border bg-surface/90 px-5 py-3 backdrop-blur max-md:flex-wrap max-md:px-4">
+          <div className="flex min-w-0 items-center gap-2">
+            <Workflow className="size-4 shrink-0 text-primary-bright" />
             <span className="text-sm font-semibold text-foreground">{t('graph.title')}</span>
-            <span className="text-xs text-faint-foreground">{activeTeamProject.name}</span>
+            <span className="truncate text-xs text-faint-foreground">
+              {project?.name ?? 'No server project selected'}
+            </span>
+            <span className="shrink-0 rounded border border-border bg-surface-2 px-1.5 py-0.5 text-[9px] font-medium uppercase tracking-wide text-faint-foreground">
+              Auto layout · view only
+            </span>
           </div>
-          <div className="flex max-w-full items-center gap-3 overflow-x-auto text-[11px] text-faint-foreground scrollbar-thin">
-            <Legend color="#4ade80" label={t('graph.legend.references')} />
-            <Legend color="#ef4444" label={t('graph.legend.blocking')} dashed />
-            <div className="flex shrink-0 items-center gap-1 rounded-md border border-border bg-surface-2 p-0.5">
-              {RELATION_FILTERS.map((filter) => (
-                <button
-                  key={filter.id}
-                  type="button"
-                  onClick={() => setRelationFilter(filter.id)}
-                  className={cn(
-                    'rounded px-2 py-0.5 text-[11px] font-medium transition-colors',
-                    relationFilter === filter.id
-                      ? 'bg-primary/15 text-primary-bright'
-                      : 'text-faint-foreground hover:text-foreground',
-                  )}
-                >
-                  {t(filter.labelKey)}
-                </button>
-              ))}
-            </div>
-            <button className="ml-2 inline-flex shrink-0 items-center gap-1 rounded-md border border-border px-2 py-1 text-muted-foreground hover:bg-white/5">
-              <Maximize2 className="size-3" /> {t('graph.fit')}
+          <div className="flex max-w-full items-center gap-2 overflow-x-auto scrollbar-thin">
+            {([
+              ['all', t('graph.filter.all')],
+              ['required', 'Required'],
+              ['dependencies', 'Dependencies'],
+              ['traces', 'Trace links'],
+            ] as const).map(([id, label]) => (
+              <button
+                key={id}
+                type="button"
+                onClick={() => setEdgeFilter(id)}
+                className={cn(
+                  'shrink-0 rounded-md px-2 py-1 text-[11px] font-medium transition-colors',
+                  edgeFilter === id
+                    ? 'bg-primary/15 text-primary-bright'
+                    : 'text-faint-foreground hover:bg-white/5 hover:text-foreground',
+                )}
+              >
+                {label}
+              </button>
+            ))}
+            <button
+              type="button"
+              onClick={() => scrollFrameRef.current?.scrollTo({ left: 0, top: 0, behavior: 'smooth' })}
+              className="inline-flex shrink-0 items-center gap-1 rounded-md border border-border px-2 py-1 text-[11px] text-muted-foreground hover:bg-white/5"
+            >
+              <PanelsTopLeft className="size-3" /> {t('graph.fit')}
+            </button>
+            <button
+              type="button"
+              onClick={() => void Promise.all([workspace.refresh(), loadDependencies()])}
+              disabled={workspace.status === 'loading' || loadingDependencies}
+              className="inline-flex shrink-0 items-center gap-1 rounded-md border border-border px-2 py-1 text-[11px] text-muted-foreground hover:bg-white/5 disabled:cursor-wait disabled:opacity-50"
+            >
+              <RefreshCw className={cn('size-3', (workspace.status === 'loading' || loadingDependencies) && 'animate-spin')} />
+              Refresh
             </button>
           </div>
         </div>
 
-        {documents.length === 0 ? (
-          <div className="flex min-h-[420px] items-center justify-center p-6">
-            <div className="max-w-lg rounded-lg border border-dashed border-border bg-panel p-5 text-center">
-              <GitFork className="mx-auto size-8 text-primary-bright" />
-              <h2 className="mt-3 text-base font-semibold text-foreground">{t('graph.emptyTitle')}</h2>
-              <p className="mt-2 text-sm leading-relaxed text-muted-foreground">{t('graph.emptyBody')}</p>
-              <div className="mt-5 flex flex-wrap justify-center gap-2">
-                <button
-                  type="button"
-                  onClick={createDocumentGraphFromTemplate}
-                  className="rounded-lg bg-primary px-3 py-2 text-xs font-semibold text-primary-foreground hover:bg-primary-bright"
-                >
-                  {t('graph.createFromTemplate')}
-                </button>
-                <button
-                  type="button"
-                  onClick={createDocumentGraphFromBlueprint}
-                  className="rounded-lg border border-border px-3 py-2 text-xs font-medium text-muted-foreground hover:bg-white/5 hover:text-foreground"
-                >
-                  {t('graph.createFromBlueprint')}
-                </button>
-                <button
-                  type="button"
-                  onClick={createBlankDocumentGraph}
-                  className="rounded-lg border border-border px-3 py-2 text-xs font-medium text-muted-foreground hover:bg-white/5 hover:text-foreground"
-                >
-                  {t('graph.createBlank')}
-                </button>
-              </div>
-            </div>
-          </div>
+        {workspace.status === 'loading' && nodes.length === 0 ? (
+          <GraphMessage icon={<RefreshCw className="size-7 animate-spin text-primary-bright" />} title="Loading project graph" body="Fetching server artifacts, immutable revisions, dependencies, and trace links." />
+        ) : workspace.error ? (
+          <GraphMessage icon={<ShieldAlert className="size-7 text-destructive" />} title="The server graph could not be loaded" body={workspace.error} />
+        ) : nodes.length === 0 ? (
+          <GraphMessage icon={<GitFork className="size-8 text-primary-bright" />} title={t('graph.emptyTitle')} body="Create a document, Blueprint, PageSpec, or prototype in its editor. This graph only shows artifacts persisted by the active project service." />
         ) : (
-        <div
-          ref={canvasRef}
-          className="relative"
-          style={{ width: canvasWidth, height: canvasHeight, backgroundSize: '28px 28px' }}
-        >
-          {/* Edges */}
-          <svg className="absolute inset-0" width={canvasWidth} height={canvasHeight}>
-            <defs>
-              <marker id="arrow-green" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
-                <path d="M0,0 L8,4 L0,8 z" fill="#4ade80" />
-              </marker>
-              <marker id="arrow-red" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
-                <path d="M0,0 L8,4 L0,8 z" fill="#ef4444" />
-              </marker>
-            </defs>
-            {visibleDependencies.map((edge) => {
-              const src = documents.find((d) => d.id === edge.sourceDocId)!
-              const tgt = documents.find((d) => d.id === edge.targetDocId)!
-              const a = nodeCenter(src)
-              const b = nodeCenter(tgt)
-              const isActive =
-                edge.sourceDocId === selectedDocId || edge.targetDocId === selectedDocId
-              const color = edge.isBlocking ? '#ef4444' : '#4ade80'
-              const mx = (a.x + b.x) / 2
-              const path = `M ${a.x} ${a.y} C ${mx} ${a.y}, ${mx} ${b.y}, ${b.x} ${b.y}`
+          <div
+            className="relative"
+            style={{ width: canvasWidth, height: canvasHeight, backgroundSize: '28px 28px' }}
+          >
+            <div className="absolute left-0 right-0 top-4 grid grid-cols-4 gap-[66px] px-10 text-[10px] font-semibold uppercase tracking-[0.16em] text-faint-foreground">
+              <ColumnHeading icon={<FileText className="size-3" />} label="Documents" count={workspace.documents.length} />
+              <ColumnHeading icon={<Boxes className="size-3" />} label="Blueprints" count={workspace.blueprints.length} />
+              <ColumnHeading icon={<Layers className="size-3" />} label="PageSpecs" count={workspace.pageSpecs.length} />
+              <ColumnHeading icon={<MonitorPlay className="size-3" />} label="Prototypes" count={workspace.prototypes.length} />
+            </div>
+
+            <svg className="absolute inset-0" width={canvasWidth} height={canvasHeight} aria-hidden="true">
+              <defs>
+                <marker id="dependency-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+                  <path d="M0,0 L8,4 L0,8 z" fill="#4ade80" />
+                </marker>
+                <marker id="required-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+                  <path d="M0,0 L8,4 L0,8 z" fill="#ef4444" />
+                </marker>
+                <marker id="trace-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+                  <path d="M0,0 L8,4 L0,8 z" fill="#a78bfa" />
+                </marker>
+              </defs>
+              {visibleEdges.map((edge) => {
+                const source = nodeById.get(edge.sourceId)
+                const target = nodeById.get(edge.targetId)
+                if (!source || !target) return null
+                const active = !selectedNodeId || edge.sourceId === selectedNodeId || edge.targetId === selectedNodeId
+                const color = edge.kind === 'trace' ? '#a78bfa' : edge.required ? '#ef4444' : '#4ade80'
+                const sourceX = source.x + NODE_WIDTH
+                const sourceY = source.y + NODE_HEIGHT / 2
+                const targetX = target.x
+                const targetY = target.y + NODE_HEIGHT / 2
+                const direction = Math.sign(targetX - sourceX) || 1
+                const bend = Math.max(58, Math.abs(targetX - sourceX) * 0.42)
+                const path = `M ${sourceX} ${sourceY} C ${sourceX + bend * direction} ${sourceY}, ${targetX - bend * direction} ${targetY}, ${targetX} ${targetY}`
+                return (
+                  <g key={edge.id} opacity={active ? 1 : 0.18}>
+                    <path
+                      d={path}
+                      fill="none"
+                      stroke={color}
+                      strokeWidth={hoveredEdgeId === edge.id ? 2.5 : 1.5}
+                      strokeDasharray={edge.kind === 'trace' ? '3 5' : edge.required ? '7 4' : undefined}
+                      markerEnd={edge.kind === 'trace' ? 'url(#trace-arrow)' : edge.required ? 'url(#required-arrow)' : 'url(#dependency-arrow)'}
+                      pointerEvents="stroke"
+                      className="cursor-pointer"
+                      onMouseEnter={() => setHoveredEdgeId(edge.id)}
+                      onMouseLeave={() => setHoveredEdgeId(null)}
+                      onClick={() => setSelectedNodeId(edge.targetId)}
+                    />
+                  </g>
+                )
+              })}
+            </svg>
+
+            {nodes.map((node) => {
+              const selected = node.id === selectedNodeId
+              const owner = members.find((member) => member.user.id === node.createdBy)?.user
               return (
-                <g key={edge.id} opacity={isActive || !selectedDocId ? 1 : 0.22}>
-                  <path
-                    d={path}
-                    fill="none"
-                    stroke={color}
-                    strokeWidth={hoverEdge === edge.id ? 2.4 : 1.6}
-                    strokeDasharray={edge.isBlocking ? '5 4' : undefined}
-                    markerEnd={edge.isBlocking ? 'url(#arrow-red)' : 'url(#arrow-green)'}
-                    className="cursor-pointer"
-                    pointerEvents="stroke"
-                    onClick={() => {
-                      setHoverEdge(edge.id)
-                      setNotice(
-                        `${src.title} ${labels.dependency(edge.type)} ${tgt.title}${
-                          edge.isBlocking ? ` · ${t('graph.legend.blocking')}` : ''
-                        }`,
-                      )
-                    }}
-                  />
-                  {isActive && (
-                    <text
-                      x={mx}
-                      y={(a.y + b.y) / 2 - 6}
-                      fill={color}
-                      fontSize="10"
-                      textAnchor="middle"
-                      className="font-medium"
-                    >
-                      {labels.dependency(edge.type)}
-                    </text>
+                <button
+                  key={node.id}
+                  type="button"
+                  onClick={() => {
+                    setSelectedNodeId(node.id)
+                    setNotice(null)
+                  }}
+                  onDoubleClick={() => openArtifactWorkspace(node)}
+                  className={cn(
+                    'absolute rounded-lg border bg-surface-2 p-3 text-left shadow-sm transition-colors outline-none',
+                    selected
+                      ? 'border-primary shadow-[0_0_0_1px_var(--color-primary),0_8px_30px_rgba(20,136,252,0.18)]'
+                      : 'border-border hover:border-white/25',
                   )}
-                </g>
+                  style={{ left: node.x, top: node.y, width: NODE_WIDTH, height: NODE_HEIGHT }}
+                >
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="flex min-w-0 items-center gap-1.5 text-[10px] font-medium uppercase tracking-wide text-faint-foreground">
+                      <span className={cn('size-1.5 shrink-0 rounded-full', statusDot(node.status))} />
+                      <span className="truncate">{kindLabel(node.kind)}</span>
+                    </span>
+                    <span className="shrink-0 rounded border border-border px-1 py-0.5 text-[9px] text-faint-foreground">
+                      {node.revisionNumber ? `r${node.revisionNumber}` : 'draft only'}
+                    </span>
+                  </div>
+                  <div className="mt-1 truncate text-sm font-semibold text-foreground">{node.title}</div>
+                  <div className="mt-1 line-clamp-2 min-h-7 text-[10px] leading-3.5 text-muted-foreground">
+                    {node.summary || 'No summary'}
+                  </div>
+                  <div className="mt-1.5 flex items-center justify-between gap-2 text-[9px] text-faint-foreground">
+                    <span className="truncate">{owner?.name ?? node.createdBy}</span>
+                    {node.hasDraft && <span className="shrink-0 text-warning">unversioned changes</span>}
+                  </div>
+                </button>
               )
             })}
-          </svg>
-
-          {/* Nodes */}
-          {documents.map((doc) => {
-            const isSel = doc.id === selectedDocId
-            return (
-              <div
-                key={doc.id}
-                role="button"
-                tabIndex={0}
-                onClick={() => {
-                  const pendingConnection = connectFromRef.current
-                  if (suppressNodeClickRef.current && !pendingConnection) {
-                    suppressNodeClickRef.current = false
-                    return
-                  }
-                  suppressNodeClickRef.current = false
-                  selectNode(doc)
-                }}
-                onDoubleClick={() => !connectFrom && openDoc(doc.id)}
-                onKeyDown={(event) => {
-                  if (event.key === 'Enter' || event.key === ' ') selectNode(doc)
-                }}
-                onPointerDown={(event) => beginDocumentDrag(event, doc)}
-                onPointerMove={(event) => moveDocumentWithPointer(event, doc.id)}
-                onPointerUp={(event) => finishDocumentDrag(event, doc.id)}
-                onPointerCancel={(event) => finishDocumentDrag(event, doc.id)}
-                onLostPointerCapture={(event) => finishDocumentDrag(event, doc.id)}
-                onDragOver={(event) => {
-                  const hasDocPayload = Array.from(event.dataTransfer.types).includes(
-                    'application/worksflow-doc',
-                  )
-                  const pendingConnection = connectFromRef.current
-                  if ((pendingConnection || hasDocPayload) && pendingConnection !== doc.id) {
-                    event.preventDefault()
-                  }
-                }}
-                onDrop={(event) => {
-                  event.preventDefault()
-                  const sourceDocId =
-                    event.dataTransfer.getData('application/worksflow-doc') ||
-                    connectFromRef.current
-                  if (sourceDocId) createBinding(sourceDocId, doc.id)
-                }}
-                className={cn(
-                  'group absolute touch-none select-none rounded-lg border bg-surface-2 p-3 text-left transition-colors outline-none',
-                  draggingDocId === doc.id ? 'cursor-grabbing' : 'cursor-grab',
-                  isSel
-                    ? 'border-primary shadow-[0_0_0_1px_var(--color-primary),0_8px_30px_rgba(20,136,252,0.2)]'
-                    : connectFrom
-                      ? 'border-border hover:border-primary/60'
-                      : 'border-border hover:border-white/20',
-                )}
-                style={{
-                  left: doc.position.x + OFFSET_X,
-                  top: doc.position.y + OFFSET_Y,
-                  width: NODE_W,
-                  height: NODE_H,
-                }}
-              >
-                <div className="flex items-center justify-between">
-                  <span className="flex items-center gap-1.5 text-[10px] font-medium uppercase tracking-wide text-faint-foreground">
-                    <span className={cn('size-1.5 rounded-full', statusDot(doc.status))} />
-                    {labels.docType(doc.type)}
-                    <Move className="size-3 opacity-0 transition-opacity group-hover:opacity-100" />
-                  </span>
-                  {doc.blocking > 0 && (
-                    <span className="inline-flex items-center gap-0.5 rounded bg-red-500/10 px-1 text-[10px] font-medium text-destructive">
-                      <TriangleAlert className="size-2.5" />
-                      {doc.blocking}
-                    </span>
-                  )}
-                </div>
-                <div className="mt-1 truncate text-sm font-semibold text-foreground">
-                  {doc.title}
-                </div>
-                <div className="mt-1 line-clamp-1 text-[11px] text-muted-foreground">
-                  {doc.summary}
-                </div>
-                <div className="mt-2 flex items-center justify-between">
-                  <StatusPill
-                    label={labels.docStatus(doc.status)}
-                    className={DOC_STATUS_CLASS[doc.status]}
-                  />
-                  <button
-                    type="button"
-                    data-doc-connect-handle
-                    draggable
-                    onPointerDown={(event) => {
-                      event.stopPropagation()
-                      suppressNodeClickRef.current = false
-                      setPendingConnection(doc.id)
-                      setNotice(t('graph.dragCreateBinding'))
-                    }}
-                    onClick={(event) => {
-                      event.stopPropagation()
-                      suppressNodeClickRef.current = false
-                      setPendingConnection(doc.id)
-                      setNotice(t('graph.dragCreateBinding'))
-                    }}
-                    onDragStart={(event) => {
-                      event.stopPropagation()
-                      suppressNodeClickRef.current = false
-                      event.dataTransfer.setData('application/worksflow-doc', doc.id)
-                      event.dataTransfer.effectAllowed = 'link'
-                      setPendingConnection(doc.id)
-                      setNotice(t('graph.dragCreateBinding'))
-                    }}
-                    onDragEnd={() => {
-                      if (connectFromRef.current) setPendingConnection(null)
-                    }}
-                    className="flex h-7 min-w-9 items-center justify-center gap-1 rounded-md px-2 text-[10px] text-faint-foreground hover:bg-white/5 hover:text-primary-bright"
-                    aria-label={`${t('graph.addBinding')}: ${doc.title}`}
-                    title={t('graph.dragCreateBinding')}
-                  >
-                    <Link2 className="size-3" />
-                    {doc.bindings}
-                  </button>
-                </div>
-              </div>
-            )
-          })}
-        </div>
+          </div>
         )}
       </div>
 
-      {/* Inspector */}
-      <aside className="flex w-80 shrink-0 flex-col border-l border-border bg-surface max-lg:w-full max-lg:max-h-[420px] max-lg:border-l-0 max-lg:border-t">
-        {selected ? (
+      <aside className="flex w-80 shrink-0 flex-col border-l border-border bg-surface max-lg:max-h-[520px] max-lg:w-full max-lg:border-l-0 max-lg:border-t">
+        {selectedNode ? (
           <>
             <div className="border-b border-border p-4">
-              <div className="flex items-center gap-1.5 text-[11px] uppercase tracking-wide text-faint-foreground">
-                <Layers className="size-3" />
-                {labels.docType(selected.type)}
-              </div>
-              <h3 className="mt-1 text-base font-semibold text-foreground">{selected.title}</h3>
-              <div className="mt-2 flex items-center gap-2">
-                <StatusPill
-                  label={labels.docStatus(selected.status)}
-                  className={DOC_STATUS_CLASS[selected.status]}
-                />
-                <span className="text-[11px] text-faint-foreground">
-                  {t('graph.updatedAt', { time: selected.updatedAt })}
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-[10px] font-semibold uppercase tracking-wider text-faint-foreground">
+                  {kindLabel(selectedNode.kind)}
                 </span>
+                <StatusBadge status={selectedNode.status} />
               </div>
-              <p className="mt-3 text-xs leading-relaxed text-muted-foreground">
-                {selected.summary}
+              <h3 className="mt-1 text-base font-semibold text-foreground">{selectedNode.title}</h3>
+              <p className="mt-2 text-xs leading-relaxed text-muted-foreground">
+                {selectedNode.summary || 'No summary has been persisted for this artifact.'}
               </p>
+              <dl className="mt-3 grid grid-cols-[92px_1fr] gap-x-2 gap-y-1 text-[10px]">
+                <dt className="text-faint-foreground">Artifact</dt>
+                <dd className="truncate font-mono text-muted-foreground">{selectedNode.id}</dd>
+                <dt className="text-faint-foreground">Pinned revision</dt>
+                <dd className="truncate font-mono text-muted-foreground">
+                  {selectedNode.revision
+                    ? `${selectedNode.revision.revisionId}${selectedNode.revisionNumber ? ` · r${selectedNode.revisionNumber}` : ''}`
+                    : 'None — create a revision first'}
+                </dd>
+              </dl>
+              <button
+                type="button"
+                onClick={() => openArtifactWorkspace(selectedNode)}
+                className="mt-3 inline-flex h-8 w-full items-center justify-center gap-1.5 rounded-md border border-primary/35 bg-primary/10 px-2 text-[10px] font-semibold text-primary-bright hover:bg-primary/15"
+              >
+                <PencilLine className="size-3.5" />
+                {selectedNode.kind === 'document'
+                  ? 'Open document editor'
+                  : selectedNode.kind === 'prototype'
+                    ? 'Open Prototype Studio'
+                    : selectedNode.kind === 'pageSpec'
+                      ? 'Open PageSpecs in Blueprint'
+                      : 'Open Blueprint editor'}
+              </button>
               {notice && (
-                <div className="mt-3 rounded-md border border-primary/30 bg-primary/10 px-2.5 py-2 text-[11px] text-primary-bright">
-                  {notice}
+                <div className={cn(
+                  'mt-3 rounded-md border px-2.5 py-2 text-[11px]',
+                  notice.kind === 'success'
+                    ? 'border-success/30 bg-success/10 text-success'
+                    : 'border-destructive/30 bg-destructive/10 text-destructive',
+                )}>
+                  {notice.message}
                 </div>
               )}
-              <button
-                onClick={() => openDoc(selected.id)}
-                className="mt-3 inline-flex w-full items-center justify-center gap-1.5 rounded-lg bg-primary px-3 py-2 text-sm font-medium text-white hover:bg-primary/90"
-              >
-                <PenLine className="size-3.5" /> {t('graph.openDoc')}
-              </button>
-              <div className="mt-2 grid grid-cols-2 gap-2">
-                <button
-                  onClick={() => useDocInWorkbench(selected.id)}
-                  className="inline-flex items-center justify-center gap-1.5 rounded-lg border border-primary/40 bg-primary/10 px-2 py-2 text-xs font-medium text-primary-bright hover:bg-primary/20"
-                >
-                  <Workflow className="size-3.5" /> {t('graph.useContext')}
-                </button>
-                <button
-                  onClick={() => {
-                    setPendingConnection(selected.id)
-                    setNotice(t('graph.addBinding'))
-                  }}
-                  className="inline-flex items-center justify-center gap-1.5 rounded-lg border border-border px-2 py-2 text-xs font-medium text-muted-foreground hover:bg-white/5"
-                >
-                  <Link2 className="size-3.5" /> {t('graph.addBinding')}
-                </button>
-              </div>
+              {dependencyError && (
+                <div className="mt-3 rounded-md border border-destructive/30 bg-destructive/10 px-2.5 py-2 text-[11px] text-destructive">
+                  {dependencyError}
+                </div>
+              )}
             </div>
 
-            <div className="flex-1 overflow-y-auto scrollbar-thin p-4">
-              <SectionLabel>{t('graph.freeBinding')}</SectionLabel>
-              <div className="mt-2 space-y-2 rounded-lg border border-border bg-surface-2 p-2">
-                <label className="block text-[11px] text-faint-foreground">
-                  {t('graph.relationType')}
-                  <select
-                    value={relationType}
-                    onChange={(e) => setRelationType(e.target.value as DependencyType)}
-                    className="mt-1 w-full rounded-md border border-border bg-background px-2 py-1.5 text-xs text-foreground outline-none focus:border-primary/60"
-                  >
-                    {RELATION_TYPES.map((type) => (
-                      <option key={type} value={type}>
-                        {labels.dependency(type)}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-                <label className="flex items-center gap-2 text-[11px] text-muted-foreground">
-                  <input
-                    type="checkbox"
-                    checked={blocking}
-                    onChange={(e) => setBlocking(e.target.checked)}
-                  />
-                  {t('graph.blockingNotify')}
-                </label>
-                <label className="flex items-center gap-2 text-[11px] text-muted-foreground">
-                  <input
-                    type="checkbox"
-                    checked={requiredForReview}
-                    onChange={(e) => setRequiredForReview(e.target.checked)}
-                  />
-                  {t('graph.requiredForReview')}
-                </label>
-                <label className="flex items-center gap-2 text-[11px] text-muted-foreground">
-                  <input
-                    type="checkbox"
-                    checked={notifyOnChange}
-                    onChange={(e) => setNotifyOnChange(e.target.checked)}
-                  />
-                  {t('graph.notifyOnChange')}
-                </label>
-                {connectFrom && (
-                  <div className="rounded-md bg-primary/10 px-2 py-1.5 text-[11px] text-primary-bright">
-                    {t('graph.bindingFrom', {
-                      source: documents.find((d) => d.id === connectFrom)?.title ?? t('common.source'),
-                    })}
-                  </div>
-                )}
-              </div>
-
-              <SectionLabel className="mt-5">{t('graph.bindingObjects')}</SectionLabel>
-              <div className="mt-2 space-y-2 rounded-lg border border-border bg-surface-2 p-2">
+            <div className="flex-1 overflow-y-auto p-4 scrollbar-thin">
+              <SectionLabel>{t('graph.addBinding')}</SectionLabel>
+              <div className="mt-2 space-y-2 rounded-lg border border-border bg-surface-2 p-3">
+                <p className="text-[10px] leading-relaxed text-faint-foreground">
+                  The server pins both sides to their latest immutable revision. Draft-only artifacts cannot be linked.
+                </p>
                 <label className="block text-[11px] text-faint-foreground">
                   {t('graph.bindingTarget')}
                   <select
-                    value={targetValue}
-                    onChange={(event) => setTargetValue(event.target.value)}
+                    value={targetNodeId}
+                    onChange={(event) => setTargetNodeId(event.target.value)}
                     className="mt-1 w-full rounded-md border border-border bg-background px-2 py-1.5 text-xs text-foreground outline-none focus:border-primary/60"
                   >
                     <option value="">{t('graph.chooseTarget')}</option>
-                    {bindingOptions.map((option) => (
-                      <option key={optionKey(option)} value={optionKey(option)}>
-                        {bindingKindLabel(option.kind, t)} · {option.label}
+                    {availableTargets.map((node) => (
+                      <option key={node.id} value={node.id} disabled={!node.revision}>
+                        {kindLabel(node.kind)} · {node.title}{node.revision ? '' : ' (draft only)'}
                       </option>
                     ))}
                   </select>
                 </label>
-                {targetKind === 'member' && (
-                  <label className="block text-[11px] text-faint-foreground">
-                    {t('graph.memberRole')}
-                    <select
-                      value={memberRole}
-                      onChange={(event) => setMemberRole(event.target.value as DocMemberRole)}
-                      className="mt-1 w-full rounded-md border border-border bg-background px-2 py-1.5 text-xs text-foreground outline-none focus:border-primary/60"
-                    >
-                      {MEMBER_ROLES.map((role) => (
-                        <option key={role} value={role}>
-                          {labels.role(role)}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
-                )}
+                <label className="block text-[11px] text-faint-foreground">
+                  {t('graph.relationType')}
+                  <select
+                    value={relation}
+                    onChange={(event) => setRelation(event.target.value as DependencyRelation)}
+                    className="mt-1 w-full rounded-md border border-border bg-background px-2 py-1.5 text-xs text-foreground outline-none focus:border-primary/60"
+                  >
+                    {RELATIONS.map((item) => (
+                      <option key={item} value={item}>{relationLabel(item)}</option>
+                    ))}
+                  </select>
+                </label>
+                <label className="flex items-center gap-2 text-[11px] text-muted-foreground">
+                  <input
+                    type="checkbox"
+                    checked={required}
+                    onChange={(event) => setRequired(event.target.checked)}
+                  />
+                  Required delivery dependency
+                </label>
                 <button
                   type="button"
-                  onClick={addSelectedTargetBinding}
-                  disabled={!selectedTarget}
-                  className="w-full rounded-md bg-primary px-2.5 py-1.5 text-[12px] font-semibold text-primary-foreground hover:bg-primary-bright disabled:cursor-not-allowed disabled:bg-white/10 disabled:text-faint-foreground"
+                  onClick={() => void createDependency()}
+                  disabled={!canCreateDependency}
+                  className="w-full rounded-md bg-primary px-2.5 py-2 text-xs font-semibold text-primary-foreground hover:bg-primary-bright disabled:cursor-not-allowed disabled:bg-white/10 disabled:text-faint-foreground"
                 >
-                  {t('graph.addSelectedBinding')}
+                  {saving ? 'Creating server dependency…' : 'Create pinned dependency'}
                 </button>
-                <div className="space-y-1.5">
-                  {relatedBindings.map((binding) => (
-                    <BindingRow
-                      key={binding.id}
-                      label={bindingKindLabel(binding.targetKind, t)}
-                      value={binding.label}
-                      meta={[
-                        bindingRelationLabel(binding.relation, labels),
-                        binding.isBlocking ? t('graph.meta.blocking') : null,
-                        binding.requiredForReview ? t('graph.meta.required') : null,
-                        binding.notifyOnChange ? t('graph.meta.notify') : null,
-                      ]
-                        .filter(Boolean)
-                        .join(' · ')}
-                    />
-                  ))}
-                </div>
-              </div>
-
-              <SectionLabel className="mt-5">{t('graph.collaborators')}</SectionLabel>
-              <div className="mt-2 space-y-2">
-                {selected.members.map((m) => {
-                  const mem = memberById(m.userId)
-                  if (!mem) return null
-                  return (
-                    <div key={m.userId} className="flex items-center gap-2">
-                      <Avatar member={mem} size={26} />
-                      <div className="min-w-0 flex-1">
-                        <div className="truncate text-xs font-medium text-foreground">
-                          {mem.name}
-                        </div>
-                        <div className="text-[10px] text-faint-foreground">{mem.title}</div>
-                      </div>
-                      <span className="rounded border border-border px-1.5 py-0.5 text-[10px] text-muted-foreground">
-                        {labels.role(m.role)}
-                      </span>
-                    </div>
-                  )
-                })}
+                {!selectedNode.revision && (
+                  <p className="flex items-start gap-1.5 text-[10px] leading-relaxed text-warning">
+                    <ShieldAlert className="mt-0.5 size-3 shrink-0" />
+                    Create an immutable revision for this artifact before connecting it.
+                  </p>
+                )}
+                {session.signedIn && !can('edit') && (
+                  <p className="text-[10px] text-warning">Your project role is read-only.</p>
+                )}
               </div>
 
               <SectionLabel className="mt-5">{t('graph.dependencies')}</SectionLabel>
               <div className="mt-2 space-y-1.5">
-                {relatedEdges.map((e) => {
-                  const other =
-                    e.sourceDocId === selected.id
-                      ? documents.find((d) => d.id === e.targetDocId)
-                      : documents.find((d) => d.id === e.sourceDocId)
-                  const outgoing = e.sourceDocId === selected.id
+                {selectedEdges.map((edge) => {
+                  const outgoing = edge.sourceId === selectedNode.id
+                  const other = nodeById.get(outgoing ? edge.targetId : edge.sourceId)
+                  if (!other) return null
                   return (
                     <button
-                      key={e.id}
-                      onClick={() => other && setSelectedDocId(other.id)}
-                      onMouseEnter={() => setHoverEdge(e.id)}
-                      onMouseLeave={() => setHoverEdge(null)}
+                      key={edge.id}
+                      type="button"
+                      onClick={() => setSelectedNodeId(other.id)}
+                      onMouseEnter={() => setHoveredEdgeId(edge.id)}
+                      onMouseLeave={() => setHoveredEdgeId(null)}
                       className="flex w-full items-center gap-2 rounded-lg border border-border bg-surface-2 px-2.5 py-2 text-left hover:border-white/20"
                     >
-                      <GitFork
-                        className={cn(
-                          'size-3.5 shrink-0',
-                          e.isBlocking ? 'text-destructive' : 'text-success',
-                        )}
-                      />
-                      <span className="text-[11px] text-faint-foreground">
-                        {outgoing ? '' : '← '}
-                        {labels.dependency(e.type)}
+                      {edge.kind === 'trace'
+                        ? <Link2 className="size-3.5 shrink-0 text-violet-400" />
+                        : <GitFork className={cn('size-3.5 shrink-0', edge.required ? 'text-destructive' : 'text-success')} />}
+                      <span className="min-w-0 flex-1">
+                        <span className="block truncate text-[10px] text-faint-foreground">
+                          {outgoing ? '' : '← '}{relationLabel(edge.relation)} · {edge.kind}
+                        </span>
+                        <span className="flex items-center gap-1 truncate text-xs font-medium text-foreground">
+                          {outgoing && <ArrowRight className="size-3 shrink-0 text-faint-foreground" />}
+                          {other.title}
+                        </span>
                       </span>
-                      <span className="ml-auto flex items-center gap-1 truncate text-xs font-medium text-foreground">
-                        {outgoing && <ArrowRight className="size-3 text-faint-foreground" />}
-                        {other?.title}
-                      </span>
+                      {edge.required && (
+                        <span className="rounded bg-destructive/10 px-1 py-0.5 text-[9px] text-destructive">required</span>
+                      )}
                     </button>
                   )
                 })}
-                {relatedEdges.length === 0 && (
+                {selectedEdges.length === 0 && (
                   <p className="text-xs text-faint-foreground">{t('graph.noDependencies')}</p>
                 )}
               </div>
 
-              {selected.blocking > 0 && (
-                <div className="mt-5 rounded-lg border border-red-500/30 bg-red-500/5 p-3">
-                  <div className="flex items-center gap-1.5 text-xs font-medium text-destructive">
-                    <TriangleAlert className="size-3.5" />
-                    {t('graph.blocksDownstream', { count: selected.blocking })}
-                  </div>
-                  <p className="mt-1 text-[11px] text-muted-foreground">
-                    {t('graph.blocksCopy')}
-                  </p>
-                </div>
-              )}
-
-              <button
-                onClick={() => {
-                  setPendingConnection(selected.id)
-                  setRelationType('generates')
-                  setNotice(t('graph.chooseDownstream'))
-                }}
-                className="mt-5 inline-flex w-full items-center justify-center gap-1.5 rounded-lg border border-dashed border-border px-3 py-2 text-xs font-medium text-muted-foreground hover:border-primary/40 hover:text-foreground"
-              >
-                <GitFork className="size-3.5 text-primary-bright" /> {t('graph.generateDownstream')}
-              </button>
+              <div className="mt-5 rounded-lg border border-border bg-background p-3 text-[10px] leading-relaxed text-faint-foreground">
+                Node positions are an automatic local view and are not saved. Dependency and trace edges are server records; this screen never reports success until the API accepts a relation.
+              </div>
             </div>
           </>
         ) : (
@@ -860,121 +662,125 @@ export function DocumentGraph() {
   )
 }
 
-function Legend({ color, label, dashed }: { color: string; label: string; dashed?: boolean }) {
+function setArtifactReference(artifactId: string) {
+  if (typeof window === 'undefined') return
+  const url = new URL(window.location.href)
+  url.searchParams.set('artifactId', artifactId)
+  window.history.replaceState(null, '', `${url.pathname}${url.search}${url.hash}`)
+}
+
+function graphNode<TContent>(
+  resource: VersionedArtifactDto<TContent>,
+  kind: GraphNodeKind,
+  summary: string,
+  column: number,
+  row: number,
+): GraphNode {
+  const revision = resource.latestRevision
+    ? {
+        artifactId: resource.latestRevision.artifactId,
+        revisionId: resource.latestRevision.id,
+        revisionNumber: resource.latestRevision.revisionNumber,
+        contentHash: resource.latestRevision.contentHash,
+      }
+    : undefined
+  return {
+    id: resource.artifact.id,
+    title: resource.artifact.title,
+    kind,
+    status: resource.artifact.status,
+    summary,
+    updatedAt: resource.artifact.updatedAt,
+    createdBy: resource.artifact.createdBy,
+    hasDraft: Boolean(resource.draft),
+    revisionNumber: resource.latestRevision?.revisionNumber,
+    revision,
+    x: CANVAS_PADDING_X + column * COLUMN_WIDTH,
+    y: CANVAS_PADDING_TOP + row * ROW_HEIGHT,
+  }
+}
+
+function exactVersionRef(reference: VersionRefDto): VersionRefDto {
+  return {
+    artifactId: reference.artifactId,
+    revisionId: reference.revisionId,
+    contentHash: reference.contentHash,
+    ...(reference.anchorId ? { anchorId: reference.anchorId } : {}),
+  }
+}
+
+function kindLabel(kind: GraphNodeKind) {
+  const labels: Record<GraphNodeKind, string> = {
+    document: 'Document',
+    blueprint: 'Blueprint',
+    pageSpec: 'PageSpec',
+    prototype: 'Prototype',
+  }
+  return labels[kind]
+}
+
+function relationLabel(relation: string) {
+  return relation.replaceAll('_', ' ')
+}
+
+function statusDot(status: ArtifactStatus) {
+  if (status === 'approved') return 'bg-success'
+  if (status === 'inReview') return 'bg-primary-bright'
+  if (status === 'changesRequested' || status === 'needsSync') return 'bg-warning'
+  return 'bg-faint-foreground'
+}
+
+function StatusBadge({ status }: { status: ArtifactStatus }) {
   return (
-    <span className="inline-flex shrink-0 items-center gap-1.5">
-      <span
-        className="inline-block h-0 w-5 border-t-2"
-        style={{ borderColor: color, borderStyle: dashed ? 'dashed' : 'solid' }}
-      />
-      {label}
+    <span className={cn(
+      'rounded border px-1.5 py-0.5 text-[9px] font-medium',
+      status === 'approved'
+        ? 'border-success/30 bg-success/10 text-success'
+        : status === 'changesRequested' || status === 'needsSync'
+          ? 'border-warning/30 bg-warning/10 text-warning'
+          : status === 'inReview'
+            ? 'border-primary/30 bg-primary/10 text-primary-bright'
+            : 'border-border bg-white/5 text-muted-foreground',
+    )}>
+      {relationLabel(status)}
     </span>
   )
 }
 
-function SectionLabel({
-  children,
-  className,
-}: {
-  children: React.ReactNode
-  className?: string
-}) {
+function ColumnHeading({ icon, label, count }: { icon: React.ReactNode; label: string; count: number }) {
   return (
-    <div
-      className={cn(
-        'text-[11px] font-semibold uppercase tracking-wider text-faint-foreground',
-        className,
-      )}
-    >
+    <div className="flex w-[220px] items-center gap-1.5 border-b border-border pb-2">
+      {icon}
+      <span>{label}</span>
+      <span className="ml-auto rounded bg-white/5 px-1.5 py-0.5 text-[9px]">{count}</span>
+    </div>
+  )
+}
+
+function SectionLabel({ children, className }: { children: React.ReactNode; className?: string }) {
+  return (
+    <div className={cn('text-[11px] font-semibold uppercase tracking-wider text-faint-foreground', className)}>
       {children}
     </div>
   )
 }
 
-function nodeTargetKind(type: BlueprintNodeType): BindingTargetKind {
-  if (type === 'workbenchTarget') return 'workbenchVersion'
-  return type
-}
-
-function buildBindingOptions(
-  documents: TeamDocument[],
-  blueprint: Blueprint,
-  importAssets: ImportAsset[],
-  labels: LocalizedLabels,
-  t: (key: MessageKey) => string,
-): BindingOption[] {
-  return [
-    {
-      kind: 'blueprint',
-      id: blueprint.id,
-      label: blueprint.title,
-      meta: bindingKindLabel('blueprint', t),
-    },
-    ...documents.map((doc) => ({
-      kind: 'document' as const,
-      id: doc.id,
-      label: doc.title,
-      meta: labels.docType(doc.type),
-    })),
-    ...MEMBERS.map((member) => ({
-      kind: 'member' as const,
-      id: member.id,
-      label: member.name,
-      meta: member.title,
-    })),
-    ...blueprint.nodes.map((node) => ({
-      kind: nodeTargetKind(node.type),
-      id: node.id,
-      label: node.title,
-      meta: bindingKindLabel(nodeTargetKind(node.type), t),
-    })),
-    ...importAssets.map((asset) => ({
-      kind: 'externalAsset' as const,
-      id: asset.id,
-      label: asset.name,
-      meta: bindingKindLabel('externalAsset', t),
-    })),
-    ...VERSIONS.map((version) => ({
-      kind: 'workbenchVersion' as const,
-      id: version.id,
-      label: version.title,
-      meta: version.subtitle,
-    })),
-  ]
-}
-
-function optionKey(option: BindingOption) {
-  return `${option.kind}:${option.id}`
-}
-
-function bindingKindLabel(kind: BindingTargetKind, t: (key: MessageKey) => string) {
-  const map: Record<BindingTargetKind, MessageKey> = {
-    document: 'graph.bindingKind.document',
-    member: 'graph.bindingKind.member',
-    blueprint: 'graph.bindingKind.blueprint',
-    feature: 'graph.bindingKind.feature',
-    page: 'graph.bindingKind.page',
-    component: 'graph.bindingKind.component',
-    api: 'graph.bindingKind.api',
-    dataModel: 'graph.bindingKind.dataModel',
-    permission: 'graph.bindingKind.permission',
-    prototype: 'graph.bindingKind.prototype',
-    workbenchVersion: 'graph.bindingKind.workbenchVersion',
-    externalAsset: 'graph.bindingKind.externalAsset',
-  }
-  return t(map[kind])
-}
-
-function BindingRow({ label, value, meta }: { label: string; value: string; meta?: string }) {
+function GraphMessage({
+  icon,
+  title,
+  body,
+}: {
+  icon: React.ReactNode
+  title: string
+  body: string
+}) {
   return (
-    <div className="rounded-lg border border-border bg-background px-2.5 py-2">
-      <div className="flex items-center justify-between gap-2">
-      <span className="text-[10px] font-medium uppercase tracking-wide text-faint-foreground">
-        {label}
-      </span>
-      <span className="min-w-0 truncate text-xs text-muted-foreground">{value}</span>
+    <div className="flex min-h-[520px] items-center justify-center p-6">
+      <div className="max-w-lg rounded-lg border border-dashed border-border bg-panel p-5 text-center">
+        <div className="flex justify-center">{icon}</div>
+        <h2 className="mt-3 text-base font-semibold text-foreground">{title}</h2>
+        <p className="mt-2 text-sm leading-relaxed text-muted-foreground">{body}</p>
       </div>
-      {meta && <div className="mt-1 truncate text-[10px] text-faint-foreground">{meta}</div>}
     </div>
   )
 }

@@ -20,6 +20,7 @@ import type {
   WorkspaceRevisionDto,
 } from './flow-contract'
 import { HttpClient } from './http'
+import { wireVersionRef } from './wire-version-ref'
 
 function segment(value: string) {
   return encodeURIComponent(value)
@@ -100,7 +101,14 @@ export class PlatformFlowClient {
   createManifest(projectId: string, input: CreateInputManifestDto, options?: ClientMutationOptions) {
     return this.http.post<InputManifestDto, CreateInputManifestDto>(
       `/v1/projects/${segment(projectId)}/input-manifests`,
-      input,
+      {
+        ...input,
+        baseRevision: input.baseRevision ? wireVersionRef(input.baseRevision) : undefined,
+        sources: input.sources.map((source) => ({
+          ...source,
+          ref: wireVersionRef(source.ref),
+        })),
+      },
       mutationOptions(options),
     )
   }
@@ -170,6 +178,19 @@ export class PlatformFlowClient {
     return this.http.post<void, { readonly nodeKey: string; readonly output: unknown }>(
       `/v1/projects/${segment(projectId)}/workflow-runs/${segment(runId)}/resume`,
       { nodeKey, output },
+      mutationOptions(options),
+    )
+  }
+
+  authorizeExecution(
+    projectId: string,
+    runId: string,
+    nodeKey: string,
+    options?: ClientMutationOptions,
+  ) {
+    return this.http.post<void, { readonly nodeKey: string }>(
+      `/v1/projects/${segment(projectId)}/workflow-runs/${segment(runId)}/execute`,
+      { nodeKey },
       mutationOptions(options),
     )
   }
@@ -253,7 +274,7 @@ export class PlatformFlowClient {
   ) {
     return this.http.post<WorkbenchBundleDto, CreateWorkbenchBundleInputDto>(
       `/v1/projects/${segment(projectId)}/build-manifests`,
-      input,
+      { ...input, prototypeRevision: wireVersionRef(input.prototypeRevision) },
       mutationOptions(options),
     )
   }
@@ -347,7 +368,7 @@ export class PlatformFlowClient {
   ) {
     return this.resumeRun(projectId, runId, nodeKey, {
       implementationProposalIds,
-      workspaceRevision,
+      workspaceRevision: wireVersionRef(workspaceRevision),
     }, options)
   }
 

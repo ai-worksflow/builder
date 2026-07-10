@@ -15,14 +15,13 @@ import type {
   WorkflowNodeDefinitionDto,
   WorkflowNodeType,
 } from '@/lib/platform/flow-contract'
+import {
+  parseEditableDefinition as parseWorkflowDefinition,
+  type EditableWorkflowDefinition,
+  validateWorkflowNode as validateNodeContract,
+} from '@/lib/platform/workflow-ui-contract'
 import { cn } from '@/lib/utils'
 
-interface EditableWorkflowDefinition {
-  readonly name: string
-  readonly schemaVersion: string
-  readonly nodes: readonly WorkflowNodeDefinitionDto[]
-  readonly edges: readonly WorkflowEdgeDto[]
-}
 
 interface WorkflowGraphEditorProps {
   readonly value: string
@@ -59,7 +58,7 @@ export function WorkflowGraphEditor({ value, onChange }: WorkflowGraphEditorProp
   const [toPort, setToPort] = useState('default')
   const [nodeDraft, setNodeDraft] = useState('')
   const [localError, setLocalError] = useState<string | null>(null)
-  const parsed = useMemo(() => parseEditableDefinition(value), [value])
+  const parsed = useMemo(() => parseWorkflowDefinition(value), [value])
   const definition = parsed.definition
   const selectedNode = definition?.nodes.find((node) => node.id === selectedNodeId)
 
@@ -120,15 +119,13 @@ export function WorkflowGraphEditor({ value, onChange }: WorkflowGraphEditorProp
     if (!definition || !selectedNode) return
     try {
       const candidate = JSON.parse(nodeDraft) as unknown
-      if (!isRecord(candidate)) throw new Error('Node must be a JSON object.')
-      if (typeof candidate.id !== 'string' || !candidate.id.trim()) throw new Error('Node id is required.')
-      if (typeof candidate.name !== 'string' || !candidate.name.trim()) throw new Error('Node name is required.')
-      if (!NODE_TYPES.some((item) => item.value === candidate.type)) throw new Error('Choose a supported node type.')
-      const nextId = candidate.id.trim()
+      const validationError = validateNodeContract(candidate, 'Node')
+      if (validationError) throw new Error(validationError)
+      const nextNode = candidate as WorkflowNodeDefinitionDto
+      const nextId = nextNode.id.trim()
       if (definition.nodes.some((node) => node.id === nextId && node.id !== selectedNode.id)) {
         throw new Error(`Node id ${nextId} already exists.`)
       }
-      const nextNode = candidate as unknown as WorkflowNodeDefinitionDto
       commit({
         ...definition,
         nodes: definition.nodes.map((node) => node.id === selectedNode.id ? nextNode : node),
@@ -319,18 +316,6 @@ function NodePortSelect({ label, nodeId, port, nodes, direction, onNodeChange, o
   )
 }
 
-function parseEditableDefinition(value: string): { readonly definition?: EditableWorkflowDefinition; readonly error?: string } {
-  try {
-    const parsed = JSON.parse(value) as unknown
-    if (!isRecord(parsed) || typeof parsed.name !== 'string' || typeof parsed.schemaVersion !== 'string' || !Array.isArray(parsed.nodes) || !Array.isArray(parsed.edges)) {
-      return { error: 'Definition requires name, schemaVersion, nodes, and edges' }
-    }
-    return { definition: parsed as unknown as EditableWorkflowDefinition }
-  } catch (cause) {
-    return { error: cause instanceof Error ? cause.message : 'Definition JSON is invalid' }
-  }
-}
-
 function createNode(id: string, type: WorkflowNodeType): WorkflowNodeDefinitionDto {
   const schema = { type: 'object', additionalProperties: true } as const
   const base = { id, name: NODE_TYPES.find((item) => item.value === type)?.label ?? type, type, inputSchema: schema, outputSchema: schema }
@@ -414,8 +399,4 @@ function graphLayout(definition: EditableWorkflowDefinition) {
     width: Math.max(620, PADDING * 2 + (maxLevel + 1) * NODE_WIDTH + maxLevel * COLUMN_GAP),
     height: Math.max(320, PADDING * 2 + maxRows * NODE_HEIGHT + (maxRows - 1) * ROW_GAP),
   }
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value)
 }

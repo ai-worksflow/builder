@@ -26,6 +26,7 @@ type WorkflowAPI interface {
 	ListRuns(context.Context, string, string, runtime.RunListOptions) (runtime.RunPage, error)
 	Events(context.Context, string, string, string, uint64, int) ([]runtime.Event, error)
 	Resume(context.Context, string, string, string, string, json.RawMessage) error
+	AuthorizeExecution(context.Context, string, string, string, string) error
 	RecordProposal(context.Context, string, string, string, string, domain.ProposalRef) error
 	ResolveReview(context.Context, string, string, string, string, runtime.ReviewResolution, string) error
 	Cancel(context.Context, string, string, string, string) error
@@ -68,6 +69,7 @@ func RegisterWorkflowRoutes(routes gin.IRoutes, handler *WorkflowHandler, mutati
 	routes.GET("/projects/:projectId/workflow-runs/:runId", handler.getRun)
 	routes.GET("/projects/:projectId/workflow-runs/:runId/events", handler.events)
 	routes.POST("/projects/:projectId/workflow-runs/:runId/resume", workflowHandlers(mutationMiddleware, handler.resume)...)
+	routes.POST("/projects/:projectId/workflow-runs/:runId/execute", workflowHandlers(mutationMiddleware, handler.authorizeExecution)...)
 	routes.POST("/projects/:projectId/workflow-runs/:runId/proposals", workflowHandlers(mutationMiddleware, handler.recordProposal)...)
 	routes.POST("/projects/:projectId/workflow-runs/:runId/approve", workflowHandlers(mutationMiddleware, handler.approve)...)
 	routes.POST("/projects/:projectId/workflow-runs/:runId/cancel", workflowHandlers(mutationMiddleware, handler.cancel)...)
@@ -92,6 +94,9 @@ type startWorkflowInput struct {
 type resumeWorkflowInput struct {
 	NodeKey string          `json:"nodeKey"`
 	Output  json.RawMessage `json:"output"`
+}
+type executeWorkflowInput struct {
+	NodeKey string `json:"nodeKey"`
 }
 type proposalWorkflowInput struct {
 	NodeKey  string             `json:"nodeKey"`
@@ -269,6 +274,22 @@ func (h *WorkflowHandler) resume(c *gin.Context) {
 		return
 	}
 	if err := h.facade.Resume(c.Request.Context(), c.Param("projectId"), c.Param("runId"), input.NodeKey, actor, input.Output); err != nil {
+		writeWorkflowError(c, err)
+		return
+	}
+	c.Status(http.StatusNoContent)
+}
+func (h *WorkflowHandler) authorizeExecution(c *gin.Context) {
+	var input executeWorkflowInput
+	if err := DecodeJSON(c, &input, h.maxBody); err != nil {
+		WriteJSONError(c, err)
+		return
+	}
+	actor, ok := workflowActor(c)
+	if !ok {
+		return
+	}
+	if err := h.facade.AuthorizeExecution(c.Request.Context(), c.Param("projectId"), c.Param("runId"), input.NodeKey, actor); err != nil {
 		writeWorkflowError(c, err)
 		return
 	}

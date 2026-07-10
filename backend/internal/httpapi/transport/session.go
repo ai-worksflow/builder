@@ -3,6 +3,8 @@ package transport
 import (
 	"crypto/rand"
 	"encoding/base64"
+	"errors"
+	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -40,11 +42,19 @@ func (s *Server) RegisterSession(context *gin.Context) {
 		WriteJSONError(context, err)
 		return
 	}
-	issued, err := s.services.Auth.SignUp(
-		context.Request.Context(), input.Email, input.DisplayName, input.Password,
-		context.Request.UserAgent(), context.ClientIP(),
+	idempotent, ok := s.services.Auth.(IdempotentAuthService)
+	if !ok {
+		writeAuthIdempotencyError(context, auth.ErrIdempotencyUnavailable)
+		return
+	}
+	issued, err := idempotent.SignUpIdempotent(
+		context.Request.Context(), worksmiddleware.IdempotencyKey(context),
+		input.Email, input.DisplayName, input.Password, context.Request.UserAgent(), context.ClientIP(),
 	)
 	if err != nil {
+		if writeAuthIdempotencyError(context, err) {
+			return
+		}
 		if registrationInputError(err) {
 			problem.Write(context, problem.New(http.StatusUnprocessableEntity, "invalid_input", "Input is invalid", "The display name, email, or password does not satisfy the account policy."))
 			return
@@ -53,7 +63,7 @@ func (s *Server) RegisterSession(context *gin.Context) {
 		problem.WriteError(context, err)
 		return
 	}
-	s.writeIssuedSession(context, issued, http.StatusCreated)
+	s.writeIdempotentIssuedSession(context, issued, http.StatusCreated)
 }
 
 func (s *Server) LoginSession(context *gin.Context) {
@@ -63,16 +73,24 @@ func (s *Server) LoginSession(context *gin.Context) {
 		WriteJSONError(context, err)
 		return
 	}
-	issued, err := s.services.Auth.SignIn(
-		context.Request.Context(), input.Email, input.Password,
-		context.Request.UserAgent(), context.ClientIP(),
+	idempotent, ok := s.services.Auth.(IdempotentAuthService)
+	if !ok {
+		writeAuthIdempotencyError(context, auth.ErrIdempotencyUnavailable)
+		return
+	}
+	issued, err := idempotent.SignInIdempotent(
+		context.Request.Context(), worksmiddleware.IdempotencyKey(context),
+		input.Email, input.Password, context.Request.UserAgent(), context.ClientIP(),
 	)
 	if err != nil {
+		if writeAuthIdempotencyError(context, err) {
+			return
+		}
 		s.writeServiceError(worksmiddleware.GetRequestID(context), context.FullPath(), err)
 		problem.WriteError(context, err)
 		return
 	}
-	s.writeIssuedSession(context, issued, http.StatusOK)
+	s.writeIdempotentIssuedSession(context, issued, http.StatusOK)
 }
 
 func (s *Server) GetSession(context *gin.Context) {
@@ -96,28 +114,43 @@ func (s *Server) GetSession(context *gin.Context) {
 
 func (s *Server) RefreshSession(context *gin.Context) {
 	noStore(context)
-	identity, ok := worksmiddleware.GetIdentity(context)
-	if !ok {
-		problem.WriteError(context, auth.ErrSessionExpired)
+	if !refreshBodyIsEmpty(context) {
 		return
 	}
-	if identity.Transport == "cookie" {
-		if rotating, supportsRotation := s.services.Auth.(RotatingAuthService); supportsRotation {
-			issued, err := rotating.Rotate(context.Request.Context(), identity.Token, context.Request.UserAgent(), context.ClientIP())
-			if err != nil {
-				s.clearSessionCookies(context)
-				problem.WriteError(context, err)
-				return
-			}
-			s.writeIssuedSession(context, issued, http.StatusOK)
+	if token, err := context.Cookie(s.config.Security.Session.CookieName); err == nil && strings.TrimSpace(token) != "" {
+		csrfToken, csrfErr := context.Cookie(s.config.Security.CSRF.CookieName)
+		if csrfErr != nil || strings.TrimSpace(csrfToken) == "" {
+			problem.Write(context, problem.New(http.StatusForbidden, "csrf_failed", "CSRF validation failed", "A valid CSRF token is required for this request."))
 			return
 		}
+		idempotent, ok := s.services.Auth.(IdempotentAuthService)
+		if !ok {
+			writeAuthIdempotencyError(context, auth.ErrIdempotencyUnavailable)
+			return
+		}
+		issued, err := idempotent.RotateIdempotent(
+			context.Request.Context(), worksmiddleware.IdempotencyKey(context), token, csrfToken,
+			context.Request.UserAgent(), context.ClientIP(),
+		)
+		if err != nil {
+			if writeAuthIdempotencyError(context, err) {
+				return
+			}
+			if errors.Is(err, auth.ErrSessionExpired) || errors.Is(err, auth.ErrUserDisabled) {
+				s.clearSessionCookies(context)
+			}
+			problem.WriteError(context, err)
+			return
+		}
+		s.writeIdempotentIssuedSession(context, issued, http.StatusOK)
+		return
 	}
-	csrfToken := ""
-	if identity.Transport == "cookie" {
-		csrfToken = s.ensureCSRFCookie(context, identity.Session.ExpiresAt)
+	identity, err := worksmiddleware.AuthenticateRequest(context, s.services.Auth, s.config.Security)
+	if err != nil {
+		problem.WriteError(context, err)
+		return
 	}
-	context.JSON(http.StatusOK, responseForSession(identity.Session, csrfToken, nil))
+	context.JSON(http.StatusOK, responseForSession(identity.Session, "", nil))
 }
 
 func (s *Server) LogoutSession(context *gin.Context) {
@@ -139,12 +172,44 @@ func (s *Server) LogoutSession(context *gin.Context) {
 	context.Status(http.StatusNoContent)
 }
 
-func (s *Server) writeIssuedSession(context *gin.Context, issued auth.IssuedSession, status int) {
-	s.setCookie(context, s.config.Security.Session.CookieName, issued.Token, true, issued.ExpiresAt)
-	csrfToken := s.newCSRFToken()
-	s.setCookie(context, s.config.Security.CSRF.CookieName, csrfToken, false, issued.ExpiresAt)
-	now := time.Now().UTC()
-	context.JSON(status, responseForSession(issued.Session, csrfToken, &now))
+func (s *Server) writeIdempotentIssuedSession(context *gin.Context, issued auth.IdempotentIssuedSession, status int) {
+	// Expires is stable across a replay. Omitting Max-Age avoids both changing
+	// the replay header and accidentally extending the server-side session when
+	// an old receipt is replayed later.
+	s.setIdempotentCookie(context, s.config.Security.Session.CookieName, issued.Token, true, issued.ExpiresAt)
+	s.setIdempotentCookie(context, s.config.Security.CSRF.CookieName, issued.CSRFToken, false, issued.ExpiresAt)
+	issuedAt := issued.IssuedAt
+	if issued.Replayed {
+		context.Header("Idempotency-Replayed", "true")
+	}
+	context.JSON(status, responseForSession(issued.Session, issued.CSRFToken, &issuedAt))
+}
+
+func refreshBodyIsEmpty(context *gin.Context) bool {
+	if context.Request.Body == nil {
+		return true
+	}
+	body, err := io.ReadAll(io.LimitReader(context.Request.Body, 1025))
+	if err != nil || len(body) > 1024 || strings.TrimSpace(string(body)) != "" {
+		problem.Write(context, problem.New(http.StatusBadRequest, "invalid_refresh_request", "Invalid refresh request", "The refresh request body must be empty."))
+		return false
+	}
+	return true
+}
+
+func writeAuthIdempotencyError(context *gin.Context, err error) bool {
+	switch {
+	case errors.Is(err, auth.ErrIdempotencyConflict):
+		problem.Write(context, problem.New(http.StatusConflict, "idempotency_key_conflict", "Idempotency key conflict", "This idempotency key was already used for a different authentication request."))
+	case errors.Is(err, auth.ErrIdempotencyInProgress):
+		context.Header("Retry-After", "1")
+		problem.Write(context, problem.New(http.StatusConflict, "idempotency_request_in_progress", "Request is in progress", "An authentication request with this idempotency key is still being processed."))
+	case errors.Is(err, auth.ErrIdempotencyUnavailable):
+		problem.Write(context, problem.New(http.StatusServiceUnavailable, "idempotency_unavailable", "Request protection unavailable", "The authentication request could not be safely committed. Retry later with the same key."))
+	default:
+		return false
+	}
+	return true
 }
 
 func responseForSession(session auth.Session, csrfToken string, issuedAt *time.Time) sessionResponse {
@@ -181,6 +246,15 @@ func (s *Server) setCookie(context *gin.Context, name, value string, httpOnly bo
 	http.SetCookie(context.Writer, &http.Cookie{
 		Name: name, Value: value, Path: s.config.Security.Session.CookiePath,
 		Domain: s.config.Security.Session.CookieDomain, Expires: expiresAt, MaxAge: maxAge,
+		HttpOnly: httpOnly, Secure: s.config.Security.Session.CookieSecure,
+		SameSite: cookieSameSite(s.config.Security.Session.CookieSameSite),
+	})
+}
+
+func (s *Server) setIdempotentCookie(context *gin.Context, name, value string, httpOnly bool, expiresAt time.Time) {
+	http.SetCookie(context.Writer, &http.Cookie{
+		Name: name, Value: value, Path: s.config.Security.Session.CookiePath,
+		Domain: s.config.Security.Session.CookieDomain, Expires: expiresAt,
 		HttpOnly: httpOnly, Secure: s.config.Security.Session.CookieSecure,
 		SameSite: cookieSameSite(s.config.Security.Session.CookieSameSite),
 	})

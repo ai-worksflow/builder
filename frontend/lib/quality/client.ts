@@ -96,6 +96,17 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null
 }
 
+function isBuildArtifactRef(value: unknown) {
+  return isRecord(value) &&
+    typeof value.id === 'string' &&
+    typeof value.contentRef === 'string' &&
+    typeof value.contentHash === 'string' &&
+    typeof value.buildHash === 'string' &&
+    typeof value.entryPath === 'string' &&
+    typeof value.fileCount === 'number' &&
+    typeof value.totalBytes === 'number'
+}
+
 function isQualityReport(value: unknown): value is QualityReportDto {
   if (!isRecord(value) || !isRecord(value.workspaceRevision)) return false
   return (
@@ -113,7 +124,8 @@ function isQualityReport(value: unknown): value is QualityReportDto {
     typeof value.etag === 'string' &&
     typeof value.workspaceRevision.artifactId === 'string' &&
     typeof value.workspaceRevision.revisionId === 'string' &&
-    typeof value.workspaceRevision.contentHash === 'string'
+    typeof value.workspaceRevision.contentHash === 'string' &&
+    (value.buildArtifact === undefined || isBuildArtifactRef(value.buildArtifact))
   )
 }
 
@@ -146,6 +158,7 @@ function normalizeQualityReport(report: QualityReportDto): QualityRunResult {
     })),
     diagnostics: report.diagnostics,
     durationMs: duration(report.startedAt, completedAt),
+    buildArtifact: report.buildArtifact,
   }
 }
 

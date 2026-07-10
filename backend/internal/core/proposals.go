@@ -91,7 +91,7 @@ func (s *ProposalService) CreateManifest(ctx context.Context, projectID, actorID
 		// Formal upstream sources are approved. A base revision may be a draft
 		// snapshot of the artifact currently being edited and is validated below.
 		if revision.WorkflowStatus != "approved" &&
-			(input.BaseRevision == nil || input.BaseRevision.RevisionID != source.Ref.RevisionID) {
+			!manifestSourceIsExactBase(input.BaseRevision, source.Ref) {
 			return domain.InputManifest{}, fmt.Errorf("%w: source revision %s is not approved", ErrBlockingGate, source.Ref.RevisionID)
 		}
 		manifestSources = append(manifestSources, domain.ManifestSource{
@@ -159,6 +159,14 @@ func (s *ProposalService) CreateManifest(ctx context.Context, projectID, actorID
 		return domain.InputManifest{}, fmt.Errorf("%w: %v", ErrContentNotReady, err)
 	}
 	return manifest, nil
+}
+
+func manifestSourceIsExactBase(base *VersionRef, source VersionRef) bool {
+	return base != nil &&
+		base.ArtifactID == source.ArtifactID &&
+		base.RevisionID == source.RevisionID &&
+		base.ContentHash == source.ContentHash &&
+		dereferenceString(base.AnchorID) == dereferenceString(source.AnchorID)
 }
 
 func (s *ProposalService) CreateProposal(ctx context.Context, projectID, actorID string, input CreateProposalInput) (domain.OutputProposal, error) {

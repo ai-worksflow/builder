@@ -81,3 +81,26 @@ func TestPublishProviderRejectsCredentialedAndNonHTTPPublicURLs(t *testing.T) {
 		}
 	}
 }
+
+func TestLocalStaticProviderDeclaresExactPublicDataOrigin(t *testing.T) {
+	t.Parallel()
+	provider, err := NewLocalStaticProvider(t.TempDir(), "https://Apps.Example.test/published")
+	if err != nil {
+		t.Fatal(err)
+	}
+	origins, err := provider.PublicDeploymentOrigins(ProviderRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(origins) != 1 || origins[0] != "https://apps.example.test" {
+		t.Fatalf("public deployment origins = %#v", origins)
+	}
+
+	relative, err := NewLocalStaticProvider(t.TempDir(), "/published")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := relative.PublicDeploymentOrigins(ProviderRequest{}); err == nil {
+		t.Fatal("relative publish URL cannot safely declare a browser Origin")
+	}
+}

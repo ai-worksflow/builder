@@ -27,13 +27,15 @@ import {
 import { useCollaboration } from '@/lib/collaboration/provider'
 import { useArtifactWorkspace } from '@/lib/platform/artifact-provider'
 import { usePlatformFlow } from '@/lib/platform/flow-provider'
-import type { FileOperationDto } from '@/lib/platform/flow-contract'
+import type { FileOperationDto, ImplementationProposalDto } from '@/lib/platform/flow-contract'
+import type { WorkbenchQueueItem } from '@/lib/platform/flow-queue'
 import { cn } from '@/lib/utils'
 import { useWorksflow } from '@/lib/worksflow/store'
 import type { WorkbenchView } from '@/lib/worksflow/types'
 import { FlowPanel } from './flow-panel'
 import { DatabasePanel } from './database-panel'
 import { ReleasePanel } from './release-panel'
+import { ConversationPanel } from './conversation-panel'
 
 const VIEWS: readonly { id: WorkbenchView; label: string; icon: typeof Monitor }[] = [
   { id: 'preview', label: 'Preview', icon: Monitor },
@@ -48,6 +50,7 @@ export function PlatformWorkbench() {
   const artifacts = useArtifactWorkspace()
   const [prototypeId, setPrototypeId] = useState('')
   const [showRelease, setShowRelease] = useState(false)
+  const [showConversation, setShowConversation] = useState(true)
   const selectedPrototype = artifacts.prototypes.find((item) => item.artifact.id === prototypeId)
     ?? artifacts.prototypes.find((item) => item.approvedRevision)
     ?? artifacts.prototypes[0]
@@ -59,7 +62,7 @@ export function PlatformWorkbench() {
   const unavailable = !session.signedIn || !project || backendStatus === 'error'
 
   return (
-    <div className="flex h-full flex-col">
+    <div className="relative flex h-full flex-col">
       <header className="flex min-h-12 shrink-0 items-center gap-3 border-b border-border bg-panel px-3 max-md:flex-wrap">
         <button
           type="button"
@@ -97,6 +100,15 @@ export function PlatformWorkbench() {
         </nav>
 
         <div className="ml-auto flex min-w-0 items-center gap-2 max-md:ml-0 max-md:w-full">
+          <button
+            type="button"
+            onClick={() => setShowConversation(true)}
+            disabled={unavailable}
+            className="inline-flex h-8 shrink-0 items-center gap-1.5 rounded-md border border-primary/30 bg-primary/10 px-3 text-[10px] font-semibold text-primary-bright disabled:opacity-40"
+            title="Open the governed conversation control plane"
+          >
+            <Sparkles className="size-3.5" /> Conversation
+          </button>
           <select
             value={selectedPrototype?.artifact.id ?? ''}
             onChange={(event) => setPrototypeId(event.target.value)}
@@ -155,6 +167,7 @@ export function PlatformWorkbench() {
           </div>
         </main>
       </div>
+      {showConversation && <ConversationPanel onClose={() => setShowConversation(false)} />}
       {showRelease && <ReleasePanel onClose={() => setShowRelease(false)} />}
     </div>
   )
@@ -165,12 +178,20 @@ function ImplementationWorkspace() {
   const { can } = useCollaboration()
   const files = flow.workspaceRevision?.content.files ?? []
   const [selectedPath, setSelectedPath] = useState('')
-  const selectedFile = files.find((item) => item.path === selectedPath) ?? files[0]
+  const selectedFile = selectedPath
+    ? files.find((item) => item.path === selectedPath)
+    : files[0]
   const [draft, setDraft] = useState(selectedFile?.content ?? '')
   const [newPath, setNewPath] = useState('')
   const [instruction, setInstruction] = useState('Build a complete runnable implementation from the frozen manifest. Preserve exact traceability and include tests.')
   const [model, setModel] = useState('gpt-5')
   const [showManifest, setShowManifest] = useState(true)
+  const selectedQueueIndex = flow.workbenchQueue.findIndex(
+    (item) => item.bundleId === flow.selectedBundleId,
+  )
+  const currentQueueItem = selectedQueueIndex >= 0
+    ? flow.workbenchQueue[selectedQueueIndex]
+    : undefined
 
   useEffect(() => {
     if (!selectedPath && selectedFile) setSelectedPath(selectedFile.path)
@@ -194,6 +215,11 @@ function ImplementationWorkspace() {
             <div className="flex items-center gap-2">
               <ShieldCheck className="size-4 text-success" />
               <h2 className="text-xs font-semibold text-foreground">Frozen application build manifest</h2>
+              {flow.workbenchProgress.total > 1 && (
+                <span className="rounded bg-primary/10 px-1.5 py-0.5 text-[8px] font-semibold text-primary-bright">
+                  {flow.workbenchProgress.applied}/{flow.workbenchProgress.total} applied
+                </span>
+              )}
               <button type="button" onClick={() => setShowManifest((value) => !value)} className="rounded p-1 text-faint-foreground hover:text-foreground" aria-label="Toggle manifest details"><ChevronDown className={cn('size-3 transition-transform', !showManifest && '-rotate-90')} /></button>
             </div>
             <p className="mt-1 truncate font-mono text-[9px] text-faint-foreground" title={flow.bundle.contentHash}>
@@ -203,11 +229,44 @@ function ImplementationWorkspace() {
           <div className="flex min-w-[320px] flex-1 gap-1.5 max-md:min-w-0 max-md:basis-full">
             <input value={model} onChange={(event) => setModel(event.target.value)} className="h-8 w-24 rounded-md border border-border bg-panel px-2 text-[10px] text-foreground outline-none" aria-label="Generation model" />
             <input value={instruction} onChange={(event) => setInstruction(event.target.value)} className="h-8 min-w-0 flex-1 rounded-md border border-border bg-panel px-2 text-[10px] text-foreground outline-none" aria-label="Implementation instruction" />
-            <button type="button" onClick={() => void flow.generateImplementation(instruction, model)} disabled={!can('edit') || flow.busy || !instruction.trim() || !model.trim()} className="inline-flex h-8 shrink-0 items-center gap-1 rounded-md bg-primary px-3 text-[10px] font-semibold text-primary-foreground disabled:opacity-40">
-              {flow.busy ? <LoaderCircle className="size-3 animate-spin" /> : <Sparkles className="size-3" />} Generate proposal
+            <button type="button" onClick={() => void flow.generateImplementation(instruction, model)} disabled={!can('edit') || flow.busy || !instruction.trim() || !model.trim() || proposalApplied(currentQueueItem?.proposal)} className="inline-flex h-8 shrink-0 items-center gap-1 rounded-md bg-primary px-3 text-[10px] font-semibold text-primary-foreground disabled:opacity-40">
+              {flow.busy ? <LoaderCircle className="size-3 animate-spin" /> : <Sparkles className="size-3" />} {currentQueueItem?.proposal ? 'Regenerate proposal' : 'Generate proposal'}
             </button>
           </div>
         </div>
+        {flow.workbenchQueue.length > 1 && (
+          <div className="mt-3 flex items-center gap-1.5 overflow-x-auto pb-0.5 scrollbar-thin" aria-label="Page build queue">
+            <span className="mr-1 shrink-0 text-[8px] font-semibold uppercase tracking-wider text-faint-foreground">Manifest order</span>
+            {flow.workbenchQueue.map((item, index) => {
+              const state = workbenchQueueItemState(item)
+              return (
+                <button
+                  key={item.bundleId}
+                  type="button"
+                  onClick={() => flow.selectWorkbenchBundle(item.bundleId)}
+                  className={cn(
+                    'inline-flex h-7 shrink-0 items-center gap-1.5 rounded border px-2 text-[9px]',
+                    item.bundleId === flow.selectedBundleId
+                      ? 'border-primary/50 bg-primary/10 text-primary-bright'
+                      : 'border-border bg-panel text-muted-foreground hover:text-foreground',
+                  )}
+                  title={`${item.sliceId ?? item.bundleId} · ${state}`}
+                >
+                  <span className="font-semibold">{index + 1}</span>
+                  <span className="max-w-32 truncate">{item.sliceId ?? `Page ${index + 1}`}</span>
+                  <span className={cn(
+                    'rounded px-1 py-0.5 text-[7px] font-semibold uppercase',
+                    state === 'applied'
+                      ? 'bg-success/15 text-success'
+                      : state === 'ready'
+                        ? 'bg-primary/15 text-primary-bright'
+                        : 'bg-warning/10 text-warning',
+                  )}>{state}</span>
+                </button>
+              )
+            })}
+          </div>
+        )}
         {showManifest && <ManifestFacts />}
       </section>
 
@@ -303,13 +362,33 @@ function ProposalReview() {
   const { can } = useCollaboration()
   const [rejectionReason, setRejectionReason] = useState('Not required for this implementation scope')
   const proposal = flow.proposal
+  const queueIndex = flow.workbenchQueue.findIndex(
+    (item) => item.bundleId === flow.selectedBundleId,
+  )
+  const queueTotal = flow.workbenchQueue.length
+  const isLastQueueItem = queueIndex >= 0 && queueIndex === queueTotal - 1
+  const applyLabel = flow.canCompleteWorkbench
+    ? 'Complete Workbench'
+    : queueTotal > 1
+      ? isLastQueueItem ? 'Apply and complete Workbench' : 'Apply and continue'
+      : 'Apply accepted operations'
+  const applyDescription = flow.canCompleteWorkbench
+    ? 'Every frozen page has an applied proposal. Submit the ordered proposal set and final workspace revision to continue the workflow.'
+    : proposal?.status === 'ready' && !flow.canApplyProposal
+      ? 'Apply earlier pages first. Each proposal is rebased onto the latest workspace in frozen manifest order.'
+      : queueTotal > 1
+        ? 'Apply creates an immutable workspace revision, then advances to the next frozen page bundle.'
+        : 'Apply creates an approved immutable workspace revision and consumes this exact build manifest.'
 
   return (
     <aside className="flex w-[330px] shrink-0 flex-col border-l border-border bg-panel max-xl:w-72 max-md:h-80 max-md:w-full max-md:border-l-0 max-md:border-t">
       <div className="flex h-9 shrink-0 items-center gap-2 border-b border-border px-2.5">
         <GitCompareArrows className="size-3.5 text-primary-bright" />
         <span className="text-[10px] font-semibold text-foreground">Reviewable output proposal</span>
-        {proposal && <span className="ml-auto rounded bg-white/5 px-1.5 py-0.5 font-mono text-[8px] text-faint-foreground">v{proposal.version}</span>}
+        {queueTotal > 1 && queueIndex >= 0 && (
+          <span className="ml-auto text-[8px] font-semibold text-faint-foreground">{queueIndex + 1}/{queueTotal}</span>
+        )}
+        {proposal && <span className={cn('rounded bg-white/5 px-1.5 py-0.5 font-mono text-[8px] text-faint-foreground', queueTotal <= 1 && 'ml-auto')}>v{proposal.version}</span>}
       </div>
       {!proposal ? (
         <div className="flex flex-1 items-center justify-center p-4 text-center text-[9px] leading-relaxed text-faint-foreground">
@@ -328,19 +407,66 @@ function ProposalReview() {
             </div>
             <input value={rejectionReason} onChange={(event) => setRejectionReason(event.target.value)} className="mt-1.5 h-7 w-full rounded border border-border bg-background px-2 text-[9px] text-foreground outline-none" aria-label="Operation rejection reason" />
           </div>
-          <div className="min-h-0 flex-1 space-y-1.5 overflow-y-auto p-2 scrollbar-thin">
+          <div className="min-h-0 flex-1 space-y-2 overflow-y-auto p-2 scrollbar-thin">
+            <ProposalOutputSummary proposal={proposal} />
+            <div className="flex items-center gap-2 px-0.5 text-[8px] font-semibold uppercase tracking-wider text-faint-foreground">
+              <span>File operations</span>
+              <span className="ml-auto rounded bg-white/5 px-1 py-0.5 font-mono">{proposal.operations.length}</span>
+            </div>
             {proposal.operations.map((operation) => <OperationCard key={operation.id} operation={operation} />)}
           </div>
           <div className="border-t border-border p-2">
             {proposal.unimplementedItems.length > 0 && <p className="mb-2 text-[8px] leading-relaxed text-warning">Unimplemented: {proposal.unimplementedItems.join(' · ')}</p>}
-            <button type="button" onClick={() => void flow.applyProposal()} disabled={!can('edit') || flow.busy || proposal.status !== 'ready'} className="inline-flex h-8 w-full items-center justify-center gap-1.5 rounded bg-primary text-[10px] font-semibold text-primary-foreground disabled:cursor-not-allowed disabled:opacity-35">
-              {flow.busy ? <LoaderCircle className="size-3 animate-spin" /> : <Play className="size-3" />} Apply accepted operations
+            <button type="button" onClick={() => void flow.applyProposal()} disabled={!can('edit') || flow.busy || (!flow.canCompleteWorkbench && (proposal.status !== 'ready' || !flow.canApplyProposal))} className="inline-flex h-8 w-full items-center justify-center gap-1.5 rounded bg-primary text-[10px] font-semibold text-primary-foreground disabled:cursor-not-allowed disabled:opacity-35">
+              {flow.busy ? <LoaderCircle className="size-3 animate-spin" /> : <Play className="size-3" />} {applyLabel}
             </button>
-            <p className="mt-1.5 text-[8px] leading-relaxed text-faint-foreground">Apply creates an approved immutable workspace revision and consumes this exact build manifest.</p>
+            <p className="mt-1.5 text-[8px] leading-relaxed text-faint-foreground">{applyDescription}</p>
           </div>
         </>
       )}
     </aside>
+  )
+}
+
+function ProposalOutputSummary({ proposal }: { proposal: ImplementationProposalDto }) {
+  const sections: readonly { readonly label: string; readonly values: readonly unknown[] }[] = [
+    { label: 'Routes', values: proposal.routes },
+    { label: 'APIs', values: proposal.apis },
+    { label: 'Migrations', values: proposal.migrations },
+    { label: 'Tests', values: proposal.tests },
+    { label: 'Previews', values: proposal.previews },
+    { label: 'Trace links', values: proposal.traceLinks },
+    { label: 'Diagnostics', values: proposal.diagnostics },
+    { label: 'Assumptions', values: proposal.assumptions },
+    { label: 'Unimplemented', values: proposal.unimplementedItems },
+  ]
+
+  return (
+    <section className="rounded-md border border-border bg-background p-2" aria-label="Implementation proposal output summary">
+      <div className="mb-1.5 flex items-center gap-2 text-[8px] font-semibold uppercase tracking-wider text-faint-foreground">
+        <PackageCheck className="size-3 text-primary-bright" /> Output contract
+      </div>
+      <div className="grid grid-cols-2 gap-1">
+        {sections.map((section) => (
+          <details key={section.label} className="group rounded border border-border/70 bg-panel open:col-span-2">
+            <summary className="flex cursor-pointer list-none items-center gap-1 px-1.5 py-1 text-[8px] text-muted-foreground hover:text-foreground">
+              <ChevronDown className="size-2.5 -rotate-90 transition-transform group-open:rotate-0" />
+              <span className="min-w-0 flex-1 truncate">{section.label}</span>
+              <span className="rounded bg-white/5 px-1 font-mono text-[7px] text-faint-foreground">{section.values.length}</span>
+            </summary>
+            <div className="space-y-1 border-t border-border/70 p-1.5">
+              {section.values.length === 0 ? (
+                <p className="text-[8px] text-faint-foreground">None declared.</p>
+              ) : section.values.map((value, index) => (
+                <pre key={index} className="max-h-32 overflow-auto whitespace-pre-wrap break-words rounded bg-black/20 p-1.5 font-mono text-[8px] leading-relaxed text-faint-foreground scrollbar-thin">
+                  {proposalSummaryValue(value)}
+                </pre>
+              ))}
+            </div>
+          </details>
+        ))}
+      </div>
+    </section>
   )
 }
 
@@ -432,6 +558,27 @@ function OperationIcon({ kind }: { kind: FileOperationDto['kind'] }) {
 
 function compactRef(ref: { artifactId: string; revisionId: string }) {
   return `${ref.artifactId.slice(0, 8)}:${ref.revisionId.slice(0, 8)}`
+}
+
+function proposalApplied(proposal: ImplementationProposalDto | null | undefined) {
+  return proposal?.status === 'applied' || proposal?.status === 'partially_applied'
+}
+
+function workbenchQueueItemState(item: WorkbenchQueueItem) {
+  if (proposalApplied(item.proposal)) return 'applied'
+  if (!item.proposal) return 'generate'
+  if (item.proposal.status === 'ready') return 'ready'
+  if (item.proposal.status === 'stale') return 'stale'
+  return 'review'
+}
+
+function proposalSummaryValue(value: unknown) {
+  if (typeof value === 'string') return value
+  try {
+    return JSON.stringify(value, null, 2)
+  } catch {
+    return String(value)
+  }
 }
 
 function previewDocument(files: readonly { path: string; content: string }[]) {

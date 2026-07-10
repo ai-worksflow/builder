@@ -240,7 +240,7 @@ function configuredUrl() {
     return `ws://${window.location.hostname}:8080/v1/ws`
   }
   const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-  return `${protocol}//${window.location.host}/api/platform/v1/ws`
+  return `${protocol}//${window.location.host}/v1/ws`
 }
 
 function defaultFactory(url: string, protocols?: string | string[]) {

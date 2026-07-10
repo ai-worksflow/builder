@@ -39,6 +39,8 @@ const workspaceRevision = {
 
 const deploymentId = '33333333-3333-4333-8333-333333333333'
 const deploymentVersionId = '44444444-4444-4444-8444-444444444444'
+const buildManifestId = '66666666-6666-4666-8666-666666666666'
+const qualityRunId = '77777777-7777-4777-8777-777777777777'
 
 function deployment(includeVersions = true) {
   return {
@@ -145,6 +147,8 @@ test('publish uses CSRF, idempotency and strong conditional writes', async () =>
     environment: 'preview',
     environmentRef: 'preview/default',
     workspaceRevision,
+    buildManifestId,
+    qualityRunId,
     message: 'Preview release',
   }, {
     ifMatch: `"deployment:${deploymentId}:1"`,
@@ -165,6 +169,8 @@ test('publish uses CSRF, idempotency and strong conditional writes', async () =>
       revisionId: workspaceRevision.revisionId,
       contentHash: workspaceRevision.contentHash,
     },
+    buildManifestId,
+    qualityRunId,
     message: 'Preview release',
   })
   assert.equal(result.deployment.deploymentId, deploymentId)
@@ -238,6 +244,8 @@ test('delivery RFC problems preserve actionable conflict metadata', async () => 
     client.publish('project', {
       environment: 'preview',
       workspaceRevision,
+      buildManifestId,
+      qualityRunId,
     }),
     (error: unknown) => (
       error instanceof DeliveryClientError &&

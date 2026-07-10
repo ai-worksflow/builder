@@ -28,8 +28,9 @@ export interface DeliveryPublishInput {
   readonly deploymentId?: string
   readonly environment: DeliveryEnvironment
   readonly environmentRef?: string
-  readonly workspaceRevision?: DeliveryVersionRef
-  readonly buildManifestId?: string
+  readonly workspaceRevision: DeliveryVersionRef
+  readonly buildManifestId: string
+  readonly qualityRunId: string
   readonly message?: string
 }
 
@@ -169,10 +170,9 @@ function publishBody(input: DeliveryPublishInput) {
     ...(input.deploymentId ? { deploymentId: input.deploymentId } : {}),
     environment: input.environment,
     environmentRef: input.environmentRef ?? '',
-    ...(input.workspaceRevision
-      ? { workspaceRevision: exactVersionRef(input.workspaceRevision) }
-      : {}),
-    ...(input.buildManifestId ? { buildManifestId: input.buildManifestId } : {}),
+    workspaceRevision: exactVersionRef(input.workspaceRevision),
+    buildManifestId: input.buildManifestId,
+    qualityRunId: input.qualityRunId,
     ...(input.message ? { message: input.message } : {}),
   }
 }

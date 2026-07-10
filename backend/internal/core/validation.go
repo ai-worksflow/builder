@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+
+	"github.com/worksflow/builder/backend/internal/domain"
 )
 
 type ValidationFinding struct {
@@ -29,8 +31,10 @@ func ValidateArtifactContent(kind string, payload json.RawMessage) ValidationRep
 	switch kind {
 	case "project_brief":
 		findings = append(findings, validateProjectBrief(value)...)
-	case "product_requirements", "requirement_baseline":
+	case "product_requirements":
 		findings = append(findings, validateRequirements(value)...)
+	case "requirement_baseline":
+		findings = append(findings, validateRequirementBaseline(value)...)
 	case "blueprint":
 		findings = append(findings, validateBlueprint(value)...)
 	case "page_spec":
@@ -48,9 +52,77 @@ func ValidateArtifactContent(kind string, payload json.RawMessage) ValidationRep
 	return ValidationReport{Valid: valid, Findings: findings}
 }
 
+func validateRequirementBaseline(value map[string]any) []ValidationFinding {
+	findings := make([]ValidationFinding, 0)
+	sources := objectSlice(value["sourceVersions"])
+	if len(sources) == 0 {
+		findings = append(findings, blocker("baseline.sources_required", "$.sourceVersions", "Requirement Baseline must pin at least one approved source revision."))
+	}
+	for index, source := range sources {
+		if !validVersionReference(source) {
+			findings = append(findings, blocker("baseline.invalid_source", fmt.Sprintf("$.sourceVersions[%d]", index), "Baseline sources require artifactId, revisionId, and contentHash."))
+		}
+	}
+	criteria := map[string]struct{}{}
+	requirements := make([]map[string]any, 0)
+	anchors := map[string]struct{}{}
+	for index, item := range objectSlice(value["requirements"]) {
+		kind := firstString(item, "type")
+		anchor := firstString(item, "requirementId", "acceptanceCriterionId", "key", "id")
+		if anchor == "" || strings.TrimSpace(firstString(item, "statement")) == "" {
+			findings = append(findings, blocker("baseline.invalid_requirement_fact", fmt.Sprintf("$.requirements[%d]", index), "Every baseline requirement fact needs a stable anchor and statement."))
+			continue
+		}
+		if _, duplicate := anchors[anchor]; duplicate {
+			findings = append(findings, blocker("baseline.duplicate_anchor", fmt.Sprintf("$.requirements[%d]", index), "Baseline requirement and acceptance anchors must be unique."))
+		}
+		anchors[anchor] = struct{}{}
+		switch kind {
+		case "requirement":
+			requirements = append(requirements, item)
+		case "acceptanceCriterion":
+			criteria[anchor] = struct{}{}
+		default:
+			findings = append(findings, blocker("baseline.invalid_requirement_type", fmt.Sprintf("$.requirements[%d].type", index), "Baseline requirement facts must be requirement or acceptanceCriterion."))
+		}
+	}
+	if len(requirements) == 0 {
+		findings = append(findings, blocker("baseline.requirement_required", "$.requirements", "Requirement Baseline must contain at least one requirement."))
+	}
+	for index, requirement := range requirements {
+		links := stringSlice(requirement["acceptanceCriterionIds"])
+		if strings.EqualFold(firstString(requirement, "priority"), "must") && len(links) == 0 {
+			findings = append(findings, blocker("baseline.must_has_ac", fmt.Sprintf("$.requirements[%d].acceptanceCriterionIds", index), "Every Must baseline requirement needs an acceptance criterion."))
+		}
+		for linkIndex, link := range links {
+			if _, exists := criteria[link]; !exists {
+				findings = append(findings, blocker("baseline.ac_reference", fmt.Sprintf("$.requirements[%d].acceptanceCriterionIds[%d]", index, linkIndex), "Baseline requirement references an acceptance criterion that is not present."))
+			}
+		}
+	}
+	expectedHash := firstString(value, "baselineHash")
+	if expectedHash == "" {
+		findings = append(findings, blocker("baseline.hash_required", "$.baselineHash", "Requirement Baseline must include its deterministic hash."))
+	} else {
+		hashPayload := make(map[string]any, len(value))
+		for key, field := range value {
+			hashPayload[key] = field
+		}
+		hashPayload["baselineHash"] = ""
+		actualHash, err := domain.CanonicalHash(hashPayload)
+		if err != nil || actualHash != expectedHash {
+			findings = append(findings, blocker("baseline.hash_mismatch", "$.baselineHash", "Requirement Baseline hash does not match its canonical content."))
+		}
+	}
+	return findings
+}
+
 func validateProjectBrief(value map[string]any) []ValidationFinding {
 	blocks := objectSlice(value["blocks"])
 	findings := make([]ValidationFinding, 0)
+	if strings.TrimSpace(firstString(value, "summary")) == "" {
+		findings = append(findings, blocker("brief.summary_required", "$.summary", "Project Brief must summarize the problem and desired outcome."))
+	}
 	if len(blocks) == 0 {
 		return append(findings, blocker("brief.blocks_required", "$.blocks", "Project Brief must contain structured blocks."))
 	}
@@ -58,7 +130,14 @@ func validateProjectBrief(value map[string]any) []ValidationFinding {
 	for index, block := range blocks {
 		typeName, _ := block["type"].(string)
 		if typeName == "goal" {
-			goals++
+			if strings.TrimSpace(firstString(block, "text")) == "" {
+				findings = append(findings, blocker(
+					"brief.goal_text_required", fmt.Sprintf("$.blocks[%d].text", index),
+					"Every Project Brief goal must contain a measurable outcome.",
+				))
+			} else {
+				goals++
+			}
 		}
 		if typeName == "openQuestion" && boolean(block["blocking"]) {
 			status, _ := block["status"].(string)
@@ -71,7 +150,7 @@ func validateProjectBrief(value map[string]any) []ValidationFinding {
 		}
 	}
 	if goals == 0 {
-		findings = append(findings, blocker("brief.goal_required", "$.blocks", "Project Brief must define at least one goal."))
+		findings = append(findings, blocker("brief.goal_required", "$.blocks", "Project Brief must define at least one non-empty goal."))
 	}
 	return findings
 }
@@ -79,19 +158,29 @@ func validateProjectBrief(value map[string]any) []ValidationFinding {
 func validateRequirements(value map[string]any) []ValidationFinding {
 	blocks := objectSlice(value["blocks"])
 	findings := make([]ValidationFinding, 0)
+	if strings.TrimSpace(firstString(value, "summary")) == "" {
+		findings = append(findings, blocker("requirements.summary_required", "$.summary", "Requirements must summarize the intended product outcome."))
+	}
 	if len(blocks) == 0 {
-		return []ValidationFinding{blocker("requirements.blocks_required", "$.blocks", "Requirements must contain structured blocks.")}
+		findings = append(findings, blocker("requirements.blocks_required", "$.blocks", "Requirements must contain structured blocks."))
+	}
+	for index, block := range blocks {
+		if firstString(block, "type") == "openQuestion" && boolean(block["blocking"]) {
+			status := firstString(block, "status")
+			if status != "answered" && status != "resolved" && status != "waived" {
+				findings = append(findings, blocker("requirements.blocking_question", fmt.Sprintf("$.blocks[%d]", index), "Blocking requirement questions must be resolved."))
+			}
+		}
+	}
+	structuredRequirements := objectSlice(value["requirements"])
+	structuredCriteria := objectSlice(value["acceptanceCriteria"])
+	if len(structuredRequirements) > 0 || len(structuredCriteria) > 0 {
+		return append(findings, validateStructuredRequirements(blocks, structuredRequirements, structuredCriteria)...)
 	}
 	requirementIDs := map[string]struct{}{}
 	acceptanceByRequirement := map[string]int{}
 	for index, block := range blocks {
 		typeName, _ := block["type"].(string)
-		if typeName == "openQuestion" && boolean(block["blocking"]) {
-			status, _ := block["status"].(string)
-			if status != "answered" && status != "resolved" && status != "waived" {
-				findings = append(findings, blocker("requirements.blocking_question", fmt.Sprintf("$.blocks[%d]", index), "Blocking requirement questions must be resolved."))
-			}
-		}
 		if typeName == "requirement" {
 			identifier := firstString(block, "requirementId", "key", "id")
 			if identifier == "" {
@@ -132,6 +221,63 @@ func validateRequirements(value map[string]any) []ValidationFinding {
 	return findings
 }
 
+func validateStructuredRequirements(blocks, requirements, criteria []map[string]any) []ValidationFinding {
+	findings := make([]ValidationFinding, 0)
+	blockIDs := make(map[string]struct{}, len(blocks))
+	for _, block := range blocks {
+		if identifier := firstString(block, "id"); identifier != "" {
+			blockIDs[identifier] = struct{}{}
+		}
+	}
+	criterionIDs := make(map[string]struct{}, len(criteria))
+	for index, criterion := range criteria {
+		identifier := firstString(criterion, "id", "key", "acceptanceCriterionId")
+		if identifier == "" || strings.TrimSpace(firstString(criterion, "statement")) == "" {
+			findings = append(findings, blocker("requirements.invalid_ac", fmt.Sprintf("$.acceptanceCriteria[%d]", index), "Every acceptance criterion needs a stable ID and statement."))
+			continue
+		}
+		if _, duplicate := criterionIDs[identifier]; duplicate {
+			findings = append(findings, blocker("requirements.duplicate_ac_id", fmt.Sprintf("$.acceptanceCriteria[%d].id", index), "Acceptance criterion IDs must be unique."))
+		}
+		criterionIDs[identifier] = struct{}{}
+	}
+	if len(requirements) == 0 {
+		findings = append(findings, blocker("requirements.requirement_required", "$.requirements", "At least one requirement is required."))
+		return findings
+	}
+	requirementIDs := make(map[string]struct{}, len(requirements))
+	for index, requirement := range requirements {
+		identifier := firstString(requirement, "id", "key", "requirementId")
+		if identifier == "" || strings.TrimSpace(firstString(requirement, "statement")) == "" {
+			findings = append(findings, blocker("requirements.invalid_requirement", fmt.Sprintf("$.requirements[%d]", index), "Every requirement needs a stable ID and statement."))
+			continue
+		}
+		if _, duplicate := requirementIDs[identifier]; duplicate {
+			findings = append(findings, blocker("requirements.duplicate_id", fmt.Sprintf("$.requirements[%d].id", index), "Requirement IDs must be unique."))
+		}
+		requirementIDs[identifier] = struct{}{}
+		linked := stringSlice(requirement["acceptanceCriterionIds"])
+		if strings.EqualFold(firstString(requirement, "priority"), "must") && len(linked) == 0 {
+			findings = append(findings, blocker("requirements.must_has_ac", fmt.Sprintf("$.requirements[%d].acceptanceCriterionIds", index), "Every Must requirement needs at least one acceptance criterion."))
+		}
+		for linkIndex, criterionID := range linked {
+			if _, exists := criterionIDs[criterionID]; !exists {
+				findings = append(findings, blocker("requirements.ac_reference", fmt.Sprintf("$.requirements[%d].acceptanceCriterionIds[%d]", index, linkIndex), "Requirement references an acceptance criterion that does not exist."))
+			}
+		}
+		sources := stringSlice(requirement["sourceBlockIds"])
+		if len(sources) == 0 {
+			findings = append(findings, blocker("requirements.source_block_required", fmt.Sprintf("$.requirements[%d].sourceBlockIds", index), "Every requirement must trace to at least one source block."))
+		}
+		for sourceIndex, blockID := range sources {
+			if _, exists := blockIDs[blockID]; !exists {
+				findings = append(findings, blocker("requirements.source_block_reference", fmt.Sprintf("$.requirements[%d].sourceBlockIds[%d]", index, sourceIndex), "Requirement references a source block that does not exist."))
+			}
+		}
+	}
+	return findings
+}
+
 func validateBlueprint(value map[string]any) []ValidationFinding {
 	nodes := objectSlice(value["nodes"])
 	edges := objectSlice(value["edges"])
@@ -149,8 +295,12 @@ func validateBlueprint(value map[string]any) []ValidationFinding {
 		"realized_by": true, "implemented_by": true, "verified_by": true,
 	}
 	nodeByID := make(map[string]map[string]any, len(nodes))
+	nodeKeys := make(map[string]struct{}, len(nodes))
 	pageHasFeature := map[string]bool{}
+	protectedOperations := map[string]bool{}
 	contains := map[string][]string{}
+	routes := map[string]struct{}{}
+	operations := map[string]struct{}{}
 	for index, node := range nodes {
 		id := firstString(node, "id")
 		key := firstString(node, "key", "businessKey")
@@ -162,21 +312,48 @@ func validateBlueprint(value map[string]any) []ValidationFinding {
 		if _, duplicate := nodeByID[id]; duplicate {
 			findings = append(findings, blocker("blueprint.duplicate_node", fmt.Sprintf("$.nodes[%d].id", index), "Node IDs must be unique."))
 		}
+		if _, duplicate := nodeKeys[key]; duplicate {
+			findings = append(findings, blocker("blueprint.duplicate_key", fmt.Sprintf("$.nodes[%d].key", index), "Blueprint business keys must be unique."))
+		}
+		nodeKeys[key] = struct{}{}
 		nodeByID[id] = node
 		if kind == "page" {
 			spec, _ := node["spec"].(map[string]any)
 			if spec == nil {
 				spec = node
 			}
-			if firstString(spec, "route") == "" || firstString(spec, "goal", "userGoal") == "" {
+			route := firstString(spec, "route")
+			if route == "" || firstString(spec, "goal", "userGoal") == "" {
 				findings = append(findings, blocker("blueprint.page_spec", fmt.Sprintf("$.nodes[%d]", index), "Every Page needs a route and user goal."))
+			}
+			if route != "" {
+				if _, duplicate := routes[route]; duplicate {
+					findings = append(findings, blocker("blueprint.duplicate_route", fmt.Sprintf("$.nodes[%d].route", index), "Page routes must be unique."))
+				}
+				routes[route] = struct{}{}
+			}
+			if len(stringSlice(node["requirementIds"])) == 0 {
+				findings = append(findings, blocker("blueprint.page_requirement", fmt.Sprintf("$.nodes[%d].requirementIds", index), "Every Page must trace to at least one stable requirement ID."))
+			}
+		}
+		if kind == "apiOperation" || kind == "api" {
+			method := strings.ToUpper(firstString(node, "method"))
+			path := firstString(node, "path", "route")
+			if !allowedHTTPMethod(method) || path == "" || !strings.HasPrefix(path, "/") {
+				findings = append(findings, blocker("blueprint.api_operation", fmt.Sprintf("$.nodes[%d]", index), "Every API operation needs a supported HTTP method and absolute path."))
+			} else {
+				operation := method + " " + path
+				if _, duplicate := operations[operation]; duplicate {
+					findings = append(findings, blocker("blueprint.duplicate_operation", fmt.Sprintf("$.nodes[%d]", index), "API method/path pairs must be unique."))
+				}
+				operations[operation] = struct{}{}
 			}
 		}
 	}
 	for index, edge := range edges {
 		from := firstString(edge, "from", "sourceNodeId", "source")
 		to := firstString(edge, "to", "targetNodeId", "target")
-		relation := firstString(edge, "type", "relation")
+		relation := firstString(edge, "type", "kind", "relation")
 		if nodeByID[from] == nil || nodeByID[to] == nil || !allowedEdges[relation] || from == to {
 			findings = append(findings, blocker("blueprint.invalid_edge", fmt.Sprintf("$.edges[%d]", index), "Edges must use valid endpoints and a supported semantic relation."))
 			continue
@@ -187,6 +364,9 @@ func validateBlueprint(value map[string]any) []ValidationFinding {
 				pageHasFeature[to] = true
 			}
 		}
+		if relation == "requires" && firstString(nodeByID[to], "type", "kind") == "permission" {
+			protectedOperations[from] = true
+		}
 	}
 	if hasDirectedCycle(contains) {
 		findings = append(findings, blocker("blueprint.contains_cycle", "$.edges", "The contains relationship must be acyclic."))
@@ -195,13 +375,33 @@ func validateBlueprint(value map[string]any) []ValidationFinding {
 		if firstString(node, "type", "kind") == "page" && !pageHasFeature[id] {
 			findings = append(findings, blocker("blueprint.page_feature", "$.nodes", fmt.Sprintf("Page %s must belong to a Feature.", id)))
 		}
+		kind := firstString(node, "type", "kind")
+		if (kind == "apiOperation" || kind == "api") && !protectedOperations[id] {
+			findings = append(findings, blocker("blueprint.api_permission", "$.edges", fmt.Sprintf("API operation %s must require a Permission node.", id)))
+		}
 	}
 	return findings
 }
 
+func allowedHTTPMethod(method string) bool {
+	switch method {
+	case "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS":
+		return true
+	default:
+		return false
+	}
+}
+
 func validatePageSpec(value map[string]any) []ValidationFinding {
 	findings := make([]ValidationFinding, 0)
-	if firstString(value, "route") == "" {
+	if firstString(value, "blueprintPageNodeId") == "" {
+		findings = append(findings, blocker("page_spec.blueprint_node", "$.blueprintPageNodeId", "PageSpec must bind one stable Blueprint Page node."))
+	}
+	if firstString(value, "title") == "" {
+		findings = append(findings, blocker("page_spec.title", "$.title", "PageSpec needs a title."))
+	}
+	route := firstString(value, "route")
+	if route == "" || !strings.HasPrefix(route, "/") {
 		findings = append(findings, blocker("page_spec.route", "$.route", "PageSpec needs a route."))
 	}
 	if firstString(value, "goal", "userGoal") == "" {
@@ -209,18 +409,60 @@ func validatePageSpec(value map[string]any) []ValidationFinding {
 	}
 	states := objectSlice(value["states"])
 	stateIDs := map[string]bool{}
-	for _, state := range states {
-		stateIDs[firstString(state, "id", "key", "name")] = true
+	stateKeys := map[string]bool{}
+	for index, state := range states {
+		identifier := firstString(state, "id")
+		key := firstString(state, "key", "name")
+		if identifier == "" || key == "" || firstString(state, "title") == "" {
+			findings = append(findings, blocker("page_spec.invalid_state", fmt.Sprintf("$.states[%d]", index), "Every PageSpec state needs a stable ID, key, and title."))
+		}
+		if stateIDs[identifier] || stateKeys[key] {
+			findings = append(findings, blocker("page_spec.duplicate_state", fmt.Sprintf("$.states[%d]", index), "PageSpec state IDs and keys must be unique."))
+		}
+		stateIDs[identifier] = true
+		stateKeys[key] = true
 	}
 	for _, required := range []string{"ready", "loading", "empty", "error"} {
-		if !stateIDs[required] {
+		if !stateKeys[required] {
 			findings = append(findings, blocker("page_spec.required_state", "$.states", fmt.Sprintf("PageSpec must declare the %s state.", required)))
 		}
 	}
 	if len(objectSlice(value["acceptanceRefs"])) == 0 && len(stringSlice(value["acceptanceCriterionIds"])) == 0 {
 		findings = append(findings, blocker("page_spec.acceptance_trace", "$.acceptanceRefs", "PageSpec must trace to at least one acceptance criterion."))
 	}
+	bindingIDs := map[string]bool{}
+	for index, binding := range objectSlice(value["dataBindings"]) {
+		identifier := firstString(binding, "id")
+		source := firstString(binding, "source")
+		if identifier == "" || firstString(binding, "name") == "" || !allowedPageDataSource(source) {
+			findings = append(findings, blocker("page_spec.invalid_binding", fmt.Sprintf("$.dataBindings[%d]", index), "Every data binding needs a stable ID, name, and supported source."))
+		}
+		if bindingIDs[identifier] {
+			findings = append(findings, blocker("page_spec.duplicate_binding", fmt.Sprintf("$.dataBindings[%d].id", index), "PageSpec data binding IDs must be unique."))
+		}
+		bindingIDs[identifier] = true
+	}
+	interactionIDs := map[string]bool{}
+	for index, interaction := range objectSlice(value["interactions"]) {
+		identifier := firstString(interaction, "id")
+		if identifier == "" || firstString(interaction, "trigger") == "" || firstString(interaction, "outcome") == "" {
+			findings = append(findings, blocker("page_spec.invalid_interaction", fmt.Sprintf("$.interactions[%d]", index), "Every interaction needs a stable ID, trigger, and outcome."))
+		}
+		if interactionIDs[identifier] {
+			findings = append(findings, blocker("page_spec.duplicate_interaction", fmt.Sprintf("$.interactions[%d].id", index), "PageSpec interaction IDs must be unique."))
+		}
+		interactionIDs[identifier] = true
+	}
 	return findings
+}
+
+func allowedPageDataSource(source string) bool {
+	switch source {
+	case "api", "database", "fixture", "local":
+		return true
+	default:
+		return false
+	}
 }
 
 func validatePrototype(value map[string]any) []ValidationFinding {
@@ -231,12 +473,46 @@ func validatePrototype(value map[string]any) []ValidationFinding {
 	if !validVersionReference(value["pageSpecRevision"]) && !legacyPageSpecRef {
 		findings = append(findings, blocker("prototype.page_spec_ref", "$.pageSpecRevision", "Prototype must pin an exact PageSpec revision and hash."))
 	}
-	if len(objectSlice(value["states"])) == 0 {
+	states := objectSlice(value["states"])
+	if len(states) == 0 {
 		findings = append(findings, blocker("prototype.states", "$.states", "Prototype must contain the PageSpec states."))
+	}
+	stateIDs := map[string]bool{}
+	stateKeys := map[string]bool{}
+	for index, state := range states {
+		identifier := firstString(state, "id")
+		key := firstString(state, "key")
+		if identifier == "" || key == "" || firstString(state, "title") == "" {
+			findings = append(findings, blocker("prototype.invalid_state", fmt.Sprintf("$.states[%d]", index), "Every prototype state needs a stable ID, key, and title."))
+		}
+		if stateIDs[identifier] || stateKeys[key] {
+			findings = append(findings, blocker("prototype.duplicate_state", fmt.Sprintf("$.states[%d]", index), "Prototype state IDs and keys must be unique."))
+		}
+		stateIDs[identifier] = true
+		stateKeys[key] = true
 	}
 	breakpoints := objectSlice(value["breakpoints"])
 	if len(breakpoints) < 3 {
 		findings = append(findings, blocker("prototype.breakpoints", "$.breakpoints", "Prototype must provide desktop, tablet, and mobile breakpoints."))
+	}
+	breakpointIDs := map[string]bool{}
+	breakpointNames := map[string]bool{}
+	for index, breakpoint := range breakpoints {
+		identifier := firstString(breakpoint, "id")
+		name := strings.ToLower(firstString(breakpoint, "name", "key"))
+		if identifier == "" || name == "" {
+			findings = append(findings, blocker("prototype.invalid_breakpoint", fmt.Sprintf("$.breakpoints[%d]", index), "Every breakpoint needs a stable ID and name."))
+		}
+		if breakpointIDs[identifier] || breakpointNames[name] {
+			findings = append(findings, blocker("prototype.duplicate_breakpoint", fmt.Sprintf("$.breakpoints[%d]", index), "Prototype breakpoint IDs and names must be unique."))
+		}
+		breakpointIDs[identifier] = true
+		breakpointNames[name] = true
+	}
+	for _, required := range []string{"desktop", "tablet", "mobile"} {
+		if !breakpointNames[required] {
+			findings = append(findings, blocker("prototype.required_breakpoint", "$.breakpoints", fmt.Sprintf("Prototype must declare the %s breakpoint.", required)))
+		}
 	}
 	layerObjects := prototypeLayerObjects(value["layers"])
 	layers := objectSlice(value["layers"])
@@ -263,15 +539,35 @@ func validatePrototype(value map[string]any) []ValidationFinding {
 		}
 		seen[id] = true
 	}
+	for id, layer := range layerObjects {
+		if parentID := firstString(layer, "parentId"); parentID != "" && layerObjects[parentID] == nil {
+			findings = append(findings, blocker("prototype.layer_parent", "$.layers."+id+".parentId", "Layer parentId must reference an existing layer."))
+		}
+		for childIndex, childID := range stringSlice(layer["childIds"]) {
+			if layerObjects[childID] == nil || childID == id {
+				findings = append(findings, blocker("prototype.layer_child", fmt.Sprintf("$.layers.%s.childIds[%d]", id, childIndex), "Layer childIds must reference another existing layer."))
+			}
+		}
+	}
 	frames := objectSlice(value["frames"])
 	if len(frames) == 0 {
 		findings = append(findings, blocker("prototype.frames", "$.frames", "Prototype must define a frame for each required state and breakpoint."))
 	} else {
 		coverage := map[string]bool{}
-		for _, frame := range frames {
-			coverage[firstString(frame, "stateId")+"\x00"+firstString(frame, "breakpointId")] = true
+		for index, frame := range frames {
+			stateID := firstString(frame, "stateId")
+			breakpointID := firstString(frame, "breakpointId")
+			rootLayerID := firstString(frame, "rootLayerId")
+			key := stateID + "\x00" + breakpointID
+			if firstString(frame, "id") == "" || !stateIDs[stateID] || !breakpointIDs[breakpointID] || layerObjects[rootLayerID] == nil {
+				findings = append(findings, blocker("prototype.invalid_frame", fmt.Sprintf("$.frames[%d]", index), "Every frame must reference an existing state, breakpoint, and root layer."))
+			}
+			if coverage[key] {
+				findings = append(findings, blocker("prototype.duplicate_frame", fmt.Sprintf("$.frames[%d]", index), "Only one base frame is allowed per state and breakpoint pair."))
+			}
+			coverage[key] = true
 		}
-		for _, state := range objectSlice(value["states"]) {
+		for _, state := range states {
 			if required, exists := state["required"].(bool); exists && !required {
 				continue
 			}
@@ -287,6 +583,21 @@ func validatePrototype(value map[string]any) []ValidationFinding {
 	for index, fixture := range objectSlice(value["fixtures"]) {
 		if sanitized, exists := fixture["sanitized"].(bool); !exists || !sanitized {
 			findings = append(findings, blocker("prototype.fixture_sanitized", fmt.Sprintf("$.fixtures[%d]", index), "Prototype fixtures must be marked sanitized."))
+		}
+		if !stateIDs[firstString(fixture, "stateId")] {
+			findings = append(findings, blocker("prototype.fixture_state", fmt.Sprintf("$.fixtures[%d].stateId", index), "Prototype fixture stateId must reference an existing state."))
+		}
+	}
+	allowedTriggers := map[string]bool{"click": true, "submit": true, "change": true, "hover": true, "load": true}
+	allowedActions := map[string]bool{"navigate": true, "setState": true, "openOverlay": true, "closeOverlay": true, "updateBinding": true, "submitFixture": true}
+	for index, interaction := range objectSlice(value["interactions"]) {
+		if firstString(interaction, "id") == "" || layerObjects[firstString(interaction, "sourceLayerId")] == nil || !allowedTriggers[firstString(interaction, "trigger")] {
+			findings = append(findings, blocker("prototype.invalid_interaction", fmt.Sprintf("$.interactions[%d]", index), "Interactions require a stable ID, existing source layer, and whitelisted trigger."))
+		}
+		for actionIndex, action := range objectSlice(interaction["actions"]) {
+			if !allowedActions[firstString(action, "type")] {
+				findings = append(findings, blocker("prototype.invalid_action", fmt.Sprintf("$.interactions[%d].actions[%d]", index, actionIndex), "Prototype interaction actions must use the declarative whitelist."))
+			}
 		}
 	}
 	return findings

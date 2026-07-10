@@ -65,21 +65,22 @@ type ArtifactDraft struct {
 }
 
 type ArtifactRevision struct {
-	ID               string          `json:"id"`
-	ArtifactID       string          `json:"artifactId"`
-	RevisionNumber   uint64          `json:"revisionNumber"`
-	ParentRevisionID *string         `json:"basedOnRevisionId,omitempty"`
-	SchemaVersion    int             `json:"schemaVersion"`
-	Content          json.RawMessage `json:"content"`
-	ContentHash      string          `json:"contentHash"`
-	WorkflowStatus   string          `json:"status"`
-	ChangeSource     string          `json:"changeSource"`
-	ChangeSummary    string          `json:"changeSummary"`
-	SourceManifestID *string         `json:"sourceManifestId,omitempty"`
-	ProposalID       *string         `json:"proposalId,omitempty"`
-	CreatedBy        string          `json:"createdBy"`
-	CreatedAt        time.Time       `json:"createdAt"`
-	ApprovedAt       *time.Time      `json:"approvedAt,omitempty"`
+	ID               string           `json:"id"`
+	ArtifactID       string           `json:"artifactId"`
+	RevisionNumber   uint64           `json:"revisionNumber"`
+	ParentRevisionID *string          `json:"basedOnRevisionId,omitempty"`
+	SourceVersions   []ArtifactSource `json:"sourceVersions,omitempty"`
+	SchemaVersion    int              `json:"schemaVersion"`
+	Content          json.RawMessage  `json:"content"`
+	ContentHash      string           `json:"contentHash"`
+	WorkflowStatus   string           `json:"status"`
+	ChangeSource     string           `json:"changeSource"`
+	ChangeSummary    string           `json:"changeSummary"`
+	SourceManifestID *string          `json:"sourceManifestId,omitempty"`
+	ProposalID       *string          `json:"proposalId,omitempty"`
+	CreatedBy        string           `json:"createdBy"`
+	CreatedAt        time.Time        `json:"createdAt"`
+	ApprovedAt       *time.Time       `json:"approvedAt,omitempty"`
 }
 
 type VersionedArtifact struct {
@@ -153,6 +154,11 @@ func (s *ArtifactService) Create(ctx context.Context, projectID, actorID string,
 	}
 	if len(input.Content) == 0 {
 		input.Content = json.RawMessage(`{"schemaVersion":1}`)
+	}
+	if err := s.validateArtifactLineage(
+		ctx, s.database, projectUUID, input.Kind, input.Content, input.SourceVersions,
+	); err != nil {
+		return VersionedArtifact{}, err
 	}
 	artifactID := uuid.New()
 	draftID := uuid.New()
@@ -334,11 +340,29 @@ func (s *ArtifactService) UpdateDraft(ctx context.Context, draftID, actorID, exp
 	if current.Status != "draft" {
 		return ArtifactDraft{}, ErrConflict
 	}
+	var artifact storage.ArtifactModel
+	if err := s.database.WithContext(ctx).Where("id = ?", current.ArtifactID).Take(&artifact).Error; err != nil {
+		return ArtifactDraft{}, err
+	}
 	if input.SchemaVersion <= 0 {
 		input.SchemaVersion = current.SchemaVersion
 	}
 	if len(input.Content) == 0 {
 		return ArtifactDraft{}, fmt.Errorf("%w: draft content", ErrInvalidInput)
+	}
+	var existingSources []storage.ArtifactDraftSourceModel
+	effectiveSources := input.SourceVersions
+	if input.SourceVersions == nil {
+		existingSources, err = s.loadDraftSourceModels(ctx, draftUUID)
+		if err != nil {
+			return ArtifactDraft{}, err
+		}
+		effectiveSources = sourceInputsFromDraftModels(existingSources)
+	}
+	if err := s.validateArtifactLineage(
+		ctx, s.database, projectUUID, artifact.Kind, input.Content, effectiveSources,
+	); err != nil {
+		return ArtifactDraft{}, err
 	}
 	contentRef, err := s.contents.PutPending(ctx, projectUUID.String(), "artifact_draft", draftID, input.SchemaVersion, input.Content)
 	if err != nil {
@@ -357,7 +381,7 @@ func (s *ArtifactService) UpdateDraft(ctx context.Context, draftID, actorID, exp
 	now := s.now().UTC()
 	nextSequence := current.Sequence + 1
 	nextETag := draftETag(draftUUID, nextSequence, contentRef.ContentHash)
-	var replacementSources []storage.ArtifactDraftSourceModel
+	replacementSources := existingSources
 	if input.SourceVersions != nil {
 		replacementSources, err = s.validateSourceModels(ctx, projectUUID, draftUUID, actorUUID, input.SourceVersions)
 		if err != nil {
@@ -414,12 +438,6 @@ func (s *ArtifactService) UpdateDraft(ctx context.Context, draftID, actorID, exp
 	current.ByteSize = contentRef.ByteSize
 	current.UpdatedBy = actorUUID
 	current.UpdatedAt = now
-	if input.SourceVersions == nil {
-		replacementSources, err = s.loadDraftSourceModels(ctx, draftUUID)
-		if err != nil {
-			return ArtifactDraft{}, err
-		}
-	}
 	return draftFromModel(current, cloneJSON(input.Content), sourcesFromModels(replacementSources)), nil
 }
 
@@ -459,6 +477,25 @@ func (s *ArtifactService) CreateRevision(ctx context.Context, artifactID, actorI
 		if expectedDraftETag == "" || draft.ETag != expectedDraftETag || draft.Status != "draft" {
 			return ErrConflict
 		}
+		storedDraft, err := s.contents.Get(ctx, draft.ContentRef, draft.ContentHash)
+		if err != nil {
+			return err
+		}
+		var draftSources []storage.ArtifactDraftSourceModel
+		if err := transaction.Where("draft_id = ?", draft.ID).
+			Order("added_at ASC, source_revision_id ASC, purpose ASC").Find(&draftSources).Error; err != nil {
+			return err
+		}
+		if err := s.validateArtifactLineage(
+			ctx,
+			transaction,
+			projectID,
+			artifact.Kind,
+			storedDraft.Payload,
+			sourceInputsFromDraftModels(draftSources),
+		); err != nil {
+			return err
+		}
 		if artifact.LatestRevisionID != nil {
 			var previous storage.ArtifactRevisionModel
 			if err := transaction.Clauses(clause.Locking{Strength: "UPDATE"}).
@@ -496,32 +533,25 @@ func (s *ArtifactService) CreateRevision(ctx context.Context, artifactID, actorI
 		if err := transaction.Create(&revisionModel).Error; err != nil {
 			return err
 		}
-		var draftSources []storage.ArtifactDraftSourceModel
-		if err := transaction.Where("draft_id = ?", draft.ID).Find(&draftSources).Error; err != nil {
-			return err
-		}
-		for _, source := range draftSources {
-			targetRevisionID := revisionID
-			dependency := storage.ArtifactDependencyModel{
-				ID: uuid.New(), ProjectID: projectID, SourceArtifactID: source.SourceArtifactID,
-				SourceRevisionID: source.SourceRevisionID, SourceContentHash: source.SourceContentHash,
-				TargetArtifactID: artifactUUID, TargetRevisionID: &targetRevisionID,
-				Relation: "derives_from", Required: source.Required, CreatedBy: actorUUID, CreatedAt: now,
+		frozenSources := revisionSourceModelsFromDraft(revisionID, draftSources)
+		if len(frozenSources) > 0 {
+			if err := transaction.Create(&frozenSources).Error; err != nil {
+				return err
 			}
+		}
+		dependencies, links := revisionLineageModelsFromDraft(
+			projectID, artifactUUID, revisionID, actorUUID, now, draftSources,
+		)
+		for index := range dependencies {
+			dependency := dependencies[index]
 			if err := transaction.Create(&dependency).Error; err != nil {
 				return err
 			}
-			if source.SourceAnchorID != nil {
-				link := storage.TraceLinkModel{
-					ID: uuid.New(), ProjectID: projectID, SourceArtifactID: source.SourceArtifactID,
-					SourceRevisionID: source.SourceRevisionID, SourceAnchorID: source.SourceAnchorID,
-					TargetArtifactID: artifactUUID, TargetRevisionID: &targetRevisionID,
-					Relation: "derives_from", Metadata: json.RawMessage(`{}`),
-					CreatedBy: actorUUID, CreatedAt: now,
-				}
-				if err := transaction.Create(&link).Error; err != nil {
-					return err
-				}
+		}
+		for index := range links {
+			link := links[index]
+			if err := transaction.Create(&link).Error; err != nil {
+				return err
 			}
 		}
 		if err := transaction.Model(&storage.ArtifactModel{}).Where("id = ?", artifactUUID).
@@ -555,13 +585,21 @@ func (s *ArtifactService) ListRevisions(ctx context.Context, artifactID, actorID
 		Order("revision_number DESC").Find(&models).Error; err != nil {
 		return nil, err
 	}
+	revisionIDs := make([]uuid.UUID, 0, len(models))
+	for _, model := range models {
+		revisionIDs = append(revisionIDs, model.ID)
+	}
+	sourceModels, err := s.loadRevisionSourceModels(ctx, revisionIDs)
+	if err != nil {
+		return nil, err
+	}
 	result := make([]ArtifactRevision, 0, len(models))
 	for _, model := range models {
-		revision, err := s.revisionWithContent(ctx, model, false)
-		if err != nil {
-			return nil, err
-		}
-		result = append(result, revision)
+		result = append(result, revisionFromModel(
+			model,
+			nil,
+			revisionSourcesFromModels(sourceModels[model.ID]),
+		))
 	}
 	return result, nil
 }
@@ -639,7 +677,11 @@ func (s *ArtifactService) revisionWithContent(ctx context.Context, model storage
 		}
 		payload = stored.Payload
 	}
-	return revisionFromModel(model, payload), nil
+	sourceModels, err := s.loadRevisionSourceModels(ctx, []uuid.UUID{model.ID})
+	if err != nil {
+		return ArtifactRevision{}, err
+	}
+	return revisionFromModel(model, payload, revisionSourcesFromModels(sourceModels[model.ID])), nil
 }
 
 type artifactStatusFields struct {
@@ -719,19 +761,272 @@ func (s *ArtifactService) validateSourceModels(ctx context.Context, projectID, d
 			return nil, fmt.Errorf("%w: duplicate source", ErrInvalidInput)
 		}
 		seen[key] = true
+		var sourceAnchorID *string
+		if input.Ref.AnchorID != nil {
+			anchor := strings.TrimSpace(*input.Ref.AnchorID)
+			if anchor != "" {
+				sourceAnchorID = &anchor
+			}
+		}
 		result = append(result, storage.ArtifactDraftSourceModel{
 			DraftID: draftID, SourceArtifactID: artifactID, SourceRevisionID: revisionID,
-			SourceContentHash: input.Ref.ContentHash, SourceAnchorID: input.Ref.AnchorID, Purpose: input.Purpose,
+			SourceContentHash: input.Ref.ContentHash, SourceAnchorID: sourceAnchorID, Purpose: input.Purpose,
 			Required: input.Required, AddedBy: actorID, AddedAt: s.now().UTC(),
 		})
 	}
 	return result, nil
 }
 
+type resolvedArtifactLineageSource struct {
+	Input    ArtifactSourceInput
+	Artifact storage.ArtifactModel
+	Revision storage.ArtifactRevisionModel
+}
+
+func (s *ArtifactService) validateArtifactLineage(
+	ctx context.Context,
+	database *gorm.DB,
+	projectID uuid.UUID,
+	kind string,
+	payload json.RawMessage,
+	inputs []ArtifactSourceInput,
+) error {
+	switch kind {
+	case "blueprint":
+		return s.validateBlueprintBaselineSources(ctx, database, projectID, inputs)
+	case "page_spec":
+		return s.validatePageSpecBlueprintSource(ctx, database, projectID, payload, inputs)
+	case "prototype":
+		return s.validatePrototypePageSpecSource(ctx, database, projectID, payload, inputs)
+	default:
+		return nil
+	}
+}
+
+func (s *ArtifactService) validatePageSpecBlueprintSource(
+	ctx context.Context,
+	database *gorm.DB,
+	projectID uuid.UUID,
+	payload json.RawMessage,
+	inputs []ArtifactSourceInput,
+) error {
+	var content map[string]any
+	if json.Unmarshal(payload, &content) != nil {
+		return fmt.Errorf("%w: PageSpec content must be a JSON object", ErrBlockingGate)
+	}
+	pageNodeID := strings.TrimSpace(firstString(content, "blueprintPageNodeId"))
+	if pageNodeID == "" {
+		return fmt.Errorf("%w: PageSpec must declare blueprintPageNodeId", ErrBlockingGate)
+	}
+	resolved, err := s.resolveArtifactLineageSources(ctx, database, projectID, inputs)
+	if err != nil {
+		return err
+	}
+	blueprints := lineageSourcesByKind(resolved, "blueprint")
+	if len(blueprints) != 1 {
+		return fmt.Errorf("%w: PageSpec requires exactly one approved Blueprint source", ErrBlockingGate)
+	}
+	source := blueprints[0]
+	anchor := ""
+	if source.Input.Ref.AnchorID != nil {
+		anchor = strings.TrimSpace(*source.Input.Ref.AnchorID)
+	}
+	if !source.Input.Required || strings.TrimSpace(source.Input.Purpose) != "blueprint" || anchor != pageNodeID {
+		return fmt.Errorf("%w: PageSpec Blueprint source must be required and anchored to blueprintPageNodeId", ErrBlockingGate)
+	}
+	if source.Artifact.Lifecycle != "active" || source.Revision.WorkflowStatus != "approved" {
+		return fmt.Errorf("%w: PageSpec Blueprint source must be an approved active revision", ErrBlockingGate)
+	}
+	stored, err := s.contents.Get(ctx, source.Revision.ContentRef, source.Revision.ContentHash)
+	if err != nil {
+		return err
+	}
+	if !blueprintContainsPageNode(stored.Payload, pageNodeID) {
+		return fmt.Errorf("%w: PageSpec Blueprint anchor must identify an existing Page node", ErrBlockingGate)
+	}
+	return nil
+}
+
+func (s *ArtifactService) validatePrototypePageSpecSource(
+	ctx context.Context,
+	database *gorm.DB,
+	projectID uuid.UUID,
+	payload json.RawMessage,
+	inputs []ArtifactSourceInput,
+) error {
+	var content struct {
+		PageSpecRevision VersionRef `json:"pageSpecRevision"`
+		Exploratory      bool       `json:"exploratory"`
+	}
+	if json.Unmarshal(payload, &content) != nil {
+		return fmt.Errorf("%w: Prototype content must pin pageSpecRevision", ErrBlockingGate)
+	}
+	resolved, err := s.resolveArtifactLineageSources(ctx, database, projectID, inputs)
+	if err != nil {
+		return err
+	}
+	pageSpecs := lineageSourcesByKind(resolved, "page_spec")
+	if len(pageSpecs) != 1 {
+		return fmt.Errorf("%w: Prototype requires exactly one PageSpec source", ErrBlockingGate)
+	}
+	source := pageSpecs[0]
+	if !source.Input.Required || strings.TrimSpace(source.Input.Purpose) != "page_spec" || hasVersionAnchor(source.Input.Ref) {
+		return fmt.Errorf("%w: Prototype PageSpec source must be one required whole revision", ErrBlockingGate)
+	}
+	if hasVersionAnchor(content.PageSpecRevision) || !sameWholeVersionRef(source.Input.Ref, content.PageSpecRevision) {
+		return fmt.Errorf("%w: Prototype content pageSpecRevision must exactly match its PageSpec source", ErrBlockingGate)
+	}
+	if source.Artifact.Lifecycle != "active" {
+		return fmt.Errorf("%w: Prototype PageSpec source must be active", ErrBlockingGate)
+	}
+	if content.Exploratory {
+		return nil
+	}
+	if source.Revision.WorkflowStatus != "approved" || source.Artifact.LatestApprovedRevisionID == nil ||
+		*source.Artifact.LatestApprovedRevisionID != source.Revision.ID {
+		return fmt.Errorf("%w: formal Prototype requires the current approved PageSpec revision", ErrBlockingGate)
+	}
+	var health storage.ArtifactHealthModel
+	if err := database.WithContext(ctx).Where("artifact_id = ?", source.Artifact.ID).Take(&health).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return fmt.Errorf("%w: formal Prototype PageSpec source has no current health state", ErrBlockingGate)
+		}
+		return err
+	}
+	if health.SyncStatus != "current" {
+		return fmt.Errorf("%w: formal Prototype requires a current PageSpec source", ErrBlockingGate)
+	}
+	return nil
+}
+
+func (s *ArtifactService) resolveArtifactLineageSources(
+	ctx context.Context,
+	database *gorm.DB,
+	projectID uuid.UUID,
+	inputs []ArtifactSourceInput,
+) ([]resolvedArtifactLineageSource, error) {
+	trace := &TraceService{database: database, contents: s.contents}
+	result := make([]resolvedArtifactLineageSource, 0, len(inputs))
+	for _, input := range inputs {
+		artifactID, revisionID, err := trace.validateRef(ctx, projectID, input.Ref)
+		if err != nil {
+			if errors.Is(err, ErrInvalidInput) || errors.Is(err, ErrNotFound) || errors.Is(err, ErrConflict) {
+				return nil, fmt.Errorf("%w: lineage source must be an exact project revision and anchor", ErrBlockingGate)
+			}
+			return nil, err
+		}
+		var artifact storage.ArtifactModel
+		if err := database.WithContext(ctx).Where("id = ?", artifactID).Take(&artifact).Error; err != nil {
+			return nil, err
+		}
+		var revision storage.ArtifactRevisionModel
+		if err := database.WithContext(ctx).Where("id = ? AND artifact_id = ?", revisionID, artifactID).Take(&revision).Error; err != nil {
+			return nil, err
+		}
+		result = append(result, resolvedArtifactLineageSource{Input: input, Artifact: artifact, Revision: revision})
+	}
+	return result, nil
+}
+
+func lineageSourcesByKind(sources []resolvedArtifactLineageSource, kind string) []resolvedArtifactLineageSource {
+	result := make([]resolvedArtifactLineageSource, 0, 1)
+	for _, source := range sources {
+		if source.Artifact.Kind == kind {
+			result = append(result, source)
+		}
+	}
+	return result
+}
+
+func blueprintContainsPageNode(payload json.RawMessage, pageNodeID string) bool {
+	var content map[string]any
+	if json.Unmarshal(payload, &content) != nil {
+		return false
+	}
+	nodes := append([]map[string]any(nil), objectSlice(content["nodes"])...)
+	if semantic, ok := content["semantic"].(map[string]any); ok {
+		nodes = append(nodes, objectSlice(semantic["nodes"])...)
+	}
+	for _, node := range nodes {
+		if strings.TrimSpace(firstString(node, "id")) == pageNodeID && firstString(node, "kind", "type") == "page" {
+			return true
+		}
+	}
+	return false
+}
+
+func sameWholeVersionRef(left, right VersionRef) bool {
+	return !hasVersionAnchor(left) && !hasVersionAnchor(right) &&
+		left.ArtifactID == right.ArtifactID && left.RevisionID == right.RevisionID &&
+		left.ContentHash == right.ContentHash
+}
+
+func hasVersionAnchor(reference VersionRef) bool {
+	return reference.AnchorID != nil && strings.TrimSpace(*reference.AnchorID) != ""
+}
+
+func (s *ArtifactService) validateBlueprintBaselineSources(
+	ctx context.Context,
+	database *gorm.DB,
+	projectID uuid.UUID,
+	inputs []ArtifactSourceInput,
+) error {
+	if len(inputs) != 1 || !inputs[0].Required || inputs[0].Ref.AnchorID != nil {
+		return fmt.Errorf("%w: Blueprint requires exactly one whole approved Requirement Baseline revision", ErrBlockingGate)
+	}
+	input := inputs[0]
+	trace := &TraceService{database: database, contents: s.contents}
+	artifactID, revisionID, err := trace.validateRef(ctx, projectID, input.Ref)
+	if err != nil {
+		if errors.Is(err, ErrInvalidInput) || errors.Is(err, ErrNotFound) || errors.Is(err, ErrConflict) {
+			return fmt.Errorf("%w: Blueprint Requirement Baseline source must be an exact current revision", ErrBlockingGate)
+		}
+		return err
+	}
+	var artifact storage.ArtifactModel
+	if err := database.WithContext(ctx).Where("id = ?", artifactID).Take(&artifact).Error; err != nil {
+		return err
+	}
+	var revision storage.ArtifactRevisionModel
+	if err := database.WithContext(ctx).Where("id = ? AND artifact_id = ?", revisionID, artifactID).Take(&revision).Error; err != nil {
+		return err
+	}
+	if !isCurrentApprovedRequirementBaseline(artifact, revision, input.Ref) {
+		return fmt.Errorf("%w: Blueprint source must be the current approved Requirement Baseline revision", ErrBlockingGate)
+	}
+	return nil
+}
+
+func isCurrentApprovedRequirementBaseline(
+	artifact storage.ArtifactModel,
+	revision storage.ArtifactRevisionModel,
+	reference VersionRef,
+) bool {
+	return artifact.Kind == "requirement_baseline" && artifact.Lifecycle == "active" &&
+		artifact.LatestApprovedRevisionID != nil && *artifact.LatestApprovedRevisionID == revision.ID &&
+		revision.ArtifactID == artifact.ID && revision.WorkflowStatus == "approved" &&
+		revision.ContentHash == reference.ContentHash && reference.ArtifactID == artifact.ID.String() &&
+		reference.RevisionID == revision.ID.String() && reference.AnchorID == nil
+}
+
+func sourceInputsFromDraftModels(models []storage.ArtifactDraftSourceModel) []ArtifactSourceInput {
+	result := make([]ArtifactSourceInput, 0, len(models))
+	for _, model := range models {
+		result = append(result, ArtifactSourceInput{
+			Ref: VersionRef{
+				ArtifactID: model.SourceArtifactID.String(), RevisionID: model.SourceRevisionID.String(),
+				ContentHash: model.SourceContentHash, AnchorID: cloneStringPointer(model.SourceAnchorID),
+			},
+			Purpose: model.Purpose, Required: model.Required,
+		})
+	}
+	return result
+}
+
 func (s *ArtifactService) loadDraftSourceModels(ctx context.Context, draftID uuid.UUID) ([]storage.ArtifactDraftSourceModel, error) {
 	var sources []storage.ArtifactDraftSourceModel
 	if err := s.database.WithContext(ctx).Where("draft_id = ?", draftID).
-		Order("added_at ASC").Find(&sources).Error; err != nil {
+		Order("added_at ASC, source_revision_id ASC, purpose ASC").Find(&sources).Error; err != nil {
 		return nil, err
 	}
 	return sources, nil
@@ -748,11 +1043,124 @@ func sourcesFromModels(models []storage.ArtifactDraftSourceModel) []ArtifactSour
 	return result
 }
 
-func revisionFromModel(model storage.ArtifactRevisionModel, payload json.RawMessage) ArtifactRevision {
+func (s *ArtifactService) loadRevisionSourceModels(
+	ctx context.Context,
+	revisionIDs []uuid.UUID,
+) (map[uuid.UUID][]storage.ArtifactRevisionSourceModel, error) {
+	result := make(map[uuid.UUID][]storage.ArtifactRevisionSourceModel, len(revisionIDs))
+	if len(revisionIDs) == 0 {
+		return result, nil
+	}
+	var models []storage.ArtifactRevisionSourceModel
+	if err := s.database.WithContext(ctx).Where("revision_id IN ?", revisionIDs).
+		Order("revision_id ASC, ordinal ASC").
+		Find(&models).Error; err != nil {
+		return nil, err
+	}
+	for _, model := range models {
+		result[model.RevisionID] = append(result[model.RevisionID], model)
+	}
+	return result, nil
+}
+
+func revisionSourceModelsFromDraft(
+	revisionID uuid.UUID,
+	models []storage.ArtifactDraftSourceModel,
+) []storage.ArtifactRevisionSourceModel {
+	result := make([]storage.ArtifactRevisionSourceModel, 0, len(models))
+	for ordinal, model := range models {
+		result = append(result, storage.ArtifactRevisionSourceModel{
+			RevisionID: revisionID, Ordinal: ordinal, SourceArtifactID: model.SourceArtifactID,
+			SourceRevisionID: model.SourceRevisionID, SourceContentHash: model.SourceContentHash,
+			SourceAnchorID: cloneStringPointer(model.SourceAnchorID), Purpose: model.Purpose,
+			Required: model.Required, AddedBy: model.AddedBy, AddedAt: model.AddedAt,
+		})
+	}
+	return result
+}
+
+func revisionSourcesFromModels(models []storage.ArtifactRevisionSourceModel) []ArtifactSource {
+	result := make([]ArtifactSource, 0, len(models))
+	for _, model := range models {
+		result = append(result, ArtifactSource{
+			VersionRef: VersionRef{
+				ArtifactID: model.SourceArtifactID.String(), RevisionID: model.SourceRevisionID.String(),
+				ContentHash: model.SourceContentHash, AnchorID: cloneStringPointer(model.SourceAnchorID),
+			},
+			Purpose: model.Purpose, Required: model.Required,
+		})
+	}
+	return result
+}
+
+func revisionLineageModelsFromDraft(
+	projectID uuid.UUID,
+	targetArtifactID uuid.UUID,
+	targetRevisionID uuid.UUID,
+	actorID uuid.UUID,
+	createdAt time.Time,
+	sources []storage.ArtifactDraftSourceModel,
+) ([]storage.ArtifactDependencyModel, []storage.TraceLinkModel) {
+	dependencies := make([]storage.ArtifactDependencyModel, 0, len(sources))
+	dependencyIndexes := make(map[uuid.UUID]int, len(sources))
+	links := make([]storage.TraceLinkModel, 0, len(sources))
+	seenLinks := make(map[string]struct{}, len(sources))
+	for _, source := range sources {
+		if index, exists := dependencyIndexes[source.SourceRevisionID]; exists {
+			if source.Required {
+				dependencies[index].Required = true
+			}
+		} else {
+			dependencyIndexes[source.SourceRevisionID] = len(dependencies)
+			revisionID := targetRevisionID
+			dependencies = append(dependencies, storage.ArtifactDependencyModel{
+				ID: uuid.New(), ProjectID: projectID, SourceArtifactID: source.SourceArtifactID,
+				SourceRevisionID: source.SourceRevisionID, SourceContentHash: source.SourceContentHash,
+				TargetArtifactID: targetArtifactID, TargetRevisionID: &revisionID,
+				Relation: "derives_from", Required: source.Required, CreatedBy: actorID, CreatedAt: createdAt,
+			})
+		}
+		if source.SourceAnchorID == nil {
+			continue
+		}
+		anchor := strings.TrimSpace(*source.SourceAnchorID)
+		if anchor == "" {
+			continue
+		}
+		key := source.SourceRevisionID.String() + "\x00" + anchor
+		if _, exists := seenLinks[key]; exists {
+			continue
+		}
+		seenLinks[key] = struct{}{}
+		revisionID := targetRevisionID
+		links = append(links, storage.TraceLinkModel{
+			ID: uuid.New(), ProjectID: projectID, SourceArtifactID: source.SourceArtifactID,
+			SourceRevisionID: source.SourceRevisionID, SourceAnchorID: &anchor,
+			TargetArtifactID: targetArtifactID, TargetRevisionID: &revisionID,
+			Relation: "derives_from", Metadata: json.RawMessage(`{}`),
+			CreatedBy: actorID, CreatedAt: createdAt,
+		})
+	}
+	return dependencies, links
+}
+
+func cloneStringPointer(value *string) *string {
+	if value == nil {
+		return nil
+	}
+	clone := *value
+	return &clone
+}
+
+func revisionFromModel(
+	model storage.ArtifactRevisionModel,
+	payload json.RawMessage,
+	sources []ArtifactSource,
+) ArtifactRevision {
 	return ArtifactRevision{
 		ID: model.ID.String(), ArtifactID: model.ArtifactID.String(), RevisionNumber: model.RevisionNumber,
 		ParentRevisionID: uuidStringPointer(model.ParentRevisionID), SchemaVersion: model.SchemaVersion,
-		Content: payload, ContentHash: model.ContentHash, WorkflowStatus: model.WorkflowStatus,
+		SourceVersions: sources, Content: payload, ContentHash: model.ContentHash, WorkflowStatus: model.WorkflowStatus,
 		ChangeSource: model.ChangeSource, ChangeSummary: model.ChangeSummary,
 		SourceManifestID: uuidStringPointer(model.SourceManifestID), ProposalID: uuidStringPointer(model.ProposalID),
 		CreatedBy: model.CreatedBy.String(), CreatedAt: model.CreatedAt, ApprovedAt: model.ApprovedAt,

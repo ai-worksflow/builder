@@ -1,12 +1,46 @@
 package middleware
 
 import (
+	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
 )
+
+type idempotencyStoreTestStub struct {
+	claim       ClaimResult
+	claimErr    error
+	completeErr error
+	complete    int
+	release     int
+	seal        int
+}
+
+func (s *idempotencyStoreTestStub) Claim(context.Context, string, string, string) (ClaimResult, error) {
+	return s.claim, s.claimErr
+}
+
+func (s *idempotencyStoreTestStub) Complete(context.Context, string, string, string, StoredResponse) error {
+	s.complete++
+	return s.completeErr
+}
+
+func (s *idempotencyStoreTestStub) Release(context.Context, string, string, string) error {
+	s.release++
+	return nil
+}
+
+func (s *idempotencyStoreTestStub) Seal(context.Context, string, string, string) error {
+	s.seal++
+	return nil
+}
+
+func (s *idempotencyStoreTestStub) MaxRequestBytes() int64 { return 1 << 20 }
+func (s *idempotencyStoreTestStub) MaxResponseBytes() int  { return 1 << 20 }
 
 func TestIdempotentRequestHashCanonicalizesQueryOrder(t *testing.T) {
 	first := httptest.NewRequest(http.MethodPost, "/v1/projects/p/artifacts?tag=b&tag=a&page=2", nil)
@@ -53,7 +87,7 @@ func TestIdempotencySeparatesPreconditionsAndHeaderScopedProjects(t *testing.T) 
 	}
 }
 
-func TestCaptureWriterPreservesOriginalResponseAndBoundsReplay(t *testing.T) {
+func TestCaptureWriterBuffersOriginalResponseAndBoundsReplay(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	recorder := httptest.NewRecorder()
 	base, ok := gin.CreateTestContextOnly(recorder, gin.New()).Writer.(gin.ResponseWriter)
@@ -64,11 +98,15 @@ func TestCaptureWriterPreservesOriginalResponseAndBoundsReplay(t *testing.T) {
 	if _, err := capture.WriteString("abcdef"); err != nil {
 		t.Fatalf("WriteString() error = %v", err)
 	}
-	if recorder.Body.String() != "abcdef" {
-		t.Fatalf("original response = %q", recorder.Body.String())
+	if recorder.Body.Len() != 0 {
+		t.Fatalf("response escaped before durable completion: %q", recorder.Body.String())
 	}
 	if string(capture.Bytes()) != "abcd" || !capture.Overflowed() {
 		t.Fatalf("capture = %q, overflow = %v", capture.Bytes(), capture.Overflowed())
+	}
+	capture.Commit(replayUnavailableResponse())
+	if recorder.Code != http.StatusConflict || !strings.Contains(recorder.Body.String(), "idempotency_response_unavailable") {
+		t.Fatalf("bounded response = %d %q", recorder.Code, recorder.Body.String())
 	}
 }
 
@@ -86,5 +124,80 @@ func TestSafeReplayHeadersExcludeCookiesAndRequestIdentity(t *testing.T) {
 	}
 	if result.Get("Set-Cookie") != "" || result.Get("X-Request-ID") != "" || result.Get("Authorization") != "" {
 		t.Fatalf("sensitive headers leaked: %#v", result)
+	}
+}
+
+func TestPublicIdempotencyIdentityHashesCapabilityDeploymentAndCanonicalRoute(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	identityFor := func(capabilityID, deploymentID, route, path string) idempotencyIdentity {
+		router := gin.New()
+		var result idempotencyIdentity
+		router.PATCH(route, func(context *gin.Context) {
+			result = publicMutationIdempotencyIdentity(context, publicIdempotencyIdentity{
+				capabilityID: capabilityID,
+				deploymentID: deploymentID,
+			})
+			context.Status(http.StatusNoContent)
+		})
+		request := httptest.NewRequest(http.MethodPatch, path, strings.NewReader(`{"value":1}`))
+		router.ServeHTTP(httptest.NewRecorder(), request)
+		return result
+	}
+	canonicalRoute := "/v1/public/data/deployments/:deploymentId/tables/:tableId/records/:recordId"
+	firstPath := "/v1/public/data/deployments/deployment-a/tables/table-a/records/record-a"
+	first := identityFor("capability-a", "deployment-a", canonicalRoute, firstPath)
+	same := identityFor("capability-a", "deployment-a", canonicalRoute, firstPath)
+	otherCapability := identityFor("capability-b", "deployment-a", canonicalRoute, firstPath)
+	otherDeployment := identityFor("capability-a", "deployment-b", canonicalRoute, "/v1/public/data/deployments/deployment-b/tables/table-a/records/record-a")
+	otherResource := identityFor("capability-a", "deployment-a", canonicalRoute, "/v1/public/data/deployments/deployment-a/tables/table-b/records/record-a")
+	otherCanonicalRoute := identityFor("capability-a", "deployment-a", "/v1/public/data/deployments/:deploymentId/:collection/:tableId/records/:recordId", firstPath)
+	if first != same || first.scope == otherCapability.scope || first.scope == otherDeployment.scope || first.scope == otherResource.scope || first.scope == otherCanonicalRoute.scope {
+		t.Fatalf("public idempotency identities were not isolated: first=%+v otherCapability=%+v otherDeployment=%+v otherResource=%+v otherCanonicalRoute=%+v", first, otherCapability, otherDeployment, otherResource, otherCanonicalRoute)
+	}
+	for _, secret := range []string{"capability-a", "deployment-a", "wfpub_secret"} {
+		if strings.Contains(first.scope, secret) || strings.Contains(first.hashIdentity, secret) {
+			t.Fatalf("public identity persisted raw capability material: scope=%q hashIdentity=%q", first.scope, first.hashIdentity)
+		}
+	}
+}
+
+func TestPublicIdempotencyInProgressAndCompletionFailureStayFailClosed(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	request := func(store IdempotencyStore, handlerCalls *int) *httptest.ResponseRecorder {
+		router := gin.New()
+		router.POST("/public/:deploymentId",
+			func(context *gin.Context) {
+				if !SetPublicIdempotencyIdentity(context, "capability-a", context.Param("deploymentId")) {
+					t.Fatal("failed to set test public identity")
+				}
+				context.Next()
+			},
+			CaptureIdempotencyKey(true),
+			PersistPublicIdempotency(store),
+			func(context *gin.Context) {
+				*handlerCalls++
+				context.JSON(http.StatusCreated, gin.H{"created": true})
+			},
+		)
+		httpRequest := httptest.NewRequest(http.MethodPost, "/public/deployment-a", strings.NewReader(`{"value":1}`))
+		httpRequest.Header.Set("Content-Type", "application/json")
+		httpRequest.Header.Set("Idempotency-Key", "public-write-1")
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, httpRequest)
+		return response
+	}
+
+	inProgressStore := &idempotencyStoreTestStub{claimErr: ErrIdempotencyInProgress}
+	inProgressCalls := 0
+	inProgress := request(inProgressStore, &inProgressCalls)
+	if inProgress.Code != http.StatusConflict || inProgress.Header().Get("Retry-After") != "1" || inProgressCalls != 0 {
+		t.Fatalf("in-progress public request was not closed: status=%d calls=%d body=%s", inProgress.Code, inProgressCalls, inProgress.Body.String())
+	}
+
+	completionStore := &idempotencyStoreTestStub{claim: ClaimResult{Acquired: true}, completeErr: errors.New("database unavailable")}
+	completionCalls := 0
+	completion := request(completionStore, &completionCalls)
+	if completion.Code != http.StatusServiceUnavailable || completionCalls != 1 || completionStore.seal != 1 || !strings.Contains(completion.Body.String(), "idempotency_completion_failed") {
+		t.Fatalf("completion failure escaped fail-closed buffering: status=%d calls=%d seal=%d body=%s", completion.Code, completionCalls, completionStore.seal, completion.Body.String())
 	}
 }

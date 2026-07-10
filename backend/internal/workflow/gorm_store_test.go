@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/worksflow/builder/backend/internal/core"
 	"github.com/worksflow/builder/backend/internal/domain"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
@@ -61,12 +62,16 @@ func TestGORMMappingPersistsAggregateContextAndEventSequence(t *testing.T) {
 	run := &RunRecord{ID: uuid.NewString(), ProjectID: uuid.NewString(), DefinitionVersionID: uuid.NewString(), Definition: domain.WorkflowDefinitionRef{ID: uuid.NewString(), Version: 1, Hash: definitionHash}, InputManifest: &domain.ManifestRef{ID: uuid.NewString(), Hash: manifestHash}, Status: RunRunning, Scope: json.RawMessage(`{"slice":"all"}`), Context: NewRunContext(), StartedBy: uuid.NewString(), CreatedAt: now, UpdatedAt: now, Nodes: map[string]*NodeRecord{}}
 	node := &NodeRecord{ID: uuid.NewString(), RunID: run.ID, Key: "input", DefinitionNodeID: "input", Type: domain.NodeArtifactInput, Status: NodeReady, AvailableAt: now, CreatedAt: now, UpdatedAt: now}
 	run.Nodes[node.Key] = node
-	run.Context.Nodes[node.Key] = NodeMetadata{DefinitionNodeID: "input", MaxAttempts: 1, TimeoutNanos: int64(time.Minute)}
+	executionActorID := uuid.NewString()
+	run.Context.Nodes[node.Key] = NodeMetadata{
+		DefinitionNodeID: "input", MaxAttempts: 1, TimeoutNanos: int64(time.Minute),
+		ExecutionActor: &ActorProvenance{ActorID: executionActorID, Role: core.RoleAdmin, Action: core.ActionPublish, Source: ActorSourceAuthenticatedCommand, AuthorizedAt: now},
+	}
 	row, nodes, err := store.runToRows(run)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(nodes) != 1 || !strings.Contains(string(row.Context), "maxAttempts") {
+	if len(nodes) != 1 || !strings.Contains(string(row.Context), "maxAttempts") || !strings.Contains(string(row.Context), executionActorID) || !strings.Contains(string(row.Context), string(ActorSourceAuthenticatedCommand)) {
 		t.Fatalf("aggregate context was not persisted: %s", row.Context)
 	}
 	events, err := store.eventsToRows(run.ID, []Event{{ID: uuid.NewString(), Type: "one", CreatedAt: now}, {ID: uuid.NewString(), Type: "two", CreatedAt: now}}, 9)

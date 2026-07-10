@@ -1,0 +1,115 @@
+import assert from 'node:assert/strict'
+import { createEmptyPageSpecContent } from '../lib/platform/artifact-workspace'
+import {
+  normalizePageSpecContent,
+  pageSpecReviewIssues,
+} from '../lib/platform/page-spec-content'
+
+type TestCase = {
+  readonly name: string
+  readonly run: () => void | Promise<void>
+}
+
+const tests: TestCase[] = []
+
+function test(name: string, run: TestCase['run']) {
+  tests.push({ name, run })
+}
+
+test('new PageSpec content carries Blueprint route and goal with four stable states', () => {
+  const content = createEmptyPageSpecContent(
+    'page-node-orders',
+    'Orders PageSpec',
+    '/orders',
+    'Review and resolve order exceptions.',
+  )
+
+  assert.equal(content.blueprintPageNodeId, 'page-node-orders')
+  assert.equal(content.route, '/orders')
+  assert.equal(content.userGoal, 'Review and resolve order exceptions.')
+  assert.deepEqual(content.states.map(({ id, key, required }) => ({ id, key, required })), [
+    { id: 'ready', key: 'ready', required: true },
+    { id: 'loading', key: 'loading', required: true },
+    { id: 'empty', key: 'empty', required: true },
+    { id: 'error', key: 'error', required: true },
+  ])
+})
+
+test('PageSpec review gate accepts a complete canonical content contract', () => {
+  const base = createEmptyPageSpecContent(
+    'page-node-orders',
+    'Orders PageSpec',
+    '/orders',
+    'Review and resolve order exceptions.',
+  )
+  const content = {
+    ...base,
+    states: base.states.map((state) => ({ ...state, id: `state-${state.key}` })),
+    acceptanceCriterionIds: ['AC-ORDER-001'],
+    dataBindings: [{
+      id: 'binding-orders',
+      name: 'Orders',
+      source: 'api' as const,
+      operationId: 'orders.list',
+      schema: { type: 'array' },
+      required: true,
+    }],
+    interactions: [{
+      id: 'interaction-open-order',
+      trigger: 'Select an order',
+      outcome: 'Open order details',
+      acceptanceCriterionIds: ['AC-ORDER-001'],
+    }],
+  }
+
+  assert.deepEqual(pageSpecReviewIssues(content), [])
+  assert.deepEqual(normalizePageSpecContent({
+    ...content,
+    requiredRoles: [' editor ', 'editor', 'admin'],
+  }).requiredRoles, ['editor', 'admin'])
+})
+
+test('PageSpec review gate blocks missing stable states, traces, and binding identity', () => {
+  const content = {
+    ...createEmptyPageSpecContent('page-node-orders', 'Orders', 'orders', ''),
+    states: [{
+      id: 'ready',
+      key: 'ready',
+      title: '',
+      required: false,
+      fixtureIds: [],
+      acceptanceCriterionIds: [],
+    }],
+    dataBindings: [{
+      id: 'binding-orders',
+      name: '',
+      source: 'api' as const,
+      required: true,
+    }],
+  }
+  const issues = pageSpecReviewIssues(content)
+
+  assert.ok(issues.some((issue) => issue.includes('Route')))
+  assert.ok(issues.some((issue) => issue.includes('User goal')))
+  assert.ok(issues.some((issue) => issue.includes('loading')))
+  assert.ok(issues.some((issue) => issue.includes('marked required')))
+  assert.ok(issues.some((issue) => issue.includes('operation ID')))
+  assert.ok(issues.some((issue) => issue.includes('acceptance criterion')))
+})
+
+async function main() {
+  let failed = 0
+  for (const { name, run } of tests) {
+    try {
+      await run()
+      console.log(`✓ ${name}`)
+    } catch (error) {
+      failed += 1
+      console.error(`✗ ${name}`)
+      console.error(error)
+    }
+  }
+  if (failed > 0) process.exitCode = 1
+}
+
+void main()

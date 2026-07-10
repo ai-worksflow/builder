@@ -105,6 +105,24 @@ func (s *Server) GetArtifactDraft(context *gin.Context) {
 	context.JSON(http.StatusOK, artifact.Draft)
 }
 
+func (s *Server) GetArtifactReviewGate(context *gin.Context) {
+	if s.services.Artifacts == nil {
+		serviceUnavailable(context, "artifact")
+		return
+	}
+	actor, ok := actorID(context)
+	if !ok {
+		return
+	}
+	gate, err := s.services.Artifacts.ReviewGate(context.Request.Context(), context.Param("artifactId"), actor)
+	if err != nil {
+		s.businessError(context, err)
+		return
+	}
+	context.Header("Cache-Control", "no-store")
+	context.JSON(http.StatusOK, gate)
+}
+
 func (s *Server) CreateArtifact(context *gin.Context) {
 	if s.services.Artifacts == nil {
 		serviceUnavailable(context, "artifact")
@@ -434,6 +452,9 @@ func (s *Server) verifyCollectionArtifact(context *gin.Context) bool {
 }
 
 func sourceInputs(refs []core.VersionRef, purpose string) []core.ArtifactSourceInput {
+	if refs == nil {
+		return nil
+	}
 	result := make([]core.ArtifactSourceInput, 0, len(refs))
 	for _, reference := range refs {
 		result = append(result, core.ArtifactSourceInput{Ref: reference, Purpose: purpose, Required: true})
@@ -451,6 +472,8 @@ func collectionKind(collection, documentKind string) string {
 		return "prototype"
 	case "documents":
 		switch documentKind {
+		case "projectBrief":
+			return "project_brief"
 		case "requirement", "featureList", "pageSplit", "":
 			return "product_requirements"
 		case "apiContract":

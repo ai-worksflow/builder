@@ -20,8 +20,8 @@ const publicDataAPIBasePath = "/v1/public/data/deployments"
 type PublicRuntimeRepository interface {
 	ListPublicTablePolicies(context.Context, string) ([]PublicTablePolicy, error)
 	GetPublicTablePolicy(context.Context, string, string) (PublicTablePolicy, error)
-	PutPublicTablePolicy(context.Context, string, string, string, PublicTablePolicyInput) (PublicTablePolicy, error)
-	DeletePublicTablePolicy(context.Context, string, string, string) error
+	PutPublicTablePolicy(context.Context, string, string, string, uint64, PublicTablePolicyInput) (PublicTablePolicy, error)
+	DeletePublicTablePolicy(context.Context, string, string, string, uint64) error
 
 	PreparePublicCapability(context.Context, PreparePublicCapabilityInput, string, []byte, []string, time.Time) (publicCapabilityRecord, error)
 	ActivatePublicCapability(context.Context, string, string, string) (publicCapabilityRecord, error)
@@ -33,11 +33,11 @@ type PublicRuntimeRepository interface {
 }
 
 type PublicRuntimeDependencies struct {
-	Data         Repository
-	Runtime      PublicRuntimeRepository
-	Access       ProjectAuthorizer
-	Now          func() time.Time
-	TokenSource  func() (string, string, error)
+	Data        Repository
+	Runtime     PublicRuntimeRepository
+	Access      ProjectAuthorizer
+	Now         func() time.Time
+	TokenSource func() (string, string, error)
 }
 
 type PublicRuntimeService struct {
@@ -47,6 +47,8 @@ type PublicRuntimeService struct {
 	now         func() time.Time
 	tokenSource func() (string, string, error)
 }
+
+var _ DeploymentPublicRuntimeProvisioner = (*PublicRuntimeService)(nil)
 
 func NewPublicRuntimeService(dependencies PublicRuntimeDependencies) (*PublicRuntimeService, error) {
 	if dependencies.Data == nil || dependencies.Runtime == nil || dependencies.Access == nil {
@@ -68,10 +70,42 @@ func (s *PublicRuntimeService) ListPolicies(ctx context.Context, projectID, acto
 	if err := s.authorizeProject(ctx, projectID, actorID, core.ActionView); err != nil {
 		return nil, err
 	}
-	return s.runtime.ListPublicTablePolicies(ctx, projectID)
+	policies, err := s.runtime.ListPublicTablePolicies(ctx, projectID)
+	if err != nil {
+		return nil, err
+	}
+	tables, err := s.data.ListTables(ctx, projectID)
+	if err != nil {
+		return nil, err
+	}
+	byTable := make(map[string]PublicTablePolicy, len(policies))
+	for _, policy := range policies {
+		policy.ETag = PublicTablePolicyETag(policy.ProjectID, policy.TableID, policy.Version)
+		byTable[policy.TableID] = policy
+	}
+	result := make([]PublicTablePolicy, 0, len(tables))
+	for _, table := range tables {
+		policy, exists := byTable[table.ID]
+		if !exists {
+			policy = PublicTablePolicy{
+				ProjectID: projectID, TableID: table.ID, TableName: table.Name,
+				ReadableFields: []string{}, WritableFields: []string{}, Version: 0,
+				ETag:      PublicTablePolicyETag(projectID, table.ID, 0),
+				CreatedAt: table.CreatedAt, UpdatedAt: table.UpdatedAt,
+			}
+		}
+		result = append(result, policy)
+	}
+	sort.Slice(result, func(left, right int) bool {
+		if result[left].TableName == result[right].TableName {
+			return result[left].TableID < result[right].TableID
+		}
+		return result[left].TableName < result[right].TableName
+	})
+	return result, nil
 }
 
-func (s *PublicRuntimeService) PutPolicy(ctx context.Context, projectID, tableID, actorID string, input PublicTablePolicyInput) (PublicTablePolicy, error) {
+func (s *PublicRuntimeService) PutPolicy(ctx context.Context, projectID, tableID, actorID string, expectedVersion uint64, input PublicTablePolicyInput) (PublicTablePolicy, error) {
 	if err := validateUUID(projectID, "projectId"); err != nil {
 		return PublicTablePolicy{}, err
 	}
@@ -88,10 +122,15 @@ func (s *PublicRuntimeService) PutPolicy(ctx context.Context, projectID, tableID
 	if err := ValidatePublicTablePolicy(&input, table); err != nil {
 		return PublicTablePolicy{}, err
 	}
-	return s.runtime.PutPublicTablePolicy(ctx, projectID, tableID, actorID, input)
+	policy, err := s.runtime.PutPublicTablePolicy(ctx, projectID, tableID, actorID, expectedVersion, input)
+	if err != nil {
+		return PublicTablePolicy{}, err
+	}
+	policy.ETag = PublicTablePolicyETag(policy.ProjectID, policy.TableID, policy.Version)
+	return policy, nil
 }
 
-func (s *PublicRuntimeService) DeletePolicy(ctx context.Context, projectID, tableID, actorID string) error {
+func (s *PublicRuntimeService) DeletePolicy(ctx context.Context, projectID, tableID, actorID string, expectedVersion uint64) error {
 	if err := validateUUID(projectID, "projectId"); err != nil {
 		return err
 	}
@@ -101,7 +140,7 @@ func (s *PublicRuntimeService) DeletePolicy(ctx context.Context, projectID, tabl
 	if err := s.authorizeProject(ctx, projectID, actorID, core.ActionAdmin); err != nil {
 		return err
 	}
-	return s.runtime.DeletePublicTablePolicy(ctx, projectID, tableID, actorID)
+	return s.runtime.DeletePublicTablePolicy(ctx, projectID, tableID, actorID, expectedVersion)
 }
 
 // PrepareDeploymentCapability creates a pending, one-time-readable capability.
@@ -117,6 +156,9 @@ func (s *PublicRuntimeService) PrepareDeploymentCapability(ctx context.Context, 
 	if err := validateUUID(input.DeploymentVersionID, "deploymentVersionId"); err != nil {
 		return PreparedPublicRuntimeConfig{}, err
 	}
+	if input.Environment != ScopePreview && input.Environment != ScopeProduction {
+		return PreparedPublicRuntimeConfig{}, Invalid("environment", "environment must be preview or production")
+	}
 	origins, err := NormalizePublicOrigins(input.AllowedOrigins)
 	if err != nil {
 		return PreparedPublicRuntimeConfig{}, err
@@ -124,7 +166,11 @@ func (s *PublicRuntimeService) PrepareDeploymentCapability(ctx context.Context, 
 	now := s.now().UTC()
 	expiresAt := input.ExpiresAt.UTC()
 	if input.ExpiresAt.IsZero() {
-		expiresAt = now.Add(DefaultProductionTTL)
+		ttl := DefaultProductionTTL
+		if input.Environment == ScopePreview {
+			ttl = DefaultPreviewCapabilityTTL
+		}
+		expiresAt = now.Add(ttl)
 	}
 	if !expiresAt.After(now) || expiresAt.After(now.Add(MaxPublicCapabilityTTL)) {
 		return PreparedPublicRuntimeConfig{}, Invalid("expiresAt", "expiresAt must be in the future and no more than 366 days away")
@@ -225,8 +271,8 @@ func (s *PublicRuntimeService) Authenticate(ctx context.Context, deploymentID, t
 	return PublicCapability{
 		ID: record.ID, ProjectID: record.ProjectID, DeploymentID: record.DeploymentID,
 		DeploymentVersionID: record.DeploymentVersionID,
-		AllowedOrigins: append([]string(nil), record.AllowedOrigins...),
-		ExpiresAt: record.ExpiresAt.UTC(), authenticated: true,
+		AllowedOrigins:      append([]string(nil), record.AllowedOrigins...),
+		ExpiresAt:           record.ExpiresAt.UTC(), authenticated: true,
 	}, nil
 }
 
@@ -342,7 +388,7 @@ func (s *PublicRuntimeService) CreatePublicRecord(ctx context.Context, capabilit
 		return Record{}, err
 	}
 	record, err := s.data.CreateRecord(ctx, capability.ProjectID, tableID, MutationContext{
-		RequestID: requestID, PublicDeploymentID: capability.DeploymentID,
+		RequestID: requestID, PublicDeploymentID: capability.DeploymentID, PublicCapabilityID: capability.ID,
 	}, input)
 	if err != nil {
 		return Record{}, err
@@ -362,7 +408,7 @@ func (s *PublicRuntimeService) UpdatePublicRecord(ctx context.Context, capabilit
 		return Record{}, err
 	}
 	record, err := s.data.UpdateRecord(ctx, capability.ProjectID, tableID, recordID, MutationContext{
-		RequestID: requestID, PublicDeploymentID: capability.DeploymentID,
+		RequestID: requestID, PublicDeploymentID: capability.DeploymentID, PublicCapabilityID: capability.ID,
 	}, input)
 	if err != nil {
 		return Record{}, err
@@ -378,7 +424,7 @@ func (s *PublicRuntimeService) DeletePublicRecord(ctx context.Context, capabilit
 		return err
 	}
 	return s.data.DeleteRecord(ctx, capability.ProjectID, tableID, recordID, MutationContext{
-		RequestID: requestID, PublicDeploymentID: capability.DeploymentID,
+		RequestID: requestID, PublicDeploymentID: capability.DeploymentID, PublicCapabilityID: capability.ID,
 	})
 }
 

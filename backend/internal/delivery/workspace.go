@@ -150,6 +150,68 @@ func (l *RevisionLoader) LoadBuildManifest(ctx context.Context, projectID, actor
 	return bundle, nil
 }
 
+// ValidateWorkspaceManifestLineage proves the immutable server-side producer
+// relation. The client-provided pair is accepted only when the exact workspace
+// revision was created by an applied proposal for the selected build manifest.
+func (l *RevisionLoader) ValidateWorkspaceManifestLineage(
+	ctx context.Context,
+	projectID, actorID string,
+	reference core.VersionRef,
+	manifestID string,
+	action core.Action,
+) error {
+	if err := ValidateVersionRef(reference); err != nil {
+		return err
+	}
+	if reference.AnchorID != nil {
+		return Invalid("workspaceRevision.anchorId", "publish provenance requires the whole workspace revision")
+	}
+	if _, err := l.access.Authorize(ctx, projectID, actorID, action); err != nil {
+		return err
+	}
+	projectUUID, err := uuid.Parse(projectID)
+	if err != nil {
+		return Invalid("projectId", "projectId must be a UUID")
+	}
+	artifactUUID, err := uuid.Parse(reference.ArtifactID)
+	if err != nil {
+		return Invalid("workspaceRevision.artifactId", "artifactId must be a UUID")
+	}
+	revisionUUID, err := uuid.Parse(reference.RevisionID)
+	if err != nil {
+		return Invalid("workspaceRevision.revisionId", "revisionId must be a UUID")
+	}
+	manifestUUID, err := uuid.Parse(strings.TrimSpace(manifestID))
+	if err != nil {
+		return Invalid("buildManifestId", "buildManifestId must be a UUID")
+	}
+	var lineage struct {
+		RevisionID uuid.UUID `gorm:"column:revision_id"`
+	}
+	query := l.database.WithContext(ctx).
+		Table("artifact_revisions AS workspace_revision").
+		Select("workspace_revision.id AS revision_id").
+		Joins("JOIN artifacts AS workspace_artifact ON workspace_artifact.id = workspace_revision.artifact_id").
+		Joins("JOIN implementation_proposals AS proposal ON proposal.id = workspace_revision.implementation_proposal_id").
+		Joins("JOIN application_build_manifests AS manifest ON manifest.id = proposal.build_manifest_id").
+		Where("workspace_revision.id = ? AND workspace_revision.artifact_id = ? AND workspace_revision.content_hash = ?", revisionUUID, artifactUUID, reference.ContentHash).
+		Where("workspace_revision.workflow_status = 'approved'").
+		Where("workspace_artifact.project_id = ? AND workspace_artifact.kind = 'workspace'", projectUUID).
+		Where("proposal.project_id = ? AND proposal.build_manifest_id = ?", projectUUID, manifestUUID).
+		Where("proposal.status IN ? AND proposal.applied_at IS NOT NULL", []string{"applied", "partially_applied"}).
+		Where("manifest.id = ? AND manifest.project_id = ? AND manifest.status = 'consumed' AND manifest.invalidated_at IS NULL", manifestUUID, projectUUID)
+	if err := query.Take(&lineage).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return conflict("workspaceRevision was not produced by the selected buildManifestId")
+		}
+		return wrapInternal("validate workspace build manifest lineage", err)
+	}
+	if lineage.RevisionID != revisionUUID {
+		return conflict("workspaceRevision build manifest lineage is inconsistent")
+	}
+	return nil
+}
+
 func decodeWorkspace(payload json.RawMessage) ([]WorkspaceFile, string, error) {
 	var value struct {
 		Name  string `json:"name"`
@@ -256,26 +318,51 @@ func materializeWorkspace(baseDirectory string, files []WorkspaceFile) (string, 
 		cleanup()
 		return "", nil, wrapInternal("protect quality workspace", err)
 	}
+	if err := writeWorkspaceFiles(directory, files); err != nil {
+		cleanup()
+		return "", nil, err
+	}
+	return directory, cleanup, nil
+}
+
+func resetMaterializedWorkspace(directory string, files []WorkspaceFile) error {
+	info, err := os.Lstat(directory)
+	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return Invalid("workspace", "quality workspace was replaced by a sandbox command")
+	}
+	entries, err := os.ReadDir(directory)
+	if err != nil {
+		return wrapInternal("inspect quality workspace before isolated check", err)
+	}
+	for _, entry := range entries {
+		target := filepath.Join(directory, entry.Name())
+		if err := ensureBuildPathContained(directory, target); err != nil {
+			return err
+		}
+		if err := os.RemoveAll(target); err != nil {
+			return wrapInternal("reset quality workspace between isolated checks", err)
+		}
+	}
+	return writeWorkspaceFiles(directory, files)
+}
+
+func writeWorkspaceFiles(directory string, files []WorkspaceFile) error {
 	for _, file := range files {
 		safePath, err := SanitizePath(file.Path)
 		if err != nil {
-			cleanup()
-			return "", nil, err
+			return err
 		}
 		target := filepath.Join(directory, filepath.FromSlash(safePath))
 		relative, err := filepath.Rel(directory, target)
 		if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(os.PathSeparator)) {
-			cleanup()
-			return "", nil, NewError(CodeUnsafePath, 422, "workspace path escapes the temporary sandbox")
+			return NewError(CodeUnsafePath, 422, "workspace path escapes the temporary sandbox")
 		}
 		if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
-			cleanup()
-			return "", nil, wrapInternal("create quality workspace directory", err)
+			return wrapInternal("create quality workspace directory", err)
 		}
 		if err := os.WriteFile(target, []byte(file.Content), 0o600); err != nil {
-			cleanup()
-			return "", nil, wrapInternal("write quality workspace file", err)
+			return wrapInternal("write quality workspace file", err)
 		}
 	}
-	return directory, cleanup, nil
+	return nil
 }

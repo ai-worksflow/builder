@@ -6,6 +6,7 @@ import { useWorksflow } from '@/lib/worksflow/store'
 import { useLocalizedLabels } from './use-localized-labels'
 import { LanguageToggle } from './language-toggle'
 import { CollaborationCenter } from './collaboration-center'
+import { useCollaboration } from '@/lib/collaboration/provider'
 import {
   Bell,
   Database,
@@ -22,21 +23,19 @@ import {
 
 export function SettingsCenter() {
   const {
-    projectName,
-    setProjectName,
     setSurface,
     setView,
     setTeamView,
     linkedDocIds,
     documents,
-    productProject,
     preferences,
     updateUserPreferences,
   } = useWorksflow()
+  const collaboration = useCollaboration()
   const { t } = useI18n()
   const labels = useLocalizedLabels()
-  const [draftName, setDraftName] = useState(projectName)
-  useEffect(() => setDraftName(projectName), [projectName])
+  const [draftName, setDraftName] = useState(collaboration.project?.name ?? '')
+  useEffect(() => setDraftName(collaboration.project?.name ?? ''), [collaboration.project?.id, collaboration.project?.name])
   const linkedDocs = linkedDocIds
     .map((id) => documents.find((doc) => doc.id === id))
     .filter(Boolean)
@@ -78,8 +77,21 @@ export function SettingsCenter() {
                   />
                   <button
                     type="button"
-                    onClick={() => setProjectName(draftName.trim() || projectName)}
-                    className="rounded-md bg-primary px-3 py-2 text-[12px] font-semibold text-primary-foreground hover:bg-primary-bright"
+                    onClick={() => {
+                      const name = draftName.trim()
+                      if (collaboration.project && name) {
+                        void collaboration.renameProject(collaboration.project.id, name)
+                      }
+                    }}
+                    disabled={
+                      collaboration.loading ||
+                      !collaboration.session.signedIn ||
+                      !collaboration.project ||
+                      !collaboration.can('admin') ||
+                      !draftName.trim() ||
+                      draftName.trim() === collaboration.project.name
+                    }
+                    className="rounded-md bg-primary px-3 py-2 text-[12px] font-semibold text-primary-foreground hover:bg-primary-bright disabled:cursor-not-allowed disabled:opacity-50"
                   >
                     {t('common.save')}
                   </button>
@@ -98,16 +110,8 @@ export function SettingsCenter() {
                 <IntegrationCard
                   icon={GitBranch}
                   title={t('settings.github')}
-                  description={
-                    productProject.githubSettings.status === 'connected'
-                      ? t('settings.githubConnected')
-                      : t('settings.githubDisconnected')
-                  }
-                  action={
-                    productProject.githubSettings.status === 'connected'
-                      ? t('common.connected')
-                      : t('settings.openWorkbench')
-                  }
+                  description="Connection status is read from the server in the Workbench GitHub panel."
+                  action={t('settings.openWorkbench')}
                   onClick={() => setSurface('workbench')}
                 />
                 <IntegrationCard

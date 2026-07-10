@@ -71,6 +71,7 @@ export interface CommentThread {
   readonly createdAt: string
   readonly resolvedAt?: string
   readonly resolvedBy?: CollaborationUser
+  readonly etag: string
   readonly replies: readonly CommentReply[]
 }
 
@@ -79,19 +80,20 @@ export type ReviewDecision = 'approve' | 'request_changes'
 export interface ProjectReview {
   readonly id: string
   readonly projectId: string
-  readonly decision: ReviewDecision
+  readonly decision?: ReviewDecision
   readonly state?: 'pending' | 'approved' | 'changesRequested'
   readonly summary: string
   readonly requiredReviewerIds?: readonly string[]
   readonly reviewer: CollaborationUser
   readonly target?: CollaborationVersionRef
   readonly createdAt: string
+  readonly etag: string
 }
 
 export interface CollaborationVersionRef {
   readonly artifactId: string
   readonly revisionId: string
-  readonly revisionNumber: number
+  readonly revisionNumber?: number
   readonly contentHash: string
   readonly title?: string
 }

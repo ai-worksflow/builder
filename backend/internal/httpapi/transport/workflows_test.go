@@ -25,12 +25,14 @@ func (a workflowAuthenticator) Authenticate(context.Context, string) (auth.Sessi
 }
 
 type fakeWorkflowAPI struct {
-	actorID    string
-	projectID  string
-	start      runtime.StartRequest
-	approveErr error
-	run        *runtime.RunRecord
-	runPage    runtime.RunPage
+	actorID      string
+	projectID    string
+	start        runtime.StartRequest
+	approveErr   error
+	executeNode  string
+	executeActor string
+	run          *runtime.RunRecord
+	runPage      runtime.RunPage
 }
 
 func (f *fakeWorkflowAPI) ListDefinitions(context.Context, string, string) ([]runtime.DefinitionRecord, error) {
@@ -67,6 +69,10 @@ func (f *fakeWorkflowAPI) Events(context.Context, string, string, string, uint64
 	return nil, nil
 }
 func (f *fakeWorkflowAPI) Resume(context.Context, string, string, string, string, json.RawMessage) error {
+	return nil
+}
+func (f *fakeWorkflowAPI) AuthorizeExecution(_ context.Context, _, _ string, nodeKey, actorID string) error {
+	f.executeNode, f.executeActor = nodeKey, actorID
 	return nil
 }
 func (f *fakeWorkflowAPI) RecordProposal(context.Context, string, string, string, string, domain.ProposalRef) error {
@@ -140,6 +146,26 @@ func TestWorkflowHandlerReturnsETagAndMapsSelfApproval(t *testing.T) {
 	approve := workflowRequest(router, http.MethodPost, "/v1/projects/"+projectID+"/workflow-runs/"+runID+"/approve", `{"nodeKey":"review","resolution":"approve"}`)
 	if approve.Code != http.StatusConflict {
 		t.Fatalf("approve status=%d body=%s", approve.Code, approve.Body.String())
+	}
+}
+
+func TestWorkflowExecuteUsesSessionActorAndRejectsForgedActor(t *testing.T) {
+	projectID, userID, runID := uuid.NewString(), uuid.NewString(), uuid.NewString()
+	api := &fakeWorkflowAPI{run: &runtime.RunRecord{ID: runID, ProjectID: projectID, Status: runtime.RunWaitingInput, Nodes: map[string]*runtime.NodeRecord{}}}
+	router := workflowRouterForTest(t, api, userID)
+	forged := workflowRequest(router, http.MethodPost, "/v1/projects/"+projectID+"/workflow-runs/"+runID+"/execute", `{"nodeKey":"publish","actorId":"`+uuid.NewString()+`"}`)
+	if forged.Code != http.StatusBadRequest {
+		t.Fatalf("forged actor status=%d body=%s", forged.Code, forged.Body.String())
+	}
+	if api.executeActor != "" {
+		t.Fatal("forged request reached the workflow execution boundary")
+	}
+	response := workflowRequest(router, http.MethodPost, "/v1/projects/"+projectID+"/workflow-runs/"+runID+"/execute", `{"nodeKey":"publish"}`)
+	if response.Code != http.StatusNoContent {
+		t.Fatalf("execute status=%d body=%s", response.Code, response.Body.String())
+	}
+	if api.executeActor != userID || api.executeNode != "publish" {
+		t.Fatalf("execute actor/node = %q/%q", api.executeActor, api.executeNode)
 	}
 }
 

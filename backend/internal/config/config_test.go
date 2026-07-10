@@ -39,6 +39,8 @@ func TestProductionRequiresExplicitStartupMutations(t *testing.T) {
 	clearConfigEnvironment(t)
 	t.Setenv("APP_ENV", EnvironmentProduction)
 	t.Setenv("PLATFORM_ENCRYPTION_KEY", "1111111111111111111111111111111111111111111111111111111111111111")
+	t.Setenv("DELIVERY_SANDBOX_NODE_IMAGE", "node:22-alpine@sha256:"+strings.Repeat("a", 64))
+	t.Setenv("DELIVERY_SANDBOX_GO_IMAGE", "golang:1.22-alpine@sha256:"+strings.Repeat("b", 64))
 	cfg, err := Load()
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
@@ -51,6 +53,27 @@ func TestProductionRequiresExplicitStartupMutations(t *testing.T) {
 	}
 	if !cfg.Security.Session.CookieSecure {
 		t.Fatal("production session cookie must default to secure")
+	}
+}
+
+func TestSharedEnvironmentsRequireDigestPinnedSandboxImages(t *testing.T) {
+	clearConfigEnvironment(t)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, environment := range []string{EnvironmentStaging, EnvironmentProduction} {
+		cfg.Environment = environment
+		cfg.Delivery.SandboxNodeImage = "node:22-alpine"
+		cfg.Delivery.SandboxGoImage = "golang:1.22-alpine"
+		if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "@sha256") {
+			t.Fatalf("%s accepted mutable sandbox tags: %v", environment, err)
+		}
+		cfg.Delivery.SandboxNodeImage = "node:22-alpine@sha256:" + strings.Repeat("a", 64)
+		cfg.Delivery.SandboxGoImage = "golang:1.22-alpine@sha256:" + strings.Repeat("b", 64)
+		if err := cfg.Validate(); err != nil && strings.Contains(err.Error(), "@sha256") {
+			t.Fatalf("%s rejected digest-pinned sandbox images: %v", environment, err)
+		}
 	}
 }
 

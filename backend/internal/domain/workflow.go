@@ -78,6 +78,7 @@ type FanOutNodeConfig struct {
 	SliceKeyPath string `json:"sliceKeyPath"`
 	MergeNodeID  string `json:"mergeNodeId"`
 	MaxParallel  int    `json:"maxParallel"`
+	ItemKind     string `json:"itemKind,omitempty"`
 }
 
 type MergePolicy string
@@ -135,8 +136,9 @@ type TransformNodeConfig struct {
 }
 
 type QualityGateNodeConfig struct {
-	GateName string `json:"gateName"`
-	Blocking bool   `json:"blocking"`
+	GateName     string `json:"gateName"`
+	Blocking     bool   `json:"blocking"`
+	RequiredRole string `json:"requiredRole,omitempty"`
 }
 
 type DeliveryNodeConfig struct {
@@ -226,7 +228,7 @@ func (n NodeDefinition) Validate() error {
 			issues = append(issues, ValidationIssue{Path: "node.condition.branches", Message: err.Error()})
 		}
 	case NodeFanOut:
-		if n.FanOut == nil || !strings.HasPrefix(n.FanOut.ItemsPath, "/") || !strings.HasPrefix(n.FanOut.SliceKeyPath, "/") || strings.TrimSpace(n.FanOut.MergeNodeID) == "" || n.FanOut.MaxParallel < 1 {
+		if n.FanOut == nil || !strings.HasPrefix(n.FanOut.ItemsPath, "/") || !strings.HasPrefix(n.FanOut.SliceKeyPath, "/") || strings.TrimSpace(n.FanOut.MergeNodeID) == "" || n.FanOut.MaxParallel < 1 || (n.FanOut.ItemKind != "" && n.FanOut.ItemKind != "generic" && n.FanOut.ItemKind != "delivery_slice") {
 			issues = append(issues, ValidationIssue{Path: "node.fanOut", Message: "matching config with JSON pointers, mergeNodeId and positive maxParallel is required"})
 		}
 	case NodeMerge:
@@ -379,9 +381,12 @@ func (r WorkflowDefinitionRef) Validate() error {
 // region. It intentionally contains no mutable delivery state; consumers must
 // resolve the exact slice snapshot from the pinned workflow run.
 type WorkflowSliceRef struct {
-	ID           string `json:"id"`
-	Key          string `json:"key"`
-	FanOutNodeID string `json:"fanOutNodeId"`
+	ID           string       `json:"id"`
+	Key          string       `json:"key"`
+	FanOutNodeID string       `json:"fanOutNodeId"`
+	Blueprint    *ArtifactRef `json:"blueprint,omitempty"`
+	PageSpec     *ArtifactRef `json:"pageSpec,omitempty"`
+	Prototype    *ArtifactRef `json:"prototype,omitempty"`
 }
 
 // NodeOutputReference identifies the exact predecessor state from which an
@@ -627,6 +632,21 @@ func normalizeNodeInputBinding(binding NodeInputBinding) (NodeInputBinding, erro
 		if strings.TrimSpace(ref.ID) == "" || strings.TrimSpace(ref.Key) == "" || strings.TrimSpace(ref.FanOutNodeID) == "" {
 			return NodeInputBinding{}, invalid("nodeInputBinding.source.deliverySliceRefs", "id, key and fanOutNodeId are required")
 		}
+		if ref.Blueprint != nil {
+			if err := ref.Blueprint.Validate(); err != nil {
+				return NodeInputBinding{}, err
+			}
+		}
+		if ref.PageSpec != nil {
+			if err := ref.PageSpec.Validate(); err != nil {
+				return NodeInputBinding{}, err
+			}
+		}
+		if ref.Prototype != nil {
+			if err := ref.Prototype.Validate(); err != nil {
+				return NodeInputBinding{}, err
+			}
+		}
 	}
 	var err error
 	binding.Output, err = CanonicalJSON(binding.Output)
@@ -676,6 +696,20 @@ func cloneNodeOutputReference(source NodeOutputReference) NodeOutputReference {
 	}
 	clone.ArtifactRevisions = append([]ArtifactRef(nil), source.ArtifactRevisions...)
 	clone.DeliverySliceRefs = append([]WorkflowSliceRef(nil), source.DeliverySliceRefs...)
+	for index := range clone.DeliverySliceRefs {
+		if source.DeliverySliceRefs[index].Blueprint != nil {
+			value := *source.DeliverySliceRefs[index].Blueprint
+			clone.DeliverySliceRefs[index].Blueprint = &value
+		}
+		if source.DeliverySliceRefs[index].PageSpec != nil {
+			value := *source.DeliverySliceRefs[index].PageSpec
+			clone.DeliverySliceRefs[index].PageSpec = &value
+		}
+		if source.DeliverySliceRefs[index].Prototype != nil {
+			value := *source.DeliverySliceRefs[index].Prototype
+			clone.DeliverySliceRefs[index].Prototype = &value
+		}
+	}
 	return clone
 }
 

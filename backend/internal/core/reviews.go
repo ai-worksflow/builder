@@ -375,6 +375,34 @@ func (s *ReviewService) checkApprovalGates(ctx context.Context, transaction *gor
 	if blockers > 0 {
 		return fmt.Errorf("%w: %d blocking comments remain", ErrBlockingGate, blockers)
 	}
+	var requiredDependencies, coveredDependencies int64
+	if err := transaction.Raw(`
+SELECT
+  count(*) AS required_dependencies,
+  count(*) FILTER (WHERE EXISTS (
+    SELECT 1
+    FROM trace_links AS traces
+    WHERE traces.project_id = dependencies.project_id
+      AND traces.source_artifact_id = dependencies.source_artifact_id
+      AND traces.source_revision_id = dependencies.source_revision_id
+      AND traces.target_artifact_id = dependencies.target_artifact_id
+      AND traces.target_revision_id = dependencies.target_revision_id
+      AND traces.relation = dependencies.relation
+  )) AS covered_dependencies
+FROM artifact_dependencies AS dependencies
+WHERE dependencies.project_id = ?
+  AND dependencies.required = true
+  AND (
+    (dependencies.source_artifact_id = ? AND dependencies.source_revision_id = ?)
+    OR (dependencies.target_artifact_id = ? AND dependencies.target_revision_id = ?)
+  )
+`, artifact.ProjectID, artifact.ID, revision.ID, artifact.ID, revision.ID).
+		Row().Scan(&requiredDependencies, &coveredDependencies); err != nil {
+		return fmt.Errorf("compute review trace coverage: %w", err)
+	}
+	if coveredDependencies != requiredDependencies {
+		return fmt.Errorf("%w: only %d of %d required dependencies have exact trace links", ErrBlockingGate, coveredDependencies, requiredDependencies)
+	}
 	if artifact.Kind != "project_brief" && artifact.Kind != "product_requirements" && artifact.Kind != "requirement_baseline" {
 		var health storage.ArtifactHealthModel
 		if err := transaction.Where("artifact_id = ?", artifact.ID).Take(&health).Error; err == nil && health.SyncStatus != "current" {

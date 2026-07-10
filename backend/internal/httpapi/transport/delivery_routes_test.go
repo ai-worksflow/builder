@@ -238,15 +238,15 @@ func TestDeliveryExportDefaultsToRedactionAndEmitsExactArchiveHeaders(t *testing
 func TestDeliveryPublishAndRollbackEnforceStrongConditionalWrites(t *testing.T) {
 	projectID, userID := uuid.NewString(), uuid.NewString()
 	reference, encodedRef := deliveryVersionRefJSON()
-	deploymentID := uuid.NewString()
+	deploymentID, manifestID, qualityRunID := uuid.NewString(), uuid.NewString(), uuid.NewString()
 	api := &fakeDeliveryAPI{deployment: delivery.Deployment{
 		ID: deploymentID, ProjectID: projectID, Environment: delivery.EnvironmentPreview,
 		PublicURL: "/published/ready/", ETag: `"deployment:` + deploymentID + `:2"`,
 	}}
 	router := deliveryRouterForTest(t, api, userID, nil)
-	body := `{"environment":"preview","workspaceRevision":` + encodedRef + `}`
+	body := `{"environment":"preview","workspaceRevision":` + encodedRef + `,"buildManifestId":"` + manifestID + `","qualityRunId":"` + qualityRunID + `"}`
 	created := deliveryHTTP(router, http.MethodPost, "/v1/projects/"+projectID+"/deployments", body, nil)
-	if created.Code != http.StatusCreated || api.publishETag != "" || api.publishActor != userID || api.publishInput.WorkspaceRevision == nil || api.publishInput.WorkspaceRevision.RevisionID != reference.RevisionID {
+	if created.Code != http.StatusCreated || api.publishETag != "" || api.publishActor != userID || api.publishInput.WorkspaceRevision == nil || api.publishInput.WorkspaceRevision.RevisionID != reference.RevisionID || api.publishInput.BuildManifestID != manifestID || api.publishInput.QualityRunID != qualityRunID || api.publishInput.WorkflowQualityRunID != "" {
 		t.Fatalf("initial publish status=%d api=%+v body=%s", created.Code, api, created.Body.String())
 	}
 	currentETag := api.deployment.ETag

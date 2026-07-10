@@ -15,6 +15,8 @@ import { collaborationErrorMessage } from '../collaboration/platform-adapter'
 import { useWorksflow } from '../worksflow/store'
 import type {
   Blueprint,
+  BlueprintEdgeType,
+  BlueprintNodeType,
   BlueprintStatus,
   DocStatus,
   DocType,
@@ -23,20 +25,29 @@ import type {
 } from '../worksflow/types'
 import {
   ArtifactWorkspaceGateway,
+  approvedRequirementBaselineSources,
+  createEmptyPageSpecContent,
+  createEmptyPrototypeContent,
+  replaceArtifactWorkspaceSnapshotResource,
   type ArtifactDetails,
+  type CreateArtifactProposalInput,
   type ArtifactWorkspaceSnapshot,
+  type ArtifactWorkspaceResourceCollection,
 } from './artifact-workspace'
 import type {
   ArtifactRevisionDto,
+  ArtifactDraftDto,
   BlueprintContentDto,
-  CreateProposalInputDto,
   DocumentContentDto,
   ImpactReportDto,
+  JsonValue,
   PageSpecContentDto,
   ProposalDto,
   PrototypeContentDto,
   VersionedArtifactDto,
 } from './dto'
+
+export { createEmptyPageSpecContent, createEmptyPrototypeContent } from './artifact-workspace'
 
 export type ArtifactWorkspaceStatus = 'idle' | 'loading' | 'ready' | 'error'
 
@@ -51,6 +62,7 @@ interface ArtifactWorkspaceContextState extends ArtifactWorkspaceSnapshot {
     blueprintPageNodeId: string,
     title: string,
     route: string,
+    userGoal: string,
   ) => Promise<string | null>
   readonly createPrototype: (
     pageSpecArtifactId: string,
@@ -67,6 +79,11 @@ interface ArtifactWorkspaceContextState extends ArtifactWorkspaceSnapshot {
     content: BlueprintContentDto,
     etag: string,
   ) => ReturnType<ArtifactWorkspaceGateway['saveBlueprintDraft']>
+  readonly savePageSpecDraft: (
+    artifactId: string,
+    content: PageSpecContentDto,
+    etag: string,
+  ) => ReturnType<ArtifactWorkspaceGateway['savePageSpecDraft']>
   readonly savePrototypeDraft: (
     artifactId: string,
     content: PrototypeContentDto,
@@ -80,17 +97,20 @@ interface ArtifactWorkspaceContextState extends ArtifactWorkspaceSnapshot {
     artifactId: string,
     content: BlueprintContentDto,
   ) => Promise<ArtifactRevisionDto<BlueprintContentDto>>
+  readonly createPageSpecRevision: (
+    artifactId: string,
+    content: PageSpecContentDto,
+  ) => Promise<ArtifactRevisionDto<PageSpecContentDto>>
   readonly createPrototypeRevision: (
     artifactId: string,
     content: PrototypeContentDto,
   ) => Promise<ArtifactRevisionDto<PrototypeContentDto>>
   readonly loadDetails: <TContent>(artifactId: string) => Promise<ArtifactDetails<TContent>>
-  readonly createProposal: (input: CreateProposalInputDto) => Promise<ProposalDto>
+  readonly createProposal: (input: CreateArtifactProposalInput) => Promise<ProposalDto>
   readonly applyProposal: (
     proposalId: string,
-    operationIndexes: readonly number[],
-    etag: string,
-  ) => Promise<ProposalDto>
+    acceptedOperationIds: readonly string[],
+  ) => Promise<ArtifactDraftDto<JsonValue>>
   readonly impact: (blueprintArtifactId: string) => Promise<ImpactReportDto>
 }
 
@@ -179,16 +199,16 @@ export function ArtifactWorkspaceProvider({ children }: { children: ReactNode })
   }, [platformClient.websocket, project, session.signedIn])
 
   const updateSnapshotResource = useCallback(<TContent,>(
-    collection: 'documents' | 'blueprints' | 'prototypes',
+    collection: ArtifactWorkspaceResourceCollection,
     artifactId: string,
     resource: VersionedArtifactDto<TContent>,
   ) => {
-    setSnapshot((current) => ({
-      ...current,
-      [collection]: current[collection].map((item) =>
-        item.artifact.id === artifactId ? resource : item,
-      ),
-    } as ArtifactWorkspaceSnapshot))
+    setSnapshot((current) => replaceArtifactWorkspaceSnapshotResource(
+      current,
+      collection,
+      artifactId,
+      resource,
+    ))
   }, [])
 
   const value = useMemo<ArtifactWorkspaceContextState>(() => ({
@@ -204,16 +224,15 @@ export function ArtifactWorkspaceProvider({ children }: { children: ReactNode })
     },
     createBlueprint: async (title) => {
       if (!project) return null
-      const requirementVersions = snapshot.documents.flatMap((document) =>
-        document.approvedRevision
-          ? [{
-              artifactId: document.approvedRevision.artifactId,
-              revisionId: document.approvedRevision.id,
-              revisionNumber: document.approvedRevision.revisionNumber,
-              contentHash: document.approvedRevision.contentHash,
-            }]
-          : [],
-      )
+      const approvedSources = approvedRequirementBaselineSources(snapshot.documents)
+      const baselineResult = await gateway.compileRequirementBaseline(project.id, approvedSources)
+      const baseline = baselineResult.data
+      const requirementVersions = [{
+        artifactId: baseline.artifactId,
+        revisionId: baseline.id,
+        revisionNumber: baseline.revisionNumber,
+        contentHash: baseline.contentHash,
+      }]
       const result = await gateway.createBlueprint(
         project.id,
         title,
@@ -223,12 +242,12 @@ export function ArtifactWorkspaceProvider({ children }: { children: ReactNode })
       await refreshRef.current()
       return result.data.artifact.id
     },
-    createPageSpec: async (blueprintArtifactId, blueprintPageNodeId, title, route) => {
+    createPageSpec: async (blueprintArtifactId, blueprintPageNodeId, title, route, userGoal) => {
       if (!project) return null
       const blueprint = snapshot.blueprints.find((item) => item.artifact.id === blueprintArtifactId)
-      const revision = blueprint?.approvedRevision ?? blueprint?.latestRevision
+      const revision = blueprint?.approvedRevision
       if (!revision) {
-        throw new Error('Create an immutable blueprint revision before creating a PageSpec.')
+        throw new Error('Approve an immutable Blueprint revision before creating a formal PageSpec.')
       }
       const result = await gateway.createPageSpec(
         project.id,
@@ -238,9 +257,10 @@ export function ArtifactWorkspaceProvider({ children }: { children: ReactNode })
           revisionId: revision.id,
           revisionNumber: revision.revisionNumber,
           contentHash: revision.contentHash,
+          anchorId: blueprintPageNodeId,
         },
         blueprintPageNodeId,
-        createEmptyPageSpecContent(blueprintPageNodeId, title, route),
+        createEmptyPageSpecContent(blueprintPageNodeId, title, route, userGoal),
       )
       await refreshRef.current()
       return result.data.artifact.id
@@ -268,7 +288,7 @@ export function ArtifactWorkspaceProvider({ children }: { children: ReactNode })
         project.id,
         title,
         reference,
-        createEmptyPrototypeContent(reference, exploratory),
+        createEmptyPrototypeContent(reference, revision.content, exploratory),
       )
       await refreshRef.current()
       return result.data.artifact.id
@@ -281,6 +301,15 @@ export function ArtifactWorkspaceProvider({ children }: { children: ReactNode })
     saveBlueprintDraft: async (artifactId, content, etag) => {
       const result = await gateway.saveBlueprintDraft(artifactId, content, etag)
       updateSnapshotResource('blueprints', artifactId, result.data)
+      return result
+    },
+    savePageSpecDraft: async (artifactId, content, etag) => {
+      const result = await gateway.savePageSpecDraft(
+        artifactId,
+        content,
+        etag,
+      )
+      updateSnapshotResource('pageSpecs', artifactId, result.data)
       return result
     },
     savePrototypeDraft: async (artifactId, content, etag) => {
@@ -296,7 +325,6 @@ export function ArtifactWorkspaceProvider({ children }: { children: ReactNode })
         artifactId,
         content,
         draftEtag,
-        resource?.draft?.sourceVersions ?? [],
       )
       const revisionEtag = saved.data.draft?.etag ?? saved.etag
       if (!revisionEtag) throw new Error('The server did not return the saved draft ETag.')
@@ -312,11 +340,25 @@ export function ArtifactWorkspaceProvider({ children }: { children: ReactNode })
         artifactId,
         content,
         draftEtag,
-        resource?.draft?.sourceVersions ?? [],
       )
       const revisionEtag = saved.data.draft?.etag ?? saved.etag
       if (!revisionEtag) throw new Error('The server did not return the saved draft ETag.')
       const result = await gateway.createBlueprintRevision(artifactId, revisionEtag)
+      await refreshRef.current()
+      return result.data
+    },
+    createPageSpecRevision: async (artifactId, content) => {
+      const resource = snapshot.pageSpecs.find((item) => item.artifact.id === artifactId)
+      const draftEtag = resource?.draft?.etag ?? resource?.artifact.etag
+      if (!draftEtag) throw new Error('Refresh the PageSpec draft before creating a revision.')
+      const saved = await gateway.savePageSpecDraft(
+        artifactId,
+        content,
+        draftEtag,
+      )
+      const revisionEtag = saved.data.draft?.etag ?? saved.etag
+      if (!revisionEtag) throw new Error('The server did not return the saved draft ETag.')
+      const result = await gateway.createPageSpecRevision(artifactId, revisionEtag)
       await refreshRef.current()
       return result.data
     },
@@ -342,8 +384,8 @@ export function ArtifactWorkspaceProvider({ children }: { children: ReactNode })
       await refreshRef.current()
       return result.data
     },
-    applyProposal: async (proposalId, operationIndexes, etag) => {
-      const result = await gateway.applyProposal(proposalId, operationIndexes, etag)
+    applyProposal: async (proposalId, acceptedOperationIds) => {
+      const result = await gateway.applyProposal(proposalId, acceptedOperationIds)
       await refreshRef.current()
       return result.data
     },
@@ -369,6 +411,17 @@ export function useArtifactWorkspace() {
 
 export function createEmptyDocumentContent(kind: DocumentContentDto['kind']): DocumentContentDto {
   const blockId = stableId('block')
+  if (kind === 'projectBrief') {
+    return {
+      kind,
+      summary: '',
+      blocks: [{ id: blockId, type: 'goal', text: '' }],
+      requirements: [],
+      acceptanceCriteria: [],
+      openQuestions: [],
+      assumptions: [],
+    }
+  }
   const requirementId = stableId('req')
   const criterionId = stableId('ac')
   return {
@@ -402,83 +455,6 @@ export function createEmptyBlueprintContent(): BlueprintContentDto {
     layout: { nodePositions: {}, groups: [], viewport: { x: 0, y: 0, zoom: 1 } },
     pageSpecRefs: [],
     validation: [],
-  }
-}
-
-export function createEmptyPageSpecContent(
-  blueprintPageNodeId: string,
-  title: string,
-  route: string,
-): PageSpecContentDto {
-  return {
-    blueprintPageNodeId,
-    title,
-    route,
-    userGoal: '',
-    entryPoints: [],
-    exitPoints: [],
-    requiredRoles: [],
-    states: [{
-      id: stableId('state'),
-      key: 'default',
-      title: 'Default',
-      required: true,
-      fixtureIds: [],
-      acceptanceCriterionIds: [],
-    }],
-    dataBindings: [],
-    interactions: [],
-    acceptanceCriterionIds: [],
-    nonFunctionalConstraints: [],
-  }
-}
-
-export function createEmptyPrototypeContent(
-  pageSpecRevision: {
-    artifactId: string
-    revisionId: string
-    revisionNumber: number
-    contentHash: string
-  },
-  exploratory = false,
-): PrototypeContentDto {
-  const stateId = stableId('state')
-  const breakpointId = stableId('breakpoint')
-  const rootLayerId = stableId('layer')
-  return {
-    pageSpecRevision,
-    exploratory,
-    states: [{ id: stateId, key: 'ready', title: 'Ready', required: true, fixtureIds: [] }],
-    breakpoints: [{
-      id: breakpointId,
-      name: 'Desktop',
-      minWidth: 1024,
-      viewportWidth: 1440,
-      viewportHeight: 900,
-    }],
-    layers: {
-      [rootLayerId]: {
-        id: rootLayerId,
-        childIds: [],
-        kind: 'frame',
-        name: 'Page',
-        semanticRole: 'main',
-        layout: { x: 0, y: 0, width: 1440, height: 900 },
-        style: { fill: '#171719' },
-        properties: {},
-        requirementIds: [],
-        acceptanceCriterionIds: [],
-        fieldMetadata: {},
-      },
-    },
-    frames: [{ id: stableId('frame'), stateId, breakpointId, rootLayerId, title: 'Ready' }],
-    overrides: [],
-    interactions: [],
-    fixtures: [],
-    tokenBindings: [],
-    componentBindings: [],
-    assets: [],
-    traceLinks: [],
   }
 }
 
@@ -554,7 +530,7 @@ function blueprintAsLegacy(resource: VersionedArtifactDto<BlueprintContentDto>):
     ownerId: resource.artifact.createdBy,
     nodes: semanticNodes.map((node) => ({
       id: node.id,
-      type: node.kind,
+      type: legacyBlueprintNodeKind(node.kind),
       title: node.title,
       description: node.description,
       position: content.layout?.nodePositions[node.id] ?? { x: 0, y: 0 },
@@ -568,7 +544,7 @@ function blueprintAsLegacy(resource: VersionedArtifactDto<BlueprintContentDto>):
       id: edge.id,
       sourceNodeId: edge.sourceNodeId,
       targetNodeId: edge.targetNodeId,
-      type: edge.kind === 'implements' ? 'implemented_by' : edge.kind,
+      type: legacyBlueprintEdgeKind(edge.kind),
       isRequired: edge.required,
     })),
     generatedDocIds: [],
@@ -577,7 +553,21 @@ function blueprintAsLegacy(resource: VersionedArtifactDto<BlueprintContentDto>):
   }
 }
 
+function legacyBlueprintNodeKind(kind: BlueprintContentDto['nodes'][number]['kind']): BlueprintNodeType {
+  if (kind === 'apiOperation') return 'api'
+  if (kind === 'dataEntity') return 'dataModel'
+  return kind
+}
+
+function legacyBlueprintEdgeKind(kind: BlueprintContentDto['edges'][number]['kind']): BlueprintEdgeType {
+  if (kind === 'implements' || kind === 'implemented_by') return 'implemented_by'
+  if (kind === 'realized_by') return 'renders'
+  if (kind === 'drives' || kind === 'satisfied_by' || kind === 'navigates_to' || kind === 'verified_by') return 'generates'
+  return kind
+}
+
 function documentKind(kind: DocumentContentDto['kind']): DocType {
+  if (kind === 'projectBrief') return 'requirement'
   if (kind === 'backendDevelopment') return 'backendDev'
   if (kind === 'frontendDevelopment') return 'frontendDev'
   if (kind === 'decisionLog') return 'requirement'

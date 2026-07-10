@@ -72,6 +72,8 @@ interface CollaborationContextState {
   restoreSession: () => Promise<void>
   refresh: () => Promise<void>
   createProject: (name: string, description?: string) => Promise<string | null>
+  renameProject: (projectId: string, name: string) => Promise<boolean>
+  archiveProject: (projectId: string) => Promise<boolean>
   selectProject: (projectId: string) => Promise<boolean>
   addComment: (
     body: string,
@@ -410,6 +412,64 @@ export function CollaborationProvider({
     }
   }, [applyProjectSnapshot, projects])
 
+  const renameProject = useCallback(async (projectId: string, name: string) => {
+    const target = projects.find((item) => item.id === projectId)
+    if (!target || !name.trim()) return false
+    setLoading(true)
+    setError(null)
+    try {
+      if (!(await gateway.authorize(projectId, 'admin'))) {
+        setError('Your project role does not allow renaming this project.')
+        return false
+      }
+      const updated = await gateway.renameProject(target, name.trim())
+      setProjects((current) => current.map((item) => item.id === updated.id ? updated : item))
+      if (project?.id === updated.id) {
+        selectPlatformProjectRef.current({ id: updated.id, name: updated.name })
+        await applyProjectSnapshot(updated.id)
+      }
+      return true
+    } catch (cause) {
+      setBackendStatus(collaborationBackendUnavailable(cause) ? 'error' : 'online')
+      setError(collaborationErrorMessage(cause, 'Unable to rename the project.'))
+      return false
+    } finally {
+      setLoading(false)
+    }
+  }, [applyProjectSnapshot, gateway, project?.id, projects])
+
+  const archiveProject = useCallback(async (projectId: string) => {
+    const target = projects.find((item) => item.id === projectId)
+    if (!target) return false
+    setLoading(true)
+    setError(null)
+    try {
+      if (!(await gateway.authorize(projectId, 'admin'))) {
+        setError('Your project role does not allow archiving this project.')
+        return false
+      }
+      await gateway.archiveProject(target)
+      const remaining = projects.filter((item) => item.id !== projectId)
+      setProjects(remaining)
+      if (project?.id === projectId) {
+        const next = remaining[0]
+        if (next) {
+          selectPlatformProjectRef.current({ id: next.id, name: next.name })
+          await applyProjectSnapshot(next.id)
+        } else {
+          clearProjectState()
+        }
+      }
+      return true
+    } catch (cause) {
+      setBackendStatus(collaborationBackendUnavailable(cause) ? 'error' : 'online')
+      setError(collaborationErrorMessage(cause, 'Unable to archive the project.'))
+      return false
+    } finally {
+      setLoading(false)
+    }
+  }, [applyProjectSnapshot, clearProjectState, gateway, project?.id, projects])
+
   const mutate = useCallback(async (
     action: ProjectAction,
     operation: (projectId: string) => Promise<unknown>,
@@ -460,6 +520,8 @@ export function CollaborationProvider({
     restoreSession,
     refresh,
     createProject,
+    renameProject,
+    archiveProject,
     selectProject,
     addComment: (body, parentId, target = reviewTargets[0]) => {
       if (!target) {
@@ -468,8 +530,14 @@ export function CollaborationProvider({
       }
       return mutate('comment', (projectId) => gateway.addComment(projectId, body, target, parentId))
     },
-    resolveComment: (commentId, resolved) =>
-      mutate('edit', () => gateway.resolveComment(commentId, resolved)),
+    resolveComment: (commentId, resolved) => {
+      const thread = comments.find((item) => item.id === commentId)
+      if (!thread?.etag) {
+        setError('Refresh comments before changing the thread state.')
+        return Promise.resolve(false)
+      }
+      return mutate('edit', () => gateway.resolveComment(commentId, resolved, thread.etag))
+    },
     addReview: (decision, summary, target = reviewTargets[0]) => {
       void decision
       if (!target) {
@@ -492,8 +560,14 @@ export function CollaborationProvider({
       mutate('edit', (projectId) =>
         gateway.requestReview(projectId, target, summary, requiredReviewerIds),
       ),
-    decideReview: (reviewId, decision, summary) =>
-      mutate('edit', () => gateway.decideReview(reviewId, decision, summary)),
+    decideReview: (reviewId, decision, summary) => {
+      const review = reviews.find((item) => item.id === reviewId)
+      if (!review?.etag) {
+        setError('Refresh reviews before recording a decision.')
+        return Promise.resolve(false)
+      }
+      return mutate('edit', () => gateway.decideReview(reviewId, decision, summary, review.etag))
+    },
     addMember: (input) => mutate('admin', (projectId) => gateway.addMember(projectId, input)),
     updateMemberRole: (userId, role) => {
       const member = members.find((item) => item.user.id === userId)
@@ -535,6 +609,7 @@ export function CollaborationProvider({
     applyProjectSnapshot,
     auditEvents,
     authorize,
+    archiveProject,
     backendStatus,
     can,
     comments,
@@ -550,6 +625,7 @@ export function CollaborationProvider({
     projects,
     refresh,
     restoreSession,
+    renameProject,
     reviewTargets,
     reviews,
     selectProject,

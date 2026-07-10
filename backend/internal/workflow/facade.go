@@ -215,6 +215,9 @@ func workflowNodeRoles(node domain.NodeDefinition) []string {
 	if node.ReviewGate != nil {
 		roles = append(roles, node.ReviewGate.RequiredRole)
 	}
+	if node.QualityGate != nil && strings.TrimSpace(node.QualityGate.RequiredRole) != "" {
+		roles = append(roles, node.QualityGate.RequiredRole)
+	}
 	if node.Publish != nil {
 		roles = append(roles, node.Publish.RequiredRole)
 	}
@@ -420,6 +423,36 @@ func (f Facade) Resume(ctx context.Context, projectID, runID, nodeKey, actorID s
 	}
 	return f.Engine.SubmitHumanInput(ctx, runID, nodeKey, output, actorID)
 }
+
+// AuthorizeExecution is the only transport-facing path that can mint the
+// actor provenance consumed by quality and publish workers. Identity comes
+// from the authenticated session; the request body contains only a node key.
+func (f Facade) AuthorizeExecution(ctx context.Context, projectID, runID, nodeKey, actorID string) error {
+	run, err := f.GetRun(ctx, projectID, runID, actorID)
+	if err != nil {
+		return err
+	}
+	_, definition, err := f.nodeDefinition(ctx, run, nodeKey)
+	if err != nil {
+		return err
+	}
+	action, requiredRole, required := nodeExecutionPolicy(definition)
+	if !required {
+		return &domain.DomainError{Kind: domain.ErrInvalidTransition, Field: "node", Message: "node does not accept privileged execution authorization"}
+	}
+	role, err := f.Access.Authorize(ctx, projectID, actorID, action)
+	if err != nil {
+		return err
+	}
+	if !workflowRoleSatisfies(role, requiredRole) {
+		return core.ErrForbidden
+	}
+	return f.Engine.AuthorizeNodeExecution(ctx, runID, nodeKey, ActorProvenance{
+		ActorID: actorID, Role: role, Action: action,
+		Source: ActorSourceAuthenticatedCommand, AuthorizedAt: f.Engine.now(),
+	})
+}
+
 func (f Facade) RecordProposal(ctx context.Context, projectID, runID, nodeKey, actorID string, proposal domain.ProposalRef) error {
 	if err := f.authorize(ctx, projectID, actorID, core.ActionEdit); err != nil {
 		return err
@@ -430,11 +463,15 @@ func (f Facade) RecordProposal(ctx context.Context, projectID, runID, nodeKey, a
 	return f.Engine.RecordProposal(ctx, runID, nodeKey, proposal, actorID)
 }
 func (f Facade) ResolveReview(ctx context.Context, projectID, runID, nodeKey, actorID string, resolution ReviewResolution, reason string) error {
+	if err := f.validate(); err != nil {
+		return err
+	}
 	action := core.ActionReview
 	if resolution == ReviewApprove || resolution == ReviewWaive {
 		action = core.ActionApprove
 	}
-	if err := f.authorize(ctx, projectID, actorID, action); err != nil {
+	role, err := f.Access.Authorize(ctx, projectID, actorID, action)
+	if err != nil {
 		return err
 	}
 	run, err := f.GetRun(ctx, projectID, runID, actorID)
@@ -444,7 +481,64 @@ func (f Facade) ResolveReview(ctx context.Context, projectID, runID, nodeKey, ac
 	if err := f.requireNodeRole(ctx, actorID, run, nodeKey); err != nil {
 		return err
 	}
-	return f.Engine.ResolveReview(ctx, runID, nodeKey, actorID, resolution, reason)
+	now := f.Engine.now()
+	decision := ReviewDecision{
+		Resolution: resolution, Reason: reason,
+		Actor:                   ActorProvenance{ActorID: actorID, Role: role, Action: action, Source: ActorSourceAuthenticatedCommand, AuthorizedAt: now},
+		ExecutionAuthorizations: map[string]ActorProvenance{},
+	}
+	if resolution == ReviewApprove || resolution == ReviewWaive {
+		node, definition, loadErr := f.nodeDefinition(ctx, run, nodeKey)
+		if loadErr != nil {
+			return loadErr
+		}
+		record, loadErr := f.Store.GetDefinitionVersion(ctx, run.DefinitionVersionID)
+		if loadErr != nil {
+			return loadErr
+		}
+		source := ActorSourceReviewApproval
+		if resolution == ReviewWaive {
+			source = ActorSourceReviewWaiver
+		}
+		for _, edge := range record.Definition.Outgoing(definition.ID) {
+			if run.Context.DisabledEdges[disabledEdgeKey(edge.ID, node.SliceID)] {
+				continue
+			}
+			successorKey := edge.To
+			if node.SliceID != "" {
+				if _, exists := run.Nodes[instanceKey(edge.To, node.SliceID)]; exists {
+					successorKey = instanceKey(edge.To, node.SliceID)
+				}
+			}
+			successor := run.Nodes[successorKey]
+			if successor == nil || successor.Status != NodePending {
+				continue
+			}
+			successorDefinition, exists := record.Definition.FindNode(successor.DefinitionNodeID)
+			if !exists {
+				return core.ErrNotFound
+			}
+			requiredAction, requiredRole, required := nodeExecutionPolicy(successorDefinition)
+			if !required {
+				continue
+			}
+			executionRole, authorizeErr := f.Access.Authorize(ctx, projectID, actorID, requiredAction)
+			if errors.Is(authorizeErr, core.ErrForbidden) {
+				continue
+			}
+			if authorizeErr != nil {
+				return authorizeErr
+			}
+			if !workflowRoleSatisfies(executionRole, requiredRole) {
+				continue
+			}
+			decision.ExecutionAuthorizations[successorKey] = ActorProvenance{
+				ActorID: actorID, Role: executionRole, Action: requiredAction,
+				Source: source, AuthorizedAt: now,
+			}
+		}
+	}
+	return f.Engine.ResolveReview(ctx, runID, nodeKey, decision)
 }
 func (f Facade) Cancel(ctx context.Context, projectID, runID, actorID, reason string) error {
 	if err := f.authorize(ctx, projectID, actorID, core.ActionEdit); err != nil {
@@ -465,7 +559,11 @@ func (f Facade) Retry(ctx context.Context, projectID, runID, nodeKey, actorID, r
 	return f.Engine.RetryNode(ctx, runID, nodeKey, actorID, reason)
 }
 func (f Facade) Waive(ctx context.Context, projectID, runID, nodeKey, actorID, reason string) error {
-	if err := f.authorize(ctx, projectID, actorID, core.ActionApprove); err != nil {
+	if err := f.validate(); err != nil {
+		return err
+	}
+	role, err := f.Access.Authorize(ctx, projectID, actorID, core.ActionApprove)
+	if err != nil {
 		return err
 	}
 	run, err := f.GetRun(ctx, projectID, runID, actorID)
@@ -475,24 +573,35 @@ func (f Facade) Waive(ctx context.Context, projectID, runID, nodeKey, actorID, r
 	if err := f.requireNodeRole(ctx, actorID, run, nodeKey); err != nil {
 		return err
 	}
-	return f.Engine.WaiveNode(ctx, runID, nodeKey, actorID, reason)
+	return f.Engine.WaiveNode(ctx, runID, nodeKey, ActorProvenance{
+		ActorID: actorID, Role: role, Action: core.ActionApprove,
+		Source: ActorSourceAuthenticatedCommand, AuthorizedAt: f.Engine.now(),
+	}, reason)
 }
 
-func (f Facade) requireNodeRole(ctx context.Context, actorID string, run *RunRecord, nodeKey string) error {
+func (f Facade) nodeDefinition(ctx context.Context, run *RunRecord, nodeKey string) (*NodeRecord, domain.NodeDefinition, error) {
 	if run == nil {
-		return core.ErrNotFound
+		return nil, domain.NodeDefinition{}, core.ErrNotFound
 	}
 	node := run.Nodes[nodeKey]
 	if node == nil {
-		return core.ErrNotFound
+		return nil, domain.NodeDefinition{}, core.ErrNotFound
 	}
 	record, err := f.Store.GetDefinitionVersion(ctx, run.DefinitionVersionID)
 	if err != nil {
-		return err
+		return nil, domain.NodeDefinition{}, err
 	}
 	definition, exists := record.Definition.FindNode(node.DefinitionNodeID)
 	if !exists {
-		return core.ErrNotFound
+		return nil, domain.NodeDefinition{}, core.ErrNotFound
+	}
+	return node, definition, nil
+}
+
+func (f Facade) requireNodeRole(ctx context.Context, actorID string, run *RunRecord, nodeKey string) error {
+	_, definition, err := f.nodeDefinition(ctx, run, nodeKey)
+	if err != nil {
+		return err
 	}
 	required := ""
 	if definition.HumanEdit != nil {
@@ -503,6 +612,11 @@ func (f Facade) requireNodeRole(ctx context.Context, actorID string, run *RunRec
 		required = definition.ReviewGate.RequiredRole
 	} else if definition.Approval != nil {
 		required = definition.Approval.RequiredRole
+	} else if definition.QualityGate != nil {
+		required = definition.QualityGate.RequiredRole
+		if strings.TrimSpace(required) == "" {
+			required = string(core.RoleEditor)
+		}
 	} else if definition.Publish != nil {
 		required = definition.Publish.RequiredRole
 	}

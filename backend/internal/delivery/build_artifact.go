@@ -19,6 +19,27 @@ import (
 
 var staticOutputDirectories = []string{"dist", "out", "build"}
 
+func clearStaticBuildOutputs(workspace string) error {
+	for _, candidate := range staticOutputDirectories {
+		target := filepath.Join(workspace, candidate)
+		if err := ensureBuildPathContained(workspace, target); err != nil {
+			return err
+		}
+		if err := os.RemoveAll(target); err != nil {
+			return wrapInternal("clear stale static build output", err)
+		}
+	}
+	return nil
+}
+
+func ensureBuildPathContained(root, target string) error {
+	relative, err := filepath.Rel(root, target)
+	if err != nil || relative == "." || relative == ".." || strings.HasPrefix(relative, ".."+string(os.PathSeparator)) || filepath.IsAbs(relative) {
+		return NewError(CodeUnsafePath, 422, "build output path escapes the temporary quality workspace")
+	}
+	return nil
+}
+
 func captureBuildArtifact(directory string, reference core.VersionRef, allowStaticRoot bool) (BuildArtifact, error) {
 	root, err := selectStaticOutputRoot(directory, allowStaticRoot)
 	if err != nil {

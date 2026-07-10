@@ -21,6 +21,13 @@ func CORS(cfg config.CORSConfig) gin.HandlerFunc {
 	maxAge := strconv.FormatInt(int64(cfg.MaxAge.Seconds()), 10)
 
 	return func(context *gin.Context) {
+		// Public application data uses a deployment-scoped dynamic Origin policy.
+		// Let its dedicated handler process both requests and preflight rather
+		// than applying the builder UI's static CORS allowlist here.
+		if strings.HasPrefix(context.Request.URL.Path, "/v1/public/data/") {
+			context.Next()
+			return
+		}
 		origin := context.GetHeader("Origin")
 		if origin == "" {
 			context.Next()

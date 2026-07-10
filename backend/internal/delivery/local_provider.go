@@ -55,6 +55,36 @@ func NewLocalStaticProvider(rootDirectory, baseURL string) (*LocalStaticProvider
 
 func (*LocalStaticProvider) Name() string { return "local-static" }
 
+func (p *LocalStaticProvider) PublicDeploymentOrigins(_ ProviderRequest) ([]string, error) {
+	parsed, err := url.Parse(p.baseURL)
+	if err != nil || !parsed.IsAbs() || parsed.Host == "" {
+		return nil, errors.New("DELIVERY_PUBLISH_BASE_URL must be absolute before public application data can be enabled")
+	}
+	return []string{strings.ToLower(parsed.Scheme) + "://" + strings.ToLower(parsed.Host)}, nil
+}
+
+func (p *LocalStaticProvider) Readiness(ctx context.Context) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+	info, err := os.Lstat(p.rootDirectory)
+	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return errors.New("publish root is unavailable")
+	}
+	probe, err := os.CreateTemp(p.rootDirectory, ".readiness-")
+	if err != nil {
+		return fmt.Errorf("publish root is not writable: %w", err)
+	}
+	name := probe.Name()
+	if closeErr := probe.Close(); closeErr != nil {
+		_ = os.Remove(name)
+		return closeErr
+	}
+	return os.Remove(name)
+}
+
 func (p *LocalStaticProvider) Deploy(ctx context.Context, request ProviderRequest) (ProviderResult, error) {
 	if _, err := uuid.Parse(request.DeploymentID); err != nil {
 		return ProviderResult{}, Invalid("deploymentId", "deploymentId must be a UUID")

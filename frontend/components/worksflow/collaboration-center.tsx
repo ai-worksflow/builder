@@ -429,7 +429,7 @@ function CommentsTab({
     <div className="space-y-2">
       {canComment && (
         <form onSubmit={(event) => { event.preventDefault(); void onAdd() }} className="grid gap-2 sm:grid-cols-[220px_1fr_auto]">
-          <select value={selectedTarget?.revisionId ?? ''} onChange={(event) => onTargetChange(event.target.value)} className="h-9 rounded-md border border-border bg-background px-2 text-[10px] text-foreground"><option value="">Select artifact version</option>{targets.map((target) => <option key={target.revisionId} value={target.revisionId}>{target.title ?? target.artifactId} · r{target.revisionNumber}</option>)}</select>
+          <select value={selectedTarget?.revisionId ?? ''} onChange={(event) => onTargetChange(event.target.value)} className="h-9 rounded-md border border-border bg-background px-2 text-[10px] text-foreground"><option value="">Select artifact version</option>{targets.map((target) => <option key={target.revisionId} value={target.revisionId}>{target.title ?? target.artifactId} · {versionDisplay(target)}</option>)}</select>
           <input value={comment} onChange={(event) => onCommentChange(event.target.value)} placeholder="Comment on this exact revision" className="h-9 min-w-0 rounded-md border border-border bg-background px-2 text-[10px] text-foreground outline-none" />
           <button type="submit" disabled={!selectedTarget || !comment.trim()} className="rounded-md bg-primary px-3 text-[10px] font-semibold text-primary-foreground disabled:opacity-50">Post</button>
         </form>
@@ -443,7 +443,7 @@ function CommentsTab({
             <span className="ml-auto text-[9px] text-faint-foreground">{new Date(thread.createdAt).toLocaleString()}</span>
           </div>
           <p className="mt-1 text-[10px] text-muted-foreground">{thread.body}</p>
-          {thread.target && <p className="mt-1 font-mono text-[8px] text-faint-foreground">revision {thread.target.revisionNumber} · {thread.target.contentHash.slice(0, 12)}</p>}
+          {thread.target && <p className="mt-1 font-mono text-[8px] text-faint-foreground">{versionDisplay(thread.target)} · {thread.target.contentHash.slice(0, 12)}</p>}
           {thread.replies.map((reply) => <p key={reply.id} className="mt-2 border-l border-border pl-2 text-[9px] text-muted-foreground"><b>{reply.author.name}:</b> {reply.body}</p>)}
           {canResolve && <button type="button" onClick={() => void onResolve(thread.id, !thread.resolvedAt)} className="mt-2 text-[9px] text-primary-bright">{thread.resolvedAt ? 'Reopen' : 'Resolve'}</button>}
         </div>
@@ -533,7 +533,7 @@ function ReviewsTab({
     <div className="space-y-2">
       {canReview && (
         <form onSubmit={(event) => { event.preventDefault(); void onSubmit() }} className="grid gap-2 rounded-md border border-border bg-card p-3 sm:grid-cols-2">
-          <label className="text-[9px] text-faint-foreground">Artifact revision<select value={selectedTarget?.revisionId ?? ''} onChange={(event) => onTargetChange(event.target.value)} className="mt-1 h-8 w-full rounded border border-border bg-background px-2 text-[10px] text-foreground"><option value="">Select a version</option>{targets.map((target) => <option key={target.revisionId} value={target.revisionId}>{target.title ?? target.artifactId} · r{target.revisionNumber}</option>)}</select></label>
+          <label className="text-[9px] text-faint-foreground">Artifact revision<select value={selectedTarget?.revisionId ?? ''} onChange={(event) => onTargetChange(event.target.value)} className="mt-1 h-8 w-full rounded border border-border bg-background px-2 text-[10px] text-foreground"><option value="">Select a version</option>{targets.map((target) => <option key={target.revisionId} value={target.revisionId}>{target.title ?? target.artifactId} · {versionDisplay(target)}</option>)}</select></label>
           <label className="text-[9px] text-faint-foreground">Required reviewer<select value={reviewerId} onChange={(event) => onReviewerChange(event.target.value)} className="mt-1 h-8 w-full rounded border border-border bg-background px-2 text-[10px] text-foreground"><option value="">Select reviewer</option>{reviewers.map((member) => <option key={member.user.id} value={member.user.id}>{member.user.name}</option>)}</select></label>
           <textarea value={summary} onChange={(event) => onSummaryChange(event.target.value)} placeholder="Version-level review summary" rows={3} className="rounded border border-border bg-background p-2 text-[10px] text-foreground sm:col-span-2" />
           <button type="submit" disabled={!selectedTarget || !reviewerId || !summary.trim()} className="rounded bg-primary px-3 py-2 text-[10px] font-semibold text-primary-foreground disabled:opacity-50 sm:col-span-2">Request version review</button>
@@ -542,13 +542,19 @@ function ReviewsTab({
       {targets.length === 0 && <EmptyState text="Create a versioned artifact before requesting review." />}
       {reviews.map((review) => (
         <div key={review.id} className="rounded-md border border-border bg-card px-3 py-2">
-          <div className="flex items-center gap-2"><span className="rounded bg-primary/10 px-1.5 py-0.5 text-[9px] text-primary-bright">{review.state ?? review.decision}</span><span className="text-[10px] font-medium text-foreground">{review.reviewer.name}</span><span className="ml-auto text-[9px] text-faint-foreground">r{review.target?.revisionNumber ?? '?'}</span></div>
+          <div className="flex items-center gap-2"><span className="rounded bg-primary/10 px-1.5 py-0.5 text-[9px] text-primary-bright">{review.state ?? review.decision}</span><span className="text-[10px] font-medium text-foreground">{review.reviewer.name}</span><span className="ml-auto text-[9px] text-faint-foreground">{review.target ? versionDisplay(review.target) : 'revision unavailable'}</span></div>
           <p className="mt-1 text-[10px] text-muted-foreground">{review.summary}</p>
           {review.state === 'pending' && canReview && review.requiredReviewerIds?.includes(currentUserId) && <div className="mt-2 flex gap-2"><button type="button" onClick={() => void onDecide(review.id, 'approve', 'Approved after reviewing this exact revision.')} className="text-[9px] text-success">Approve</button><button type="button" onClick={() => { const reason = window.prompt('Describe the required changes')?.trim(); if (reason) void onDecide(review.id, 'request_changes', reason) }} className="text-[9px] text-warning">Request changes</button></div>}
         </div>
       ))}
     </div>
   )
+}
+
+function versionDisplay(target: Pick<CollaborationVersionRef, 'revisionId' | 'revisionNumber'>) {
+  return target.revisionNumber
+    ? `r${target.revisionNumber}`
+    : `revision ${target.revisionId.slice(0, 12)}`
 }
 
 function AuthField({

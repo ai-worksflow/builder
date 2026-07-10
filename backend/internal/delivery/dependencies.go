@@ -294,6 +294,30 @@ func materializeDependencyPlan(baseDirectory string, plan dependencyPlan) (strin
 	return directory, cleanup, nil
 }
 
+func ensurePreparedDependencyLayout(directory, ecosystem string) error {
+	var target string
+	switch ecosystem {
+	case "node":
+		target = filepath.Join(directory, "node_modules")
+	case "go":
+		target = filepath.Join(directory, "pkg", "mod")
+	default:
+		return Invalid("dependencies", "prepared dependency ecosystem is unsupported")
+	}
+	if info, err := os.Lstat(target); err == nil {
+		if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+			return Invalid("dependencies", "prepared dependency root must be a real directory")
+		}
+		return nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return wrapInternal("inspect prepared dependency root", err)
+	}
+	if err := os.MkdirAll(target, 0o700); err != nil {
+		return wrapInternal("create empty prepared dependency root", err)
+	}
+	return nil
+}
+
 func hasErrorDiagnostic(diagnostics []Diagnostic) bool {
 	for _, diagnostic := range diagnostics {
 		if diagnostic.Severity == SeverityError {

@@ -4,6 +4,8 @@ import { useEffect, useState } from 'react'
 import { useCollaboration } from '@/lib/collaboration/provider'
 import {
   ArtifactWorkspaceConflictError,
+  documentReviewIssues,
+  reviewGateReadyForRequest,
   type ArtifactDetails,
 } from '@/lib/platform/artifact-workspace'
 import { useArtifactWorkspace } from '@/lib/platform/artifact-provider'
@@ -49,7 +51,7 @@ export function DocumentEditor() {
   const [conflict, setConflict] = useState(false)
   const [details, setDetails] = useState<ArtifactDetails<DocumentContentDto> | null>(null)
   const [proposalInstruction, setProposalInstruction] = useState('Improve clarity and preserve every stable requirement and acceptance ID.')
-  const [selectedOperations, setSelectedOperations] = useState<Record<string, number[]>>({})
+  const [selectedOperations, setSelectedOperations] = useState<Record<string, string[]>>({})
   const [comment, setComment] = useState('')
   const [reviewSummary, setReviewSummary] = useState('Ready for version-level review.')
   const [reviewerId, setReviewerId] = useState('')
@@ -59,15 +61,15 @@ export function DocumentEditor() {
   const serverContent = resource?.draft?.content ?? resource?.latestRevision?.content
   const serverEtag = resource?.draft?.etag ?? resource?.artifact.etag
   const dirty = Boolean(content && serverContent && JSON.stringify(content) !== JSON.stringify(serverContent))
-  const proposals = workspace.proposals.filter((proposal) => proposal.targetArtifactId === resource?.artifact.id)
+  const proposals = workspace.proposals.filter((proposal) => proposal.artifactId === resource?.artifact.id)
   const latestVersion = resource?.latestRevision
     ? versionRef(resource.latestRevision)
     : undefined
   const comments = collaboration.comments.filter((thread) => thread.target?.artifactId === resource?.artifact.id)
   const currentUserId = collaboration.session.signedIn ? collaboration.session.user.id : null
-  const clientGate = content ? documentGate(content) : []
+  const clientGate = content ? documentReviewIssues(content) : []
   const revisionReady = clientGate.length === 0
-  const gatePassed = revisionReady && (details?.reviewGate.passed ?? false)
+  const gatePassed = revisionReady && reviewGateReadyForRequest(details?.reviewGate)
 
   useEffect(() => {
     if (!resource) {
@@ -119,9 +121,9 @@ export function DocumentEditor() {
     return (
       <Unavailable
         title="No document artifacts"
-        detail="Create the first structured requirement document on the platform."
-        action="Create requirement document"
-        onAction={() => void workspace.createDocument('Product requirements')}
+        detail="Create the first Project Brief on the platform, then use immutable revisions to drive the workflow."
+        action="Create Project Brief"
+        onAction={() => void workspace.createDocument('Project Brief', 'projectBrief')}
       />
     )
   }
@@ -198,10 +200,10 @@ export function DocumentEditor() {
               instruction={proposalInstruction}
               onInstruction={setProposalInstruction}
               canEdit={collaboration.can('edit')}
+              canCreate={Boolean(latestVersion) && !dirty}
               onCreate={() => void workspace.createProposal({
-                kind: 'document.patch',
-                targetArtifactId: resource.artifact.id,
-                baseDraftHash: resource.draft?.contentHash ?? '',
+                jobType: 'document.patch',
+                targetRevision: latestVersion!,
                 instruction: proposalInstruction,
                 inputVersions: resource.draft?.sourceVersions ?? [],
                 outputSchemaVersion: 'document.patch.v1',
@@ -209,14 +211,13 @@ export function DocumentEditor() {
               onApply={(proposal) => void workspace.applyProposal(
                 proposal.id,
                 selectedOperations[proposal.id] ?? [],
-                serverEtag ?? '',
               ).catch((error) => setLocalError(message(error)))}
             />
           )}
           {tab === 'trace' && (
             <section className="mx-auto max-w-4xl space-y-2">
               {details?.dependencies.map((dependency) => <div key={dependency.id} className="rounded-md border border-border bg-panel p-3 text-[10px]"><Link2 className="mr-2 inline size-3.5 text-primary-bright" />{dependency.source.artifactId} <b>{dependency.relation}</b> {dependency.target.artifactId}</div>)}
-              {workspace.traces.filter((trace) => trace.source.id === resource.artifact.id || trace.target.id === resource.artifact.id).map((trace) => <div key={trace.id} className="rounded-md border border-border bg-panel p-3 text-[10px]"><code>{trace.source.kind}:{trace.source.id}</code> → {trace.relation} → <code>{trace.target.kind}:{trace.target.id}</code></div>)}
+              {workspace.traces.filter((trace) => trace.source.artifactId === resource.artifact.id || trace.target.artifactId === resource.artifact.id).map((trace) => <div key={trace.id} className="rounded-md border border-border bg-panel p-3 text-[10px]"><code>{trace.source.artifactId}:{trace.source.revisionId}</code> → {trace.relation} → <code>{trace.target.artifactId}:{trace.target.revisionId}</code></div>)}
             </section>
           )}
           {tab === 'review' && (
@@ -234,34 +235,114 @@ export function DocumentEditor() {
 }
 
 function ContentEditor({ content, readOnly, onChange }: { content: DocumentContentDto; readOnly: boolean; onChange: (patch: Partial<DocumentContentDto>) => void }) {
-  return <section className="mx-auto max-w-4xl space-y-5">
-    <label className="block text-[11px] font-medium text-muted-foreground">Summary<textarea value={content.summary} onChange={(event) => onChange({ summary: event.target.value })} readOnly={readOnly} rows={3} className="mt-1.5 w-full rounded-md border border-border bg-panel p-3 text-sm text-foreground" /></label>
-    <div><div className="flex items-center justify-between"><h2 className="text-sm font-semibold text-foreground">Structured blocks</h2><button type="button" disabled={readOnly} onClick={() => onChange({ blocks: [...content.blocks, { id: stableId('block'), type: 'paragraph', text: '' }] })} className="text-[10px] text-primary-bright"><Plus className="mr-1 inline size-3" />Block</button></div><div className="mt-2 space-y-2">{content.blocks.map((block, index) => <div key={block.id} className="rounded-md border border-border bg-panel p-3"><div className="flex items-center gap-2"><code className="text-[9px] text-faint-foreground">{block.id}</code><select value={block.type} disabled={readOnly} onChange={(event) => onChange({ blocks: content.blocks.map((item, itemIndex) => itemIndex === index ? { ...item, type: event.target.value as typeof block.type } : item) })} className="ml-auto rounded border border-border bg-background text-[9px] text-foreground"><option>heading</option><option>paragraph</option><option>list</option><option>table</option><option>code</option><option>callout</option></select><button type="button" disabled={readOnly} onClick={() => onChange({ blocks: content.blocks.filter((_, itemIndex) => itemIndex !== index) })}><Trash2 className="size-3 text-destructive" /></button></div><textarea value={block.text ?? ''} onChange={(event) => onChange({ blocks: content.blocks.map((item, itemIndex) => itemIndex === index ? { ...item, text: event.target.value } : item) })} readOnly={readOnly} rows={3} className="mt-2 w-full rounded border border-border bg-background p-2 text-[11px] text-foreground" /></div>)}</div></div>
-    <div><div className="flex items-center justify-between"><h2 className="text-sm font-semibold text-foreground">Requirements</h2><button type="button" disabled={readOnly} onClick={() => onChange({ requirements: [...(content.requirements ?? []), { id: stableId('req'), title: 'Requirement', statement: '', priority: 'must', acceptanceCriterionIds: [], sourceBlockIds: [] }] })} className="text-[10px] text-primary-bright"><Plus className="mr-1 inline size-3" />Requirement</button></div><div className="mt-2 space-y-2">{(content.requirements ?? []).map((requirement, index) => <div key={requirement.id} className="grid gap-2 rounded-md border border-border bg-panel p-3 sm:grid-cols-[160px_1fr]"><code className="text-[9px] text-faint-foreground">{requirement.id}</code><input value={requirement.title} onChange={(event) => onChange({ requirements: content.requirements?.map((item, itemIndex) => itemIndex === index ? { ...item, title: event.target.value } : item) })} readOnly={readOnly} className="rounded border border-border bg-background px-2 text-[11px] text-foreground" /><span /><textarea value={requirement.statement} onChange={(event) => onChange({ requirements: content.requirements?.map((item, itemIndex) => itemIndex === index ? { ...item, statement: event.target.value } : item) })} readOnly={readOnly} rows={2} className="rounded border border-border bg-background p-2 text-[11px] text-foreground" /></div>)}</div></div>
-    <div><div className="flex items-center justify-between"><h2 className="text-sm font-semibold text-foreground">Acceptance criteria</h2><button type="button" disabled={readOnly} onClick={() => onChange({ acceptanceCriteria: [...content.acceptanceCriteria, { id: stableId('ac'), statement: '', priority: 'must', status: 'open' }] })} className="text-[10px] text-primary-bright"><Plus className="mr-1 inline size-3" />Criterion</button></div><div className="mt-2 space-y-2">{content.acceptanceCriteria.map((criterion, index) => <div key={criterion.id} className="flex gap-2 rounded-md border border-border bg-panel p-3"><code className="w-32 shrink-0 text-[9px] text-faint-foreground">{criterion.id}</code><input value={criterion.statement} onChange={(event) => onChange({ acceptanceCriteria: content.acceptanceCriteria.map((item, itemIndex) => itemIndex === index ? { ...item, statement: event.target.value } : item) })} readOnly={readOnly} className="min-w-0 flex-1 rounded border border-border bg-background px-2 text-[11px] text-foreground" /></div>)}</div></div>
-  </section>
+  const updateBlock = (index: number, patch: Partial<DocumentContentDto['blocks'][number]>) => {
+    onChange({
+      blocks: content.blocks.map((item, itemIndex) =>
+        itemIndex === index ? { ...item, ...patch } : item),
+    })
+  }
+
+  return (
+    <section className="mx-auto max-w-4xl space-y-5">
+      <label className="block text-[11px] font-medium text-muted-foreground">
+        Summary
+        <textarea value={content.summary} onChange={(event) => onChange({ summary: event.target.value })} readOnly={readOnly} rows={3} className="mt-1.5 w-full rounded-md border border-border bg-panel p-3 text-sm text-foreground" />
+      </label>
+
+      <div>
+        <div className="flex items-center justify-between">
+          <h2 className="text-sm font-semibold text-foreground">Structured blocks</h2>
+          <button type="button" disabled={readOnly} onClick={() => onChange({ blocks: [...content.blocks, { id: stableId('block'), type: content.kind === 'projectBrief' ? 'goal' : 'paragraph', text: '' }] })} className="text-[10px] text-primary-bright"><Plus className="mr-1 inline size-3" />Block</button>
+        </div>
+        <div className="mt-2 space-y-2">
+          {content.blocks.map((block, index) => (
+            <div key={block.id} className="rounded-md border border-border bg-panel p-3">
+              <div className="flex flex-wrap items-center gap-2">
+                <code className="text-[9px] text-faint-foreground">{block.id}</code>
+                <select value={block.type} disabled={readOnly} onChange={(event) => updateBlock(index, { type: event.target.value as typeof block.type })} className="ml-auto rounded border border-border bg-background text-[9px] text-foreground">
+                  <option value="richText">rich text</option>
+                  <option value="goal">goal</option>
+                  <option value="actor">actor</option>
+                  <option value="userJourney">user journey</option>
+                  <option value="requirement">requirement context</option>
+                  <option value="acceptanceCriterion">acceptance criterion context</option>
+                  <option value="businessRule">business rule</option>
+                  <option value="constraint">constraint</option>
+                  <option value="nonFunctionalRequirement">non-functional requirement</option>
+                  <option value="metric">metric</option>
+                  <option value="openQuestion">open question</option>
+                  <option value="decision">decision</option>
+                  <option value="sourceReference">source reference</option>
+                  <option value="heading">heading</option>
+                  <option value="paragraph">paragraph</option>
+                  <option value="list">list</option>
+                  <option value="table">table</option>
+                  <option value="code">code</option>
+                  <option value="callout">callout</option>
+                </select>
+                {block.type === 'openQuestion' && (
+                  <>
+                    <label className="flex items-center gap-1 text-[9px] text-muted-foreground"><input type="checkbox" checked={Boolean(block.blocking)} disabled={readOnly} onChange={(event) => updateBlock(index, { blocking: event.target.checked })} />Blocking</label>
+                    <select value={block.status ?? 'open'} disabled={readOnly} onChange={(event) => updateBlock(index, { status: event.target.value as NonNullable<typeof block.status> })} className="rounded border border-border bg-background text-[9px] text-foreground">
+                      <option value="open">open</option>
+                      <option value="answered">answered</option>
+                      <option value="resolved">resolved</option>
+                      <option value="waived">waived</option>
+                    </select>
+                  </>
+                )}
+                <button type="button" disabled={readOnly} onClick={() => onChange({ blocks: content.blocks.filter((_, itemIndex) => itemIndex !== index) })}><Trash2 className="size-3 text-destructive" /></button>
+              </div>
+              <textarea value={block.text ?? ''} onChange={(event) => updateBlock(index, { text: event.target.value })} readOnly={readOnly} rows={3} className="mt-2 w-full rounded border border-border bg-background p-2 text-[11px] text-foreground" />
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {content.kind !== 'projectBrief' && (
+        <>
+          <div>
+            <div className="flex items-center justify-between"><h2 className="text-sm font-semibold text-foreground">Requirements</h2><button type="button" disabled={readOnly} onClick={() => onChange({ requirements: [...(content.requirements ?? []), { id: stableId('req'), title: 'Requirement', statement: '', priority: 'must', acceptanceCriterionIds: [], sourceBlockIds: [] }] })} className="text-[10px] text-primary-bright"><Plus className="mr-1 inline size-3" />Requirement</button></div>
+            <div className="mt-2 space-y-2">{(content.requirements ?? []).map((requirement, index) => {
+              const updateRequirement = (patch: Partial<typeof requirement>) => onChange({ requirements: content.requirements?.map((item, itemIndex) => itemIndex === index ? { ...item, ...patch } : item) })
+              return <div key={requirement.id} className="space-y-2 rounded-md border border-border bg-panel p-3"><div className="flex flex-wrap items-center gap-2"><input value={requirement.id} onChange={(event) => updateRequirement({ id: event.target.value })} readOnly={readOnly} className="h-8 min-w-40 rounded border border-border bg-background px-2 font-mono text-[9px] text-foreground" aria-label="Stable requirement ID" /><select value={requirement.priority} disabled={readOnly} onChange={(event) => updateRequirement({ priority: event.target.value as typeof requirement.priority })} className="h-8 rounded border border-border bg-background px-2 text-[9px] text-foreground"><option value="must">must</option><option value="should">should</option><option value="could">could</option></select><button type="button" disabled={readOnly} onClick={() => onChange({ requirements: content.requirements?.filter((_, itemIndex) => itemIndex !== index) })} className="ml-auto"><Trash2 className="size-3 text-destructive" /></button></div><input value={requirement.title} onChange={(event) => updateRequirement({ title: event.target.value })} readOnly={readOnly} placeholder="Requirement title" className="h-8 w-full rounded border border-border bg-background px-2 text-[11px] text-foreground" /><textarea value={requirement.statement} onChange={(event) => updateRequirement({ statement: event.target.value })} readOnly={readOnly} rows={2} placeholder="Testable requirement statement" className="w-full rounded border border-border bg-background p-2 text-[11px] text-foreground" /><div className="grid gap-2 sm:grid-cols-2"><label className="text-[9px] text-muted-foreground">Acceptance criterion IDs<input value={requirement.acceptanceCriterionIds.join(', ')} onChange={(event) => updateRequirement({ acceptanceCriterionIds: commaList(event.target.value) })} readOnly={readOnly} className="mt-1 h-8 w-full rounded border border-border bg-background px-2 font-mono text-[9px] text-foreground" /></label><label className="text-[9px] text-muted-foreground">Source block IDs<input value={requirement.sourceBlockIds.join(', ')} onChange={(event) => updateRequirement({ sourceBlockIds: commaList(event.target.value) })} readOnly={readOnly} className="mt-1 h-8 w-full rounded border border-border bg-background px-2 font-mono text-[9px] text-foreground" /></label></div></div>
+            })}</div>
+          </div>
+          <div>
+            <div className="flex items-center justify-between"><h2 className="text-sm font-semibold text-foreground">Acceptance criteria</h2><button type="button" disabled={readOnly} onClick={() => onChange({ acceptanceCriteria: [...content.acceptanceCriteria, { id: stableId('ac'), statement: '', priority: 'must', status: 'open' }] })} className="text-[10px] text-primary-bright"><Plus className="mr-1 inline size-3" />Criterion</button></div>
+            <div className="mt-2 space-y-2">{content.acceptanceCriteria.map((criterion, index) => {
+              const updateCriterion = (patch: Partial<typeof criterion>) => onChange({ acceptanceCriteria: content.acceptanceCriteria.map((item, itemIndex) => itemIndex === index ? { ...item, ...patch } : item) })
+              return <div key={criterion.id} className="grid gap-2 rounded-md border border-border bg-panel p-3 sm:grid-cols-[150px_100px_110px_1fr_auto]"><input value={criterion.id} onChange={(event) => updateCriterion({ id: event.target.value })} readOnly={readOnly} className="h-8 rounded border border-border bg-background px-2 font-mono text-[9px] text-foreground" aria-label="Stable acceptance criterion ID" /><select value={criterion.priority} disabled={readOnly} onChange={(event) => updateCriterion({ priority: event.target.value as typeof criterion.priority })} className="h-8 rounded border border-border bg-background px-2 text-[9px] text-foreground"><option value="must">must</option><option value="should">should</option><option value="could">could</option></select><select value={criterion.status} disabled={readOnly} onChange={(event) => updateCriterion({ status: event.target.value as typeof criterion.status })} className="h-8 rounded border border-border bg-background px-2 text-[9px] text-foreground"><option value="open">open</option><option value="accepted">accepted</option><option value="rejected">rejected</option></select><input value={criterion.statement} onChange={(event) => updateCriterion({ statement: event.target.value })} readOnly={readOnly} className="min-w-0 rounded border border-border bg-background px-2 text-[11px] text-foreground" /><button type="button" disabled={readOnly} onClick={() => onChange({ acceptanceCriteria: content.acceptanceCriteria.filter((_, itemIndex) => itemIndex !== index) })}><Trash2 className="size-3 text-destructive" /></button></div>
+            })}</div>
+          </div>
+          <StringListEditor title="Open questions" values={content.openQuestions} readOnly={readOnly} onChange={(openQuestions) => onChange({ openQuestions })} />
+          <StringListEditor title="Assumptions" values={content.assumptions} readOnly={readOnly} onChange={(assumptions) => onChange({ assumptions })} />
+        </>
+      )}
+    </section>
+  )
+}
+
+function StringListEditor({ title, values, readOnly, onChange }: { title: string; values: readonly string[]; readOnly: boolean; onChange: (values: string[]) => void }) {
+  return <div><div className="flex items-center justify-between"><h2 className="text-sm font-semibold text-foreground">{title}</h2><button type="button" disabled={readOnly} onClick={() => onChange([...values, ''])} className="text-[10px] text-primary-bright"><Plus className="mr-1 inline size-3" />Add</button></div><div className="mt-2 space-y-2">{values.map((value, index) => <div key={index} className="flex gap-2 rounded-md border border-border bg-panel p-2"><input value={value} onChange={(event) => onChange(values.map((item, itemIndex) => itemIndex === index ? event.target.value : item))} readOnly={readOnly} className="h-8 min-w-0 flex-1 rounded border border-border bg-background px-2 text-[10px] text-foreground" /><button type="button" disabled={readOnly} onClick={() => onChange(values.filter((_, itemIndex) => itemIndex !== index))}><Trash2 className="size-3 text-destructive" /></button></div>)}</div></div>
 }
 
 function GatePanel({ clientIssues, serverGate }: { clientIssues: string[]; serverGate?: ArtifactDetails<DocumentContentDto>['reviewGate'] }) {
-  const issues = [...clientIssues, ...(serverGate?.checks.filter((check) => check.severity === 'error').map((check) => check.message) ?? [])]
-  return <div className={cn('rounded-lg border p-3', issues.length === 0 && serverGate?.passed ? 'border-success/30 bg-success/10' : 'border-warning/30 bg-warning/10')}><p className="text-[11px] font-semibold text-foreground">Review gate</p>{issues.length === 0 && serverGate?.passed ? <p className="mt-1 text-[10px] text-success"><Check className="mr-1 inline size-3" />Stable IDs, trace coverage and blocking comments passed.</p> : <ul className="mt-1 list-disc pl-4 text-[10px] text-warning">{issues.map((issue) => <li key={issue}>{issue}</li>)}{!serverGate && <li>Waiting for the server review gate.</li>}</ul>}</div>
+  const serverIssues = serverGate?.checks
+    .filter((check) => check.severity === 'error' && check.code !== 'canonical_review_approved')
+    .map((check) => check.message) ?? []
+  const issues = [...clientIssues, ...serverIssues]
+  const requestReady = issues.length === 0 && reviewGateReadyForRequest(serverGate)
+  const approved = Boolean(serverGate?.passed)
+  return <div className={cn('rounded-lg border p-3', approved || requestReady ? 'border-success/30 bg-success/10' : 'border-warning/30 bg-warning/10')}><p className="text-[11px] font-semibold text-foreground">Review gate</p>{approved ? <p className="mt-1 text-[10px] text-success"><Check className="mr-1 inline size-3" />The exact revision has canonical approval.</p> : requestReady ? <p className="mt-1 text-[10px] text-success"><Check className="mr-1 inline size-3" />Pre-review checks passed; canonical reviewer approval is still pending.</p> : <ul className="mt-1 list-disc pl-4 text-[10px] text-warning">{issues.map((issue) => <li key={issue}>{issue}</li>)}{!serverGate && <li>Waiting for the server review gate.</li>}</ul>}</div>
 }
 
-function ProposalPanel({ proposals, selected, onSelected, instruction, onInstruction, canEdit, onCreate, onApply }: { proposals: ProposalDto[]; selected: Record<string, number[]>; onSelected: (value: Record<string, number[]>) => void; instruction: string; onInstruction: (value: string) => void; canEdit: boolean; onCreate: () => void; onApply: (proposal: ProposalDto) => void }) {
-  return <section className="mx-auto max-w-4xl space-y-3"><div className="flex gap-2"><input value={instruction} onChange={(event) => onInstruction(event.target.value)} className="h-9 min-w-0 flex-1 rounded-md border border-border bg-background px-2 text-[10px] text-foreground" /><button type="button" onClick={onCreate} disabled={!canEdit || !instruction.trim()} className="rounded-md bg-primary px-3 text-[10px] font-semibold text-primary-foreground disabled:opacity-50"><Bot className="mr-1 inline size-3" />Ask AI</button></div>{proposals.map((proposal) => <div key={proposal.id} className="rounded-lg border border-border bg-panel p-3"><div className="flex items-center gap-2"><span className="text-[11px] font-semibold text-foreground">{proposal.kind}</span><span className="rounded bg-primary/10 px-1.5 py-0.5 text-[9px] text-primary-bright">{proposal.status}</span></div><div className="mt-2 space-y-1">{proposal.operations.map((operation, index) => <label key={index} className="flex gap-2 rounded border border-border bg-background p-2 text-[9px] text-muted-foreground"><input type="checkbox" checked={(selected[proposal.id] ?? []).includes(index)} onChange={(event) => onSelected({ ...selected, [proposal.id]: event.target.checked ? [...(selected[proposal.id] ?? []), index] : (selected[proposal.id] ?? []).filter((item) => item !== index) })} /><pre className="overflow-auto whitespace-pre-wrap">{JSON.stringify(operation, null, 2)}</pre></label>)}</div><button type="button" onClick={() => onApply(proposal)} disabled={!canEdit || (selected[proposal.id]?.length ?? 0) === 0} className="mt-2 rounded bg-primary px-2.5 py-1.5 text-[9px] font-semibold text-primary-foreground disabled:opacity-50">Apply selected operations</button></div>)}</section>
+function ProposalPanel({ proposals, selected, onSelected, instruction, onInstruction, canEdit, canCreate, onCreate, onApply }: { proposals: ProposalDto[]; selected: Record<string, string[]>; onSelected: (value: Record<string, string[]>) => void; instruction: string; onInstruction: (value: string) => void; canEdit: boolean; canCreate: boolean; onCreate: () => void; onApply: (proposal: ProposalDto) => void }) {
+  return <section className="mx-auto max-w-4xl space-y-3"><div className="flex gap-2"><input value={instruction} onChange={(event) => onInstruction(event.target.value)} className="h-9 min-w-0 flex-1 rounded-md border border-border bg-background px-2 text-[10px] text-foreground" /><button type="button" onClick={onCreate} disabled={!canEdit || !canCreate || !instruction.trim()} className="rounded-md bg-primary px-3 text-[10px] font-semibold text-primary-foreground disabled:opacity-50"><Bot className="mr-1 inline size-3" />Ask AI</button></div>{!canCreate && <p className="rounded border border-warning/30 bg-warning/10 p-2 text-[9px] text-warning">Save and create an immutable revision before asking AI. Draft bytes are never sent as workflow truth.</p>}{proposals.map((proposal) => { const selectedIds = selected[proposal.id] ?? []; const hasAccepted = proposal.operations.some((operation) => operation.decision === 'accepted' || selectedIds.includes(operation.id)); return <div key={proposal.id} className="rounded-lg border border-border bg-panel p-3"><div className="flex items-center gap-2"><span className="text-[11px] font-semibold text-foreground">Manifest {proposal.manifest.id.slice(0, 12)}</span><span className="rounded bg-primary/10 px-1.5 py-0.5 text-[9px] text-primary-bright">{proposal.status}</span><code className="ml-auto text-[9px] text-faint-foreground">base {proposal.baseRevision.contentHash.slice(0, 12)}</code></div><div className="mt-2 space-y-1">{proposal.operations.map((operation) => <label key={operation.id} className="flex gap-2 rounded border border-border bg-background p-2 text-[9px] text-muted-foreground"><input type="checkbox" disabled={operation.decision !== 'pending'} checked={operation.decision === 'accepted' || operation.decision === 'applied' || selectedIds.includes(operation.id)} onChange={(event) => onSelected({ ...selected, [proposal.id]: event.target.checked ? [...selectedIds, operation.id] : selectedIds.filter((item) => item !== operation.id) })} /><span className="min-w-0 flex-1"><code>{operation.kind} {operation.path || '/'}</code><span className="ml-2 text-faint-foreground">{operation.decision}</span>{operation.rationale && <span className="mt-1 block">{operation.rationale}</span>}</span></label>)}</div><button type="button" onClick={() => onApply(proposal)} disabled={!canEdit || !hasAccepted || !['open', 'reviewing', 'ready'].includes(proposal.status)} className="mt-2 rounded bg-primary px-2.5 py-1.5 text-[9px] font-semibold text-primary-foreground disabled:opacity-50">Decide all and apply accepted operations</button></div>})}</section>
 }
 
 function Unavailable({ title, detail, loading, action, onAction, onRetry }: { title: string; detail: string; loading?: boolean; action?: string; onAction?: () => void; onRetry?: () => Promise<void> }) {
   return <div className="flex h-full items-center justify-center bg-canvas p-6 text-center"><div className="max-w-md rounded-lg border border-dashed border-border bg-panel p-6">{loading ? <Loader2 className="mx-auto size-7 animate-spin text-primary-bright" /> : <AlertTriangle className="mx-auto size-7 text-warning" />}<h1 className="mt-3 text-base font-semibold text-foreground">{title}</h1><p className="mt-2 text-sm text-muted-foreground">{detail}</p>{action && onAction && <button type="button" onClick={onAction} className="mt-4 rounded-md bg-primary px-3 py-2 text-sm font-medium text-primary-foreground">{action}</button>}{onRetry && <button type="button" onClick={() => void onRetry()} className="mt-4 rounded-md bg-primary px-3 py-2 text-sm font-medium text-primary-foreground"><RefreshCw className="mr-1 inline size-4" />Retry</button>}</div></div>
-}
-
-function documentGate(content: DocumentContentDto) {
-  const issues: string[] = []
-  if (!content.summary.trim()) issues.push('Summary is required.')
-  if (content.blocks.length === 0) issues.push('At least one structured block is required.')
-  if ((content.requirements ?? []).some((item) => !item.id || !item.statement.trim())) issues.push('Every requirement needs a stable ID and statement.')
-  if (content.acceptanceCriteria.some((item) => !item.id || !item.statement.trim())) issues.push('Every acceptance criterion needs a stable ID and statement.')
-  return issues
 }
 
 function versionRef(revision: ArtifactRevisionDto<DocumentContentDto>): VersionRefDto {
@@ -270,6 +351,10 @@ function versionRef(revision: ArtifactRevisionDto<DocumentContentDto>): VersionR
 
 function stableId(prefix: string) {
   return `${prefix}-${typeof crypto !== 'undefined' && crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(36).slice(2)}`}`
+}
+
+function commaList(value: string) {
+  return Array.from(new Set(value.split(',').map((item) => item.trim()).filter(Boolean)))
 }
 
 function message(error: unknown) {

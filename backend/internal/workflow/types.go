@@ -8,6 +8,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
+	"github.com/worksflow/builder/backend/internal/core"
 	"github.com/worksflow/builder/backend/internal/domain"
 )
 
@@ -65,16 +67,57 @@ type DefinitionRecord struct {
 }
 
 type NodeMetadata struct {
-	DefinitionNodeID string                     `json:"definitionNodeId"`
-	SliceID          string                     `json:"sliceId,omitempty"`
-	MaxAttempts      int                        `json:"maxAttempts"`
-	TimeoutNanos     int64                      `json:"timeoutNanos"`
-	Waived           bool                       `json:"waived,omitempty"`
-	WaiverReason     string                     `json:"waiverReason,omitempty"`
-	SelectedBranch   string                     `json:"selectedBranch,omitempty"`
-	Input            json.RawMessage            `json:"input,omitempty"`
-	Output           json.RawMessage            `json:"output,omitempty"`
-	FanOutOutputs    map[string]json.RawMessage `json:"fanOutOutputs,omitempty"`
+	DefinitionNodeID    string                     `json:"definitionNodeId"`
+	SliceID             string                     `json:"sliceId,omitempty"`
+	MaxAttempts         int                        `json:"maxAttempts"`
+	TimeoutNanos        int64                      `json:"timeoutNanos"`
+	Waived              bool                       `json:"waived,omitempty"`
+	WaiverReason        string                     `json:"waiverReason,omitempty"`
+	SelectedBranch      string                     `json:"selectedBranch,omitempty"`
+	Input               json.RawMessage            `json:"input,omitempty"`
+	Output              json.RawMessage            `json:"output,omitempty"`
+	FanOutOutputs       map[string]json.RawMessage `json:"fanOutOutputs,omitempty"`
+	ExecutionActor      *ActorProvenance           `json:"executionActor,omitempty"`
+	ReviewDecisionActor *ActorProvenance           `json:"reviewDecisionActor,omitempty"`
+}
+
+type ActorProvenanceSource string
+
+const (
+	ActorSourceAuthenticatedCommand ActorProvenanceSource = "authenticated_command"
+	ActorSourceReviewApproval       ActorProvenanceSource = "review_approval"
+	ActorSourceReviewWaiver         ActorProvenanceSource = "review_waiver"
+)
+
+// ActorProvenance is minted at an authenticated application boundary. Node
+// output is never decoded into this structure, so an artifact or proposal
+// payload cannot impersonate the user who authorized a privileged side effect.
+type ActorProvenance struct {
+	ActorID      string                `json:"actorId"`
+	Role         core.Role             `json:"role"`
+	Action       core.Action           `json:"action"`
+	Source       ActorProvenanceSource `json:"source"`
+	AuthorizedAt time.Time             `json:"authorizedAt"`
+}
+
+func (a ActorProvenance) Validate() error {
+	if strings.TrimSpace(a.ActorID) == "" || !core.ValidRole(a.Role) || a.AuthorizedAt.IsZero() {
+		return fmt.Errorf("execution actor id, role and authorization time are required")
+	}
+	if _, err := uuid.Parse(a.ActorID); err != nil {
+		return fmt.Errorf("execution actor id must be a UUID")
+	}
+	switch a.Action {
+	case core.ActionEdit, core.ActionReview, core.ActionApprove, core.ActionPublish:
+	default:
+		return fmt.Errorf("unsupported workflow actor action %q", a.Action)
+	}
+	switch a.Source {
+	case ActorSourceAuthenticatedCommand, ActorSourceReviewApproval, ActorSourceReviewWaiver:
+		return nil
+	default:
+		return fmt.Errorf("unsupported workflow actor source %q", a.Source)
+	}
 }
 
 type SliceContext struct {
@@ -82,6 +125,7 @@ type SliceContext struct {
 	Key          string              `json:"key"`
 	Title        string              `json:"title"`
 	FanOutNodeID string              `json:"fanOutNodeId"`
+	Payload      json.RawMessage     `json:"payload,omitempty"`
 	Blueprint    domain.ArtifactRef  `json:"blueprint"`
 	PageSpec     *domain.ArtifactRef `json:"pageSpec,omitempty"`
 	Prototype    *domain.ArtifactRef `json:"prototype,omitempty"`
@@ -361,6 +405,28 @@ type Execution struct {
 	Inputs     domain.NodeInputEnvelope
 }
 
+// ExecutionActor returns the server-recorded actor for a privileged node and
+// verifies that the grant matches the immutable node definition. It never
+// consults node input/output JSON or the user who originally started the run.
+func (e Execution) ExecutionActor() (ActorProvenance, error) {
+	action, role, required := nodeExecutionPolicy(e.Definition)
+	if !required {
+		return ActorProvenance{}, fmt.Errorf("node %q does not require an execution actor", e.Node.Key)
+	}
+	metadata, exists := e.Run.Context.Nodes[e.Node.Key]
+	if !exists || metadata.ExecutionActor == nil {
+		return ActorProvenance{}, fmt.Errorf("node %q has no trusted execution actor", e.Node.Key)
+	}
+	actor := *metadata.ExecutionActor
+	if err := actor.Validate(); err != nil {
+		return ActorProvenance{}, err
+	}
+	if actor.Action != action || !workflowRoleSatisfies(actor.Role, role) {
+		return ActorProvenance{}, core.ErrForbidden
+	}
+	return actor, nil
+}
+
 // IncomingValues returns immutable copies of the mapped inputs for a port.
 // Quality, publish, and other adapters should use this instead of scanning
 // Run.Context for whichever completed node happens to be latest.
@@ -403,6 +469,7 @@ const (
 type FanOutItem struct {
 	Key       string              `json:"key"`
 	Title     string              `json:"title"`
+	Payload   json.RawMessage     `json:"payload,omitempty"`
 	Blueprint domain.ArtifactRef  `json:"blueprint"`
 	PageSpec  *domain.ArtifactRef `json:"pageSpec,omitempty"`
 	Prototype *domain.ArtifactRef `json:"prototype,omitempty"`
@@ -444,6 +511,68 @@ func buildManifestFromExecution(execution Execution) (BuildManifest, error) {
 	}
 	if len(manifests) != 1 {
 		return BuildManifest{}, fmt.Errorf("workbench build requires exactly one incoming frozen application build manifest, got %d", len(manifests))
+	}
+	for _, manifest := range manifests {
+		return manifest, nil
+	}
+	return BuildManifest{}, fmt.Errorf("incoming build manifest is unavailable")
+}
+
+// buildManifestFromInputLineage follows only the immutable input bindings of
+// the current node and their exact predecessor input snapshots. It deliberately
+// does not inspect Run.Context.Values or unrelated nodes, so parallel workflow
+// branches cannot leak a different build manifest into quality or publish.
+func buildManifestFromInputLineage(execution Execution) (BuildManifest, error) {
+	manifests := make(map[string]BuildManifest)
+	visitedNodes := make(map[string]bool)
+	var visit func(domain.NodeInputEnvelope) error
+	visit = func(inputs domain.NodeInputEnvelope) error {
+		if err := inputs.Validate(); err != nil {
+			return err
+		}
+		for _, binding := range inputs.Bindings() {
+			for _, raw := range []json.RawMessage{binding.Value, binding.Output} {
+				var manifest BuildManifest
+				if err := json.Unmarshal(raw, &manifest); err != nil || manifest.Validate() != nil {
+					continue
+				}
+				if manifest.ProjectID != execution.Run.ProjectID || manifest.RunID != execution.Run.ID {
+					return fmt.Errorf("incoming build manifest does not match the workflow run")
+				}
+				manifests[manifest.Hash] = manifest
+			}
+			if binding.Source.RunID != execution.Run.ID || strings.TrimSpace(binding.Source.NodeKey) == "" {
+				return fmt.Errorf("input binding references a stale workflow predecessor")
+			}
+			if visitedNodes[binding.Source.NodeKey] {
+				continue
+			}
+			visitedNodes[binding.Source.NodeKey] = true
+			predecessor := execution.Run.Nodes[binding.Source.NodeKey]
+			if predecessor == nil || predecessor.Key != binding.Source.NodeKey || predecessor.DefinitionNodeID != binding.Source.DefinitionNodeID {
+				return fmt.Errorf("input binding predecessor does not match the workflow snapshot")
+			}
+			metadata, exists := execution.Run.Context.Nodes[binding.Source.NodeKey]
+			if !exists || len(metadata.Input) == 0 {
+				continue
+			}
+			predecessorInputs, ok, err := decodeStoredInputs(metadata.Input)
+			if err != nil {
+				return err
+			}
+			if ok {
+				if err := visit(predecessorInputs); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}
+	if err := visit(execution.Inputs); err != nil {
+		return BuildManifest{}, err
+	}
+	if len(manifests) != 1 {
+		return BuildManifest{}, fmt.Errorf("quality requires exactly one incoming frozen application build manifest, got %d", len(manifests))
 	}
 	for _, manifest := range manifests {
 		return manifest, nil

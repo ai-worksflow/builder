@@ -42,18 +42,18 @@ func (s WorkflowRuntimeService) SubmitHumanInput(ctx context.Context, runID, nod
 	return s.Engine.SubmitHumanInput(ctx, runID, nodeKey, output, actorID)
 }
 
-func (s WorkflowRuntimeService) ResolveReview(ctx context.Context, runID, nodeKey, actorID string, resolution runtime.ReviewResolution, reason string) error {
+func (s WorkflowRuntimeService) ResolveReview(ctx context.Context, runID, nodeKey string, decision runtime.ReviewDecision) error {
 	if s.Engine == nil {
 		return domain.ErrInvalidArgument
 	}
-	return s.Engine.ResolveReview(ctx, runID, nodeKey, actorID, resolution, reason)
+	return s.Engine.ResolveReview(ctx, runID, nodeKey, decision)
 }
 
-func (s WorkflowRuntimeService) WaiveNode(ctx context.Context, runID, nodeKey, actorID, reason string) error {
+func (s WorkflowRuntimeService) WaiveNode(ctx context.Context, runID, nodeKey string, actor runtime.ActorProvenance, reason string) error {
 	if s.Engine == nil {
 		return domain.ErrInvalidArgument
 	}
-	return s.Engine.WaiveNode(ctx, runID, nodeKey, actorID, reason)
+	return s.Engine.WaiveNode(ctx, runID, nodeKey, actor, reason)
 }
 
 func (s WorkflowRuntimeService) Cancel(ctx context.Context, runID, actorID, reason string) error {

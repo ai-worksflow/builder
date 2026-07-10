@@ -25,6 +25,16 @@ const NAV: {
   { id: 'settings', labelKey: 'nav.settings', shortLabelKey: 'nav.settingsShort', icon: Settings },
 ] as const
 
+const WORKBENCH_DEEP_LINK_KEYS = [
+  'runId',
+  'bundleId',
+  'proposalId',
+  'workspaceRevisionId',
+  'conversationId',
+] as const
+
+const TEAM_DEEP_LINK_KEYS = ['artifactId'] as const
+
 export function AppShell() {
   const {
     routeReady,
@@ -47,10 +57,24 @@ export function AppShell() {
         : surface === 'team'
           ? teamPathFor(activeTeamProjectId, teamView)
           : `/${surface}`
-    const currentPath = `${window.location.pathname}${window.location.search}`
+    const currentUrl = new URL(window.location.href)
+    const nextUrl = new URL(nextPath, window.location.origin)
+    if (surface === 'workbench') {
+      WORKBENCH_DEEP_LINK_KEYS.forEach((key) => {
+        const value = currentUrl.searchParams.get(key)
+        if (value) nextUrl.searchParams.set(key, value)
+      })
+    } else if (surface === 'team') {
+      TEAM_DEEP_LINK_KEYS.forEach((key) => {
+        const value = currentUrl.searchParams.get(key)
+        if (value) nextUrl.searchParams.set(key, value)
+      })
+    }
+    const currentPath = `${currentUrl.pathname}${currentUrl.search}`
+    const preservedPath = `${nextUrl.pathname}${nextUrl.search}`
 
-    if (currentPath !== nextPath) {
-      window.history.replaceState(null, '', nextPath)
+    if (currentPath !== preservedPath) {
+      window.history.replaceState(null, '', preservedPath)
     }
   }, [activeTeamProjectId, phase, routeReady, surface, teamView, view])
 

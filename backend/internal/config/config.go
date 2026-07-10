@@ -240,6 +240,7 @@ type DeliveryConfig struct {
 
 var deliveryResolverNetworkPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$`)
 var deliverySumDBPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9.+_-]{0,255}$`)
+var deliveryImageDigestPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._/:-]{0,255}@sha256:[a-f0-9]{64}$`)
 
 func Load() (Config, error) {
 	loader := envLoader{}
@@ -274,7 +275,7 @@ func Load() (Config, error) {
 			AllowedHeaders: loader.list("CORS_ALLOWED_HEADERS", []string{"Accept", "Authorization", "Content-Type", "Idempotency-Key", "If-Match", "X-CSRF-Token", "X-Request-ID"}),
 			ExposedHeaders: loader.list("CORS_EXPOSED_HEADERS", []string{
 				"ETag", "Idempotency-Replayed", "X-Request-ID", "Content-Disposition", "Digest",
-				"X-Archive-File-Count", "X-Archive-Redaction-Count",
+				"X-Archive-File-Count", "X-Archive-Redaction-Count", "X-Command-ETag", "X-Command-Location",
 			}),
 			AllowCredentials: loader.boolean("CORS_ALLOW_CREDENTIALS", true),
 			MaxAge:           loader.duration("CORS_MAX_AGE", 12*time.Hour),
@@ -416,7 +417,7 @@ func Load() (Config, error) {
 			ResolverPIDs:        loader.integer("DELIVERY_RESOLVER_PIDS", 128),
 			QualityTempRoot:     loader.string("DELIVERY_QUALITY_TEMP_ROOT", ""),
 			PublishRoot:         loader.string("DELIVERY_PUBLISH_ROOT", "./var/published"),
-			PublishBaseURL:      loader.string("DELIVERY_PUBLISH_BASE_URL", "/published"),
+			PublishBaseURL:      loader.string("DELIVERY_PUBLISH_BASE_URL", "http://localhost:8080/published"),
 		},
 	}
 
@@ -584,6 +585,10 @@ func (c Config) Validate() error {
 	}
 	if strings.TrimSpace(c.Delivery.SandboxRuntime) == "" || strings.TrimSpace(c.Delivery.SandboxNodeImage) == "" || strings.TrimSpace(c.Delivery.SandboxGoImage) == "" {
 		errs = append(errs, errors.New("delivery sandbox runtime and fixed images are required"))
+	}
+	if (c.Environment == EnvironmentStaging || c.Environment == EnvironmentProduction) &&
+		(!deliveryImageDigestPattern.MatchString(c.Delivery.SandboxNodeImage) || !deliveryImageDigestPattern.MatchString(c.Delivery.SandboxGoImage)) {
+		errs = append(errs, errors.New("DELIVERY_SANDBOX_NODE_IMAGE and DELIVERY_SANDBOX_GO_IMAGE must use immutable @sha256: digests in staging and production"))
 	}
 	if c.Delivery.SandboxHost != "" && !strings.HasPrefix(c.Delivery.SandboxHost, "unix:///") && !strings.HasPrefix(c.Delivery.SandboxHost, "tcp://") {
 		errs = append(errs, errors.New("DELIVERY_SANDBOX_HOST must use unix:/// or tcp://"))

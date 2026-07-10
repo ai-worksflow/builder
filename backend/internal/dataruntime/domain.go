@@ -37,6 +37,7 @@ const (
 	CodeRequestTooLarge      ErrorCode = "request_too_large"
 	CodeNotFound             ErrorCode = "not_found"
 	CodeConflict             ErrorCode = "conflict"
+	CodePreconditionFailed   ErrorCode = "etag_mismatch"
 	CodeConfirmationRequired ErrorCode = "confirmation_required"
 	CodeConfirmationExpired  ErrorCode = "confirmation_expired"
 	CodeConnectionFailed     ErrorCode = "connection_failed"
@@ -78,6 +79,10 @@ func NotFound(resource string) *RuntimeError {
 
 func Conflict(message string) *RuntimeError {
 	return NewError(CodeConflict, http.StatusConflict, message)
+}
+
+func PreconditionFailed(message string) *RuntimeError {
+	return NewError(CodePreconditionFailed, http.StatusPreconditionFailed, message)
 }
 
 func AsRuntimeError(err error) (*RuntimeError, bool) {

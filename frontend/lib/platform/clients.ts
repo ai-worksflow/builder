@@ -1,6 +1,7 @@
 import type {
   AddProjectMemberInputDto,
   ApplyProposalInputDto,
+  ArtifactGenerationResultDto,
   AuditEventDto,
   ArtifactDependencyDto,
   ArtifactDto,
@@ -13,8 +14,8 @@ import type {
   CreateArtifactInputDto,
   CreateBlueprintInputDto,
   CreateCommentInputDto,
+  CreateDependencyInputDto,
   CreateDocumentInputDto,
-  CreateInputManifestDto,
   CreatePageSpecInputDto,
   CreateProjectInputDto,
   CreateProjectInvitationInputDto,
@@ -22,11 +23,12 @@ import type {
   CreatePrototypeInputDto,
   CreateReviewInputDto,
   CreateRevisionInputDto,
+  CreateTraceLinkInputDto,
   CreateWorkbenchBundleInputDto,
   CreateWorkflowInputDto,
+  DecideProposalInputDto,
   DecideReviewInputDto,
   DocumentContentDto,
-  InputManifestDto,
   ImpactReportDto,
   JsonValue,
   NotificationDto,
@@ -50,15 +52,19 @@ import type {
   StartRunInputDto,
   TraceLinkDto,
   TraceMatrixDto,
+  UpdateArtifactDraftInputDto,
   UpdateDraftInputDto,
   UpdateProjectInputDto,
   UpdateProjectMemberInputDto,
   VersionedArtifactDto,
+  VersionRefDto,
   WorkbenchBundleDto,
   WorkflowDto,
 } from './dto'
+import type { CreateInputManifestDto, InputManifestDto } from './flow-contract'
 import type { HttpRequestOptions, HttpResult, QueryValue } from './http'
 import { HttpClient } from './http'
+import { wireVersionRef } from './wire-version-ref'
 
 export interface ClientRequestOptions {
   readonly signal?: AbortSignal
@@ -103,6 +109,120 @@ function listQuery(
     ...additional,
     cursor: options?.cursor,
     limit: options?.limit,
+  }
+}
+
+type VersionedCommandInput = {
+  readonly sourceVersions?: readonly import('./dto').VersionRefDto[]
+  readonly requirementVersions?: readonly import('./dto').VersionRefDto[]
+  readonly blueprintRevision?: import('./dto').VersionRefDto
+  readonly pageSpecRevision?: import('./dto').VersionRefDto
+  readonly content?: unknown
+}
+
+function wireArtifactContent<T>(content: T): T {
+  if (!content || typeof content !== 'object' || Array.isArray(content)) return content
+  const value = content as Record<string, unknown>
+  const next: Record<string, unknown> = { ...value }
+
+  if (isVersionRef(value.pageSpecRevision)) {
+    next.pageSpecRevision = wireVersionRef(value.pageSpecRevision)
+  }
+  if (Array.isArray(value.pageSpecRefs)) {
+    next.pageSpecRefs = value.pageSpecRefs.map((reference) =>
+      isVersionRef(reference) ? wireVersionRef(reference) : reference)
+  }
+  if (value.layers && typeof value.layers === 'object' && !Array.isArray(value.layers)) {
+    next.layers = Object.fromEntries(Object.entries(value.layers).map(([id, layer]) => {
+      if (!layer || typeof layer !== 'object' || Array.isArray(layer)) return [id, layer]
+      const record = layer as Record<string, unknown>
+      return [id, isVersionRef(record.componentRef)
+        ? { ...record, componentRef: wireVersionRef(record.componentRef) }
+        : record]
+    }))
+  }
+  if (Array.isArray(value.traceLinks)) {
+    next.traceLinks = value.traceLinks.map((link) => {
+      if (!link || typeof link !== 'object' || Array.isArray(link)) return link
+      const record = link as Record<string, unknown>
+      return {
+        ...record,
+        source: wireTraceEndpoint(record.source),
+        target: wireTraceEndpoint(record.target),
+      }
+    })
+  }
+  return next as T
+}
+
+function wireTraceEndpoint(endpoint: unknown) {
+  if (!endpoint || typeof endpoint !== 'object' || Array.isArray(endpoint)) return endpoint
+  const record = endpoint as Record<string, unknown>
+  return isVersionRef(record.version)
+    ? { ...record, version: wireVersionRef(record.version) }
+    : record
+}
+
+function isVersionRef(value: unknown): value is import('./wire-version-ref').WireVersionRef {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  const record = value as Record<string, unknown>
+  return typeof record.artifactId === 'string' &&
+    typeof record.revisionId === 'string' &&
+    typeof record.contentHash === 'string'
+}
+
+function wireVersionedCommand<T>(input: T): T {
+  const value = input as T & VersionedCommandInput
+  return {
+    ...value,
+    ...(value.sourceVersions
+      ? { sourceVersions: value.sourceVersions.map(wireVersionRef) }
+      : {}),
+    ...(value.requirementVersions
+      ? { requirementVersions: value.requirementVersions.map(wireVersionRef) }
+      : {}),
+    ...(value.blueprintRevision
+      ? { blueprintRevision: wireVersionRef(value.blueprintRevision) }
+      : {}),
+    ...(value.pageSpecRevision
+      ? { pageSpecRevision: wireVersionRef(value.pageSpecRevision) }
+      : {}),
+    ...('content' in value ? { content: wireArtifactContent(value.content) } : {}),
+  } as T
+}
+
+function wireGenericArtifactCommand<T extends {
+  readonly sourceVersions?: readonly {
+    readonly version: import('./dto').VersionRefDto
+    readonly purpose: string
+    readonly required: boolean
+  }[]
+}>(input: T): T {
+  return {
+    ...input,
+    ...(input.sourceVersions
+      ? {
+          sourceVersions: input.sourceVersions.map((source) => ({
+            ...source,
+            version: wireVersionRef(source.version),
+          })),
+        }
+      : {}),
+  } as T
+}
+
+function wireCommentInput(input: CreateCommentInputDto): CreateCommentInputDto {
+  return {
+    ...input,
+    target: input.target ? wireVersionRef(input.target) : undefined,
+    anchor: input.anchor
+      ? {
+          ...input.anchor,
+          revision: input.anchor.revision
+            ? wireVersionRef(input.anchor.revision)
+            : undefined,
+        }
+      : undefined,
   }
 }
 
@@ -253,6 +373,18 @@ export class MembersClient extends DomainClient {
 }
 
 export class ArtifactsClient extends DomainClient {
+  compileRequirementBaseline(
+    projectId: string,
+    sources: readonly VersionRefDto[],
+    options?: ClientMutationOptions,
+  ) {
+    return this.http.post<ArtifactRevisionDto<JsonValue>, { readonly sources: readonly VersionRefDto[] }>(
+      `/v1/projects/${segment(projectId)}/requirement-baselines`,
+      { sources: sources.map(wireVersionRef) },
+      mutationOptions(options, true),
+    )
+  }
+
   list(
     projectId: string,
     filters: { readonly kind?: string; readonly status?: ArtifactStatus } = {},
@@ -264,14 +396,21 @@ export class ArtifactsClient extends DomainClient {
     })
   }
 
-  get(artifactId: string, options?: ClientRequestOptions) {
-    return this.http.get<ArtifactDto>(`/v1/artifacts/${segment(artifactId)}`, requestOptions(options))
+  get<TContent = JsonValue>(artifactId: string, options?: ClientRequestOptions) {
+    return this.http.get<VersionedArtifactDto<TContent>>(
+      `/v1/artifacts/${segment(artifactId)}`,
+      requestOptions(options),
+    )
   }
 
-  create(projectId: string, input: CreateArtifactInputDto, options?: ClientMutationOptions) {
-    return this.http.post<ArtifactDto, CreateArtifactInputDto>(
+  create<TContent = JsonValue>(
+    projectId: string,
+    input: CreateArtifactInputDto<TContent>,
+    options?: ClientMutationOptions,
+  ) {
+    return this.http.post<VersionedArtifactDto<TContent>, CreateArtifactInputDto<TContent>>(
       `/v1/projects/${segment(projectId)}/artifacts`,
-      input,
+      wireGenericArtifactCommand(input),
       mutationOptions(options, true),
     )
   }
@@ -297,21 +436,44 @@ export class ArtifactsClient extends DomainClient {
     )
   }
 
+  createDependency(
+    projectId: string,
+    input: CreateDependencyInputDto,
+    options?: ClientMutationOptions,
+  ) {
+    return this.http.post<ArtifactDependencyDto, CreateDependencyInputDto>(
+      `/v1/projects/${segment(projectId)}/dependencies`,
+      {
+        ...input,
+        source: wireVersionRef(input.source),
+        target: wireVersionRef(input.target),
+      },
+      mutationOptions(options, true),
+    )
+  }
+
   getVersioned<TContent = JsonValue>(artifactId: string, options?: ClientRequestOptions) {
     return this.http.get<VersionedArtifactDto<TContent>>(
-      `/v1/artifacts/${segment(artifactId)}/workspace`,
+      `/v1/artifacts/${segment(artifactId)}`,
+      requestOptions(options),
+    )
+  }
+
+  getDraft<TContent = JsonValue>(artifactId: string, options?: ClientRequestOptions) {
+    return this.http.get<ArtifactDraftDto<TContent>>(
+      `/v1/artifacts/${segment(artifactId)}/draft`,
       requestOptions(options),
     )
   }
 
   updateDraft<TContent>(
-    artifactId: string,
-    input: UpdateDraftInputDto<TContent>,
+    draftId: string,
+    input: UpdateArtifactDraftInputDto<TContent>,
     options: ClientMutationOptions,
   ) {
-    return this.http.patch<ArtifactDraftDto<TContent>, UpdateDraftInputDto<TContent>>(
-      `/v1/artifacts/${segment(artifactId)}/draft`,
-      input,
+    return this.http.patch<ArtifactDraftDto<TContent>, UpdateArtifactDraftInputDto<TContent>>(
+      `/v1/drafts/${segment(draftId)}`,
+      wireGenericArtifactCommand(input),
       mutationOptions(options),
     )
   }
@@ -356,7 +518,7 @@ abstract class VersionedDomainClient<TContent, TCreate> extends DomainClient {
   create(projectId: string, input: TCreate, options?: ClientMutationOptions) {
     return this.http.post<VersionedArtifactDto<TContent>, TCreate>(
       `/v1/projects/${segment(projectId)}/${this.collection}`,
-      input,
+      wireVersionedCommand(input),
       mutationOptions(options, true),
     )
   }
@@ -368,7 +530,7 @@ abstract class VersionedDomainClient<TContent, TCreate> extends DomainClient {
   ) {
     return this.http.patch<VersionedArtifactDto<TContent>, UpdateDraftInputDto<TContent>>(
       `/v1/${this.collection}/${segment(artifactId)}/draft`,
-      input,
+      wireVersionedCommand(input),
       mutationOptions(options),
     )
   }
@@ -407,22 +569,6 @@ export class PageSpecsClient extends VersionedDomainClient<PageSpecContentDto, C
 
 export class PrototypesClient extends VersionedDomainClient<PrototypeContentDto, CreatePrototypeInputDto> {
   protected readonly collection = 'prototypes'
-
-  importSnapshot(
-    artifactId: string,
-    body: BodyInit,
-    mediaType: string,
-    options?: ClientMutationOptions,
-  ) {
-    return this.http.post<ProposalDto, BodyInit>(
-      `/v1/prototypes/${segment(artifactId)}/imports`,
-      body,
-      {
-        ...mutationOptions(options, true),
-        headers: { 'Content-Type': mediaType },
-      },
-    )
-  }
 }
 
 export class ReviewsClient extends DomainClient {
@@ -440,7 +586,7 @@ export class ReviewsClient extends DomainClient {
   create(projectId: string, input: CreateReviewInputDto, options?: ClientMutationOptions) {
     return this.http.post<ReviewDto, CreateReviewInputDto>(
       `/v1/projects/${segment(projectId)}/reviews`,
-      input,
+      { ...input, target: wireVersionRef(input.target) },
       mutationOptions(options, true),
     )
   }
@@ -469,7 +615,7 @@ export class CommentsClient extends DomainClient {
   ) {
     return this.http.post<CommentDto, CreateCommentInputDto>(
       `/v1/projects/${segment(projectId)}/comments`,
-      input,
+      wireCommentInput(input),
       mutationOptions(options, true),
     )
   }
@@ -484,7 +630,7 @@ export class CommentsClient extends DomainClient {
   create(artifactId: string, input: CreateCommentInputDto, options?: ClientMutationOptions) {
     return this.http.post<CommentDto, CreateCommentInputDto>(
       `/v1/artifacts/${segment(artifactId)}/comments`,
-      input,
+      wireCommentInput(input),
       mutationOptions(options, true),
     )
   }
@@ -544,7 +690,7 @@ export class PresenceClient extends DomainClient {
 export class ProposalsClient extends DomainClient {
   create(projectId: string, input: CreateProposalInputDto, options?: ClientMutationOptions) {
     return this.http.post<ProposalDto, CreateProposalInputDto>(
-      `/v1/projects/${segment(projectId)}/proposals`,
+      `/v1/projects/${segment(projectId)}/output-proposals`,
       input,
       mutationOptions(options, true),
     )
@@ -555,14 +701,26 @@ export class ProposalsClient extends DomainClient {
     filters: { readonly artifactId?: string; readonly status?: ProposalStatus } = {},
     options?: ListOptions,
   ) {
-    return this.http.get<PageDto<ProposalDto>>(`/v1/projects/${segment(projectId)}/proposals`, {
+    return this.http.get<PageDto<ProposalDto>>(`/v1/projects/${segment(projectId)}/output-proposals`, {
       ...requestOptions(options),
       query: listQuery(options, filters),
     })
   }
 
   get(proposalId: string, options?: ClientRequestOptions) {
-    return this.http.get<ProposalDto>(`/v1/proposals/${segment(proposalId)}`, requestOptions(options))
+    return this.http.get<ProposalDto>(`/v1/output-proposals/${segment(proposalId)}`, requestOptions(options))
+  }
+
+  decide(
+    proposalId: string,
+    input: DecideProposalInputDto,
+    options: ClientMutationOptions,
+  ) {
+    return this.http.post<ProposalDto, DecideProposalInputDto>(
+      `/v1/output-proposals/${segment(proposalId)}/decisions`,
+      input,
+      mutationOptions(options, true),
+    )
   }
 
   apply(
@@ -570,20 +728,13 @@ export class ProposalsClient extends DomainClient {
     input: ApplyProposalInputDto,
     options: ClientMutationOptions,
   ) {
-    return this.http.post<ProposalDto, ApplyProposalInputDto>(
-      `/v1/proposals/${segment(proposalId)}/apply`,
+    return this.http.post<ArtifactDraftDto<JsonValue>, ApplyProposalInputDto>(
+      `/v1/output-proposals/${segment(proposalId)}/apply`,
       input,
       mutationOptions(options, true),
     )
   }
 
-  reject(proposalId: string, reason: string, options: ClientMutationOptions) {
-    return this.http.post<ProposalDto, { readonly reason: string }>(
-      `/v1/proposals/${segment(proposalId)}/reject`,
-      { reason },
-      mutationOptions(options, true),
-    )
-  }
 }
 
 export class WorkflowsClient extends DomainClient {
@@ -622,16 +773,35 @@ export class WorkflowsClient extends DomainClient {
 export class ManifestsClient extends DomainClient {
   create(projectId: string, input: CreateInputManifestDto, options?: ClientMutationOptions) {
     return this.http.post<InputManifestDto, CreateInputManifestDto>(
-      `/v1/projects/${segment(projectId)}/manifests`,
-      input,
+      `/v1/projects/${segment(projectId)}/input-manifests`,
+      {
+        ...input,
+        baseRevision: input.baseRevision ? wireVersionRef(input.baseRevision) : undefined,
+        sources: input.sources.map((source) => ({
+          ...source,
+          ref: wireVersionRef(source.ref),
+        })),
+      },
       mutationOptions(options, true),
     )
   }
 
   get(manifestId: string, options?: ClientRequestOptions) {
     return this.http.get<InputManifestDto>(
-      `/v1/manifests/${segment(manifestId)}`,
+      `/v1/input-manifests/${segment(manifestId)}`,
       requestOptions(options),
+    )
+  }
+
+  generateArtifactProposal(
+    manifestId: string,
+    model: string,
+    options?: ClientMutationOptions,
+  ) {
+    return this.http.post<ArtifactGenerationResultDto, { readonly model: string }>(
+      `/v1/input-manifests/${segment(manifestId)}/generate`,
+      { model },
+      mutationOptions(options, true),
     )
   }
 }
@@ -683,15 +853,15 @@ export class WorkbenchClient extends DomainClient {
     options?: ClientMutationOptions,
   ) {
     return this.http.post<WorkbenchBundleDto, CreateWorkbenchBundleInputDto>(
-      `/v1/projects/${segment(projectId)}/workbench-bundles`,
-      input,
+      `/v1/projects/${segment(projectId)}/build-manifests`,
+      { ...input, prototypeRevision: wireVersionRef(input.prototypeRevision) },
       mutationOptions(options, true),
     )
   }
 
   getBundle(bundleId: string, options?: ClientRequestOptions) {
     return this.http.get<WorkbenchBundleDto>(
-      `/v1/workbench-bundles/${segment(bundleId)}`,
+      `/v1/build-manifests/${segment(bundleId)}`,
       requestOptions(options),
     )
   }
@@ -705,10 +875,14 @@ export class TracesClient extends DomainClient {
     })
   }
 
-  create(projectId: string, trace: TraceLinkDto, options?: ClientMutationOptions) {
-    return this.http.post<TraceLinkDto, TraceLinkDto>(
+  create(projectId: string, trace: CreateTraceLinkInputDto, options?: ClientMutationOptions) {
+    return this.http.post<TraceLinkDto, CreateTraceLinkInputDto>(
       `/v1/projects/${segment(projectId)}/traces`,
-      trace,
+      {
+        ...trace,
+        source: wireVersionRef(trace.source),
+        target: wireVersionRef(trace.target),
+      },
       mutationOptions(options, true),
     )
   }

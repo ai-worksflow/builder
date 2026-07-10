@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/worksflow/builder/backend/internal/core"
 	"github.com/worksflow/builder/backend/internal/domain"
 )
 
@@ -29,6 +30,30 @@ func (c *mutableClock) Advance(duration time.Duration) {
 
 func engineSchema() json.RawMessage {
 	return json.RawMessage(`{"type":"object","properties":{"payload":{"type":"object"}},"required":["payload"]}`)
+}
+
+func engineReviewDecision(actorID string, resolution ReviewResolution, reason string) ReviewDecision {
+	action := core.ActionReview
+	if resolution == ReviewApprove || resolution == ReviewWaive {
+		action = core.ActionApprove
+	}
+	return ReviewDecision{
+		Resolution: resolution, Reason: reason,
+		Actor: ActorProvenance{
+			ActorID: actorID, Role: core.RoleOwner, Action: action,
+			Source: ActorSourceAuthenticatedCommand, AuthorizedAt: time.Date(2026, 7, 10, 10, 0, 0, 0, time.UTC),
+		},
+	}
+}
+
+func authorizeTestExecution(t *testing.T, engine *Engine, runID, nodeKey string, role core.Role, action core.Action) {
+	t.Helper()
+	if err := engine.AuthorizeNodeExecution(context.Background(), runID, nodeKey, ActorProvenance{
+		ActorID: uuid.NewString(), Role: role, Action: action,
+		Source: ActorSourceAuthenticatedCommand, AuthorizedAt: engine.now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func testManifestForEngine(t *testing.T, projectID, userID string, now time.Time) domain.InputManifest {
@@ -198,6 +223,7 @@ func TestEngineRetriesFailureAndResumesWithPinnedDefinition(t *testing.T) {
 	if err := engine.ClaimAndExecute(context.Background(), "worker"); err != nil {
 		t.Fatal(err)
 	}
+	authorizeTestExecution(t, engine, run.ID, "publish", core.RoleOwner, core.ActionPublish)
 	if err := engine.ClaimAndExecute(context.Background(), "worker"); err != nil {
 		t.Fatal(err)
 	}
@@ -268,10 +294,14 @@ func TestConditionRoutesOneBranchAndCancelsTheOther(t *testing.T) {
 	engine, store, _, record, manifest, projectID, startedBy := newTestEngine(t, definition, registry)
 	engine.ConditionEvaluator = ConditionEvaluatorFunc(func(context.Context, Execution, []domain.ConditionBranch) (string, error) { return "yes", nil })
 	run, _ := engine.Start(context.Background(), StartRequest{RunID: uuid.NewString(), ProjectID: projectID, DefinitionVersionID: record.VersionID, InputManifest: manifest.Ref(), StartedBy: startedBy})
-	for index := 0; index < 4; index++ {
+	for index := 0; index < 3; index++ {
 		if err := engine.ClaimAndExecute(context.Background(), "worker"); err != nil {
 			t.Fatal(err)
 		}
+	}
+	authorizeTestExecution(t, engine, run.ID, "publish", core.RoleOwner, core.ActionPublish)
+	if err := engine.ClaimAndExecute(context.Background(), "worker"); err != nil {
+		t.Fatal(err)
 	}
 	final, _ := store.GetRun(context.Background(), run.ID)
 	if final.Status != RunCompleted || final.Nodes["yes"].Status != NodeCompleted || final.Nodes["no"].Status != NodeCancelled {
@@ -326,10 +356,14 @@ func TestFanOutCreatesSlicesHonorsParallelismAndMerges(t *testing.T) {
 	if len(afterFan.Context.Slices) != 3 || ready != 2 {
 		t.Fatalf("expected 3 slices and max 2 ready, got slices=%d ready=%d", len(afterFan.Context.Slices), ready)
 	}
-	for iteration := 0; iteration < 5; iteration++ {
+	for iteration := 0; iteration < 4; iteration++ {
 		if err := engine.ClaimAndExecute(context.Background(), "worker"); err != nil {
 			t.Fatal(err)
 		}
+	}
+	authorizeTestExecution(t, engine, run.ID, "publish", core.RoleOwner, core.ActionPublish)
+	if err := engine.ClaimAndExecute(context.Background(), "worker"); err != nil {
+		t.Fatal(err)
 	}
 	final, _ := store.GetRun(context.Background(), run.ID)
 	if final.Status != RunCompleted || final.Nodes["merge"].Status != NodeCompleted {
@@ -361,7 +395,7 @@ func TestReviewWaitSelfApprovalAndWaiver(t *testing.T) {
 	engine.ReviewGate = ReviewGateVerifierFunc(func(context.Context, string, []domain.ArtifactRef, domain.ReviewGateNodeConfig) error {
 		return gateErr
 	})
-	if err := engine.ResolveReview(context.Background(), run.ID, "review", uuid.NewString(), ReviewApprove, ""); !errors.Is(err, gateErr) {
+	if err := engine.ResolveReview(context.Background(), run.ID, "review", engineReviewDecision(uuid.NewString(), ReviewApprove, "")); !errors.Is(err, gateErr) {
 		t.Fatalf("expected canonical review guard, got %v", err)
 	}
 	stillWaiting, _ := store.GetRun(context.Background(), run.ID)
@@ -369,10 +403,13 @@ func TestReviewWaitSelfApprovalAndWaiver(t *testing.T) {
 		t.Fatalf("failed canonical review changed node state: %s", stillWaiting.Nodes["review"].Status)
 	}
 	engine.ReviewGate = nil
-	if err := engine.ResolveReview(context.Background(), run.ID, "review", startedBy, ReviewApprove, ""); !errors.Is(err, domain.ErrSelfApproval) {
+	if err := engine.ResolveReview(context.Background(), run.ID, "review", engineReviewDecision(startedBy, ReviewApprove, "")); !errors.Is(err, domain.ErrSelfApproval) {
 		t.Fatalf("expected self approval guard, got %v", err)
 	}
-	if err := engine.ResolveReview(context.Background(), run.ID, "review", uuid.NewString(), ReviewWaive, "emergency"); err != nil {
+	if err := engine.ResolveReview(context.Background(), run.ID, "review", engineReviewDecision(uuid.NewString(), ReviewWaive, "emergency")); err != nil {
+		t.Fatal(err)
+	}
+	if err := engine.AuthorizeNodeExecution(context.Background(), run.ID, "publish", ActorProvenance{ActorID: uuid.NewString(), Role: core.RoleOwner, Action: core.ActionPublish, Source: ActorSourceAuthenticatedCommand, AuthorizedAt: time.Date(2026, 7, 10, 10, 0, 0, 0, time.UTC)}); err != nil {
 		t.Fatal(err)
 	}
 	if err := engine.ClaimAndExecute(context.Background(), "worker"); err != nil {
@@ -421,7 +458,7 @@ func TestChangesRequestedReopensHumanEditBeforeReviewCanContinue(t *testing.T) {
 	if err := engine.ClaimAndExecute(context.Background(), "worker"); err != nil {
 		t.Fatal(err)
 	}
-	if err := engine.ResolveReview(context.Background(), run.ID, "review", uuid.NewString(), ReviewChanges, "Acceptance criteria are incomplete"); err != nil {
+	if err := engine.ResolveReview(context.Background(), run.ID, "review", engineReviewDecision(uuid.NewString(), ReviewChanges, "Acceptance criteria are incomplete")); err != nil {
 		t.Fatal(err)
 	}
 	reopened, err := store.GetRun(context.Background(), run.ID)

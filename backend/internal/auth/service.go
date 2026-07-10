@@ -46,16 +46,20 @@ type IssuedSession struct {
 }
 
 type ServiceConfig struct {
-	TTL         time.Duration
-	CachePrefix string
-	Now         func() time.Time
+	TTL            time.Duration
+	CachePrefix    string
+	IdempotencyTTL time.Duration
+	ReplayKey      []byte
+	Now            func() time.Time
 }
 
 type Service struct {
-	database *gorm.DB
-	cache    redis.UniversalClient
-	hasher   PasswordHasher
-	config   ServiceConfig
+	database            *gorm.DB
+	cache               redis.UniversalClient
+	hasher              PasswordHasher
+	config              ServiceConfig
+	replayKey           []byte
+	receiptCompleteHook func() error
 }
 
 type cachedSession struct {
@@ -74,10 +78,21 @@ func NewService(database *gorm.DB, cache redis.UniversalClient, hasher PasswordH
 	if config.CachePrefix == "" {
 		config.CachePrefix = "worksflow:session:"
 	}
+	if config.IdempotencyTTL <= 0 {
+		config.IdempotencyTTL = 24 * time.Hour
+	}
+	if len(config.ReplayKey) != 32 {
+		return nil, errors.New("auth replay key must contain exactly 32 bytes")
+	}
 	if config.Now == nil {
 		config.Now = time.Now
 	}
-	return &Service{database: database, cache: cache, hasher: hasher, config: config}, nil
+	replayKey := append([]byte(nil), config.ReplayKey...)
+	config.ReplayKey = nil
+	return &Service{
+		database: database, cache: cache, hasher: hasher, config: config,
+		replayKey: replayKey,
+	}, nil
 }
 
 func (s *Service) SignUp(ctx context.Context, email, displayName, password, userAgent, ipAddress string) (IssuedSession, error) {

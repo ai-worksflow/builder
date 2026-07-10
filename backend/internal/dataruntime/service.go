@@ -22,8 +22,9 @@ type ConnectionProber interface {
 
 type MutationContext struct {
 	ActorID            string
-	RequestID           string
+	RequestID          string
 	PublicDeploymentID string
+	PublicCapabilityID string
 }
 
 type Repository interface {

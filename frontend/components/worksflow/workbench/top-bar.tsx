@@ -4,26 +4,20 @@ import { useState } from 'react'
 import { cn } from '@/lib/utils'
 import { useI18n, type MessageKey } from '@/lib/i18n'
 import { useWorksflow } from '@/lib/worksflow/store'
-import { DOC_STATUS_CLASS } from '@/lib/worksflow/labels'
 import type { WorkbenchView } from '@/lib/worksflow/types'
 import { useDropdown } from '../use-dropdown'
 import { LanguageToggle } from '../language-toggle'
-import { useLocalizedLabels } from '../use-localized-labels'
-import { StatusPill } from '../shared'
-import { downloadBlob } from '@/lib/delivery/client'
-import { findSensitiveArtifactIssue } from '@/lib/delivery/sensitive'
 import { GitHubPanel } from './github-panel'
 import { useCollaboration } from '@/lib/collaboration/provider'
+import { useArtifactWorkspace } from '@/lib/platform/artifact-provider'
 import {
   BarChart3,
   Blocks,
   ChevronDown,
   Code2,
-  Copy,
   Database,
   Download,
   FileClock,
-  FileText,
   GitBranch,
   Home,
   Link2,
@@ -33,7 +27,6 @@ import {
   Plug,
   Rocket,
   Share2,
-  Star,
   Trash2,
   Users2,
   X,
@@ -48,26 +41,19 @@ const VIEWS: { id: WorkbenchView; labelKey: MessageKey; icon: typeof Monitor }[]
 export function TopBar() {
   const {
     session: collaborationSession,
+    project: collaborationProject,
     can: canCollaborate,
     authorize: authorizeCollaboration,
     error: collaborationError,
+    renameProject,
+    archiveProject,
   } = useCollaboration()
   const {
     view,
     setView,
-    projectName,
-    setProjectName,
     setSurface,
     setComposerDraft,
-    duplicateProject,
-    deleteProductProject,
-    versions,
-    linkedDocIds,
-    documents,
-    toggleLinkedDoc,
     setTeamView,
-    previewDocument,
-    blueprint,
     deliveryStatus,
     deliveryError,
     deliveryLogs,
@@ -78,26 +64,24 @@ export function TopBar() {
     refreshDeployments,
     rollbackDeployment,
   } = useWorksflow()
+  const artifactWorkspace = useArtifactWorkspace()
+  const projectName = collaborationProject?.name ?? 'Select a server project'
   const { t } = useI18n()
-  const labels = useLocalizedLabels()
   const projectMenu = useDropdown()
   const moreMenu = useDropdown()
   const [notice, setNotice] = useState<string | null>(null)
   const [panel, setPanel] = useState<
     | null
     | 'versions'
-    | 'transfer'
     | 'rename'
     | 'export'
     | 'delete'
     | 'connect'
-    | 'share'
     | 'publish'
     | 'analytics'
     | 'knowledge'
     | 'connectors'
     | 'stripe'
-    | 'linkedDocs'
   >(null)
   const [renameDraft, setRenameDraft] = useState(projectName)
   const [publishMessage, setPublishMessage] = useState('Publish from Worksflow')
@@ -106,10 +90,6 @@ export function TopBar() {
     deploymentId: string
     versionId: string
   } | null>(null)
-  const linkedDocs = linkedDocIds
-    .map((id) => documents.find((doc) => doc.id === id))
-    .filter((doc): doc is (typeof documents)[number] => Boolean(doc))
-  const availableDocs = documents.filter((doc) => !linkedDocIds.includes(doc.id))
 
   function showNotice(message: string) {
     setNotice(message)
@@ -118,45 +98,9 @@ export function TopBar() {
 
   async function handleExport(key: string) {
     if (!(await authorizeCollaboration('view'))) return
-    if (key === 'sourceZip') {
-      const ok = await exportWorkspace()
-      if (ok) showNotice(t('workbench.notice.exportPrepared', { item: t('workbench.export.sourceZip') }))
-      return
-    }
-    if (key === 'documentBundle') {
-      const markdown = linkedDocs.length > 0
-        ? linkedDocs
-            .map((document) => [
-              `# ${document.title}`,
-              '',
-              document.summary,
-              '',
-              ...document.sections.flatMap((section) => [`## ${section.title}`, '', section.body, '']),
-            ].join('\n'))
-            .join('\n---\n\n')
-        : `# ${projectName}\n\nNo linked team documents were selected.`
-      const issue = findSensitiveArtifactIssue(markdown)
-      if (issue) {
-        showNotice(`Export blocked: ${issue.message}`)
-        return
-      }
-      downloadText(markdown, `${projectSlug(projectName)}-documents.md`, 'text/markdown;charset=utf-8')
-    } else if (key === 'previewSnapshot') {
-      const issue = findSensitiveArtifactIssue(previewDocument.html)
-      if (issue) {
-        showNotice(`Export blocked: ${issue.message}`)
-        return
-      }
-      downloadText(previewDocument.html, `${projectSlug(projectName)}-preview.html`, 'text/html;charset=utf-8')
-    } else if (key === 'blueprintJson') {
-      const serialized = JSON.stringify(blueprint, null, 2)
-      const issue = findSensitiveArtifactIssue(serialized)
-      if (issue) {
-        showNotice(`Export blocked: ${issue.message}`)
-        return
-      }
-      downloadText(serialized, `${projectSlug(projectName)}-blueprint.json`, 'application/json;charset=utf-8')
-    }
+    if (key !== 'sourceZip') return
+    const ok = await exportWorkspace()
+    if (!ok) return
     const option = EXPORT_OPTIONS.find((item) => item.key === key)
     if (option) showNotice(t('workbench.notice.exportPrepared', { item: t(option.labelKey) }))
   }
@@ -170,7 +114,7 @@ export function TopBar() {
       {/* Workspace / project path */}
       <div className="flex min-w-0 flex-1 items-center gap-1.5 text-sm md:flex-none">
         <span className="shrink-0 rounded-md bg-white/5 px-2 py-1 text-xs font-medium text-muted-foreground">
-          Acme
+          Projects
         </span>
         <span className="shrink-0 text-faint-foreground">/</span>
 
@@ -194,9 +138,6 @@ export function TopBar() {
               <MenuItem icon={FileClock} onClick={() => setPanel('versions')}>
                 {t('workbench.menu.versionHistory')}
               </MenuItem>
-              <MenuItem icon={Share2} onClick={() => setPanel('transfer')}>
-                {t('workbench.menu.transferTo')}
-              </MenuItem>
               <MenuDivider />
               <MenuItem
                 icon={Pencil}
@@ -209,21 +150,6 @@ export function TopBar() {
                 }}
               >
                 {t('workbench.menu.rename')}
-              </MenuItem>
-              <MenuItem
-                icon={Copy}
-                onClick={() => {
-                  void authorizeCollaboration('admin').then((allowed) => {
-                    if (!allowed) return
-                    duplicateProject()
-                    showNotice(t('workbench.notice.projectDuplicated'))
-                  })
-                }}
-              >
-                {t('workbench.menu.duplicate')}
-              </MenuItem>
-              <MenuItem icon={Star} onClick={() => showNotice(t('workbench.notice.projectStarred'))}>
-                {t('workbench.menu.starProject')}
               </MenuItem>
               <MenuItem icon={Download} onClick={() => setPanel('export')}>
                 {t('workbench.menu.export')}
@@ -300,11 +226,14 @@ export function TopBar() {
         <LanguageToggle className="max-sm:hidden" />
         <button
           type="button"
-          onClick={() => setPanel('linkedDocs')}
+          onClick={() => {
+            setTeamView('graph')
+            setSurface('team')
+          }}
           className="hidden items-center gap-1 rounded-md border border-primary/30 bg-primary/10 px-2 py-1 text-[11px] font-medium text-primary-bright hover:bg-primary/15 md:inline-flex"
         >
           <Link2 className="h-3 w-3" />
-          {t('workbench.linkedDocs', { count: linkedDocIds.length })}
+          Server artifacts · {artifactWorkspace.documents.length + artifactWorkspace.blueprints.length + artifactWorkspace.pageSpecs.length + artifactWorkspace.prototypes.length}
         </button>
         <button
           type="button"
@@ -316,7 +245,10 @@ export function TopBar() {
         </button>
         <button
           type="button"
-          onClick={() => setPanel('share')}
+          onClick={() => {
+            setTeamView('members')
+            setSurface('team')
+          }}
           className="flex items-center gap-1.5 rounded-md border border-border px-2.5 py-1.5 text-[13px] font-medium text-muted-foreground hover:bg-white/5 hover:text-foreground"
         >
           <Share2 className="h-4 w-4" />
@@ -356,26 +288,22 @@ export function TopBar() {
             panel === 'rename' ? (
               <button
                 type="button"
-                onClick={() => {
-                  void authorizeCollaboration('admin').then((allowed) => {
-                    if (!allowed) return
-                    setProjectName(renameDraft.trim() || projectName)
-                    setPanel(null)
-                  })
+                disabled={!collaborationProject || !renameDraft.trim() || renameDraft.trim() === collaborationProject.name}
+                onClick={async () => {
+                  if (!collaborationProject || !(await authorizeCollaboration('admin'))) return
+                  if (await renameProject(collaborationProject.id, renameDraft.trim())) setPanel(null)
                 }}
-                className="rounded-md bg-primary px-3 py-1.5 text-[12px] font-semibold text-primary-foreground hover:bg-primary-bright"
+                className="rounded-md bg-primary px-3 py-1.5 text-[12px] font-semibold text-primary-foreground hover:bg-primary-bright disabled:opacity-50"
               >
                 {t('workbench.panel.saveName')}
               </button>
             ) : panel === 'delete' ? (
               <button
                 type="button"
-                onClick={() => {
-                  void authorizeCollaboration('admin').then((allowed) => {
-                    if (!allowed) return
-                    deleteProductProject()
-                    setPanel(null)
-                  })
+                disabled={!collaborationProject}
+                onClick={async () => {
+                  if (!collaborationProject || !(await authorizeCollaboration('admin'))) return
+                  if (await archiveProject(collaborationProject.id)) setPanel(null)
                 }}
                 className="rounded-md bg-destructive px-3 py-1.5 text-[12px] font-semibold text-destructive-foreground hover:opacity-90"
               >
@@ -440,105 +368,15 @@ export function TopBar() {
         >
           {panel === 'versions' && (
             <div className="space-y-2">
-              {versions.map((version) => (
-                <div key={version.id} className="rounded-md border border-border bg-card px-3 py-2">
-                  <div className="text-sm font-medium text-foreground">{version.title}</div>
-                  <div className="mt-0.5 text-[11px] text-faint-foreground">{version.subtitle}</div>
+              {deployments.flatMap((deployment) => deployment.versions.map((version) => (
+                <div key={`${deployment.deploymentId}:${version.id}`} className="rounded-md border border-border bg-card px-3 py-2">
+                  <div className="text-sm font-medium text-foreground">v{version.number} · {version.action}</div>
+                  <div className="mt-0.5 text-[11px] text-faint-foreground">{new Date(version.createdAt).toLocaleString()} · {version.environment ?? 'preview'} · {version.checksum.slice(0, 12)}</div>
                 </div>
-              ))}
-            </div>
-          )}
-          {panel === 'linkedDocs' && (
-            <div className="space-y-3">
-              <div className="rounded-md border border-primary/25 bg-primary/10 px-3 py-2 text-[12px] leading-relaxed text-primary-bright">
-                {t('chat.linkedDocs')} · {t('chat.contextLocked')}
-              </div>
-              <div className="space-y-1.5">
-                {linkedDocs.map((doc) => (
-                  <div
-                    key={doc.id}
-                    className="flex items-center justify-between gap-2 rounded-md border border-border bg-card px-3 py-2"
-                  >
-                    <span className="flex min-w-0 items-start gap-2">
-                      <FileText className="mt-0.5 h-3.5 w-3.5 shrink-0 text-faint-foreground" />
-                      <span className="min-w-0">
-                        <span className="block truncate text-[12px] font-medium text-foreground">
-                          {doc.title}
-                        </span>
-                        <span className="text-[10px] text-faint-foreground">
-                          {labels.docType(doc.type)}
-                        </span>
-                      </span>
-                    </span>
-                    <span className="flex shrink-0 items-center gap-1.5">
-                      <StatusPill
-                        label={labels.docStatus(doc.status)}
-                        className={DOC_STATUS_CLASS[doc.status]}
-                      />
-                      <button
-                        type="button"
-                        onClick={() => void authorizeCollaboration('edit').then((allowed) => allowed && toggleLinkedDoc(doc.id))}
-                        disabled={!collaborationSession.signedIn || !canCollaborate('edit')}
-                        className="rounded px-1.5 py-0.5 text-[10px] text-faint-foreground hover:bg-white/5 hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40"
-                      >
-                        {t('common.remove')}
-                      </button>
-                    </span>
-                  </div>
-                ))}
-              </div>
-              {availableDocs.length > 0 && (
-                <details>
-                  <summary className="cursor-pointer rounded-md px-2 py-1 text-[12px] font-medium text-muted-foreground hover:bg-white/5">
-                    {t('chat.addLinkedContext')}
-                  </summary>
-                  <div className="mt-1 space-y-1">
-                    {availableDocs.slice(0, 5).map((doc) => (
-                      <button
-                        key={doc.id}
-                        type="button"
-                        onClick={() => void authorizeCollaboration('edit').then((allowed) => allowed && toggleLinkedDoc(doc.id))}
-                        disabled={!collaborationSession.signedIn || !canCollaborate('edit')}
-                        className="flex w-full items-center justify-between gap-2 rounded-md px-2 py-1.5 text-left hover:bg-white/5 disabled:cursor-not-allowed disabled:opacity-40"
-                      >
-                        <span className="min-w-0 truncate text-[12px] text-muted-foreground">
-                          {doc.title}
-                        </span>
-                        <span className="shrink-0 text-[10px] text-faint-foreground">
-                          {labels.docType(doc.type)}
-                        </span>
-                      </button>
-                    ))}
-                  </div>
-                </details>
+              )))}
+              {deployments.every((deployment) => deployment.versions.length === 0) && (
+                <p className="rounded-md border border-dashed border-border px-3 py-4 text-[11px] text-faint-foreground">No server release versions yet.</p>
               )}
-              <button
-                type="button"
-                onClick={() => {
-                  setPanel(null)
-                  setTeamView('graph')
-                  setSurface('team')
-                }}
-                className="inline-flex w-full items-center justify-center gap-1.5 rounded-md border border-border px-3 py-1.5 text-[12px] font-medium text-muted-foreground hover:bg-white/5 hover:text-foreground"
-              >
-                <GitBranch className="h-3.5 w-3.5" />
-                {t('team.nav.graph')}
-              </button>
-            </div>
-          )}
-          {panel === 'transfer' && (
-            <div className="space-y-2">
-              {['Acme / CRM Rewrite', 'Acme / Design Systems', 'Personal workspace'].map((target) => (
-                <button
-                  key={target}
-                  type="button"
-                  onClick={() => showNotice(t('workbench.notice.transferTarget', { target }))}
-                  className="flex w-full items-center justify-between rounded-md border border-border bg-card px-3 py-2 text-left text-sm text-muted-foreground hover:border-primary/40 hover:text-foreground"
-                >
-                  {target}
-                  <Users2 className="h-4 w-4 text-faint-foreground" />
-                </button>
-              ))}
             </div>
           )}
           {panel === 'rename' && (
@@ -579,28 +417,6 @@ export function TopBar() {
                 {t('workbench.github.signInRequired')}
               </div>
             )
-          )}
-          {panel === 'share' && (
-            <div className="space-y-3">
-              <div className="rounded-md border border-border bg-card px-3 py-2 font-mono text-[12px] text-muted-foreground">
-                https://worksflow.local/acme/{projectName.toLowerCase().replace(/\s+/g, '-')}
-              </div>
-              <div className="grid grid-cols-3 gap-2 text-[11px]">
-                {[
-                  t('common.viewer'),
-                  t('common.commenter'),
-                  t('common.editor'),
-                ].map((role) => (
-                  <button
-                    key={role}
-                    type="button"
-                    className="rounded-md border border-border px-2 py-1.5 text-muted-foreground hover:bg-white/5 hover:text-foreground"
-                  >
-                    {role}
-                  </button>
-                ))}
-              </div>
-            </div>
           )}
           {panel === 'publish' && (
             <div className="space-y-3">
@@ -688,9 +504,9 @@ export function TopBar() {
           {panel === 'analytics' && (
             <div className="grid grid-cols-3 gap-2">
               {[
-                [t('workbench.panel.previewLoads'), '42'],
-                [t('workbench.panel.promptRuns'), '8'],
-                [t('workbench.panel.syncBacks'), '3'],
+                ['Deployments', String(deployments.length)],
+                ['Release log entries', String(deliveryLogs.length)],
+                ['Server artifacts', String(artifactWorkspace.documents.length + artifactWorkspace.blueprints.length + artifactWorkspace.pageSpecs.length + artifactWorkspace.prototypes.length)],
               ].map(([label, value]) => (
                 <div key={label} className="rounded-md border border-border bg-card p-3">
                   <div className="text-lg font-semibold text-foreground">{value}</div>
@@ -700,20 +516,13 @@ export function TopBar() {
             </div>
           )}
           {panel === 'knowledge' && (
-            <div className="space-y-2">
-              {[
-                t('workbench.panel.approvedDocsOnly'),
-                t('workbench.panel.includeApiContracts'),
-                t('workbench.panel.includeUiStates'),
-              ].map((item) => (
-                <label
-                  key={item}
-                  className="flex items-center justify-between rounded-md border border-border bg-card px-3 py-2 text-[12px] text-muted-foreground"
-                >
-                  {item}
-                  <input type="checkbox" defaultChecked />
-                </label>
-              ))}
+            <div className="space-y-2 text-[12px] leading-relaxed text-muted-foreground">
+              <p className="rounded-md border border-border bg-card px-3 py-2">
+                Build knowledge is frozen by the server InputManifest and BuildManifest. Context selection is reviewed in the workflow; this panel does not mutate it locally.
+              </p>
+              <p className="rounded-md border border-border bg-card px-3 py-2">
+                {artifactWorkspace.documents.length} server document artifact{artifactWorkspace.documents.length === 1 ? '' : 's'} are visible. Only exact approved revisions included by the workflow reach AI generation.
+              </p>
             </div>
           )}
           {panel === 'connectors' && (
@@ -724,9 +533,7 @@ export function TopBar() {
                   className="flex items-center justify-between rounded-md border border-border bg-card px-3 py-2 text-[12px]"
                 >
                   <span className="text-muted-foreground">{item}</span>
-                  <span className="text-primary-bright">
-                    {item === 'Supabase' ? t('workbench.panel.ready') : t('common.connected')}
-                  </span>
+                  <span className="text-faint-foreground">Not configured</span>
                 </div>
               ))}
             </div>
@@ -759,18 +566,15 @@ export function TopBar() {
 function panelTitle(panel: string, t: (key: MessageKey) => string) {
   const map: Record<string, MessageKey> = {
     versions: 'workbench.panel.versionHistory',
-    transfer: 'workbench.panel.transferProject',
     rename: 'workbench.panel.renameProject',
     export: 'workbench.panel.exportProject',
     delete: 'workbench.panel.deleteProject',
     connect: 'workbench.panel.githubConnection',
-    share: 'workbench.panel.shareProject',
     publish: 'workbench.panel.publishResult',
     analytics: 'workbench.panel.analytics',
     knowledge: 'workbench.panel.knowledge',
     connectors: 'workbench.panel.connectors',
     stripe: 'workbench.panel.stripeIntegration',
-    linkedDocs: 'chat.linkedDocs',
   }
   return t(map[String(panel)] ?? 'workbench.panel.projectAction')
 }
@@ -811,22 +615,7 @@ function TopBarPanel({
 
 const EXPORT_OPTIONS: { key: string; labelKey: MessageKey }[] = [
   { key: 'sourceZip', labelKey: 'workbench.export.sourceZip' },
-  { key: 'documentBundle', labelKey: 'workbench.export.documentBundle' },
-  { key: 'previewSnapshot', labelKey: 'workbench.export.previewSnapshot' },
-  { key: 'blueprintJson', labelKey: 'workbench.export.blueprintJson' },
 ]
-
-function projectSlug(value: string) {
-  return value
-    .normalize('NFKD')
-    .replace(/[^a-zA-Z0-9_-]+/g, '-')
-    .replace(/^-+|-+$/g, '')
-    .slice(0, 80) || 'worksflow-project'
-}
-
-function downloadText(content: string, filename: string, type: string) {
-  downloadBlob(new Blob([content], { type }), filename)
-}
 
 function IconButton({
   children,

@@ -166,9 +166,11 @@ func nodeOutputReference(run *RunRecord, definition domain.NodeDefinition, sourc
 		value := *source.OutputProposal
 		reference.OutputProposal = &value
 	}
+	producedArtifactIDs := map[string]bool{}
 	if refs, err := artifactRefsFromNodeOutput(output); err == nil {
 		for _, ref := range refs {
 			reference.ArtifactRevisions = appendUniqueArtifactRef(reference.ArtifactRevisions, ref)
+			producedArtifactIDs[ref.ArtifactID] = true
 		}
 	}
 	var sourceEnvelope struct {
@@ -178,11 +180,15 @@ func nodeOutputReference(run *RunRecord, definition domain.NodeDefinition, sourc
 		for _, ref := range sourceEnvelope.Sources {
 			if ref.Validate() == nil {
 				reference.ArtifactRevisions = appendUniqueArtifactRef(reference.ArtifactRevisions, ref)
+				producedArtifactIDs[ref.ArtifactID] = true
 			}
 		}
 	}
 	if hasStoredInputs {
 		for _, ref := range storedInputs.ArtifactRefs() {
+			if producedArtifactIDs[ref.ArtifactID] {
+				continue
+			}
 			reference.ArtifactRevisions = appendUniqueArtifactRef(reference.ArtifactRevisions, ref)
 		}
 		for _, ref := range storedInputs.SliceRefs() {
@@ -195,12 +201,32 @@ func nodeOutputReference(run *RunRecord, definition domain.NodeDefinition, sourc
 		reference.SliceID = targetSliceID
 	}
 	if slice, exists := run.Context.Slices[sliceID]; exists {
-		reference.DeliverySliceRefs = appendUniqueSliceRef(reference.DeliverySliceRefs, domain.WorkflowSliceRef{ID: slice.ID, Key: slice.Key, FanOutNodeID: slice.FanOutNodeID})
+		reference.DeliverySliceRefs = appendUniqueSliceRef(reference.DeliverySliceRefs, workflowSliceRef(slice))
 		for _, ref := range sliceArtifactRefs(slice) {
+			if producedArtifactIDs[ref.ArtifactID] {
+				continue
+			}
 			reference.ArtifactRevisions = appendUniqueArtifactRef(reference.ArtifactRevisions, ref)
 		}
 	}
 	return reference
+}
+
+func workflowSliceRef(slice SliceContext) domain.WorkflowSliceRef {
+	ref := domain.WorkflowSliceRef{ID: slice.ID, Key: slice.Key, FanOutNodeID: slice.FanOutNodeID}
+	if slice.Blueprint.Validate() == nil {
+		value := slice.Blueprint
+		ref.Blueprint = &value
+	}
+	if slice.PageSpec != nil {
+		value := *slice.PageSpec
+		ref.PageSpec = &value
+	}
+	if slice.Prototype != nil {
+		value := *slice.Prototype
+		ref.Prototype = &value
+	}
+	return ref
 }
 
 func decodeStoredInputs(raw json.RawMessage) (domain.NodeInputEnvelope, bool, error) {

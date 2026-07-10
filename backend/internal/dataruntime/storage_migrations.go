@@ -425,6 +425,9 @@ func (s *GORMStore) applyPlan(transaction *gorm.DB, projectID uuid.UUID, plan mi
 				}); err != nil {
 					return err
 				}
+				if err := rewritePublicPolicyColumn(transaction, projectID, tableID, column.Name, operation.Name, now); err != nil {
+					return err
+				}
 			} else {
 				if err := transaction.Delete(&column).Error; err != nil {
 					return err
@@ -432,6 +435,9 @@ func (s *GORMStore) applyPlan(transaction *gorm.DB, projectID uuid.UUID, plan mi
 				if err := rewriteRecordValues(transaction, projectID, tableID, now, func(values map[string]json.RawMessage) {
 					delete(values, column.Name)
 				}); err != nil {
+					return err
+				}
+				if err := rewritePublicPolicyColumn(transaction, projectID, tableID, column.Name, "", now); err != nil {
 					return err
 				}
 			}

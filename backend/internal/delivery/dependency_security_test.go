@@ -97,6 +97,53 @@ func TestResolverAndBuildContainerArgumentsKeepNetworkBoundary(t *testing.T) {
 		strings.Contains(buildText, "resolver-egress") {
 		t.Fatalf("offline build boundary is unsafe: %s", buildText)
 	}
+	goDependencies := filepath.Join(root, "go-dependencies")
+	if err := os.MkdirAll(filepath.Join(goDependencies, "pkg", "mod"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	goResolverText := strings.Join(sandbox.dependencyRunArgs("go-resolver", goDependencies, "go", sandbox.goImage, []string{"go", "mod", "download", "all"}), " ")
+	if !strings.Contains(goResolverText, "GOPROXY="+defaultGoProxy) ||
+		!strings.Contains(goResolverText, "GOSUMDB="+defaultGoSumDB) || strings.Contains(goResolverText, ",direct") {
+		t.Fatalf("Go resolver policy is not fixed: %s", goResolverText)
+	}
+	goBuildArgs, err := sandbox.qualityRunArgs("go-quality", workspace, SandboxRequest{
+		Ecosystem: "go", Check: CheckBuild, DependencyDirectory: goDependencies,
+	}, sandbox.goImage, []string{"go", "build", "./..."})
+	if err != nil {
+		t.Fatal(err)
+	}
+	goBuildText := strings.Join(goBuildArgs, " ")
+	if !strings.Contains(goBuildText, "--network none") || !strings.Contains(goBuildText, "GOPROXY=off") ||
+		!strings.Contains(goBuildText, "dst=/go/pkg/mod,readonly") || !strings.Contains(goBuildText, "GOFLAGS=-mod=readonly") {
+		t.Fatalf("Go offline build policy is unsafe: %s", goBuildText)
+	}
+}
+
+func TestSandboxImageReproducibilityRequiresDigestPins(t *testing.T) {
+	t.Parallel()
+	mutable := &ContainerSandbox{nodeImage: "node:22-alpine", goImage: "golang:1.22-alpine"}
+	if mutable.ImagesDigestPinned() {
+		t.Fatal("mutable development tags were reported as reproducible")
+	}
+	pinned := &ContainerSandbox{
+		nodeImage: "node:22-alpine@sha256:" + strings.Repeat("a", 64),
+		goImage:   "golang:1.22-alpine@sha256:" + strings.Repeat("b", 64),
+	}
+	if !pinned.ImagesDigestPinned() {
+		t.Fatal("valid image digests were not recognized")
+	}
+}
+
+func TestNodeTestCommandUsesCIWithoutFrameworkSpecificArguments(t *testing.T) {
+	t.Parallel()
+	sandbox := &ContainerSandbox{nodeImage: "node:22-alpine"}
+	_, command, err := sandbox.fixedCommand(SandboxRequest{Ecosystem: "node", Check: CheckTest})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(command, " ") != "npm test --if-present" {
+		t.Fatalf("Node test command is not framework-neutral: %#v", command)
+	}
 }
 
 func TestRemoteDaemonRequiresSharedWorkspaceRoot(t *testing.T) {
@@ -107,6 +154,25 @@ func TestRemoteDaemonRequiresSharedWorkspaceRoot(t *testing.T) {
 	root := t.TempDir()
 	if actual, err := validateWorkspaceRoot(root, "tcp://sandbox:2375"); err != nil || actual != root {
 		t.Fatalf("shared remote workspace root rejected: %q %v", actual, err)
+	}
+}
+
+func TestPreparedDependencyRootCannotBeSymlinkedOutsideResolverDirectory(t *testing.T) {
+	t.Parallel()
+	directory := t.TempDir()
+	outside := t.TempDir()
+	if err := os.Symlink(outside, filepath.Join(directory, "node_modules")); err != nil {
+		t.Fatal(err)
+	}
+	if err := ensurePreparedDependencyLayout(directory, "node"); err == nil {
+		t.Fatal("resolver-controlled dependency root symlink was accepted")
+	}
+	goDirectory := t.TempDir()
+	if err := ensurePreparedDependencyLayout(goDirectory, "go"); err != nil {
+		t.Fatal(err)
+	}
+	if info, err := os.Lstat(filepath.Join(goDirectory, "pkg", "mod")); err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		t.Fatalf("empty Go module cache was not safely materialized: %v %v", info, err)
 	}
 }
 

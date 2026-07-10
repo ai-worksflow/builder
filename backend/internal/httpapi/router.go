@@ -21,8 +21,10 @@ type RouterOptions struct {
 	Authentication worksmiddleware.SessionAuthenticator
 	Idempotency    *worksmiddleware.IdempotencyRepository
 	Workflow       *transport.WorkflowHandler
+	Conversation   *transport.ConversationHandler
 	GitHub         *transport.GitHubHandler
 	Data           *transport.DataHandler
+	PublicData     *transport.PublicDataHandler
 	Delivery       *transport.DeliveryHandler
 }
 
@@ -32,6 +34,9 @@ func NewRouter(cfg config.Config, logger *slog.Logger, options RouterOptions) (*
 	}
 	if (options.Transport == nil) != (options.Authentication == nil) {
 		return nil, errors.New("API transport and authentication must be configured together")
+	}
+	if options.Conversation != nil && options.Idempotency == nil {
+		return nil, errors.New("conversation control-plane routes require durable idempotency")
 	}
 	if cfg.Environment == config.EnvironmentProduction {
 		gin.SetMode(gin.ReleaseMode)
@@ -85,6 +90,11 @@ func NewRouter(cfg config.Config, logger *slog.Logger, options RouterOptions) (*
 			return nil, err
 		}
 	}
+	if options.PublicData != nil {
+		if err := transport.RegisterPublicDataRoutes(router.Group("/v1"), options.PublicData, options.Idempotency); err != nil {
+			return nil, err
+		}
+	}
 	if options.Transport != nil && options.Authentication != nil {
 		api := options.Transport
 		captureIdempotency := worksmiddleware.CaptureIdempotencyKey(false)
@@ -96,13 +106,20 @@ func NewRouter(cfg config.Config, logger *slog.Logger, options RouterOptions) (*
 		csrf := worksmiddleware.RequireCSRF(cfg.Security)
 		ifMatch := worksmiddleware.RequireIfMatch()
 
-		router.POST("/v1/session/register", captureIdempotency, api.RegisterSession)
-		router.POST("/v1/session", captureIdempotency, api.LoginSession)
+		// Session issuance uses an auth-owned transactional replay receipt. The
+		// generic HTTP response repository deliberately never sees credentials,
+		// session cookies, or CSRF tokens.
+		authIdempotency := worksmiddleware.CaptureIdempotencyKey(true)
+		router.POST("/v1/session/register", authIdempotency, api.RegisterSession)
+		router.POST("/v1/session", authIdempotency, api.LoginSession)
 		// Compatibility aliases for the first PlatformClient revision.
-		router.POST("/v1/session/sign-up", captureIdempotency, api.RegisterSession)
-		router.POST("/v1/session/sign-in", captureIdempotency, api.LoginSession)
+		router.POST("/v1/session/sign-up", authIdempotency, api.RegisterSession)
+		router.POST("/v1/session/sign-in", authIdempotency, api.LoginSession)
 		router.GET("/v1/session", api.GetSession)
-		router.POST("/v1/session/refresh", authenticate, csrf, captureIdempotency, api.RefreshSession)
+		// Refresh validates the double-submit CSRF token before the auth service
+		// looks up its receipt. It intentionally runs before normal authentication
+		// so the revoked old cookie can still retrieve a completed replay.
+		router.POST("/v1/session/refresh", csrf, authIdempotency, api.RefreshSession)
 		router.DELETE("/v1/session", csrf, api.LogoutSession)
 
 		protected := router.Group("/v1", authenticate)
@@ -127,6 +144,12 @@ func NewRouter(cfg config.Config, logger *slog.Logger, options RouterOptions) (*
 				return nil, err
 			}
 		}
+		if options.Conversation != nil {
+			conversationMutation := []gin.HandlerFunc{csrf, worksmiddleware.CaptureIdempotencyKey(true), persistIdempotency}
+			if err := transport.RegisterConversationRoutes(protected, options.Conversation, conversationMutation...); err != nil {
+				return nil, err
+			}
+		}
 		if options.GitHub != nil {
 			githubMutation := []gin.HandlerFunc{csrf, worksmiddleware.CaptureIdempotencyKey(true), persistIdempotency}
 			if err := transport.RegisterGitHubRoutes(protected, options.GitHub, githubMutation...); err != nil {
@@ -137,6 +160,11 @@ func NewRouter(cfg config.Config, logger *slog.Logger, options RouterOptions) (*
 			dataMutation := []gin.HandlerFunc{csrf, worksmiddleware.CaptureIdempotencyKey(true), persistIdempotency}
 			if err := transport.RegisterDataRoutes(protected, options.Data, dataMutation...); err != nil {
 				return nil, err
+			}
+			if options.PublicData != nil {
+				if err := transport.RegisterPublicDataManagementRoutes(protected, options.PublicData, dataMutation...); err != nil {
+					return nil, err
+				}
 			}
 		}
 		if options.Delivery != nil {

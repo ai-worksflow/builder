@@ -106,7 +106,7 @@ type ArtifactDraftModel struct {
 	ArtifactID     uuid.UUID  `gorm:"type:uuid;not null;index"`
 	BaseRevisionID *uuid.UUID `gorm:"type:uuid"`
 	Sequence       uint64     `gorm:"not null"`
-	ETag           string     `gorm:"not null"`
+	ETag           string     `gorm:"column:etag;not null"`
 	SchemaVersion  int        `gorm:"not null"`
 	ContentStore   string     `gorm:"not null"`
 	ContentRef     string     `gorm:"not null"`
@@ -158,6 +158,21 @@ type ArtifactRevisionModel struct {
 }
 
 func (ArtifactRevisionModel) TableName() string { return "artifact_revisions" }
+
+type ArtifactRevisionSourceModel struct {
+	RevisionID        uuid.UUID `gorm:"type:uuid;primaryKey"`
+	Ordinal           int       `gorm:"not null"`
+	SourceArtifactID  uuid.UUID `gorm:"type:uuid;not null;index"`
+	SourceRevisionID  uuid.UUID `gorm:"type:uuid;primaryKey"`
+	SourceContentHash string    `gorm:"not null"`
+	SourceAnchorID    *string
+	Purpose           string    `gorm:"primaryKey"`
+	Required          bool      `gorm:"not null"`
+	AddedBy           uuid.UUID `gorm:"type:uuid;not null"`
+	AddedAt           time.Time
+}
+
+func (ArtifactRevisionSourceModel) TableName() string { return "artifact_revision_sources" }
 
 type ArtifactResponsibilityModel struct {
 	ArtifactID     uuid.UUID `gorm:"type:uuid;primaryKey"`
@@ -439,6 +454,86 @@ type WorkflowRunEventModel struct {
 }
 
 func (WorkflowRunEventModel) TableName() string { return "workflow_run_events" }
+
+type ConversationModel struct {
+	ID         uuid.UUID `gorm:"type:uuid;primaryKey"`
+	ProjectID  uuid.UUID `gorm:"type:uuid;not null;index"`
+	Title      string    `gorm:"not null"`
+	Status     string    `gorm:"not null"`
+	Version    uint64    `gorm:"not null"`
+	CreatedBy  uuid.UUID `gorm:"type:uuid;not null"`
+	CreatedAt  time.Time
+	UpdatedAt  time.Time
+	ArchivedAt *time.Time
+}
+
+func (ConversationModel) TableName() string { return "conversations" }
+
+type ConversationMessageModel struct {
+	ID             uuid.UUID  `gorm:"type:uuid;primaryKey"`
+	ConversationID uuid.UUID  `gorm:"type:uuid;not null;index"`
+	Sequence       uint64     `gorm:"not null"`
+	Role           string     `gorm:"not null"`
+	Content        string     `gorm:"not null"`
+	ProposalID     *uuid.UUID `gorm:"type:uuid"`
+	CreatedBy      uuid.UUID  `gorm:"type:uuid;not null"`
+	CreatedAt      time.Time
+}
+
+func (ConversationMessageModel) TableName() string { return "conversation_messages" }
+
+type WorkflowIntentProposalModel struct {
+	ID                           uuid.UUID       `gorm:"type:uuid;primaryKey"`
+	ProjectID                    uuid.UUID       `gorm:"type:uuid;not null;index"`
+	ConversationID               uuid.UUID       `gorm:"type:uuid;not null;index"`
+	TriggerMessageID             uuid.UUID       `gorm:"type:uuid;not null"`
+	AssistantMessageID           uuid.UUID       `gorm:"type:uuid;not null"`
+	Kind                         string          `gorm:"not null"`
+	Status                       string          `gorm:"not null"`
+	Version                      uint64          `gorm:"not null"`
+	SuggestedDefinitionVersionID uuid.UUID       `gorm:"type:uuid;not null"`
+	Scope                        json.RawMessage `gorm:"type:jsonb;not null"`
+	SourceRefs                   json.RawMessage `gorm:"type:jsonb;not null"`
+	ManifestIntent               json.RawMessage `gorm:"type:jsonb;not null"`
+	WorkbenchInstruction         json.RawMessage `gorm:"type:jsonb;not null"`
+	Origin                       string          `gorm:"not null"`
+	AIProvider                   *string
+	AIModel                      *string
+	AIResponseID                 *string
+	DecisionReason               string     `gorm:"not null"`
+	ProposedBy                   uuid.UUID  `gorm:"type:uuid;not null"`
+	DecidedBy                    *uuid.UUID `gorm:"type:uuid"`
+	CreatedAt                    time.Time
+	DecidedAt                    *time.Time
+}
+
+func (WorkflowIntentProposalModel) TableName() string { return "workflow_intent_proposals" }
+
+type ConversationCommandModel struct {
+	ID               uuid.UUID       `gorm:"type:uuid;primaryKey"`
+	ProjectID        uuid.UUID       `gorm:"type:uuid;not null;index"`
+	ConversationID   uuid.UUID       `gorm:"type:uuid;not null;index"`
+	ProposalID       uuid.UUID       `gorm:"type:uuid;not null;uniqueIndex"`
+	Kind             string          `gorm:"not null"`
+	Status           string          `gorm:"not null"`
+	Version          uint64          `gorm:"not null"`
+	Payload          json.RawMessage `gorm:"type:jsonb;not null"`
+	Result           json.RawMessage `gorm:"type:jsonb"`
+	Failure          json.RawMessage `gorm:"type:jsonb"`
+	AcceptedBy       uuid.UUID       `gorm:"type:uuid;not null"`
+	ExecutionActorID *uuid.UUID      `gorm:"type:uuid"`
+	ExecutionClaim   *uuid.UUID      `gorm:"type:uuid"`
+	ClaimExpiresAt   *time.Time
+	ExecutedBy       *uuid.UUID `gorm:"type:uuid"`
+	RejectedBy       *uuid.UUID `gorm:"type:uuid"`
+	CreatedAt        time.Time
+	UpdatedAt        time.Time
+	ExecutedAt       *time.Time
+	RejectedAt       *time.Time
+	FailedAt         *time.Time
+}
+
+func (ConversationCommandModel) TableName() string { return "conversation_commands" }
 
 type ApplicationBuildManifestModel struct {
 	ID                 uuid.UUID  `gorm:"type:uuid;primaryKey"`

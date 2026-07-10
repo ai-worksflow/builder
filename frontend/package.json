@@ -9,7 +9,7 @@
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",
     "test": "pnpm test:unit && pnpm test:e2e",
-    "test:unit": "jiti tests/workspace-model.test.ts && jiti tests/persistence.test.ts && jiti tests/project-catalog.test.ts && jiti tests/prompt-library.test.ts && jiti tests/preferences.test.ts && jiti tests/team-persistence.test.ts && jiti tests/preview-controls.test.ts && jiti tests/quality-platform-client.test.ts && jiti tests/delivery-platform-client.test.ts && jiti tests/data-platform-client.test.ts && jiti tests/collaboration-platform.test.ts && jiti tests/platform-client.test.ts && jiti tests/platform-flow.test.ts && jiti tests/artifact-workspace.test.ts && jiti tests/worksflow-mock-flow.test.ts",
+    "test:unit": "jiti tests/workspace-model.test.ts && jiti tests/persistence.test.ts && jiti tests/project-catalog.test.ts && jiti tests/prompt-library.test.ts && jiti tests/preferences.test.ts && jiti tests/team-persistence.test.ts && jiti tests/preview-controls.test.ts && jiti tests/quality-platform-client.test.ts && jiti tests/delivery-platform-client.test.ts && jiti tests/release-provenance.test.ts && jiti tests/data-platform-client.test.ts && jiti tests/collaboration-platform.test.ts && jiti tests/platform-client.test.ts && jiti tests/conversation-platform-client.test.ts && jiti tests/platform-flow.test.ts && jiti tests/platform-flow-queue.test.ts && jiti tests/workflow-entry.test.ts && jiti tests/workflow-fanout-contract.test.ts && jiti tests/artifact-workspace.test.ts && jiti tests/page-spec-content.test.ts && jiti tests/prototype-content.test.ts && jiti tests/worksflow-mock-flow.test.ts",
     "test:mock": "jiti tests/worksflow-mock-flow.test.ts",
     "test:e2e": "playwright test"
   },

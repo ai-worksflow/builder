@@ -24,6 +24,7 @@ import type {
 } from '../data-runtime/types'
 import type { HttpResult } from './http'
 import { HttpClient } from './http'
+import { PublicDataRuntimeClient } from './public-data-client'
 
 export interface DataClientRequestOptions {
   readonly signal?: AbortSignal
@@ -92,9 +93,11 @@ function projectPath(projectId: string) {
  */
 export class DataRuntimeClient {
   private readonly http: HttpClient
+  readonly publicRuntime: PublicDataRuntimeClient
 
   constructor(http: HttpClient) {
     this.http = http
+    this.publicRuntime = new PublicDataRuntimeClient(http)
   }
 
   snapshot(projectId: string, options?: DataClientRequestOptions) {

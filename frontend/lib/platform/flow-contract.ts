@@ -74,6 +74,7 @@ export interface WorkflowFanOutConfigDto {
   readonly sliceKeyPath: string
   readonly mergeNodeId: string
   readonly maxParallel: number
+  readonly itemKind?: 'generic' | 'delivery_slice'
 }
 
 export interface WorkflowMergeConfigDto {
@@ -86,6 +87,7 @@ export interface WorkflowMergeConfigDto {
 export interface WorkflowQualityGateConfigDto {
   readonly gateName: string
   readonly blocking: boolean
+  readonly requiredRole?: string
 }
 
 export interface WorkflowManifestCompilerConfigDto {
@@ -267,7 +269,8 @@ export interface WorkflowSliceContextDto {
   readonly key: string
   readonly title: string
   readonly fanOutNodeId: string
-  readonly blueprint: ExactArtifactRefDto
+  readonly payload?: JsonValue
+  readonly blueprint?: ExactArtifactRefDto
   readonly pageSpec?: ExactArtifactRefDto
   readonly prototype?: ExactArtifactRefDto
   readonly ownerId?: string
@@ -284,10 +287,20 @@ export interface WorkflowRunContextDto {
     readonly waiverReason?: string
     readonly selectedBranch?: string
     readonly output?: JsonValue
+    readonly executionActor?: WorkflowActorProvenanceDto
+    readonly reviewDecisionActor?: WorkflowActorProvenanceDto
   }>>
   readonly disabledEdges?: Readonly<Record<string, boolean>>
   readonly selectedBranches?: Readonly<Record<string, string>>
   readonly slices?: Readonly<Record<string, WorkflowSliceContextDto>>
+}
+
+export interface WorkflowActorProvenanceDto {
+  readonly actorId: string
+  readonly role: string
+  readonly action: string
+  readonly source: 'authenticated_command' | 'review_approval' | 'review_waiver'
+  readonly authorizedAt: IsoDateTime
 }
 
 export interface WorkflowRunDto {

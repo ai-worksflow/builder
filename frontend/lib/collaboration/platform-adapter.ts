@@ -38,18 +38,23 @@ export interface CollaborationPlatformClient {
   readonly http: PlatformClient['http']
   readonly data: PlatformClient['data']
   readonly flow: PlatformClient['flow']
+  readonly conversation: PlatformClient['conversation']
   readonly session: Pick<PlatformClient['session'], 'get' | 'signUp' | 'signIn' | 'signOut'>
-  readonly projects: Pick<PlatformClient['projects'], 'list' | 'get' | 'create' | 'authorize'>
+  readonly projects: Pick<
+    PlatformClient['projects'],
+    'list' | 'get' | 'create' | 'update' | 'remove' | 'authorize'
+  >
   readonly members: Pick<PlatformClient['members'], 'list' | 'add' | 'update' | 'remove' | 'invite'>
   readonly artifacts: Pick<
     PlatformClient['artifacts'],
-    'list' | 'listRevisions' | 'listDependencies' | 'reviewGate'
+    'list' | 'getRevision' | 'listRevisions' | 'listDependencies' | 'createDependency' | 'compileRequirementBaseline' | 'reviewGate'
   >
   readonly documents: PlatformClient['documents']
   readonly blueprints: PlatformClient['blueprints']
   readonly pageSpecs: PlatformClient['pageSpecs']
   readonly prototypes: PlatformClient['prototypes']
   readonly proposals: PlatformClient['proposals']
+  readonly manifests: PlatformClient['manifests']
   readonly traces: PlatformClient['traces']
   readonly comments: Pick<PlatformClient['comments'], 'listProject' | 'createProject' | 'resolve'>
   readonly reviews: Pick<PlatformClient['reviews'], 'list' | 'create' | 'decide'>
@@ -135,62 +140,75 @@ function memberRecord(member: ProjectMemberDto): ProjectMember {
 }
 
 function commentAuthor(
-  comment: CommentDto,
+  userId: string,
   members: ReadonlyMap<string, CollaborationUser>,
 ) {
-  return comment.author
-    ? legacyUser(comment.author)
-    : members.get(comment.createdBy) ?? unknownUser(comment.createdBy)
+  return members.get(userId) ?? unknownUser(userId)
 }
 
 function commentThreads(
   comments: readonly CommentDto[],
   members: ReadonlyMap<string, CollaborationUser>,
 ) {
-  const roots = comments.filter((comment) => !comment.parentId)
-  const replies = comments.filter((comment) => comment.parentId)
-  return roots.map<CommentThread>((comment) => ({
-    id: comment.id,
-    projectId: comment.projectId,
-    threadId: comment.id,
-    body: comment.body,
-    author: commentAuthor(comment, members),
-    target: comment.target,
-    createdAt: comment.createdAt,
-    resolvedAt: comment.resolved ? comment.updatedAt : undefined,
-    replies: replies
-      .filter((reply) => reply.parentId === comment.id)
-      .map<CommentReply>((reply) => ({
-        id: reply.id,
-        projectId: reply.projectId,
-        threadId: comment.id,
-        parentId: comment.id,
-        body: reply.body,
-        author: commentAuthor(reply, members),
-        createdAt: reply.createdAt,
-      })),
-  }))
+  return comments.map<CommentThread>((comment) => {
+    const root = comment.messages.find((message) => !message.parentId) ?? comment.messages[0]
+    const anchored = comment.anchor?.revision
+    const target = comment.revisionId && anchored &&
+      anchored.artifactId === comment.artifactId && anchored.revisionId === comment.revisionId
+      ? anchored
+      : undefined
+    return {
+      id: comment.id,
+      projectId: comment.projectId,
+      threadId: comment.id,
+      body: root?.body ?? '',
+      author: commentAuthor(root?.createdBy ?? comment.createdBy, members),
+      target,
+      createdAt: root?.createdAt ?? comment.createdAt,
+      resolvedAt: comment.resolvedAt,
+      resolvedBy: comment.resolvedBy
+        ? commentAuthor(comment.resolvedBy, members)
+        : undefined,
+      etag: comment.etag,
+      replies: comment.messages
+        .filter((message) => message.id !== root?.id)
+        .map<CommentReply>((reply) => ({
+          id: reply.id,
+          projectId: comment.projectId,
+          threadId: comment.id,
+          parentId: reply.parentId ?? root?.id ?? comment.id,
+          body: reply.body,
+          author: commentAuthor(reply.createdBy, members),
+          createdAt: reply.createdAt,
+        })),
+    }
+  })
 }
 
 function reviewRecord(
   review: ReviewDto,
   members: ReadonlyMap<string, CollaborationUser>,
 ): ProjectReview {
-  const reviewer = review.decidedByUser
-    ? legacyUser(review.decidedByUser)
-    : review.createdByUser
-      ? legacyUser(review.createdByUser)
-      : members.get(review.decidedBy ?? review.createdBy) ?? unknownUser(review.createdBy)
+  const latestDecision = review.decisions.at(-1)
+  const reviewerId = latestDecision?.reviewerId ?? review.policy.reviewerIds[0] ?? review.requestedBy
+  const reviewer = members.get(reviewerId) ?? unknownUser(reviewerId)
   return {
     id: review.id,
     projectId: review.projectId,
-    decision: review.decision === 'approved' ? 'approve' : 'request_changes',
-    state: review.decision,
-    summary: review.summary,
-    requiredReviewerIds: review.requiredReviewerIds,
+    decision: latestDecision?.decision,
+    state: review.status === 'changes_requested'
+      ? 'changesRequested'
+      : review.status === 'approved' ? 'approved' : 'pending',
+    summary: latestDecision?.summary ?? 'Review requested for this immutable revision.',
+    requiredReviewerIds: review.policy.reviewerIds,
     reviewer,
-    target: review.target,
-    createdAt: review.createdAt,
+    target: {
+      artifactId: review.artifactId,
+      revisionId: review.revisionId,
+      contentHash: review.contentHash,
+    },
+    createdAt: review.requestedAt,
+    etag: review.etag,
   }
 }
 
@@ -229,8 +247,8 @@ function exactVersionRef(version: VersionRefDto): VersionRefDto {
   return {
     artifactId: version.artifactId,
     revisionId: version.revisionId,
-    revisionNumber: version.revisionNumber,
     contentHash: version.contentHash,
+    ...(version.anchorId ? { anchorId: version.anchorId } : {}),
   }
 }
 
@@ -288,6 +306,24 @@ export class PlatformCollaborationGateway {
     return projectRecord(response.data)
   }
 
+  async renameProject(project: CollaborationProject, name: string) {
+    if (!project.etag) throw new PlatformProtocolError('Refresh the project before renaming it.')
+    const response = await this.client.projects.update(
+      project.id,
+      { name },
+      { ifMatch: project.etag, idempotencyKey: true },
+    )
+    return projectRecord(response.data)
+  }
+
+  async archiveProject(project: CollaborationProject) {
+    if (!project.etag) throw new PlatformProtocolError('Refresh the project before archiving it.')
+    await this.client.projects.remove(project.id, {
+      ifMatch: project.etag,
+      idempotencyKey: true,
+    })
+  }
+
   async authorize(projectId: string, action: ProjectAction) {
     const authorization = (await this.client.projects.authorize(projectId, action)).data
     return authorization.allowed
@@ -319,8 +355,21 @@ export class PlatformCollaborationGateway {
           createdAt: event.createdAt,
         }))
       : []
-    const reviewTargets = artifactResult.data.items.flatMap((artifact) =>
-      artifact.latestRevision ? [versionTarget(artifact, artifact.latestRevision)] : [],
+    const targetRevisions = await Promise.all(artifactResult.data.items.map(async (artifact) => {
+      if (!artifact.latestRevisionId) return undefined
+      const revision = (await this.client.artifacts.getRevision(artifact.latestRevisionId)).data
+      if (revision.artifactId !== artifact.id) {
+        throw new PlatformProtocolError('The latest revision does not belong to its listed artifact.')
+      }
+      return versionTarget(artifact, {
+        artifactId: artifact.id,
+        revisionId: revision.id,
+        revisionNumber: revision.revisionNumber,
+        contentHash: revision.contentHash,
+      })
+    }))
+    const reviewTargets = targetRevisions.filter(
+      (target): target is CollaborationVersionRef => Boolean(target),
     )
 
     return {
@@ -383,8 +432,8 @@ export class PlatformCollaborationGateway {
     })
   }
 
-  async resolveComment(commentId: string, resolved: boolean) {
-    await this.client.comments.resolve(commentId, resolved, {})
+  async resolveComment(commentId: string, resolved: boolean, etag: string) {
+    await this.client.comments.resolve(commentId, resolved, { ifMatch: etag })
   }
 
   async requestReview(
@@ -401,11 +450,11 @@ export class PlatformCollaborationGateway {
     })
   }
 
-  async decideReview(reviewId: string, decision: ReviewDecision, summary: string) {
+  async decideReview(reviewId: string, decision: ReviewDecision, summary: string, etag: string) {
     return this.client.reviews.decide(reviewId, {
       decision: decision === 'approve' ? 'approved' : 'changesRequested',
       summary,
-    }, {})
+    }, { ifMatch: etag })
   }
 
   async markNotification(notificationId: string, read: boolean) {

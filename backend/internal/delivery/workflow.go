@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"sort"
 	"strings"
 
 	"github.com/worksflow/builder/backend/internal/core"
@@ -14,7 +13,7 @@ import (
 
 type workflowQualityAPI interface {
 	Evaluate(context.Context, string, string, QualityRunInput) (QualityReport, error)
-	LatestPassingForWorkflow(context.Context, string, string, string) (QualityReport, error)
+	Get(context.Context, string, string) (QualityReport, error)
 }
 
 type workflowPublishAPI interface {
@@ -23,7 +22,7 @@ type workflowPublishAPI interface {
 }
 
 // WorkflowQualityEvaluator binds the workflow quality node to the exact
-// WorkspaceRevision produced by the latest completed workbench node.
+// WorkspaceRevision carried by the quality node's exact typed input lineage.
 type WorkflowQualityEvaluator struct {
 	Quality workflowQualityAPI
 }
@@ -32,17 +31,24 @@ func (a WorkflowQualityEvaluator) Evaluate(ctx context.Context, execution workfl
 	if a.Quality == nil {
 		return workflow.QualityResult{}, fmt.Errorf("delivery quality service is required")
 	}
+	actor, err := execution.ExecutionActor()
+	if err != nil {
+		return workflow.QualityResult{}, err
+	}
 	reference, err := workspaceRevisionFromExecution(execution)
 	if err != nil {
 		return workflow.QualityResult{}, err
 	}
 	runID := execution.Run.ID
-	report, err := a.Quality.Evaluate(ctx, execution.Run.ProjectID, execution.Run.StartedBy, QualityRunInput{
+	report, err := a.Quality.Evaluate(ctx, execution.Run.ProjectID, actor.ActorID, QualityRunInput{
 		WorkspaceRevision: reference,
 		WorkflowRunID:     &runID,
 	})
 	if err != nil {
 		return workflow.QualityResult{}, err
+	}
+	if report.ProjectID != execution.Run.ProjectID || report.WorkflowRunID == nil || *report.WorkflowRunID != runID || !exactVersionRefEqual(report.WorkspaceRevision, reference) {
+		return workflow.QualityResult{}, conflict("quality service result does not match the exact typed workflow input")
 	}
 	findings, err := json.Marshal(map[string]any{
 		"qualityRunId": report.ID, "score": report.Score,
@@ -52,7 +58,11 @@ func (a WorkflowQualityEvaluator) Evaluate(ctx context.Context, execution workfl
 	if err != nil {
 		return workflow.QualityResult{}, err
 	}
-	return workflow.QualityResult{Passed: report.Passed, Findings: findings}, nil
+	workspaceRevision := deliveryArtifactReference(report.WorkspaceRevision)
+	return workflow.QualityResult{
+		Passed: report.Passed, Findings: findings, QualityRunID: report.ID,
+		WorkspaceRevision: &workspaceRevision,
+	}, nil
 }
 
 // WorkflowPublisher requires a passing quality report from the same workflow
@@ -65,30 +75,34 @@ type WorkflowPublisher struct {
 func (a WorkflowPublisher) Publish(
 	ctx context.Context,
 	projectID, runID, actorID, environment string,
-	manifest workflow.BuildManifest,
+	input workflow.WorkflowPublishInput,
 ) (workflow.PublishResult, error) {
 	if a.Quality == nil || a.Publisher == nil {
 		return workflow.PublishResult{}, fmt.Errorf("delivery quality and publish services are required")
 	}
-	if err := manifest.Validate(); err != nil {
+	if err := input.BuildManifest.Validate(); err != nil {
 		return workflow.PublishResult{}, err
 	}
-	if manifest.ProjectID != projectID || manifest.RunID != runID {
+	if input.BuildManifest.ProjectID != projectID || input.BuildManifest.RunID != runID {
 		return workflow.PublishResult{}, conflict("workflow build manifest does not match the publish invocation")
+	}
+	if err := input.WorkspaceRevision.Validate(); err != nil {
+		return workflow.PublishResult{}, err
 	}
 	targetEnvironment := Environment(strings.TrimSpace(environment))
 	if !targetEnvironment.Valid() {
 		return workflow.PublishResult{}, Invalid("environment", "workflow publish environment must be preview or production")
 	}
-	report, err := a.Quality.LatestPassingForWorkflow(ctx, projectID, runID, actorID)
+	report, err := a.Quality.Get(ctx, input.QualityRunID, actorID)
 	if err != nil {
 		if deliveryError, ok := AsError(err); ok && deliveryError.Code == CodeNotFound {
-			return workflow.PublishResult{}, conflict("workflow publishing requires a passing quality report from the same run")
+			return workflow.PublishResult{}, conflict("workflow publishing requires its exact passing quality report")
 		}
 		return workflow.PublishResult{}, err
 	}
-	if !report.Passed {
-		return workflow.PublishResult{}, conflict("workflow publishing requires a passing quality report")
+	workspaceReference := workflowArtifactReference(input.WorkspaceRevision)
+	if report.ProjectID != projectID || report.WorkflowRunID == nil || *report.WorkflowRunID != runID || !report.Passed || !exactVersionRefEqual(report.WorkspaceRevision, workspaceReference) {
+		return workflow.PublishResult{}, conflict("workflow publishing requires the exact passing quality result from its typed input lineage")
 	}
 	expectedETag := ""
 	deploymentID := ""
@@ -102,10 +116,12 @@ func (a WorkflowPublisher) Publish(
 			break
 		}
 	}
-	workspaceReference := report.WorkspaceRevision
 	deployment, err := a.Publisher.Publish(ctx, projectID, actorID, expectedETag, PublishInput{
 		DeploymentID: deploymentID, Environment: targetEnvironment, EnvironmentRef: "workflow:" + runID,
-		WorkspaceRevision: &workspaceReference, Message: "Publish workflow run " + runID,
+		WorkspaceRevision:    &workspaceReference,
+		BuildManifestID:      input.BuildManifest.BundleIDs[len(input.BuildManifest.BundleIDs)-1],
+		WorkflowQualityRunID: report.ID,
+		Message:              "Publish workflow run " + runID,
 	})
 	if err != nil {
 		return workflow.PublishResult{}, err
@@ -114,42 +130,27 @@ func (a WorkflowPublisher) Publish(
 }
 
 func workspaceRevisionFromExecution(execution workflow.Execution) (core.VersionRef, error) {
-	type candidate struct {
-		completed bool
-		at        int64
-		key       string
-		output    json.RawMessage
-	}
-	candidates := make([]candidate, 0, len(execution.Run.Nodes))
-	for key, node := range execution.Run.Nodes {
-		if node == nil || node.Status != workflow.NodeCompleted || node.Type != domain.NodeWorkbenchBuild {
-			continue
-		}
-		metadata, exists := execution.Run.Context.Nodes[key]
-		if !exists || len(metadata.Output) == 0 {
-			continue
-		}
-		at := int64(0)
-		if node.CompletedAt != nil {
-			at = node.CompletedAt.UnixNano()
-		}
-		candidates = append(candidates, candidate{completed: node.CompletedAt != nil, at: at, key: key, output: metadata.Output})
-	}
-	sort.Slice(candidates, func(i, j int) bool {
-		if candidates[i].completed != candidates[j].completed {
-			return candidates[i].completed
-		}
-		if candidates[i].at != candidates[j].at {
-			return candidates[i].at > candidates[j].at
-		}
-		return candidates[i].key > candidates[j].key
-	})
-	for _, candidate := range candidates {
-		if reference, ok := decodeWorkspaceReference(candidate.output); ok {
-			return reference, nil
+	references := make(map[string]core.VersionRef)
+	for _, binding := range execution.Inputs.Bindings() {
+		for _, raw := range []json.RawMessage{binding.Value, binding.Output} {
+			reference, ok := decodeWorkspaceReference(raw)
+			if !ok {
+				continue
+			}
+			key := reference.ArtifactID + "\x00" + reference.RevisionID + "\x00" + reference.ContentHash
+			if reference.AnchorID != nil {
+				key += "\x00" + *reference.AnchorID
+			}
+			references[key] = reference
 		}
 	}
-	return core.VersionRef{}, conflict("quality gate requires an exact WorkspaceRevision output from a completed workbench node")
+	if len(references) != 1 {
+		return core.VersionRef{}, conflict(fmt.Sprintf("quality gate requires exactly one WorkspaceRevision from its typed inputs, got %d", len(references)))
+	}
+	for _, reference := range references {
+		return reference, nil
+	}
+	return core.VersionRef{}, conflict("quality gate has no incoming WorkspaceRevision")
 }
 
 func decodeWorkspaceReference(raw json.RawMessage) (core.VersionRef, bool) {
@@ -173,6 +174,17 @@ func workflowArtifactReference(reference domain.ArtifactRef) core.VersionRef {
 		anchor = &value
 	}
 	return core.VersionRef{
+		ArtifactID: reference.ArtifactID, RevisionID: reference.RevisionID,
+		ContentHash: reference.ContentHash, AnchorID: anchor,
+	}
+}
+
+func deliveryArtifactReference(reference core.VersionRef) domain.ArtifactRef {
+	anchor := ""
+	if reference.AnchorID != nil {
+		anchor = *reference.AnchorID
+	}
+	return domain.ArtifactRef{
 		ArtifactID: reference.ArtifactID, RevisionID: reference.RevisionID,
 		ContentHash: reference.ContentHash, AnchorID: anchor,
 	}

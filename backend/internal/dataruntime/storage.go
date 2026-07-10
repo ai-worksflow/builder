@@ -269,6 +269,7 @@ func (s *GORMStore) recordMutation(
 ) error {
 	var actorID *uuid.UUID
 	var publicDeploymentID *uuid.UUID
+	var publicCapabilityID *uuid.UUID
 	if strings.TrimSpace(mutation.ActorID) != "" {
 		parsed, err := uuid.Parse(mutation.ActorID)
 		if err != nil {
@@ -283,14 +284,27 @@ func (s *GORMStore) recordMutation(
 		}
 		publicDeploymentID = &parsed
 	}
+	if strings.TrimSpace(mutation.PublicCapabilityID) != "" {
+		parsed, err := uuid.Parse(mutation.PublicCapabilityID)
+		if err != nil {
+			return Invalid("publicCapabilityId", "publicCapabilityId must be a UUID")
+		}
+		publicCapabilityID = &parsed
+	}
 	if (actorID == nil) == (publicDeploymentID == nil) {
 		return Invalid("mutation", "exactly one authenticated actor or public deployment is required")
+	}
+	if publicCapabilityID != nil && publicDeploymentID == nil {
+		return Invalid("mutation", "publicCapabilityId requires a public deployment identity")
 	}
 	if details == nil {
 		details = map[string]any{}
 	}
 	if publicDeploymentID != nil {
 		details["publicDeploymentId"] = publicDeploymentID.String()
+	}
+	if publicCapabilityID != nil {
+		details["publicCapabilityId"] = publicCapabilityID.String()
 	}
 	metadata, err := json.Marshal(details)
 	if err != nil {
@@ -323,7 +337,7 @@ func (s *GORMStore) recordMutation(
 	}
 	payload := map[string]any{
 		"projectId": state.ProjectID.String(),
-		"action": action, "resource": resource, "resourceId": targetID,
+		"action":    action, "resource": resource, "resourceId": targetID,
 		"details": details, "revision": state.Revision,
 	}
 	if actorID != nil {
@@ -331,6 +345,9 @@ func (s *GORMStore) recordMutation(
 	}
 	if publicDeploymentID != nil {
 		payload["publicDeploymentId"] = publicDeploymentID.String()
+	}
+	if publicCapabilityID != nil {
+		payload["publicCapabilityId"] = publicCapabilityID.String()
 	}
 	encodedPayload, err := json.Marshal(payload)
 	if err != nil {

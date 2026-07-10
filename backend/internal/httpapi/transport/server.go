@@ -18,8 +18,13 @@ type AuthService interface {
 	SignOut(context.Context, string) error
 }
 
-type RotatingAuthService interface {
-	Rotate(context.Context, string, string, string) (auth.IssuedSession, error)
+// IdempotentAuthService issues cookie-backed sessions through a transactionally
+// completed, non-sensitive replay receipt. These methods must not persist raw
+// session or CSRF tokens.
+type IdempotentAuthService interface {
+	SignUpIdempotent(context.Context, string, string, string, string, string, string) (auth.IdempotentIssuedSession, error)
+	SignInIdempotent(context.Context, string, string, string, string, string) (auth.IdempotentIssuedSession, error)
+	RotateIdempotent(context.Context, string, string, string, string, string) (auth.IdempotentIssuedSession, error)
 }
 
 type ProjectService interface {
@@ -50,6 +55,7 @@ type ArtifactService interface {
 	CreateRevision(context.Context, string, string, string, core.CreateRevisionInput) (core.ArtifactRevision, error)
 	ListRevisions(context.Context, string, string) ([]core.ArtifactRevision, error)
 	GetRevision(context.Context, string, string) (core.ArtifactRevision, error)
+	ReviewGate(context.Context, string, string) (core.ArtifactReviewGate, error)
 }
 
 type TraceService interface {

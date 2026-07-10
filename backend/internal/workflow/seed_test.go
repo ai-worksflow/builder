@@ -27,6 +27,11 @@ func TestMinimumLoopSeedIsPublishedOnlyByInstallerAndValid(t *testing.T) {
 		if _, exists := required[node.Type]; exists {
 			required[node.Type] = true
 		}
+		if node.ID == "pages" {
+			if node.FanOut == nil || node.FanOut.ItemKind != "delivery_slice" || node.FanOut.ItemsPath != "/workflowContext/deliverySlices" || node.FanOut.SliceKeyPath != "/key" {
+				t.Fatalf("minimum loop page fan-out is not an explicit exact delivery-slice mode: %+v", node.FanOut)
+			}
+		}
 	}
 	for nodeType, present := range required {
 		if !present {

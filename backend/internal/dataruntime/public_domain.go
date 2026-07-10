@@ -1,13 +1,16 @@
 package dataruntime
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -15,19 +18,20 @@ import (
 )
 
 const (
-	MaxPublicRequestBytes       = 96_000
-	MaxPublicOrigins            = 16
-	MaxPublicOriginBytes        = 2_048
-	DefaultPreviewCapabilityTTL = 7 * 24 * time.Hour
-	DefaultProductionTTL        = 180 * 24 * time.Hour
-	MaxPublicCapabilityTTL      = 366 * 24 * time.Hour
+	MaxPublicRequestBytes                     = 96_000
+	MaxPublicOrigins                          = 16
+	MaxPublicOriginBytes                      = 2_048
+	MaxPendingPublicCapabilitiesPerDeployment = 8
+	DefaultPreviewCapabilityTTL               = 7 * 24 * time.Hour
+	DefaultProductionTTL                      = 180 * 24 * time.Hour
+	MaxPublicCapabilityTTL                    = 366 * 24 * time.Hour
 )
 
 const (
-	CodePublicCapabilityInvalid ErrorCode = "public_capability_invalid"
-	CodePublicPolicyDenied      ErrorCode = "public_policy_denied"
-	CodePublicOriginDenied      ErrorCode = "public_origin_denied"
-	CodePublicRateLimited       ErrorCode = "public_rate_limited"
+	CodePublicCapabilityInvalid  ErrorCode = "public_capability_invalid"
+	CodePublicPolicyDenied       ErrorCode = "public_policy_denied"
+	CodePublicOriginDenied       ErrorCode = "public_origin_denied"
+	CodePublicRateLimited        ErrorCode = "public_rate_limited"
 	CodePublicRuntimeUnavailable ErrorCode = "public_runtime_unavailable"
 )
 
@@ -51,8 +55,13 @@ type PublicTablePolicy struct {
 	ReadableFields []string  `json:"readableFields"`
 	WritableFields []string  `json:"writableFields"`
 	Version        uint64    `json:"version"`
+	ETag           string    `json:"etag"`
 	CreatedAt      time.Time `json:"createdAt"`
 	UpdatedAt      time.Time `json:"updatedAt"`
+}
+
+func PublicTablePolicyETag(projectID, tableID string, version uint64) string {
+	return `"public-data-policy:` + projectID + `:` + tableID + `:` + strconv.FormatUint(version, 10) + `"`
 }
 
 func (p PublicTablePolicy) permits(operation PublicDataOperation) bool {
@@ -80,36 +89,48 @@ const (
 )
 
 type PreparePublicCapabilityInput struct {
-	ProjectID            string    `json:"projectId"`
-	DeploymentID         string    `json:"deploymentId"`
-	DeploymentVersionID  string    `json:"deploymentVersionId"`
-	AllowedOrigins       []string  `json:"allowedOrigins"`
-	ExpiresAt            time.Time `json:"expiresAt,omitempty"`
+	ProjectID           string           `json:"projectId"`
+	DeploymentID        string           `json:"deploymentId"`
+	DeploymentVersionID string           `json:"deploymentVersionId"`
+	Environment         EnvironmentScope `json:"environment"`
+	AllowedOrigins      []string         `json:"allowedOrigins"`
+	ExpiresAt           time.Time        `json:"expiresAt,omitempty"`
 }
 
 // PreparedPublicRuntimeConfig contains the capability exactly once. Only the
 // digest is persisted. A delivery provider should inject this object as a
 // per-deployment runtime overlay, never into the immutable build artifact.
 type PreparedPublicRuntimeConfig struct {
-	APIBasePath          string    `json:"apiBasePath"`
-	ProjectID            string    `json:"projectId"`
-	DeploymentID         string    `json:"deploymentId"`
-	DeploymentVersionID  string    `json:"deploymentVersionId"`
-	CapabilityID         string    `json:"capabilityId"`
-	CapabilityToken      string    `json:"capabilityToken"`
-	AllowedOrigins       []string  `json:"allowedOrigins"`
-	ExpiresAt            time.Time `json:"expiresAt"`
+	APIBasePath         string    `json:"apiBasePath"`
+	ProjectID           string    `json:"projectId"`
+	DeploymentID        string    `json:"deploymentId"`
+	DeploymentVersionID string    `json:"deploymentVersionId"`
+	CapabilityID        string    `json:"capabilityId"`
+	CapabilityToken     string    `json:"capabilityToken"`
+	AllowedOrigins      []string  `json:"allowedOrigins"`
+	ExpiresAt           time.Time `json:"expiresAt"`
 }
 
 type PublicDeploymentRuntime struct {
-	APIBasePath          string     `json:"apiBasePath"`
-	ProjectID            string     `json:"projectId"`
-	DeploymentID         string     `json:"deploymentId"`
-	DeploymentVersionID  string     `json:"deploymentVersionId"`
-	CapabilityID         string     `json:"capabilityId"`
-	AllowedOrigins       []string   `json:"allowedOrigins"`
-	ExpiresAt            time.Time  `json:"expiresAt"`
-	ActivatedAt          *time.Time `json:"activatedAt,omitempty"`
+	APIBasePath         string     `json:"apiBasePath"`
+	ProjectID           string     `json:"projectId"`
+	DeploymentID        string     `json:"deploymentId"`
+	DeploymentVersionID string     `json:"deploymentVersionId"`
+	CapabilityID        string     `json:"capabilityId"`
+	AllowedOrigins      []string   `json:"allowedOrigins"`
+	ExpiresAt           time.Time  `json:"expiresAt"`
+	ActivatedAt         *time.Time `json:"activatedAt,omitempty"`
+}
+
+// DeploymentPublicRuntimeProvisioner is the narrow delivery-layer seam. The
+// publish implementation should depend on this interface rather than the
+// concrete data runtime service.
+type DeploymentPublicRuntimeProvisioner interface {
+	PrepareDeploymentCapability(context.Context, PreparePublicCapabilityInput) (PreparedPublicRuntimeConfig, error)
+	ActivateDeploymentCapability(context.Context, string, string, string) (PublicDeploymentRuntime, error)
+	RevokeDeploymentCapability(context.Context, string, string, string) error
+	RevokeDeployment(context.Context, string, string) error
+	ActiveDeploymentRuntime(context.Context, string, string) (PublicDeploymentRuntime, error)
 }
 
 type PublicCapability struct {
@@ -123,12 +144,12 @@ type PublicCapability struct {
 }
 
 type PublicTable struct {
-	ID               string                `json:"id"`
-	Name             string                `json:"name"`
-	Columns          []Column              `json:"columns"`
-	ReadableFields   []string              `json:"readableFields"`
-	WritableFields   []string              `json:"writableFields"`
-	Permissions      PublicTablePermission `json:"permissions"`
+	ID             string                `json:"id"`
+	Name           string                `json:"name"`
+	Columns        []Column              `json:"columns"`
+	ReadableFields []string              `json:"readableFields"`
+	WritableFields []string              `json:"writableFields"`
+	Permissions    PublicTablePermission `json:"permissions"`
 }
 
 type PublicTablePermission struct {
@@ -209,7 +230,7 @@ func NormalizePublicOrigins(values []string) ([]string, error) {
 			return nil, Invalid(fmt.Sprintf("allowedOrigins[%d]", index), "allowed origin must be an explicit http or https origin")
 		}
 		parsed, err := url.Parse(value)
-		if err != nil || parsed.Scheme == "" || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" || (parsed.Path != "" && parsed.Path != "/") {
+		if err != nil || parsed.Scheme == "" || parsed.Host == "" || parsed.Opaque != "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" || (parsed.Path != "" && parsed.Path != "/") {
 			return nil, Invalid(fmt.Sprintf("allowedOrigins[%d]", index), "allowed origin must contain only scheme, host, and optional port")
 		}
 		if parsed.Scheme != "https" && parsed.Scheme != "http" {
@@ -218,7 +239,18 @@ func NormalizePublicOrigins(values []string) ([]string, error) {
 		if parsed.Scheme == "http" && parsed.Hostname() != "localhost" && parsed.Hostname() != "127.0.0.1" && parsed.Hostname() != "::1" {
 			return nil, Invalid(fmt.Sprintf("allowedOrigins[%d]", index), "non-local public origins must use https")
 		}
-		normalized := parsed.Scheme + "://" + strings.ToLower(parsed.Host)
+		hostname := strings.ToLower(parsed.Hostname())
+		port := parsed.Port()
+		if (parsed.Scheme == "https" && port == "443") || (parsed.Scheme == "http" && port == "80") {
+			port = ""
+		}
+		host := hostname
+		if port != "" {
+			host = net.JoinHostPort(hostname, port)
+		} else if strings.Contains(hostname, ":") {
+			host = "[" + hostname + "]"
+		}
+		normalized := parsed.Scheme + "://" + host
 		if _, duplicate := seen[normalized]; duplicate {
 			continue
 		}

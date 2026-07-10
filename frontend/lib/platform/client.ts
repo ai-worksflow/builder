@@ -3,6 +3,7 @@ import {
   type PlatformDomainClients,
 } from './clients'
 import { DataRuntimeClient } from './data-client'
+import { PlatformConversationClient } from './conversation-client'
 import { PlatformFlowClient } from './flow-client'
 import { HttpClient, type HttpClientOptions } from './http'
 import {
@@ -40,6 +41,7 @@ export class PlatformClient implements PlatformDomainClients {
   readonly traces: PlatformDomainClients['traces']
   readonly data: DataRuntimeClient
   readonly flow: PlatformFlowClient
+  readonly conversation: PlatformConversationClient
 
   constructor(options: PlatformClientOptions = {}) {
     this.http = options.httpClient ?? new HttpClient(options.http)
@@ -69,6 +71,7 @@ export class PlatformClient implements PlatformDomainClients {
     this.traces = clients.traces
     this.data = new DataRuntimeClient(this.http)
     this.flow = new PlatformFlowClient(this.http)
+    this.conversation = new PlatformConversationClient(this.http)
   }
 }
 

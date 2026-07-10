@@ -21,6 +21,10 @@ import {
   type DeliveryEnvironment,
   type DeploymentMetadata,
 } from '@/lib/delivery/client'
+import {
+  selectLatestPassingQualityRun,
+  selectReleaseBuildManifestId,
+} from '@/lib/delivery/release-provenance'
 import { QualityClient } from '@/lib/quality/client'
 import type { QualityRunResult } from '@/lib/quality/types'
 import { usePlatformFlow } from '@/lib/platform/flow-provider'
@@ -82,6 +86,12 @@ export function ReleasePanel({ onClose }: { readonly onClose: () => void }) {
   }, [refresh])
 
   const latestQuality = qualityRuns[0]
+  const latestPassingQuality = selectLatestPassingQualityRun(qualityRuns, exactWorkspace)
+  const releaseManifestId = selectReleaseBuildManifestId(
+    flow.workbenchQueue,
+    flow.bundle,
+    flow.proposal,
+  )
   const selectedDeployment = deployments.find((item) => item.environment === environment)
 
   async function runQuality() {
@@ -117,7 +127,7 @@ export function ReleasePanel({ onClose }: { readonly onClose: () => void }) {
   }
 
   async function publish() {
-    if (!project || !exactWorkspace) return
+    if (!project || !exactWorkspace || !latestPassingQuality || !releaseManifestId) return
     setBusy('publish')
     setError(null)
     try {
@@ -125,6 +135,8 @@ export function ReleasePanel({ onClose }: { readonly onClose: () => void }) {
         deploymentId: selectedDeployment?.deploymentId,
         environment,
         workspaceRevision: exactWorkspace,
+        buildManifestId: releaseManifestId,
+        qualityRunId: latestPassingQuality.metadata.runId,
         environmentRef: `data-runtime:${environment}`,
         message: `Publish workspace revision ${workspace!.revisionNumber}`,
       }, { ifMatch: selectedDeployment?.etag })
@@ -212,7 +224,7 @@ export function ReleasePanel({ onClose }: { readonly onClose: () => void }) {
               <button type="button" onClick={() => void exportSource()} disabled={!workspace || busy !== null} className="inline-flex h-8 items-center gap-1.5 rounded border border-border px-3 text-[10px] text-muted-foreground hover:text-foreground disabled:opacity-35">
                 {busy === 'export' ? <LoaderCircle className="size-3 animate-spin" /> : <Archive className="size-3" />} Export redacted source
               </button>
-              <button type="button" onClick={() => void publish()} disabled={!workspace || !latestQuality?.passed || busy !== null || (environment === 'production' ? !can('publish') : !can('edit'))} className="inline-flex h-8 items-center gap-1.5 rounded bg-primary px-3 text-[10px] font-semibold text-primary-foreground disabled:opacity-35" title={!latestQuality?.passed ? 'A passing report for this exact revision is required' : undefined}>
+              <button type="button" onClick={() => void publish()} disabled={!workspace || !latestPassingQuality || !releaseManifestId || busy !== null || (environment === 'production' ? !can('publish') : !can('edit'))} className="inline-flex h-8 items-center gap-1.5 rounded bg-primary px-3 text-[10px] font-semibold text-primary-foreground disabled:opacity-35" title={!latestPassingQuality ? 'A passing report with an immutable build artifact for this exact revision is required' : !releaseManifestId ? 'Select the applied flow bundle that produced this workspace revision' : undefined}>
                 {busy === 'publish' ? <LoaderCircle className="size-3 animate-spin" /> : <Rocket className="size-3" />} Publish {environment}
               </button>
             </div>

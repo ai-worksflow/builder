@@ -491,7 +491,7 @@ func (s *ImplementationService) Apply(ctx context.Context, proposalID, actorID s
 	if err := errors.Join(finalizeErrors...); err != nil {
 		return ArtifactRevision{}, fmt.Errorf("%w: %v", ErrContentNotReady, err)
 	}
-	return revisionFromModel(revision, workspacePayload), nil
+	return revisionFromModel(revision, workspacePayload, nil), nil
 }
 
 func (s *ImplementationService) load(ctx context.Context, proposalID string) (ImplementationProposal, storage.ImplementationProposalModel, error) {

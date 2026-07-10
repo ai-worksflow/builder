@@ -30,6 +30,45 @@ export interface DataTable {
   readonly updatedAt: string
 }
 
+/**
+ * Authenticated builder contract for the deployment-scoped public data plane.
+ * A missing policy is deliberately equivalent to this shape with every
+ * operation disabled and both field allowlists empty.
+ */
+export interface PublicTablePolicyInput {
+  readonly allowRead: boolean
+  readonly allowCreate: boolean
+  readonly allowUpdate: boolean
+  readonly allowDelete: boolean
+  readonly readableFields: readonly string[]
+  readonly writableFields: readonly string[]
+}
+
+export interface PublicTablePolicy extends PublicTablePolicyInput {
+  readonly projectId: string
+  readonly tableId: string
+  readonly tableName: string
+  readonly version: number
+  readonly etag: string
+  readonly createdAt: string
+  readonly updatedAt: string
+}
+
+/**
+ * Management responses never contain the one-time capability token. The token
+ * is injected by the publish service directly into the deployment overlay.
+ */
+export interface PublicDeploymentRuntime {
+  readonly apiBasePath: string
+  readonly projectId: string
+  readonly deploymentId: string
+  readonly deploymentVersionId: string
+  readonly capabilityId: string
+  readonly allowedOrigins: readonly string[]
+  readonly expiresAt: string
+  readonly activatedAt?: string
+}
+
 export interface DataRecord {
   readonly id: string
   readonly values: Readonly<Record<string, JsonValue>>

@@ -14,6 +14,7 @@ import (
 	"github.com/worksflow/builder/backend/internal/ai"
 	"github.com/worksflow/builder/backend/internal/auth"
 	"github.com/worksflow/builder/backend/internal/config"
+	"github.com/worksflow/builder/backend/internal/conversation"
 	"github.com/worksflow/builder/backend/internal/core"
 	"github.com/worksflow/builder/backend/internal/dataruntime"
 	"github.com/worksflow/builder/backend/internal/delivery"
@@ -71,8 +72,13 @@ func Run(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 	if err != nil {
 		return fmt.Errorf("configure password hashing: %w", err)
 	}
+	encryptionKey, err := dataruntime.ParseEncryptionKey(cfg.Secrets.EncryptionKey)
+	if err != nil {
+		return fmt.Errorf("parse platform encryption key: %w", err)
+	}
 	authService, err := auth.NewService(dependencies.Postgres, dependencies.Redis, passwordHasher, auth.ServiceConfig{
 		TTL: cfg.Security.Session.TTL, CachePrefix: cfg.Security.Session.CachePrefix,
+		IdempotencyTTL: cfg.Idempotency.TTL, ReplayKey: encryptionKey,
 	})
 	if err != nil {
 		return fmt.Errorf("create auth service: %w", err)
@@ -80,10 +86,6 @@ func Run(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 	accessControl, err := core.NewAccessControl(dependencies.Postgres)
 	if err != nil {
 		return fmt.Errorf("create access control: %w", err)
-	}
-	encryptionKey, err := dataruntime.ParseEncryptionKey(cfg.Secrets.EncryptionKey)
-	if err != nil {
-		return fmt.Errorf("parse platform encryption key: %w", err)
 	}
 	githubAPI, err := worksgithub.NewAPIClient(cfg.GitHub.APIBaseURL, cfg.GitHub.RequestTimeout, nil)
 	if err != nil {
@@ -111,6 +113,23 @@ func Run(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 	if err != nil {
 		return fmt.Errorf("create data runtime transport: %w", err)
 	}
+	publicDataService, err := dataruntime.NewPlatformPublicRuntime(dataruntime.PublicRuntimePlatformDependencies{
+		Database: dependencies.Postgres, Access: accessControl, EncryptionKey: encryptionKey,
+	})
+	if err != nil {
+		return fmt.Errorf("create public data runtime: %w", err)
+	}
+	publicDataLimiter, err := dataruntime.NewRedisPublicRateLimiter(dependencies.Redis, dataruntime.RedisPublicRateLimiterOptions{})
+	if err != nil {
+		return fmt.Errorf("create public data rate limiter: %w", err)
+	}
+	publicDataHandler, err := transport.NewPublicDataHandler(transport.PublicDataDependencies{
+		Service: publicDataService, RateLimiter: publicDataLimiter,
+		MaxJSONBodyBytes: cfg.HTTP.MaxJSONBodyBytes,
+	})
+	if err != nil {
+		return fmt.Errorf("create public data transport: %w", err)
+	}
 	qualitySandbox, err := delivery.NewContainerSandbox(delivery.ContainerSandboxConfig{
 		RuntimeBinary: cfg.Delivery.SandboxRuntime, DaemonHost: cfg.Delivery.SandboxHost,
 		WorkspaceRoot: cfg.Delivery.QualityTempRoot,
@@ -134,7 +153,8 @@ func Run(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 	deliveryServices, err := delivery.NewPlatformServices(delivery.PlatformDependencies{
 		Database: dependencies.Postgres, Contents: contentStore, Access: accessControl,
 		Sandbox: qualitySandbox, QualityRoot: cfg.Delivery.QualityTempRoot, Provider: publishProvider,
-		Environments: delivery.DataRuntimeEnvironmentResolver{Source: dataService},
+		Environments:  delivery.DataRuntimeEnvironmentResolver{Source: dataService},
+		PublicRuntime: publicDataService,
 	})
 	if err != nil {
 		return fmt.Errorf("create delivery services: %w", err)
@@ -146,7 +166,10 @@ func Run(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 	if err != nil {
 		return fmt.Errorf("create delivery transport: %w", err)
 	}
-	projectService, err := core.NewProjectService(dependencies.Postgres, contentStore, accessControl, workflowruntime.MinimumLoopProjectInitializer{})
+	projectService, err := core.NewProjectService(
+		dependencies.Postgres, contentStore, accessControl,
+		workflowruntime.MinimumLoopProjectInitializer{}, conversation.ProjectInitializer{},
+	)
 	if err != nil {
 		return fmt.Errorf("create project service: %w", err)
 	}
@@ -214,6 +237,7 @@ func Run(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 		Store: workflowStore, CoreProposals: proposalService, Generation: generationService,
 		Workbench: workbenchService, ArtifactInputs: workflowruntime.CoreArtifactInputValidator{Database: dependencies.Postgres},
 		TargetArtifacts:     workflowruntime.CoreTargetArtifactInitializer{Artifacts: artifactService},
+		RequirementBaseline: baselineService,
 		WorkbenchCompletion: workflowruntime.CoreWorkbenchCompletionValidator{Database: dependencies.Postgres},
 		ReviewGate:          workflowruntime.CoreReviewGateVerifier{Database: dependencies.Postgres},
 		Access:              accessControl, FanOut: workflowruntime.ContextFanOutResolver{ValueKey: "deliverySlices"},
@@ -228,6 +252,18 @@ func Run(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 	workflowHandler, err := transport.NewWorkflowHandler(transport.WorkflowDependencies{Facade: workflowFacade, MaxJSONBodyBytes: cfg.HTTP.MaxJSONBodyBytes})
 	if err != nil {
 		return fmt.Errorf("create workflow transport: %w", err)
+	}
+	conversationService, err := conversation.NewService(conversation.ServiceDependencies{
+		Database: dependencies.Postgres, Access: accessControl, Workflow: workflowFacade, Manifests: workflowStore, AIProvider: aiProvider,
+	})
+	if err != nil {
+		return fmt.Errorf("create conversation control-plane service: %w", err)
+	}
+	conversationHandler, err := transport.NewConversationHandler(transport.ConversationDependencies{
+		Service: conversationService, MaxJSONBodyBytes: cfg.HTTP.MaxJSONBodyBytes,
+	})
+	if err != nil {
+		return fmt.Errorf("create conversation control-plane transport: %w", err)
 	}
 	apiTransport := transport.NewServer(transport.Services{
 		Auth: authService, Projects: projectService, Members: memberService, Access: accessControl,
@@ -300,16 +336,14 @@ func Run(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 	}
 	websocketHandler := realtime.NewHandler(hub, authenticator, subscriptionAuthorizer, logger, cfg.WebSocket, historyReader)
 	fanout := realtime.NewNATSFanout(dependencies.JetStream, hub, logger)
-	fanoutErrors, err := fanout.Start(runtimeCtx)
+	fanoutSupervisor, err := realtime.NewFanoutSupervisor(fanout, logger, realtime.FanoutSupervisorConfig{})
 	if err != nil {
-		return fmt.Errorf("start NATS realtime fanout: %w", err)
+		return fmt.Errorf("create NATS realtime fanout supervisor: %w", err)
 	}
 	runtimeWorkers.Add(1)
 	go func() {
 		defer runtimeWorkers.Done()
-		if fanoutErr := <-fanoutErrors; fanoutErr != nil && !errors.Is(fanoutErr, context.Canceled) {
-			logger.Error("NATS realtime fanout stopped", "error", fanoutErr)
-		}
+		fanoutSupervisor.Run(runtimeCtx)
 	}()
 	if cfg.Outbox.Enabled {
 		publisher, err := events.NewOutboxPublisher(dependencies.Postgres, dependencies.JetStream, logger, events.OutboxConfig{
@@ -330,15 +364,25 @@ func Run(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 	}
 
 	readinessChecks := dependencies.Checks()
+	qualitySandboxCheck := "quality_sandbox"
+	if !qualitySandbox.ImagesDigestPinned() {
+		qualitySandboxCheck = "quality_sandbox_mutable_images_development_only"
+		logger.Warn("sandbox images use mutable development tags; quality runs are not reproducible across image refreshes",
+			"node_image", cfg.Delivery.SandboxNodeImage, "go_image", cfg.Delivery.SandboxGoImage)
+	}
+	readinessChecks[qualitySandboxCheck] = qualitySandbox.Readiness
+	readinessChecks["publish_storage"] = publishProvider.Readiness
 	readinessChecks["nats_event_stream"] = func(checkCtx context.Context) error {
 		_, checkErr := dependencies.JetStream.StreamInfo(events.DefaultStreamName, nats.Context(checkCtx))
 		return checkErr
 	}
+	readinessChecks["realtime_fanout"] = fanoutSupervisor.Readiness
 	readiness := health.NewReadiness(cfg.Dependencies.ReadinessTimeout, readinessChecks)
 	router, err := httpapi.NewRouter(cfg, logger, httpapi.RouterOptions{
 		Readiness: readiness, WebSocket: websocketHandler,
 		Transport: apiTransport, Authentication: authService, Idempotency: idempotency,
-		Workflow: workflowHandler, GitHub: githubHandler, Data: dataHandler, Delivery: deliveryHandler,
+		Workflow: workflowHandler, Conversation: conversationHandler, GitHub: githubHandler, Data: dataHandler,
+		PublicData: publicDataHandler, Delivery: deliveryHandler,
 	})
 	if err != nil {
 		stopRuntime()

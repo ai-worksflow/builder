@@ -14,7 +14,7 @@ import (
 )
 
 const (
-	RunnerVersion         = "1.0.0"
+	RunnerVersion         = "2.0.0"
 	MaxWorkspaceFiles     = 2_000
 	MaxWorkspaceFileSize  = 2 << 20
 	MaxWorkspaceBytes     = 32 << 20
@@ -281,12 +281,14 @@ type DeploymentLog struct {
 }
 
 type PublishInput struct {
-	DeploymentID      string           `json:"deploymentId,omitempty"`
-	Environment       Environment      `json:"environment"`
-	EnvironmentRef    string           `json:"environmentRef"`
-	WorkspaceRevision *core.VersionRef `json:"workspaceRevision,omitempty"`
-	BuildManifestID   string           `json:"buildManifestId,omitempty"`
-	Message           string           `json:"message,omitempty"`
+	DeploymentID         string           `json:"deploymentId,omitempty"`
+	Environment          Environment      `json:"environment"`
+	EnvironmentRef       string           `json:"environmentRef"`
+	WorkspaceRevision    *core.VersionRef `json:"workspaceRevision,omitempty"`
+	BuildManifestID      string           `json:"buildManifestId,omitempty"`
+	QualityRunID         string           `json:"qualityRunId,omitempty"`
+	Message              string           `json:"message,omitempty"`
+	WorkflowQualityRunID string           `json:"-"`
 }
 
 type RollbackInput struct {

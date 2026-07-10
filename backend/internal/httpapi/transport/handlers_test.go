@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -131,7 +132,10 @@ func TestRegistrationSetsSecureHttpOnlySessionAndCSRFToken(t *testing.T) {
 	services.auth.signUp = auth.IssuedSession{
 		Session: testSession(), Token: "issued-token",
 	}
-	headers := http.Header{"Content-Type": []string{"application/json"}}
+	headers := http.Header{
+		"Content-Type":    []string{"application/json"},
+		"Idempotency-Key": []string{"register-owner-1"},
+	}
 	response := performRequest(router, http.MethodPost, "/v1/session/register", []byte(`{"displayName":"Owner","email":"owner@example.com","password":"password-123"}`), headers)
 	if response.Code != http.StatusCreated {
 		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
@@ -159,6 +163,86 @@ func TestRegistrationSetsSecureHttpOnlySessionAndCSRFToken(t *testing.T) {
 	decodeResponse(t, response, &body)
 	if body["state"] != "authenticated" || body["csrfToken"] == "" {
 		t.Fatalf("body = %#v", body)
+	}
+}
+
+func TestAuthenticationIssuanceRequiresIdempotencyKey(t *testing.T) {
+	router, _ := newTransportRouter(t, nil)
+	cases := []struct {
+		method  string
+		path    string
+		body    string
+		headers http.Header
+	}{
+		{method: http.MethodPost, path: "/v1/session/register", body: `{"displayName":"Owner","email":"owner@example.com","password":"password-123"}`, headers: http.Header{"Content-Type": []string{"application/json"}}},
+		{method: http.MethodPost, path: "/v1/session", body: `{"email":"owner@example.com","password":"password-123"}`, headers: http.Header{"Content-Type": []string{"application/json"}}},
+		{method: http.MethodPost, path: "/v1/session/refresh", headers: authenticatedHeaders(true)},
+	}
+	for _, testCase := range cases {
+		response := performRequest(router, testCase.method, testCase.path, []byte(testCase.body), testCase.headers)
+		assertProblem(t, response, http.StatusBadRequest, "invalid_idempotency_key")
+	}
+}
+
+func TestRefreshReplaysIdenticalSessionAndCSRFCookiesWithoutGenericPersistence(t *testing.T) {
+	router, services := newTransportRouter(t, nil)
+	issued := auth.IdempotentIssuedSession{
+		IssuedSession: auth.IssuedSession{Session: testSession(), Token: "replacement-session-token"},
+		CSRFToken:     "csrf-token",
+		IssuedAt:      time.Unix(1_700_000_000, 0).UTC(),
+	}
+	services.auth.idempotent = issued
+	headers := authenticatedHeaders(true)
+	headers.Set("Idempotency-Key", "refresh-session-1")
+
+	first := performRequest(router, http.MethodPost, "/v1/session/refresh", nil, headers)
+	replay := performRequest(router, http.MethodPost, "/v1/session/refresh", nil, headers)
+	if first.Code != http.StatusOK || replay.Code != http.StatusOK || replay.Header().Get("Idempotency-Replayed") != "true" {
+		t.Fatalf("refresh replay failed: first=%d replay=%d header=%q firstBody=%s replayBody=%s", first.Code, replay.Code, replay.Header().Get("Idempotency-Replayed"), first.Body.String(), replay.Body.String())
+	}
+	if first.Body.String() != replay.Body.String() {
+		t.Fatalf("refresh body changed on replay: first=%s replay=%s", first.Body.String(), replay.Body.String())
+	}
+	if strings.Join(first.Header().Values("Set-Cookie"), "\n") != strings.Join(replay.Header().Values("Set-Cookie"), "\n") {
+		t.Fatalf("refresh Set-Cookie headers changed on replay: first=%#v replay=%#v", first.Header().Values("Set-Cookie"), replay.Header().Values("Set-Cookie"))
+	}
+	for _, response := range []*httptest.ResponseRecorder{first, replay} {
+		cookies := response.Result().Cookies()
+		if len(cookies) != 2 {
+			t.Fatalf("refresh cookies = %#v", cookies)
+		}
+		values := map[string]string{}
+		for _, cookie := range cookies {
+			values[cookie.Name] = cookie.Value
+		}
+		if values[testSessionCookie] != issued.Token || values[testCSRFCookie] != issued.CSRFToken {
+			t.Fatalf("refresh cookie values changed: %#v", values)
+		}
+		if strings.Contains(response.Body.String(), issued.Token) || strings.Contains(response.Body.String(), "Set-Cookie") {
+			t.Fatalf("session cookie leaked into JSON response: %s", response.Body.String())
+		}
+	}
+}
+
+func TestAuthReceiptCompletionFailureReturnsNoReplacementCookie(t *testing.T) {
+	router, services := newTransportRouter(t, nil)
+	services.auth.idempotencyErr = auth.ErrIdempotencyUnavailable
+	cases := []struct {
+		path    string
+		body    string
+		headers http.Header
+	}{
+		{path: "/v1/session/register", body: `{"displayName":"Owner","email":"owner@example.com","password":"password-123"}`, headers: http.Header{"Content-Type": []string{"application/json"}, "Idempotency-Key": []string{"register-failure-1"}}},
+		{path: "/v1/session", body: `{"email":"owner@example.com","password":"password-123"}`, headers: http.Header{"Content-Type": []string{"application/json"}, "Idempotency-Key": []string{"sign-in-failure-1"}}},
+		{path: "/v1/session/refresh", headers: authenticatedHeaders(true)},
+	}
+	cases[2].headers.Set("Idempotency-Key", "refresh-session-failure-1")
+	for _, testCase := range cases {
+		response := performRequest(router, http.MethodPost, testCase.path, []byte(testCase.body), testCase.headers)
+		assertProblem(t, response, http.StatusServiceUnavailable, "idempotency_unavailable")
+		if values := response.Header().Values("Set-Cookie"); len(values) != 0 {
+			t.Fatalf("failed receipt on %s exposed replacement cookies: %#v", testCase.path, values)
+		}
 	}
 }
 
@@ -267,7 +351,11 @@ func testProject(role core.Role) core.Project {
 }
 
 type fakeAuthService struct {
-	signUp auth.IssuedSession
+	mu             sync.Mutex
+	signUp         auth.IssuedSession
+	idempotent     auth.IdempotentIssuedSession
+	idempotencyErr error
+	issueCalls     int
 }
 
 func (f *fakeAuthService) SignUp(context.Context, string, string, string, string, string) (auth.IssuedSession, error) {
@@ -289,6 +377,46 @@ func (*fakeAuthService) Authenticate(_ context.Context, token string) (auth.Sess
 }
 
 func (*fakeAuthService) SignOut(context.Context, string) error { return nil }
+
+func (f *fakeAuthService) SignUpIdempotent(context.Context, string, string, string, string, string, string) (auth.IdempotentIssuedSession, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.nextIdempotentIssue(true)
+}
+
+func (f *fakeAuthService) SignInIdempotent(context.Context, string, string, string, string, string) (auth.IdempotentIssuedSession, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.nextIdempotentIssue(false)
+}
+
+func (f *fakeAuthService) RotateIdempotent(_ context.Context, _, _, csrfToken, _, _ string) (auth.IdempotentIssuedSession, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	result, err := f.nextIdempotentIssue(false)
+	result.CSRFToken = csrfToken
+	return result, err
+}
+
+func (f *fakeAuthService) nextIdempotentIssue(useSignUp bool) (auth.IdempotentIssuedSession, error) {
+	if f.idempotencyErr != nil {
+		return auth.IdempotentIssuedSession{}, f.idempotencyErr
+	}
+	result := f.idempotent
+	if result.Token == "" {
+		issued := auth.IssuedSession{Session: testSession(), Token: "issued-token"}
+		if useSignUp && f.signUp.Token != "" {
+			issued = f.signUp
+		}
+		result = auth.IdempotentIssuedSession{
+			IssuedSession: issued, CSRFToken: "issued-csrf-token",
+			IssuedAt: time.Unix(1_700_000_000, 0).UTC(),
+		}
+	}
+	result.Replayed = f.issueCalls > 0
+	f.issueCalls++
+	return result, nil
+}
 
 type fakeProjectService struct {
 	list            []core.Project

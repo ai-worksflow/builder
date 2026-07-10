@@ -24,18 +24,20 @@ import {
 } from 'lucide-react'
 import { useCollaboration } from '@/lib/collaboration/provider'
 import { useArtifactWorkspace } from '@/lib/platform/artifact-provider'
-import {
-  revisionRef,
-  usePlatformFlow,
-} from '@/lib/platform/flow-provider'
+import { usePlatformFlow } from '@/lib/platform/flow-provider'
 import type {
   CreateWorkflowDefinitionInputDto,
-  ExactArtifactRefDto,
   WorkflowDefinitionRecordDto,
-  WorkflowNodeDefinitionDto,
   WorkflowNodeRunDto,
 } from '@/lib/platform/flow-contract'
-import type { JsonObject, JsonValue } from '@/lib/platform/dto'
+import {
+  deliverySliceContext as resolveDeliverySliceContext,
+  exactArtifactRefsEqual,
+  parseEditableDefinition as parseWorkflowContract,
+  resolveCandidateSelection as resolveLineageSelection,
+  revisionCandidates as resolveLineageCandidates,
+  starterWorkflowDefinition,
+} from '@/lib/platform/workflow-ui-contract'
 import { cn } from '@/lib/utils'
 import { WorkflowGraphEditor } from './workflow-graph-editor'
 
@@ -71,7 +73,7 @@ export function FlowPanel() {
       }, null, 2))
       return
     }
-    setDefinitionJSON(JSON.stringify(starterDefinition(), null, 2))
+    setDefinitionJSON(JSON.stringify(starterWorkflowDefinition(), null, 2))
   }
 
   async function saveDefinition() {
@@ -217,13 +219,13 @@ export function FlowPanel() {
                   })}
                   disabled={!canStart || flow.busy || (selectedVersion ? !selectedVersion.published : false)}
                   className="mt-2 inline-flex h-9 w-full items-center justify-center gap-1.5 rounded-md bg-primary px-3 text-[11px] font-semibold text-primary-foreground hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-40"
-                  title="Freeze the exact approved Project Brief revision and start"
+                  title="Freeze the exact Project Brief revision required by this published workflow version"
                 >
                   <Play className="size-3.5" />
-                  Start from approved Project Brief
+                  Start from exact Project Brief
                 </button>
                 <p className="mt-1.5 text-[9px] leading-relaxed text-faint-foreground">
-                  The server freezes artifactId + revisionId + contentHash before the first node runs.
+                  The published definition decides whether approval is required; the server always freezes artifactId + revisionId + contentHash.
                 </p>
               </Section>
 
@@ -336,15 +338,50 @@ function RunNodeCard({ node }: { node: WorkflowNodeRunDto }) {
   const { can } = useCollaboration()
   const [revisionKey, setRevisionKey] = useState('')
   const [reason, setReason] = useState('')
+  const [selectionError, setSelectionError] = useState<string | null>(null)
   const definitionNode = flow.selectedDefinition?.definition.nodes.find(
     (item) => item.id === node.definitionNodeId,
   )
-  const candidates = useMemo(
-    () => revisionCandidates(definitionNode, artifacts),
-    [artifacts, definitionNode],
+  const candidateResolution = useMemo(
+    () => resolveLineageCandidates(definitionNode, node, flow.run, artifacts),
+    [artifacts, definitionNode, flow.run, node],
   )
-  const selected = candidates.find((candidate) => candidate.key === revisionKey) ?? candidates[0]
+  const candidates = candidateResolution.candidates
+  const selected = resolveLineageSelection(candidates, revisionKey)
+  const sliceContextResolution = selected && definitionNode?.humanEdit?.artifactType === 'blueprint'
+    ? resolveDeliverySliceContext(selected.ref, artifacts)
+    : { context: undefined, error: undefined }
+  const staleSelection = Boolean(revisionKey && !selected)
+  const selectionRequired = candidates.length > 1 && !selected
+  const submitError = candidateResolution.error
+    ?? (staleSelection ? 'The previously selected revision is no longer part of this node lineage.' : undefined)
+    ?? (selectionRequired ? 'Multiple lineage revisions match. Select one exact revision.' : undefined)
+    ?? sliceContextResolution.error
   const active = ['waiting_input', 'waiting_review', 'failed'].includes(node.status)
+
+  function submitSelectedRevision() {
+    setSelectionError(null)
+    if (!selected) {
+      setSelectionError(submitError ?? 'Select an exact lineage revision.')
+      return
+    }
+    const stillAllowed = candidateResolution.candidates.find((candidate) =>
+      candidate.key === selected.key && exactArtifactRefsEqual(candidate.ref, selected.ref),
+    )
+    if (!stillAllowed) {
+      setSelectionError('The selected revision is no longer part of this node input lineage.')
+      return
+    }
+    if (definitionNode?.humanEdit?.artifactType === 'blueprint' && !sliceContextResolution.context) {
+      setSelectionError(sliceContextResolution.error ?? 'Blueprint delivery slices could not be resolved.')
+      return
+    }
+    void flow.submitNodeRevision(
+      node,
+      stillAllowed.ref,
+      sliceContextResolution.context,
+    )
+  }
 
   return (
     <div className={cn(
@@ -370,40 +407,61 @@ function RunNodeCard({ node }: { node: WorkflowNodeRunDto }) {
         )}
       </div>
 
-      {node.status === 'waiting_input' && node.type !== 'workbench_build' && (
+      {node.status === 'waiting_input' && node.type === 'human_edit' && (
         <div className="mt-2 border-t border-border pt-2">
           {candidates.length > 0 ? (
             <>
               <select
                 value={selected?.key ?? ''}
-                onChange={(event) => setRevisionKey(event.target.value)}
+                onChange={(event) => {
+                  setRevisionKey(event.target.value)
+                  setSelectionError(null)
+                }}
                 className="h-7 w-full rounded border border-border bg-panel px-1.5 text-[9px] text-foreground outline-none"
                 aria-label="Exact artifact revision"
               >
+                {candidates.length > 1 && <option value="">Select a revision from this node lineage…</option>}
                 {candidates.map((candidate) => (
                   <option key={candidate.key} value={candidate.key}>{candidate.label}</option>
                 ))}
               </select>
               <button
                 type="button"
-                onClick={() => selected && void flow.submitNodeRevision(
-                  node,
-                  selected.ref,
-                  definitionNode?.humanEdit?.artifactType === 'blueprint'
-                    ? deliverySliceContext(selected.ref, artifacts)
-                    : undefined,
-                )}
-                disabled={!selected || !can('edit') || flow.busy}
+                onClick={submitSelectedRevision}
+                disabled={!selected || Boolean(submitError) || !can('edit') || flow.busy}
                 className="mt-1.5 inline-flex h-7 w-full items-center justify-center gap-1 rounded bg-primary text-[9px] font-semibold text-primary-foreground disabled:opacity-40"
               >
                 <Send className="size-3" /> Submit pinned revision
               </button>
+              {(submitError || selectionError) && (
+                <p className="mt-1 text-[9px] leading-relaxed text-warning">
+                  {selectionError ?? submitError}
+                </p>
+              )}
             </>
           ) : (
             <p className="text-[9px] leading-relaxed text-warning">
-              No immutable server revision matches this node. Create a revision in Documents, Blueprint, or Prototype first.
+              {candidateResolution.error ?? 'No immutable revision belongs to this node input lineage. Create the required revision, then refresh the run.'}
             </p>
           )}
+        </div>
+      )}
+
+      {node.status === 'waiting_input'
+        && (node.type === 'quality_gate' || node.type === 'publish') && (
+        <div className="mt-2 border-t border-border pt-2">
+          <button
+            type="button"
+            onClick={() => void flow.authorizeExecution(node)}
+            disabled={!(node.type === 'publish' ? can('publish') : can('edit')) || flow.busy}
+            className="inline-flex h-7 w-full items-center justify-center gap-1 rounded bg-primary text-[9px] font-semibold text-primary-foreground disabled:opacity-40"
+          >
+            <ShieldCheck className="size-3" />
+            {node.type === 'publish' ? 'Authorize and publish' : 'Authorize and run quality gate'}
+          </button>
+          <p className="mt-1 text-[8px] leading-relaxed text-faint-foreground">
+            The server records your current project role and rechecks permission immediately before the privileged operation runs.
+          </p>
         </div>
       )}
 
@@ -507,141 +565,10 @@ function DefinitionEditor({
   )
 }
 
-function revisionCandidates(
-  definitionNode: WorkflowNodeDefinitionDto | undefined,
-  artifacts: ReturnType<typeof useArtifactWorkspace>,
-) {
-  const type = definitionNode?.humanEdit?.artifactType
-  const resources = type === 'document'
-    ? artifacts.documents
-    : type === 'blueprint'
-      ? [...artifacts.blueprints, ...artifacts.pageSpecs]
-      : type === 'prototype'
-        ? artifacts.prototypes
-        : []
-  return resources.flatMap((resource) => {
-    const revision = resource.latestRevision ?? resource.approvedRevision
-    if (!revision) return []
-    return [{
-      key: `${revision.artifactId}:${revision.id}`,
-      label: `${resource.artifact.title} · r${revision.revisionNumber} · ${resource.artifact.status}`,
-      ref: revisionRef(revision),
-    }]
-  })
-}
-
-function deliverySliceContext(
-  blueprintRevision: ExactArtifactRefDto,
-  artifacts: ReturnType<typeof useArtifactWorkspace>,
-) {
-  const slices = artifacts.pageSpecs.flatMap((pageSpec) => {
-    const pageSpecRevision = pageSpec.latestRevision ?? pageSpec.approvedRevision
-    if (!pageSpecRevision) return []
-    const content = pageSpecRevision.content
-    const matchingPrototype = artifacts.prototypes.find((prototype) => {
-      const prototypeContent = prototype.latestRevision?.content ?? prototype.draft?.content
-      return prototypeContent?.pageSpecRevision?.revisionId === pageSpecRevision.id
-    })
-    const prototypeRevision = matchingPrototype?.latestRevision ?? matchingPrototype?.approvedRevision
-    return [{
-      key: content.blueprintPageNodeId || pageSpec.artifact.id,
-      title: content.title || pageSpec.artifact.title,
-      blueprint: blueprintRevision,
-      pageSpec: revisionRef(pageSpecRevision),
-      ...(prototypeRevision ? { prototype: revisionRef(prototypeRevision) } : {}),
-    }]
-  })
-  return { deliverySlices: slices }
-}
-
-function starterDefinition(): {
-  name: string
-  schemaVersion: string
-  nodes: WorkflowNodeDefinitionDto[]
-  edges: CreateWorkflowDefinitionInputDto['edges']
-} {
-  const envelope: JsonObject = {
-    type: 'object',
-    additionalProperties: true,
-  }
-  return {
-    name: 'Custom application flow',
-    schemaVersion: 'workflow/v2',
-    nodes: [
-      {
-        id: 'input',
-        name: 'Pinned project input',
-        type: 'artifact_input',
-        inputSchema: envelope,
-        outputSchema: envelope,
-        artifactInput: {
-          allowedTypes: ['document'],
-          requireApproved: true,
-          minimumArtifacts: 1,
-        },
-      },
-      {
-        id: 'edit',
-        name: 'Human refinement',
-        type: 'human_edit',
-        inputSchema: envelope,
-        outputSchema: envelope,
-        humanEdit: {
-          artifactType: 'document',
-          requiredRole: 'editor',
-          instructions: 'Submit an exact immutable artifact revision.',
-        },
-      },
-      {
-        id: 'review',
-        name: 'Canonical review gate',
-        type: 'review_gate',
-        inputSchema: envelope,
-        outputSchema: envelope,
-        reviewGate: {
-          requiredRole: 'admin',
-          minimumApprovals: 1,
-          prohibitSelfReview: true,
-          allowWaiver: false,
-        },
-      },
-      {
-        id: 'publish',
-        name: 'Publish',
-        type: 'publish',
-        inputSchema: envelope,
-        outputSchema: envelope,
-        publish: {
-          environment: 'preview',
-          requiredRole: 'admin',
-          allowRollback: true,
-        },
-      },
-    ],
-    edges: [
-      { id: 'input-edit', from: 'input', to: 'edit' },
-      { id: 'edit-review', from: 'edit', to: 'review' },
-      { id: 'review-publish', from: 'review', to: 'publish' },
-    ],
-  }
-}
-
-function parseDefinitionJSON(value: string) {
-  const parsed: unknown = JSON.parse(value)
-  if (!record(parsed)) throw new Error('Definition must be a JSON object.')
-  if (typeof parsed.name !== 'string' || !parsed.name.trim()) throw new Error('Definition name is required.')
-  if (typeof parsed.schemaVersion !== 'string' || !parsed.schemaVersion.trim()) throw new Error('schemaVersion is required.')
-  if (!Array.isArray(parsed.nodes) || !Array.isArray(parsed.edges)) throw new Error('nodes and edges must be arrays.')
-  return {
-    name: parsed.name,
-    schemaVersion: parsed.schemaVersion,
-    nodes: parsed.nodes as unknown as WorkflowNodeDefinitionDto[],
-    edges: parsed.edges as unknown as CreateWorkflowDefinitionInputDto['edges'],
-  }
-}
-
-function record(value: unknown): value is Record<string, JsonValue> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value)
+export function parseDefinitionJSON(value: string) {
+  const parsed = parseWorkflowContract(value, true)
+  if (!parsed.definition) throw new Error(parsed.error ?? 'Definition JSON is invalid.')
+  return parsed.definition
 }
 
 function Section({ title, icon: Icon, children }: { title: string; icon: typeof Workflow; children: React.ReactNode }) {

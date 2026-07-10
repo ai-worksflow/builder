@@ -109,6 +109,44 @@ test('project creation requires the backend to return the creator as owner', asy
   )
 })
 
+test('project rename and archive use server ETags and never mutate a browser catalog', async () => {
+  const calls: Array<{ method: string; path: string; ifMatch: string | null; idempotencyKey: string | null }> = []
+  const client = new PlatformClient({
+    http: {
+      baseUrl: 'https://platform.example.test',
+      fetch: (async (input, init) => {
+        const headers = new Headers(init?.headers)
+        calls.push({
+          method: init?.method ?? 'GET',
+          path: new URL(input.toString()).pathname,
+          ifMatch: headers.get('if-match'),
+          idempotencyKey: headers.get('idempotency-key'),
+        })
+        if (init?.method === 'DELETE') return new Response(null, { status: 204 })
+        return json({ ...project(), name: 'Renamed project', etag: '"project-2"' })
+      }) as FetchLike,
+    },
+  })
+  const gateway = new PlatformCollaborationGateway(client)
+  const target = {
+    id: 'project-1',
+    name: 'Platform project',
+    createdAt: '2026-07-10T00:00:00Z',
+    updatedAt: '2026-07-10T00:00:00Z',
+    memberCount: 1,
+    role: 'owner' as const,
+    etag: '"project-1"',
+  }
+  const renamed = await gateway.renameProject(target, 'Renamed project')
+  await gateway.archiveProject(renamed)
+
+  assert.equal(renamed.name, 'Renamed project')
+  assert.deepEqual(calls.map((call) => ({ ...call, idempotencyKey: Boolean(call.idempotencyKey) })), [
+    { method: 'PATCH', path: '/v1/projects/project-1', ifMatch: '"project-1"', idempotencyKey: true },
+    { method: 'DELETE', path: '/v1/projects/project-1', ifMatch: '"project-2"', idempotencyKey: true },
+  ])
+})
+
 test('authorization always asks the backend and preserves a denied result', async () => {
   let requested = ''
   const client = new PlatformClient({
@@ -154,14 +192,12 @@ test('formal comments pin the exact artifact revision and content hash', async (
     target: {
       artifactId: 'artifact-1',
       revisionId: 'revision-3',
-      revisionNumber: 3,
       contentHash: 'sha256:abc123',
     },
     anchor: {
       revision: {
         artifactId: 'artifact-1',
         revisionId: 'revision-3',
-        revisionNumber: 3,
         contentHash: 'sha256:abc123',
       },
       revisionId: 'revision-3',
@@ -201,12 +237,128 @@ test('review requests pin a revision and assign explicit reviewers without self-
     target: {
       artifactId: 'artifact-1',
       revisionId: 'revision-4',
-      revisionNumber: 4,
       contentHash: 'sha256:def456',
     },
     summary: 'Please verify the acceptance criteria.',
     requiredReviewerIds: ['reviewer-2'],
   })
+})
+
+test('canonical backend comment threads and review requests map without legacy fields', async () => {
+  const client = new PlatformClient({
+    http: {
+      baseUrl: 'https://platform.example.test',
+      fetch: (async (input) => {
+        const path = new URL(input.toString()).pathname
+        if (path === '/v1/projects/project-1') return json(project())
+        if (path.endsWith('/members')) {
+          return json({ items: [{
+            projectId: 'project-1',
+            user: user(),
+            role: 'owner',
+            joinedAt: '2026-07-10T00:00:00Z',
+            etag: '"member-1"',
+          }] })
+        }
+        if (path.endsWith('/comments')) {
+          return json({ items: [{
+            id: 'thread-1',
+            projectId: 'project-1',
+            artifactId: 'artifact-1',
+            revisionId: 'revision-4',
+            anchor: {
+              revision: {
+                artifactId: 'artifact-1',
+                revisionId: 'revision-4',
+                contentHash: 'sha256:def456',
+              },
+              blockId: 'requirement-7',
+            },
+            severity: 'blocking',
+            createdBy: 'user-1',
+            createdAt: '2026-07-10T01:00:00Z',
+            messages: [
+              {
+                id: 'message-1',
+                body: 'Pin the acceptance criterion.',
+                mentions: [],
+                createdBy: 'user-1',
+                createdAt: '2026-07-10T01:00:00Z',
+              },
+              {
+                id: 'message-2',
+                parentId: 'message-1',
+                body: 'Pinned in this revision.',
+                mentions: [],
+                createdBy: 'user-1',
+                createdAt: '2026-07-10T01:05:00Z',
+              },
+            ],
+            etag: '"comment-thread:thread-1:2"',
+          }] })
+        }
+        if (path.endsWith('/reviews')) {
+          return json({ items: [{
+            id: 'review-1',
+            projectId: 'project-1',
+            artifactId: 'artifact-1',
+            revisionId: 'revision-4',
+            contentHash: 'sha256:def456',
+            status: 'open',
+            policy: {
+              reviewerIds: ['user-1'],
+              minimumApprovals: 1,
+              prohibitSelfReview: true,
+            },
+            requestedBy: 'user-1',
+            requestedAt: '2026-07-10T01:10:00Z',
+            decisions: [],
+            etag: '"review-request:review-1:1"',
+          }] })
+        }
+        if (path.endsWith('/artifacts')) {
+          return json({ items: [{
+            id: 'artifact-1',
+            projectId: 'project-1',
+            kind: 'product_requirements',
+            title: 'Requirements',
+            status: 'inReview',
+            latestRevisionId: 'revision-4',
+            createdBy: 'user-1',
+            createdAt: '2026-07-10T00:00:00Z',
+            updatedAt: '2026-07-10T01:10:00Z',
+            etag: '"artifact-1"',
+          }] })
+        }
+        if (path === '/v1/revisions/revision-4') {
+          return json({
+            id: 'revision-4',
+            artifactId: 'artifact-1',
+            revisionNumber: 4,
+            contentHash: 'sha256:def456',
+            content: {},
+            createdBy: 'user-1',
+            createdAt: '2026-07-10T01:00:00Z',
+          })
+        }
+        return json({ items: [] })
+      }) as FetchLike,
+    },
+  })
+
+  const snapshot = await new PlatformCollaborationGateway(client).loadProject('project-1')
+  assert.equal(snapshot.comments[0].body, 'Pin the acceptance criterion.')
+  assert.equal(snapshot.comments[0].replies[0].body, 'Pinned in this revision.')
+  assert.equal(snapshot.comments[0].etag, '"comment-thread:thread-1:2"')
+  assert.deepEqual(snapshot.comments[0].target, {
+    artifactId: 'artifact-1',
+    revisionId: 'revision-4',
+    contentHash: 'sha256:def456',
+  })
+  assert.equal(snapshot.reviews[0].state, 'pending')
+  assert.equal(snapshot.reviews[0].etag, '"review-request:review-1:1"')
+  assert.deepEqual(snapshot.reviews[0].requiredReviewerIds, ['user-1'])
+  assert.equal(snapshot.reviewTargets[0].title, 'Requirements')
 })
 
 test('backend outages propagate and never fall back to local collaboration data', async () => {
