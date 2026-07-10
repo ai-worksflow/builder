@@ -1,0 +1,2 @@
+DROP INDEX IF EXISTS workflow_runs_project_status_history_idx;
+DROP INDEX IF EXISTS workflow_runs_project_history_idx;

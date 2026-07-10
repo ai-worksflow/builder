@@ -10,6 +10,7 @@ import { RecentProjects } from './recent-projects'
 import { SettingsCenter } from './settings-center'
 import { LanguageToggle } from './language-toggle'
 import { Boxes, Clock, PanelsTopLeft, Settings, Zap } from 'lucide-react'
+import { useCollaboration } from '@/lib/collaboration/provider'
 
 const NAV: {
   id: 'workbench' | 'team' | 'recent' | 'settings'
@@ -19,7 +20,7 @@ const NAV: {
   badge?: number
 }[] = [
   { id: 'workbench', labelKey: 'nav.workbench', shortLabelKey: 'nav.workbenchShort', icon: Zap },
-  { id: 'team', labelKey: 'nav.team', shortLabelKey: 'nav.teamShort', icon: Boxes, badge: 3 },
+  { id: 'team', labelKey: 'nav.team', shortLabelKey: 'nav.teamShort', icon: Boxes },
   { id: 'recent', labelKey: 'nav.recent', shortLabelKey: 'nav.recentShort', icon: Clock },
   { id: 'settings', labelKey: 'nav.settings', shortLabelKey: 'nav.settingsShort', icon: Settings },
 ] as const
@@ -35,6 +36,7 @@ export function AppShell() {
     activeTeamProjectId,
   } = useWorksflow()
   const { t } = useI18n()
+  const { unreadCount } = useCollaboration()
 
   useEffect(() => {
     if (!routeReady || typeof window === 'undefined') return
@@ -65,6 +67,7 @@ export function AppShell() {
         {NAV.map((item) => {
           const Icon = item.icon
           const active = item.id === surface
+          const badge = (item.id === 'team' ? unreadCount : item.badge) ?? 0
           return (
             <button
               key={item.id}
@@ -87,9 +90,9 @@ export function AppShell() {
               <span className="max-w-[52px] truncate leading-none">
                 {t(item.shortLabelKey)}
               </span>
-              {'badge' in item && item.badge ? (
+              {badge > 0 ? (
                 <span className="absolute right-1.5 top-1.5 flex h-3.5 min-w-3.5 items-center justify-center rounded-full bg-primary px-1 text-[9px] font-semibold text-primary-foreground">
-                  {item.badge}
+                  {badge}
                 </span>
               ) : null}
             </button>

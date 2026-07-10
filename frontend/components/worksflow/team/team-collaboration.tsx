@@ -27,6 +27,8 @@ import { ImportCenter } from './import-center'
 import { ReviewCenter } from './review-center'
 import { MemberSettings } from './member-settings'
 import { LanguageToggle } from '../language-toggle'
+import { useCollaboration } from '@/lib/collaboration/provider'
+import { useArtifactWorkspace } from '@/lib/platform/artifact-provider'
 
 const NAV: { id: TeamView; labelKey: MessageKey; icon: typeof LayoutDashboard; badge?: number }[] = [
   { id: 'dashboard', labelKey: 'team.nav.overview', icon: LayoutDashboard },
@@ -35,7 +37,7 @@ const NAV: { id: TeamView; labelKey: MessageKey; icon: typeof LayoutDashboard; b
   { id: 'editor', labelKey: 'team.nav.documents', icon: FileText },
   { id: 'prototype', labelKey: 'team.nav.prototype', icon: MonitorPlay },
   { id: 'imports', labelKey: 'team.nav.imports', icon: UploadCloud },
-  { id: 'reviews', labelKey: 'team.nav.reviews', icon: Users2, badge: 3 },
+  { id: 'reviews', labelKey: 'team.nav.reviews', icon: Users2 },
   { id: 'members', labelKey: 'team.nav.members', icon: Users2 },
 ]
 
@@ -43,14 +45,39 @@ export function TeamCollaboration() {
   const {
     teamView,
     setTeamView,
-    teamProjects,
-    activeTeamProjectId,
     activeTeamProject,
-    openTeamProject,
-    createTeamProject,
+    documents,
+    openDoc,
+    setSurface,
+    platformTeamFactsStatus,
+    platformTeamFactsError,
   } = useWorksflow()
+  const artifactWorkspace = useArtifactWorkspace()
+  const {
+    session,
+    projects,
+    project,
+    reviews,
+    unreadCount,
+    presence,
+    backendStatus,
+    can,
+    createProject,
+    selectProject,
+  } = useCollaboration()
+  const canEdit = session.signedIn && can('edit')
+  const canUseActiveTeamView = teamView === 'members' || teamView === 'reviews' || canEdit
   const { t } = useI18n()
   const [navCollapsed, setNavCollapsed] = useState(false)
+  const [searchQuery, setSearchQuery] = useState('')
+  const searchResults = searchQuery.trim()
+    ? documents.filter((document) =>
+        [document.title, document.summary, document.type]
+          .join(' ')
+          .toLowerCase()
+          .includes(searchQuery.trim().toLowerCase()),
+      ).slice(0, 6)
+    : []
 
   return (
     <div className="flex h-full flex-col">
@@ -59,27 +86,33 @@ export function TeamCollaboration() {
         <div className="flex min-w-0 flex-1 items-center gap-2 md:flex-none">
           <div className="flex min-w-0 items-center gap-1.5 rounded-md px-2 py-1 text-sm font-medium">
             <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded bg-primary text-[10px] font-bold text-primary-foreground">
-              {activeTeamProject.teamName.slice(0, 1)}
+              {(project?.name ?? activeTeamProject.name).slice(0, 1)}
             </span>
-            <span className="shrink-0">{activeTeamProject.teamName}</span>
+            <span className="shrink-0">Projects</span>
             <span className="shrink-0 text-faint-foreground">/</span>
             <select
-              value={activeTeamProjectId}
-              onChange={(event) => openTeamProject(event.target.value)}
+              value={project?.id ?? ''}
+              onChange={(event) => void selectProject(event.target.value)}
+              disabled={!session.signedIn || projects.length === 0}
               className="max-w-[220px] truncate rounded border border-transparent bg-transparent text-sm font-medium text-foreground outline-none hover:border-border hover:bg-white/5"
               aria-label={t('recent.project')}
             >
-              {teamProjects.map((project) => (
-                <option key={project.id} value={project.id}>
-                  {project.name} · {t('team.project.docsCount', { count: project.documents.length })}
+              {projects.length === 0 && <option value="">No server projects</option>}
+              {projects.map((item) => (
+                <option key={item.id} value={item.id}>
+                  {item.name} · {item.role}
                 </option>
               ))}
             </select>
           </div>
           <button
             type="button"
-            onClick={() => createTeamProject()}
-            className="flex h-8 w-8 items-center justify-center rounded-md border border-border text-muted-foreground hover:bg-white/5 hover:text-foreground"
+            onClick={() => {
+              const name = window.prompt('New project name')?.trim()
+              if (name) void createProject(name)
+            }}
+            disabled={!session.signedIn || backendStatus !== 'online'}
+            className="flex h-8 w-8 items-center justify-center rounded-md border border-border text-muted-foreground hover:bg-white/5 hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40"
             aria-label={t('team.project.new')}
             title={t('team.project.new')}
           >
@@ -87,24 +120,58 @@ export function TeamCollaboration() {
           </button>
         </div>
 
-        <div className="mx-auto flex w-full max-w-md items-center gap-2 rounded-md border border-border bg-white/5 px-3 py-1.5 text-[13px] text-faint-foreground max-md:hidden">
-          <Search className="h-3.5 w-3.5" />
-          {t('team.searchPlaceholder')}
+        <div className="relative mx-auto w-full max-w-md max-md:hidden">
+          <label className="flex items-center gap-2 rounded-md border border-border bg-white/5 px-3 py-1.5 text-[13px] text-faint-foreground">
+            <Search className="h-3.5 w-3.5" />
+            <span className="sr-only">{t('team.searchPlaceholder')}</span>
+            <input
+              value={searchQuery}
+              onChange={(event) => setSearchQuery(event.target.value)}
+              placeholder={t('team.searchPlaceholder')}
+              className="min-w-0 flex-1 bg-transparent text-[12px] text-foreground outline-none placeholder:text-faint-foreground"
+            />
+          </label>
+          {searchResults.length > 0 && (
+            <div className="absolute inset-x-0 top-[calc(100%+6px)] z-50 rounded-lg border border-border bg-popover p-1 shadow-2xl">
+              {searchResults.map((document) => (
+                <button
+                  key={document.id}
+                  type="button"
+                  onClick={() => {
+                    openDoc(document.id)
+                    setSearchQuery('')
+                  }}
+                  className="block w-full rounded-md px-2.5 py-2 text-left hover:bg-white/5"
+                >
+                  <span className="block truncate text-[11px] font-medium text-foreground">{document.title}</span>
+                  <span className="block truncate text-[9px] text-faint-foreground">{document.type} · {document.status}</span>
+                </button>
+              ))}
+            </div>
+          )}
         </div>
 
         <div className="flex shrink-0 items-center gap-2">
           <LanguageToggle />
           <button
             type="button"
+            onClick={() => setSurface('settings')}
             className="relative flex h-8 w-8 items-center justify-center rounded-md text-muted-foreground hover:bg-white/5 hover:text-foreground"
             aria-label={t('team.notifications')}
           >
             <Bell className="h-4 w-4" />
-            <span className="absolute right-1.5 top-1.5 h-2 w-2 rounded-full bg-primary" />
+            {unreadCount > 0 && <span className="absolute right-0.5 top-0.5 flex h-4 min-w-4 items-center justify-center rounded-full bg-primary px-1 text-[8px] font-semibold text-primary-foreground">{unreadCount}</span>}
           </button>
-          <span className="flex h-7 w-7 items-center justify-center rounded-full bg-primary text-[11px] font-semibold text-primary-foreground">
-            MC
-          </span>
+          <button
+            type="button"
+            onClick={() => setSurface('settings')}
+            className="relative flex h-7 w-7 items-center justify-center rounded-full bg-primary text-[10px] font-semibold text-primary-foreground"
+            title={session.signedIn ? `${session.user.name} · ${presence.filter((item) => item.status !== 'offline').length} online` : 'Sign in'}
+          >
+            {session.signedIn
+              ? session.user.name.split(/\s+/).slice(0, 2).map((part) => part[0]).join('').toUpperCase()
+              : '?'}
+          </button>
         </div>
       </header>
 
@@ -138,6 +205,7 @@ export function TeamCollaboration() {
           {NAV.map((item) => {
             const Icon = item.icon
             const active = teamView === item.id
+            const badge = item.id === 'reviews' ? reviews.length : item.badge
             return (
               <button
                 key={item.id}
@@ -158,14 +226,14 @@ export function TeamCollaboration() {
                 <span className={cn('flex-1 text-left max-lg:not-sr-only', navCollapsed && 'sr-only')}>
                   {t(item.labelKey)}
                 </span>
-                {item.badge ? (
+                {badge ? (
                   <span
                     className={cn(
                       'flex h-4 min-w-4 items-center justify-center rounded-full bg-primary px-1 text-[10px] font-semibold text-primary-foreground',
                       navCollapsed && 'absolute right-1 top-1',
                     )}
                   >
-                    {item.badge}
+                    {badge}
                   </span>
                 ) : null}
               </button>
@@ -181,17 +249,33 @@ export function TeamCollaboration() {
         </nav>
 
         {/* Active surface */}
-        <div className="min-h-0 min-w-0 flex-1 overflow-hidden">
-          {teamView === 'dashboard' && <TeamDashboard />}
-          {teamView === 'graph' && <DocumentGraph />}
+        <fieldset
+          disabled={!canUseActiveTeamView}
+          className="relative min-h-0 min-w-0 flex-1 overflow-hidden border-0 p-0"
+        >
+          {!canUseActiveTeamView && (
+            <div className="absolute inset-x-3 top-3 z-40 rounded-md border border-warning/30 bg-popover/95 px-3 py-2 text-[10px] text-warning shadow-lg">
+              This project role is read-only. Shared edits require editor access.
+            </div>
+          )}
+          {teamView === 'dashboard' && platformTeamFactsStatus === 'loading' && <PlatformFactsState loading message="Loading server documents and blueprint…" />}
+          {teamView === 'dashboard' && platformTeamFactsStatus === 'error' && <PlatformFactsState message={platformTeamFactsError ?? 'Server artifacts are unavailable.'} onRetry={artifactWorkspace.refresh} />}
+          {teamView === 'dashboard' && !['loading', 'error'].includes(platformTeamFactsStatus) && <TeamDashboard />}
+          {teamView === 'graph' && platformTeamFactsStatus === 'loading' && <PlatformFactsState loading message="Loading the server dependency graph…" />}
+          {teamView === 'graph' && platformTeamFactsStatus === 'error' && <PlatformFactsState message={platformTeamFactsError ?? 'Server artifacts are unavailable.'} onRetry={artifactWorkspace.refresh} />}
+          {teamView === 'graph' && !['loading', 'error'].includes(platformTeamFactsStatus) && <DocumentGraph />}
           {teamView === 'editor' && <DocumentEditor />}
           {teamView === 'blueprint' && <BlueprintEditor />}
           {teamView === 'prototype' && <PrototypeStudio />}
           {teamView === 'imports' && <ImportCenter />}
           {teamView === 'reviews' && <ReviewCenter />}
           {teamView === 'members' && <MemberSettings />}
-        </div>
+        </fieldset>
       </div>
     </div>
   )
+}
+
+function PlatformFactsState({ message, loading, onRetry }: { message: string; loading?: boolean; onRetry?: () => Promise<void> }) {
+  return <div className="flex h-full items-center justify-center bg-canvas p-6"><div className="max-w-md rounded-lg border border-dashed border-border bg-panel p-6 text-center"><p className="text-sm text-muted-foreground">{message}</p>{loading && <p className="mt-2 text-[10px] text-primary-bright">Platform artifact request in progress</p>}{onRetry && <button type="button" onClick={() => void onRetry()} className="mt-4 rounded-md bg-primary px-3 py-2 text-[10px] font-semibold text-primary-foreground">Retry platform artifacts</button>}</div></div>
 }

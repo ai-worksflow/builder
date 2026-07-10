@@ -21,10 +21,12 @@ import {
   VersionCard,
 } from './chat-blocks'
 import { Check, ChevronsLeft, ChevronsRight, FileSearch, Loader2, RotateCcw, Sparkles } from 'lucide-react'
+import { useCollaboration } from '@/lib/collaboration/provider'
 
 export function ChatPanel() {
   const { phase, versions, followUps, toggleVersionStar, startBuild, resetWorkbench } =
     useWorksflow()
+  const { session, can, authorize } = useCollaboration()
   const { t } = useI18n()
   const [collapsed, setCollapsed] = useState(false)
 
@@ -98,8 +100,11 @@ export function ChatPanel() {
         {phase === 'planReady' && (
           <button
             type="button"
-            onClick={startBuild}
-            className="flex w-full items-center justify-center gap-2 rounded-lg bg-primary py-2.5 text-[13px] font-semibold text-primary-foreground hover:bg-primary-bright"
+            onClick={async () => {
+              if (session.signedIn && (await authorize('edit'))) startBuild()
+            }}
+            disabled={!session.signedIn || !can('edit')}
+            className="flex w-full items-center justify-center gap-2 rounded-lg bg-primary py-2.5 text-[13px] font-semibold text-primary-foreground hover:bg-primary-bright disabled:cursor-not-allowed disabled:opacity-50"
           >
             <Sparkles className="h-4 w-4" />
             {t('chat.implementPlan')}
@@ -107,7 +112,12 @@ export function ChatPanel() {
         )}
 
         {phase === 'planReady' && (
-          <VersionCard version={versions[0]} onToggleStar={toggleVersionStar} />
+          <VersionCard
+            version={versions[0]}
+            onToggleStar={(versionId) => {
+              void authorize('edit').then((allowed) => allowed && toggleVersionStar(versionId))
+            }}
+          />
         )}
 
         {(phase === 'building' || phase === 'complete' || phase === 'error') && (
@@ -121,13 +131,20 @@ export function ChatPanel() {
             <LinkedDocsCard />
             <div className="space-y-2">
               {versions.map((v) => (
-                <VersionCard key={v.id} version={v} onToggleStar={toggleVersionStar} />
+                <VersionCard
+                  key={v.id}
+                  version={v}
+                  onToggleStar={(versionId) => {
+                    void authorize('edit').then((allowed) => allowed && toggleVersionStar(versionId))
+                  }}
+                />
               ))}
             </div>
             <button
               type="button"
-              onClick={resetWorkbench}
-              className="flex w-full items-center justify-center gap-2 rounded-md border border-border py-2 text-[12px] font-medium text-muted-foreground hover:bg-white/5 hover:text-foreground"
+              onClick={() => void authorize('edit').then((allowed) => allowed && resetWorkbench())}
+              disabled={!session.signedIn || !can('edit')}
+              className="flex w-full items-center justify-center gap-2 rounded-md border border-border py-2 text-[12px] font-medium text-muted-foreground hover:bg-white/5 hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40"
             >
               <RotateCcw className="h-3.5 w-3.5" />
               {t('chat.replayDemo')}
@@ -188,7 +205,9 @@ function AssistantHeader() {
 }
 
 function PlanningState() {
+  const { workspace, generationEvents } = useWorksflow()
   const { t } = useI18n()
+  const latestLog = [...generationEvents].reverse().find((event) => event.type === 'log')
   return (
     <div className="space-y-3">
       <p className="text-[13px] leading-relaxed text-muted-foreground">
@@ -197,30 +216,48 @@ function PlanningState() {
       </p>
       <div className="flex items-center gap-2 rounded-md border border-border bg-card px-3 py-2 text-[12px] text-muted-foreground">
         <FileSearch className="h-4 w-4 text-primary-bright" />
-        <span className="font-mono">{t('chat.filesRead', { read: 0, total: 9 })}</span>
+        <span className="font-mono">
+          {t('chat.filesRead', { read: workspace.files.length, total: workspace.files.length })}
+        </span>
         <Loader2 className="ml-auto h-3.5 w-3.5 animate-spin text-primary-bright" />
       </div>
       <div className="flex items-center gap-2 text-[13px] font-medium text-primary-bright">
         <Loader2 className="h-4 w-4 animate-spin" />
         {t('chat.planning')}
       </div>
+      {latestLog?.type === 'log' && (
+        <p className="rounded-md bg-black/20 px-2.5 py-2 font-mono text-[10px] leading-relaxed text-faint-foreground">
+          {latestLog.message}
+        </p>
+      )}
     </div>
   )
 }
 
 function PlanBlock() {
+  const { generationPlan, workspace } = useWorksflow()
   const { t } = useI18n()
   return (
     <div className="space-y-3">
       <div className="flex items-center gap-2 rounded-md border border-border bg-card px-3 py-1.5 text-[11px] text-muted-foreground">
         <Check className="h-3.5 w-3.5 text-success" />
-        <span className="font-mono">{t('chat.filesRead', { read: 9, total: 9 })}</span>
+        <span className="font-mono">
+          {t('chat.filesRead', { read: workspace.files.length, total: workspace.files.length })}
+        </span>
       </div>
 
-      <h3 className="text-[15px] font-semibold text-foreground text-balance">{PLAN_TITLE}</h3>
+      <h3 className="text-[15px] font-semibold text-foreground text-balance">
+        {generationPlan?.title ?? PLAN_TITLE}
+      </h3>
 
       <ol className="space-y-3">
-        {PLAN_GROUPS.map((group, i) => (
+        {(generationPlan
+          ? generationPlan.tasks.map((task) => ({
+              title: task.title,
+              items: [task.description],
+            }))
+          : PLAN_GROUPS
+        ).map((group, i) => (
           <li key={group.title}>
             <div className="flex items-center gap-2">
               <span className="flex h-5 w-5 items-center justify-center rounded-full bg-white/5 text-[11px] font-semibold text-muted-foreground">
@@ -242,14 +279,37 @@ function PlanBlock() {
         ))}
       </ol>
 
-      <p className="text-[12px] leading-relaxed text-muted-foreground">{PLAN_SUMMARY}</p>
+      <p className="text-[12px] leading-relaxed text-muted-foreground">
+        {generationPlan?.summary ?? PLAN_SUMMARY}
+      </p>
       <ResponseActions />
     </div>
   )
 }
 
 function BuildBlock() {
-  const { phase, tasks } = useWorksflow()
+  const { session, can, authorize } = useCollaboration()
+  const {
+    phase,
+    tasks,
+    generationSummary,
+    generationPlan,
+    generationError,
+    generationErrorCode,
+    generationErrorStatus,
+    generationErrorRetryable,
+    generationErrorAction,
+    generationErrorRetryAfterSeconds,
+    generationEvents,
+    generationLifecycleEvents,
+    generationProvider,
+    generationModel,
+    generationUsage,
+    generationDurationMs,
+    generationCost,
+    generationLimits,
+    retryGeneration,
+  } = useWorksflow()
   const { t } = useI18n()
   return (
     <div className="space-y-3">
@@ -287,13 +347,101 @@ function BuildBlock() {
         <TaskChecklist tasks={tasks} />
       </div>
 
+      {(generationEvents.some((event) => event.type === 'log') || generationLifecycleEvents.length > 0) && (
+        <div className="max-h-28 space-y-1 overflow-y-auto rounded-md border border-border bg-black/20 p-2 font-mono text-[10px] text-faint-foreground scrollbar-thin">
+          {generationLifecycleEvents.slice(-2).map((event) => (
+            <div key={`lifecycle-${event.sequence}`}>
+              <span className="text-primary-bright">[lifecycle]</span>{' '}{event.status}
+            </div>
+          ))}
+          {generationEvents
+            .filter((event) => event.type === 'log')
+            .slice(-6)
+            .map((event) =>
+              event.type === 'log' ? (
+                <div key={event.sequence}>
+                  <span className="text-primary-bright">[{generationProvider ?? event.provider ?? 'run'}]</span>{' '}
+                  {event.message}
+                </div>
+              ) : null,
+            )}
+        </div>
+      )}
+
+      {(generationProvider || generationDurationMs > 0) && (
+        <div className="grid grid-cols-3 gap-1.5 sm:grid-cols-6">
+          {[
+            [t('chat.runProvider'), generationProvider ?? '—'],
+            [t('chat.runModel'), generationProvider === 'local' ? 'Local' : generationModel],
+            [
+              t('chat.runTokens'),
+              generationUsage
+                ? `${generationUsage.totalTokens.toLocaleString()}${generationUsage.estimated ? '~' : ''}`
+                : '—',
+            ],
+            [
+              t('chat.runDuration'),
+              generationDurationMs ? `${(generationDurationMs / 1000).toFixed(1)}s` : '—',
+            ],
+            [
+              t('chat.runCost'),
+              generationCost
+                ? `${generationCost.estimated ? '~' : ''}$${generationCost.amount.toFixed(4)}`
+                : t('chat.notConfigured'),
+            ],
+            [
+              t('chat.runLimit'),
+              generationLimits?.maxTotalTokens
+                ? generationLimits.maxTotalTokens.toLocaleString()
+                : t('chat.notConfigured'),
+            ],
+          ].map(([label, value]) => (
+            <div key={label} className="min-w-0 rounded-md border border-border bg-card px-2 py-1.5">
+              <div className="truncate text-[9px] uppercase tracking-wide text-faint-foreground">
+                {label}
+              </div>
+              <div className="mt-0.5 truncate text-[10px] font-medium text-muted-foreground">
+                {value}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {phase === 'error' && (
+        <div className="rounded-lg border border-red-500/30 bg-red-500/10 p-3">
+          <p className="text-[12px] leading-relaxed text-destructive">
+            {generationError ?? t('preview.errorCopy')}
+          </p>
+          <p className="mt-1 text-[10px] leading-relaxed text-muted-foreground">
+            {generationErrorAction ?? generationRecoveryHint(generationErrorCode, generationErrorStatus, t)}
+            {generationErrorRetryAfterSeconds !== undefined
+              ? ` Retry after about ${generationErrorRetryAfterSeconds} seconds.`
+              : ''}
+          </p>
+          {generationErrorRetryable && (
+            <button
+              type="button"
+              onClick={() => void authorize('edit').then((allowed) => allowed && retryGeneration())}
+              disabled={!session.signedIn || !can('edit')}
+              className="mt-2 inline-flex items-center gap-1.5 rounded-md border border-red-400/30 px-2.5 py-1.5 text-[11px] font-medium text-foreground hover:bg-white/5 disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              <RotateCcw className="h-3.5 w-3.5" />
+              {t('common.retry')}
+            </button>
+          )}
+        </div>
+      )}
+
       {phase === 'complete' && (
         <div className="space-y-3">
-          <p className="text-[13px] leading-relaxed text-foreground">{BUILD_SUMMARY}</p>
+          <p className="text-[13px] leading-relaxed text-foreground">
+            {generationSummary || BUILD_SUMMARY}
+          </p>
           <div>
             <p className="mb-1.5 text-[12px] font-medium text-foreground">{t('chat.whatWasBuilt')}</p>
             <ul className="space-y-1">
-              {WHAT_WAS_BUILT.map((item) => (
+              {(generationPlan?.tasks.map((task) => task.title) ?? WHAT_WAS_BUILT).map((item) => (
                 <li key={item} className="flex items-center gap-2 text-[12px] text-muted-foreground">
                   <Check className="h-3.5 w-3.5 text-success" />
                   {item}
@@ -309,4 +457,17 @@ function BuildBlock() {
       )}
     </div>
   )
+}
+
+function generationRecoveryHint(
+  code: string | null,
+  status: number | undefined,
+  t: ReturnType<typeof useI18n>['t'],
+) {
+  if (status === 429 || code?.includes('rate')) return t('chat.recovery.rateLimit')
+  if (code?.includes('context') || code?.includes('too_large')) return t('chat.recovery.contextLimit')
+  if (code?.includes('quota') || code?.includes('billing')) return t('chat.recovery.quota')
+  if (code?.includes('unreachable') || status === undefined) return t('chat.recovery.network')
+  if (status && status >= 500) return t('chat.recovery.provider')
+  return t('chat.recovery.adjust')
 }

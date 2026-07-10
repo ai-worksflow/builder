@@ -1,0 +1,201 @@
+name: worksflow-builder
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: worksflow
+      POSTGRES_USER: worksflow
+      POSTGRES_PASSWORD: worksflow
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U worksflow -d worksflow"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  redis:
+    image: redis:7.4-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  mongo:
+    image: mongo:7.0
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: root
+      MONGO_INITDB_ROOT_PASSWORD: worksflow
+      MONGO_INITDB_DATABASE: worksflow
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo-data:/data/db
+    healthcheck:
+      test: ["CMD-SHELL", "mongosh --quiet --username root --password worksflow --authenticationDatabase admin --eval 'quit(db.adminCommand({ ping: 1 }).ok ? 0 : 2)'"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  nats:
+    image: nats:2.10-alpine
+    command: ["--jetstream", "--store_dir=/data", "--http_port=8222"]
+    ports:
+      - "4222:4222"
+      - "8222:8222"
+    volumes:
+      - nats-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- 'http://localhost:8222/healthz?js-enabled-only=true' >/dev/null"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  storage-init:
+    image: alpine:3.20
+    command: ["sh", "-c", "chown -R 10001:10001 /var/lib/worksflow/quality /var/lib/worksflow/published"]
+    network_mode: none
+    volumes:
+      - quality-workspaces:/var/lib/worksflow/quality
+      - published-data:/var/lib/worksflow/published
+    restart: "no"
+
+  sandbox:
+    image: docker:27-dind
+    privileged: true
+    command: ["--host=tcp://0.0.0.0:2375", "--host=unix:///var/run/docker.sock"]
+    environment:
+      DOCKER_TLS_CERTDIR: ""
+    expose:
+      - "2375"
+    volumes:
+      - sandbox-data:/var/lib/docker
+      - quality-workspaces:/var/lib/worksflow/quality
+    networks:
+      - sandbox-net
+    healthcheck:
+      test: ["CMD", "docker", "-H", "tcp://127.0.0.1:2375", "info"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  sandbox-images:
+    image: docker:27-cli
+    environment:
+      DOCKER_HOST: tcp://sandbox:2375
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        docker pull node:22-alpine
+        docker pull golang:1.22-alpine
+    depends_on:
+      sandbox:
+        condition: service_healthy
+    networks:
+      - sandbox-net
+    restart: "no"
+
+  api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    environment:
+      APP_ENV: development
+      SERVICE_NAME: worksflow-api
+      LOG_LEVEL: info
+      LOG_FORMAT: json
+      HTTP_HOST: 0.0.0.0
+      HTTP_PORT: 8080
+      STARTUP_MIGRATE: "true"
+      STARTUP_ENSURE_MONGO_INDEXES: "true"
+      STARTUP_ENSURE_NATS_STREAM: "true"
+      OUTBOX_ENABLED: "true"
+      CORS_ALLOWED_ORIGINS: http://localhost:3000,http://127.0.0.1:3000
+      CORS_ALLOW_CREDENTIALS: "true"
+      POSTGRES_DSN: postgres://worksflow:worksflow@postgres:5432/worksflow?sslmode=disable
+      REDIS_ADDRESS: redis:6379
+      MONGO_URI: mongodb://root:worksflow@mongo:27017/?authSource=admin
+      MONGO_DATABASE: worksflow
+      NATS_URL: nats://nats:4222
+      WS_ALLOWED_ORIGINS: http://localhost:3000,http://127.0.0.1:3000
+      SESSION_COOKIE_SECURE: "false"
+      WS_ALLOW_ANONYMOUS: "false"
+      DELIVERY_SANDBOX_RUNTIME: docker
+      DELIVERY_SANDBOX_HOST: tcp://sandbox:2375
+      DELIVERY_SANDBOX_NODE_IMAGE: node:22-alpine
+      DELIVERY_SANDBOX_GO_IMAGE: golang:1.22-alpine
+      # Only dependency preparation uses this explicit network. Build, type,
+      # lint and test containers are always forced to network=none.
+      DELIVERY_RESOLVER_NETWORK: bridge
+      DELIVERY_RESOLVER_NPM_REGISTRY: https://registry.npmjs.org
+      DELIVERY_RESOLVER_GO_PROXY: https://proxy.golang.org
+      DELIVERY_RESOLVER_GO_SUMDB: sum.golang.org
+      DELIVERY_RESOLVER_TIMEOUT: 3m
+      DELIVERY_RESOLVER_OUTPUT_MAX_BYTES: "1048576"
+      DELIVERY_RESOLVER_MEMORY: 512m
+      DELIVERY_RESOLVER_CPUS: "1.0"
+      DELIVERY_RESOLVER_PIDS: "128"
+      DELIVERY_QUALITY_TEMP_ROOT: /var/lib/worksflow/quality
+      DELIVERY_PUBLISH_ROOT: /var/lib/worksflow/published
+      DELIVERY_PUBLISH_BASE_URL: http://localhost:8080/published
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_RESPONSES_URL: ${OPENAI_RESPONSES_URL:-https://api.openai.com/v1/responses}
+      AI_DEFAULT_MODEL: ${AI_DEFAULT_MODEL:-gpt-5}
+      OPENAI_ORGANIZATION: ${OPENAI_ORGANIZATION:-}
+      OPENAI_PROJECT: ${OPENAI_PROJECT:-}
+    ports:
+      - "8080:8080"
+    volumes:
+      - quality-workspaces:/var/lib/worksflow/quality
+      - published-data:/var/lib/worksflow/published
+    networks:
+      - default
+      - sandbox-net
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      mongo:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+      storage-init:
+        condition: service_completed_successfully
+      sandbox-images:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/health/ready"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    init: true
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
+  redis-data:
+  mongo-data:
+  nats-data:
+  sandbox-data:
+  quality-workspaces:
+  published-data:
+
+networks:
+  sandbox-net:

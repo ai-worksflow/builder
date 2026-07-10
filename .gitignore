@@ -37,3 +37,7 @@ frontend/playwright-report/
 # Codex / generated runtime clutter
 .vercel/
 frontend/.vercel/
+
+# Local Worksflow runtime data
+.worksflow-data/
+frontend/.worksflow-data/

@@ -1,10 +1,11 @@
 'use client'
 
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { useI18n } from '@/lib/i18n'
 import { useWorksflow } from '@/lib/worksflow/store'
 import { useLocalizedLabels } from './use-localized-labels'
 import { LanguageToggle } from './language-toggle'
+import { CollaborationCenter } from './collaboration-center'
 import {
   Bell,
   Database,
@@ -28,11 +29,14 @@ export function SettingsCenter() {
     setTeamView,
     linkedDocIds,
     documents,
+    productProject,
+    preferences,
+    updateUserPreferences,
   } = useWorksflow()
   const { t } = useI18n()
   const labels = useLocalizedLabels()
   const [draftName, setDraftName] = useState(projectName)
-  const [githubConnected, setGithubConnected] = useState(false)
+  useEffect(() => setDraftName(projectName), [projectName])
   const linkedDocs = linkedDocIds
     .map((id) => documents.find((doc) => doc.id === id))
     .filter(Boolean)
@@ -83,6 +87,8 @@ export function SettingsCenter() {
               </label>
             </div>
 
+            <CollaborationCenter />
+
             <div className="rounded-lg border border-border bg-panel p-4">
               <div className="mb-3 flex items-center gap-2 text-sm font-semibold text-foreground">
                 <Plug className="h-4 w-4 text-primary-bright" />
@@ -93,12 +99,16 @@ export function SettingsCenter() {
                   icon={GitBranch}
                   title={t('settings.github')}
                   description={
-                    githubConnected
+                    productProject.githubSettings.status === 'connected'
                       ? t('settings.githubConnected')
                       : t('settings.githubDisconnected')
                   }
-                  action={githubConnected ? t('common.connected') : t('common.connect')}
-                  onClick={() => setGithubConnected(true)}
+                  action={
+                    productProject.githubSettings.status === 'connected'
+                      ? t('common.connected')
+                      : t('settings.openWorkbench')
+                  }
+                  onClick={() => setSurface('workbench')}
                 />
                 <IntegrationCard
                   icon={Database}
@@ -157,19 +167,21 @@ export function SettingsCenter() {
                 <Bell className="h-4 w-4 text-primary-bright" />
                 {t('settings.notificationRules')}
               </div>
-              {[
-                [t('settings.notifyBlocking'), true],
-                [t('settings.notifyReviewers'), true],
-                [t('settings.requireApproval'), false],
-              ].map(([label, checked]) => (
-                <label
-                  key={String(label)}
-                  className="flex items-center justify-between rounded-md px-1 py-2 text-[12px] text-muted-foreground"
-                >
-                  {label}
-                  <input type="checkbox" defaultChecked={Boolean(checked)} />
-                </label>
-              ))}
+              <PreferenceToggle
+                label={t('settings.notifyBlocking')}
+                checked={preferences.notifyBlockingChanges}
+                onChange={(checked) => updateUserPreferences({ notifyBlockingChanges: checked })}
+              />
+              <PreferenceToggle
+                label={t('settings.notifyReviewers')}
+                checked={preferences.notifyReviewSync}
+                onChange={(checked) => updateUserPreferences({ notifyReviewSync: checked })}
+              />
+              <PreferenceToggle
+                label={t('settings.requireApproval')}
+                checked={preferences.requireApprovedContext}
+                onChange={(checked) => updateUserPreferences({ requireApprovedContext: checked })}
+              />
             </div>
 
             <div className="rounded-lg border border-border bg-panel p-4">
@@ -179,16 +191,49 @@ export function SettingsCenter() {
               </div>
               <div className="flex items-center justify-between rounded-md border border-border bg-card px-3 py-2 text-[12px] text-muted-foreground">
                 {t('settings.defaultRole')}
-                <span className="inline-flex items-center gap-1 text-foreground">
+                <label className="inline-flex items-center gap-1 text-foreground">
                   <KeyRound className="h-3.5 w-3.5 text-primary-bright" />
-                  {t('common.editor')}
-                </span>
+                  <select
+                    value={preferences.defaultProjectRole}
+                    onChange={(event) => {
+                      const defaultProjectRole = event.target.value as typeof preferences.defaultProjectRole
+                      updateUserPreferences({ defaultProjectRole })
+                    }}
+                    className="bg-transparent text-[12px] text-foreground outline-none"
+                    aria-label={t('settings.defaultRole')}
+                  >
+                    <option value="viewer">{t('common.viewer')}</option>
+                    <option value="commenter">{t('common.commenter')}</option>
+                    <option value="editor">{t('common.editor')}</option>
+                  </select>
+                </label>
               </div>
             </div>
           </aside>
         </div>
       </main>
     </div>
+  )
+}
+
+function PreferenceToggle({
+  label,
+  checked,
+  onChange,
+}: {
+  label: string
+  checked: boolean
+  onChange: (checked: boolean) => void
+}) {
+  return (
+    <label className="flex items-center justify-between rounded-md px-1 py-2 text-[12px] text-muted-foreground">
+      {label}
+      <input
+        type="checkbox"
+        checked={checked}
+        onChange={(event) => onChange(event.target.checked)}
+      />
+    </label>
   )
 }
 

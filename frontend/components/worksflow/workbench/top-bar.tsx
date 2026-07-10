@@ -10,6 +10,10 @@ import { useDropdown } from '../use-dropdown'
 import { LanguageToggle } from '../language-toggle'
 import { useLocalizedLabels } from '../use-localized-labels'
 import { StatusPill } from '../shared'
+import { downloadBlob } from '@/lib/delivery/client'
+import { findSensitiveArtifactIssue } from '@/lib/delivery/sensitive'
+import { GitHubPanel } from './github-panel'
+import { useCollaboration } from '@/lib/collaboration/provider'
 import {
   BarChart3,
   Blocks,
@@ -43,6 +47,12 @@ const VIEWS: { id: WorkbenchView; labelKey: MessageKey; icon: typeof Monitor }[]
 
 export function TopBar() {
   const {
+    session: collaborationSession,
+    can: canCollaborate,
+    authorize: authorizeCollaboration,
+    error: collaborationError,
+  } = useCollaboration()
+  const {
     view,
     setView,
     projectName,
@@ -50,18 +60,29 @@ export function TopBar() {
     setSurface,
     setComposerDraft,
     duplicateProject,
+    deleteProductProject,
     versions,
     linkedDocIds,
     documents,
     toggleLinkedDoc,
     setTeamView,
+    previewDocument,
+    blueprint,
+    deliveryStatus,
+    deliveryError,
+    deliveryLogs,
+    deployments,
+    publishedUrl,
+    exportWorkspace,
+    publishCurrentWorkspace,
+    refreshDeployments,
+    rollbackDeployment,
   } = useWorksflow()
   const { t } = useI18n()
   const labels = useLocalizedLabels()
   const projectMenu = useDropdown()
   const moreMenu = useDropdown()
   const [notice, setNotice] = useState<string | null>(null)
-  const [publishState, setPublishState] = useState<'idle' | 'publishing' | 'published'>('idle')
   const [panel, setPanel] = useState<
     | null
     | 'versions'
@@ -79,7 +100,12 @@ export function TopBar() {
     | 'linkedDocs'
   >(null)
   const [renameDraft, setRenameDraft] = useState(projectName)
-  const [githubConnected, setGithubConnected] = useState(false)
+  const [publishMessage, setPublishMessage] = useState('Publish from Worksflow')
+  const [publishEnvironment, setPublishEnvironment] = useState<'preview' | 'production'>('preview')
+  const [rollbackCandidate, setRollbackCandidate] = useState<{
+    deploymentId: string
+    versionId: string
+  } | null>(null)
   const linkedDocs = linkedDocIds
     .map((id) => documents.find((doc) => doc.id === id))
     .filter((doc): doc is (typeof documents)[number] => Boolean(doc))
@@ -88,6 +114,51 @@ export function TopBar() {
   function showNotice(message: string) {
     setNotice(message)
     window.setTimeout(() => setNotice(null), 2400)
+  }
+
+  async function handleExport(key: string) {
+    if (!(await authorizeCollaboration('view'))) return
+    if (key === 'sourceZip') {
+      const ok = await exportWorkspace()
+      if (ok) showNotice(t('workbench.notice.exportPrepared', { item: t('workbench.export.sourceZip') }))
+      return
+    }
+    if (key === 'documentBundle') {
+      const markdown = linkedDocs.length > 0
+        ? linkedDocs
+            .map((document) => [
+              `# ${document.title}`,
+              '',
+              document.summary,
+              '',
+              ...document.sections.flatMap((section) => [`## ${section.title}`, '', section.body, '']),
+            ].join('\n'))
+            .join('\n---\n\n')
+        : `# ${projectName}\n\nNo linked team documents were selected.`
+      const issue = findSensitiveArtifactIssue(markdown)
+      if (issue) {
+        showNotice(`Export blocked: ${issue.message}`)
+        return
+      }
+      downloadText(markdown, `${projectSlug(projectName)}-documents.md`, 'text/markdown;charset=utf-8')
+    } else if (key === 'previewSnapshot') {
+      const issue = findSensitiveArtifactIssue(previewDocument.html)
+      if (issue) {
+        showNotice(`Export blocked: ${issue.message}`)
+        return
+      }
+      downloadText(previewDocument.html, `${projectSlug(projectName)}-preview.html`, 'text/html;charset=utf-8')
+    } else if (key === 'blueprintJson') {
+      const serialized = JSON.stringify(blueprint, null, 2)
+      const issue = findSensitiveArtifactIssue(serialized)
+      if (issue) {
+        showNotice(`Export blocked: ${issue.message}`)
+        return
+      }
+      downloadText(serialized, `${projectSlug(projectName)}-blueprint.json`, 'application/json;charset=utf-8')
+    }
+    const option = EXPORT_OPTIONS.find((item) => item.key === key)
+    if (option) showNotice(t('workbench.notice.exportPrepared', { item: t(option.labelKey) }))
   }
 
   return (
@@ -130,8 +201,11 @@ export function TopBar() {
               <MenuItem
                 icon={Pencil}
                 onClick={() => {
-                  setRenameDraft(projectName)
-                  setPanel('rename')
+                  void authorizeCollaboration('admin').then((allowed) => {
+                    if (!allowed) return
+                    setRenameDraft(projectName)
+                    setPanel('rename')
+                  })
                 }}
               >
                 {t('workbench.menu.rename')}
@@ -139,8 +213,11 @@ export function TopBar() {
               <MenuItem
                 icon={Copy}
                 onClick={() => {
-                  duplicateProject()
-                  showNotice(t('workbench.notice.projectDuplicated'))
+                  void authorizeCollaboration('admin').then((allowed) => {
+                    if (!allowed) return
+                    duplicateProject()
+                    showNotice(t('workbench.notice.projectDuplicated'))
+                  })
                 }}
               >
                 {t('workbench.menu.duplicate')}
@@ -152,7 +229,11 @@ export function TopBar() {
                 {t('workbench.menu.export')}
               </MenuItem>
               <MenuDivider />
-              <MenuItem icon={Trash2} danger onClick={() => setPanel('delete')}>
+              <MenuItem icon={Trash2} danger onClick={() => {
+                void authorizeCollaboration('admin').then((allowed) => {
+                  if (allowed) setPanel('delete')
+                })
+              }}>
                 {t('workbench.menu.delete')}
               </MenuItem>
             </Menu>
@@ -244,19 +325,18 @@ export function TopBar() {
         <button
           type="button"
           onClick={() => {
-            setPublishState('publishing')
-            window.setTimeout(() => {
-              setPublishState('published')
-              setPanel('publish')
-            }, 900)
+            setRollbackCandidate(null)
+            setPanel('publish')
+            void refreshDeployments()
           }}
+          disabled={deliveryStatus === 'publishing' || deliveryStatus === 'rollingBack'}
           className="flex h-8 items-center gap-1.5 rounded-md bg-primary px-3 text-[13px] font-semibold text-primary-foreground hover:bg-primary-bright max-sm:w-8 max-sm:px-0 max-sm:justify-center"
         >
           <Rocket className="h-4 w-4 shrink-0" />
           <span className="max-sm:hidden">
-            {publishState === 'publishing'
+            {deliveryStatus === 'publishing'
               ? t('workbench.publishing')
-              : publishState === 'published'
+              : publishedUrl
                 ? t('workbench.published')
                 : t('workbench.publish')}
           </span>
@@ -270,14 +350,18 @@ export function TopBar() {
       {panel && (
         <TopBarPanel
           title={panelTitle(panel, t)}
+          wide={panel === 'connect'}
           onClose={() => setPanel(null)}
           footer={
             panel === 'rename' ? (
               <button
                 type="button"
                 onClick={() => {
-                  setProjectName(renameDraft.trim() || projectName)
-                  setPanel(null)
+                  void authorizeCollaboration('admin').then((allowed) => {
+                    if (!allowed) return
+                    setProjectName(renameDraft.trim() || projectName)
+                    setPanel(null)
+                  })
                 }}
                 className="rounded-md bg-primary px-3 py-1.5 text-[12px] font-semibold text-primary-foreground hover:bg-primary-bright"
               >
@@ -287,24 +371,62 @@ export function TopBar() {
               <button
                 type="button"
                 onClick={() => {
-                  showNotice(t('workbench.notice.deleteConfirmed'))
-                  setPanel(null)
+                  void authorizeCollaboration('admin').then((allowed) => {
+                    if (!allowed) return
+                    deleteProductProject()
+                    setPanel(null)
+                  })
                 }}
                 className="rounded-md bg-destructive px-3 py-1.5 text-[12px] font-semibold text-destructive-foreground hover:opacity-90"
               >
                 {t('workbench.panel.confirmDelete')}
               </button>
-            ) : panel === 'connect' ? (
-              <button
-                type="button"
-                onClick={() => {
-                  setGithubConnected(true)
-                  setPanel(null)
-                }}
-                className="rounded-md bg-primary px-3 py-1.5 text-[12px] font-semibold text-primary-foreground hover:bg-primary-bright"
-              >
-                {t('workbench.panel.connectGithub')}
-              </button>
+            ) : panel === 'publish' ? (
+              !collaborationSession.signedIn ? (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setPanel(null)
+                    setSurface('settings')
+                  }}
+                  className="rounded-md bg-primary px-3 py-1.5 text-[12px] font-semibold text-primary-foreground"
+                >
+                  {t('workbench.publish.signIn')}
+                </button>
+              ) : rollbackCandidate ? (
+                <button
+                  type="button"
+                  disabled={deliveryStatus === 'rollingBack'}
+                  onClick={async () => {
+                    if (!(await authorizeCollaboration('publish'))) return
+                    const completed = await rollbackDeployment(
+                      rollbackCandidate.deploymentId,
+                      rollbackCandidate.versionId,
+                    )
+                    if (completed) setRollbackCandidate(null)
+                  }}
+                  className="rounded-md bg-destructive px-3 py-1.5 text-[12px] font-semibold text-destructive-foreground hover:opacity-90 disabled:opacity-60"
+                >
+                  {deliveryStatus === 'rollingBack'
+                    ? t('workbench.publish.rollingBack')
+                    : t('workbench.publish.confirmRollback')}
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  onClick={async () => {
+                    if (await authorizeCollaboration('publish')) {
+                      await publishCurrentWorkspace(publishMessage, publishEnvironment)
+                    }
+                  }}
+                  disabled={deliveryStatus === 'publishing' || !canCollaborate('publish')}
+                  className="rounded-md bg-primary px-3 py-1.5 text-[12px] font-semibold text-primary-foreground hover:bg-primary-bright disabled:opacity-60"
+                >
+                  {deliveryStatus === 'publishing'
+                    ? t('workbench.publishing')
+                    : t('workbench.publish.confirmPublish')}
+                </button>
+              )
             ) : (
               <button
                 type="button"
@@ -355,8 +477,9 @@ export function TopBar() {
                       />
                       <button
                         type="button"
-                        onClick={() => toggleLinkedDoc(doc.id)}
-                        className="rounded px-1.5 py-0.5 text-[10px] text-faint-foreground hover:bg-white/5 hover:text-foreground"
+                        onClick={() => void authorizeCollaboration('edit').then((allowed) => allowed && toggleLinkedDoc(doc.id))}
+                        disabled={!collaborationSession.signedIn || !canCollaborate('edit')}
+                        className="rounded px-1.5 py-0.5 text-[10px] text-faint-foreground hover:bg-white/5 hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40"
                       >
                         {t('common.remove')}
                       </button>
@@ -374,8 +497,9 @@ export function TopBar() {
                       <button
                         key={doc.id}
                         type="button"
-                        onClick={() => toggleLinkedDoc(doc.id)}
-                        className="flex w-full items-center justify-between gap-2 rounded-md px-2 py-1.5 text-left hover:bg-white/5"
+                        onClick={() => void authorizeCollaboration('edit').then((allowed) => allowed && toggleLinkedDoc(doc.id))}
+                        disabled={!collaborationSession.signedIn || !canCollaborate('edit')}
+                        className="flex w-full items-center justify-between gap-2 rounded-md px-2 py-1.5 text-left hover:bg-white/5 disabled:cursor-not-allowed disabled:opacity-40"
                       >
                         <span className="min-w-0 truncate text-[12px] text-muted-foreground">
                           {doc.title}
@@ -425,19 +549,21 @@ export function TopBar() {
             />
           )}
           {panel === 'export' && (
-            <div className="grid grid-cols-2 gap-2">
+            <div className="space-y-3">
+              <div className="grid grid-cols-2 gap-2">
               {EXPORT_OPTIONS.map((item) => (
                 <button
                   key={item.key}
                   type="button"
-                  onClick={() =>
-                    showNotice(t('workbench.notice.exportPrepared', { item: t(item.labelKey) }))
-                  }
+                  onClick={() => void handleExport(item.key)}
+                  disabled={deliveryStatus === 'exporting'}
                   className="rounded-md border border-border bg-card px-3 py-2 text-left text-[12px] text-muted-foreground hover:border-primary/40 hover:text-foreground"
                 >
                   {t(item.labelKey)}
                 </button>
               ))}
+              </div>
+              {deliveryError && <p role="alert" className="text-[11px] text-destructive">{deliveryError}</p>}
             </div>
           )}
           {panel === 'delete' && (
@@ -446,11 +572,13 @@ export function TopBar() {
             </p>
           )}
           {panel === 'connect' && (
-            <div className="rounded-md border border-border bg-card px-3 py-2 text-[12px] text-muted-foreground">
-              {githubConnected
-                ? t('workbench.panel.githubConnected')
-                : t('workbench.panel.githubConnectCopy')}
-            </div>
+            collaborationSession.signedIn ? (
+              <GitHubPanel />
+            ) : (
+              <div className="rounded-md border border-warning/30 bg-warning/10 px-3 py-3 text-[11px] leading-relaxed text-warning">
+                {t('workbench.github.signInRequired')}
+              </div>
+            )
           )}
           {panel === 'share' && (
             <div className="space-y-3">
@@ -475,13 +603,86 @@ export function TopBar() {
             </div>
           )}
           {panel === 'publish' && (
-            <div className="space-y-2">
-              <div className="rounded-md border border-emerald-400/30 bg-emerald-400/10 px-3 py-2 text-[12px] text-success">
-                {t('workbench.panel.publishedUrlReady')}
+            <div className="space-y-3">
+              <div className="rounded-md border border-warning/30 bg-warning/10 px-3 py-2 text-[11px] leading-relaxed text-warning">
+                {t('workbench.publish.confirmationCopy')}
               </div>
-              <div className="rounded-md border border-border bg-card px-3 py-2 text-[12px] text-muted-foreground">
-                {t('workbench.panel.contextLocked', { count: linkedDocIds.length })}
-              </div>
+              {collaborationSession.signedIn && !canCollaborate('publish') && (
+                <div className="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-[11px] text-destructive">
+                  {t('workbench.publish.permissionDenied')}
+                </div>
+              )}
+              <label className="block text-[11px] text-muted-foreground">
+                {t('workbench.publish.message')}
+                <input
+                  value={publishMessage}
+                  onChange={(event) => setPublishMessage(event.target.value)}
+                  maxLength={500}
+                  className="mt-1.5 h-9 w-full rounded-md border border-border bg-background px-2.5 text-[12px] text-foreground outline-none focus:border-primary/60"
+                />
+              </label>
+              <label className="block text-[11px] text-muted-foreground">
+                Environment
+                <select
+                  value={publishEnvironment}
+                  onChange={(event) => setPublishEnvironment(event.target.value as 'preview' | 'production')}
+                  className="mt-1.5 h-9 w-full rounded-md border border-border bg-background px-2.5 text-[12px] text-foreground outline-none focus:border-primary/60"
+                >
+                  <option value="preview">Preview</option>
+                  <option value="production">Production</option>
+                </select>
+                <span className="mt-1 block text-[10px] text-faint-foreground">
+                  Plain variables in this scope are embedded as window.__WORKSFLOW_ENV__. Secrets remain server-only.
+                </span>
+              </label>
+              {publishedUrl && (
+                <a
+                  href={publishedUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="block truncate rounded-md border border-success/30 bg-success/10 px-3 py-2 font-mono text-[11px] text-success hover:underline"
+                >
+                  {publishedUrl}
+                </a>
+              )}
+              {rollbackCandidate && (
+                <div className="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-[11px] text-destructive">
+                  {t('workbench.publish.rollbackCopy', { version: rollbackCandidate.versionId })}
+                </div>
+              )}
+              {deployments.flatMap((deployment) =>
+                deployment.versions
+                  .slice()
+                  .reverse()
+                  .map((version) => (
+                    <div key={version.id} className="flex items-center gap-2 rounded-md border border-border bg-card px-3 py-2">
+                      <span className="min-w-0 flex-1">
+                        <span className="block text-[11px] font-medium text-foreground">
+                          v{version.number} · {version.action}
+                        </span>
+                        <span className="block truncate text-[10px] text-faint-foreground">
+                          {new Date(version.createdAt).toLocaleString()} · {version.environment ?? 'preview'} · {version.environmentVariableNames?.length ?? 0} public vars · {version.checksum.slice(0, 12)}
+                        </span>
+                      </span>
+                      {version.id !== deployment.activeVersionId && (
+                        <button
+                          type="button"
+                          onClick={() => setRollbackCandidate({ deploymentId: deployment.deploymentId, versionId: version.id })}
+                          className="rounded-md border border-border px-2 py-1 text-[10px] text-muted-foreground hover:bg-white/5 hover:text-foreground"
+                        >
+                          {t('workbench.publish.rollback')}
+                        </button>
+                      )}
+                    </div>
+                  )),
+              )}
+              {deliveryLogs.length > 0 && (
+                <div className="max-h-24 overflow-y-auto rounded-md border border-border bg-background px-3 py-2 font-mono text-[10px] leading-relaxed text-faint-foreground scrollbar-thin">
+                  {deliveryLogs.slice(-6).map((line, index) => <div key={`${index}-${line}`}>{line}</div>)}
+                </div>
+              )}
+              {deliveryError && <p role="alert" className="text-[11px] text-destructive">{deliveryError}</p>}
+              {collaborationError && <p role="alert" className="text-[11px] text-destructive">{collaborationError}</p>}
             </div>
           )}
           {panel === 'analytics' && (
@@ -579,16 +780,18 @@ function TopBarPanel({
   children,
   footer,
   onClose,
+  wide = false,
 }: {
   title: string
   children: React.ReactNode
   footer: React.ReactNode
   onClose: () => void
+  wide?: boolean
 }) {
   const { t } = useI18n()
 
   return (
-    <div className="absolute right-3 top-[calc(100%+4px)] z-50 w-[360px] rounded-lg border border-border bg-popover shadow-2xl shadow-black/50 max-md:left-3 max-md:w-auto">
+    <div className={cn('absolute right-3 top-[calc(100%+4px)] z-50 rounded-lg border border-border bg-popover shadow-2xl shadow-black/50 max-md:left-3 max-md:w-auto', wide ? 'w-[620px]' : 'w-[360px]')}>
       <div className="flex items-center justify-between border-b border-border px-4 py-3">
         <h3 className="text-sm font-semibold text-foreground">{title}</h3>
         <button
@@ -600,7 +803,7 @@ function TopBarPanel({
           <X className="h-4 w-4" />
         </button>
       </div>
-      <div className="max-h-[360px] overflow-y-auto scrollbar-thin p-4">{children}</div>
+      <div className="max-h-[560px] overflow-y-auto scrollbar-thin p-4">{children}</div>
       <div className="flex justify-end border-t border-border px-4 py-3">{footer}</div>
     </div>
   )
@@ -612,6 +815,18 @@ const EXPORT_OPTIONS: { key: string; labelKey: MessageKey }[] = [
   { key: 'previewSnapshot', labelKey: 'workbench.export.previewSnapshot' },
   { key: 'blueprintJson', labelKey: 'workbench.export.blueprintJson' },
 ]
+
+function projectSlug(value: string) {
+  return value
+    .normalize('NFKD')
+    .replace(/[^a-zA-Z0-9_-]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 80) || 'worksflow-project'
+}
+
+function downloadText(content: string, filename: string, type: string) {
+  downloadBlob(new Blob([content], { type }), filename)
+}
 
 function IconButton({
   children,

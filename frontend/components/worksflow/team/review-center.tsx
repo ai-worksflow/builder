@@ -1,236 +1,109 @@
 'use client'
 
-import { useState } from 'react'
-import { useI18n, type MessageKey } from '@/lib/i18n'
-import { cn } from '@/lib/utils'
+import { useMemo, useState, type FormEvent } from 'react'
+import { useCollaboration } from '@/lib/collaboration/provider'
 import { useWorksflow } from '@/lib/worksflow/store'
-import { DOC_STATUS_CLASS } from '@/lib/worksflow/labels'
-import { useLocalizedLabels } from '../use-localized-labels'
-import { Avatar, StatusPill, memberById } from '../shared'
-import { Check, MessageSquare, RefreshCw, X } from 'lucide-react'
+import { cn } from '@/lib/utils'
+import { Check, Loader2, MessageSquare, RefreshCw, X } from 'lucide-react'
 
-const FILTERS = [
-  { id: 'all', labelKey: 'reviews.filter.all' },
-  { id: 'assigned', labelKey: 'reviews.filter.assigned' },
-  { id: 'review', labelKey: 'reviews.filter.review' },
-  { id: 'blocked', labelKey: 'reviews.filter.blocked' },
-  { id: 'needsSync', labelKey: 'reviews.filter.needsSync' },
-  { id: 'approved', labelKey: 'reviews.filter.approved' },
-] as const
-
-type FilterId = (typeof FILTERS)[number]['id']
+type ReviewFilter = 'all' | 'pending' | 'approved' | 'changesRequested'
 
 export function ReviewCenter() {
-  const { t } = useI18n()
-  const labels = useLocalizedLabels()
-  const { documents, updateDocumentStatus } = useWorksflow()
-  const [filter, setFilter] = useState<FilterId>('all')
-  const [selectedId, setSelectedId] = useState('d3')
-  const selected = documents.find((doc) => doc.id === selectedId) ?? documents[0]
+  const {
+    loading,
+    session,
+    project,
+    members,
+    reviews,
+    reviewTargets,
+    error,
+    can,
+    refresh,
+    requestReview,
+    decideReview,
+  } = useCollaboration()
+  const { setSurface } = useWorksflow()
+  const [filter, setFilter] = useState<ReviewFilter>('all')
+  const [targetRevisionId, setTargetRevisionId] = useState('')
+  const [reviewerId, setReviewerId] = useState('')
+  const [summary, setSummary] = useState('')
+  const target = reviewTargets.find((item) => item.revisionId === targetRevisionId) ?? reviewTargets[0]
+  const visibleReviews = useMemo(
+    () => reviews.filter((review) => filter === 'all' || review.state === filter),
+    [filter, reviews],
+  )
 
-  const docs = documents.filter((d) => {
-    if (filter === 'all') return true
-    if (filter === 'assigned') return d.members.some((m) => m.userId === 'm1')
-    if (filter === 'review') return d.status === 'readyForReview'
-    if (filter === 'blocked') return d.blocking > 0
-    if (filter === 'needsSync') return d.status === 'needsSync'
-    if (filter === 'approved') return d.status === 'approved'
-    return true
-  })
+  async function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    if (!target || !reviewerId || !summary.trim()) return
+    if (await requestReview(summary.trim(), target, [reviewerId])) setSummary('')
+  }
 
-  if (!selected) {
-    return (
-      <div className="flex h-full items-center justify-center bg-canvas p-6 text-center">
-        <div className="max-w-md rounded-lg border border-dashed border-border bg-panel p-5">
-          <MessageSquare className="mx-auto size-8 text-primary-bright" />
-          <h1 className="mt-3 text-base font-semibold text-foreground">{t('graph.emptyTitle')}</h1>
-          <p className="mt-2 text-sm text-muted-foreground">{t('graph.emptyBody')}</p>
-        </div>
-      </div>
-    )
+  if (!session.signedIn) {
+    return <ReviewEmpty title="Sign in to review shared versions" detail="Reviews are stored on the platform backend and are always bound to an immutable artifact revision." action="Open sign in" onAction={() => setSurface('settings')} />
+  }
+  if (!project) {
+    return <ReviewEmpty title="Select a shared project" detail={error ?? 'No project is selected.'} action="Retry" onAction={() => void refresh()} />
   }
 
   return (
-    <div className="flex h-full flex-col">
-      <div className="flex items-center justify-between border-b border-border px-6 py-4 max-sm:px-4">
-        <div>
-          <h1 className="text-lg font-semibold text-foreground">{t('reviews.title')}</h1>
-          <p className="text-[12px] text-muted-foreground">
-            {t('reviews.description')}
-          </p>
-        </div>
+    <div className="flex h-full flex-col bg-canvas">
+      <header className="flex flex-wrap items-start gap-3 border-b border-border bg-panel px-6 py-4 max-sm:px-4">
+        <span className="min-w-0 flex-1"><h1 className="text-lg font-semibold text-foreground">Version reviews</h1><p className="mt-1 text-[12px] text-muted-foreground">{project.name} · reviews target exact revision IDs and content hashes</p></span>
+        <button type="button" onClick={() => void refresh()} disabled={loading} className="rounded-md border border-border p-2 text-muted-foreground disabled:opacity-50" aria-label="Refresh reviews"><RefreshCw className={cn('size-4', loading && 'animate-spin')} /></button>
+      </header>
+
+      {error && <p role="alert" className="border-b border-destructive/20 bg-destructive/10 px-6 py-2 text-[11px] text-destructive">{error}</p>}
+
+      <div className="flex gap-1.5 overflow-x-auto border-b border-border bg-panel px-6 py-2.5 scrollbar-thin max-sm:px-4">
+        {(['all', 'pending', 'approved', 'changesRequested'] as ReviewFilter[]).map((item) => <button key={item} type="button" onClick={() => setFilter(item)} className={cn('rounded-md px-2.5 py-1 text-[11px] font-medium', filter === item ? 'bg-primary/15 text-primary-bright' : 'text-muted-foreground hover:bg-white/5')}>{item}</button>)}
       </div>
 
-      {/* Filters */}
-      <div className="flex items-center gap-1.5 overflow-x-auto border-b border-border px-6 py-2.5 scrollbar-thin max-sm:px-4">
-        {FILTERS.map((f) => (
-          <button
-            key={f.id}
-            type="button"
-            onClick={() => setFilter(f.id)}
-            className={cn(
-              'shrink-0 rounded-md px-2.5 py-1 text-[12px] font-medium transition-colors',
-              filter === f.id
-                ? 'bg-primary/15 text-primary-bright'
-                : 'text-muted-foreground hover:bg-white/5 hover:text-foreground',
-            )}
-          >
-            {t(f.labelKey as MessageKey)}
-          </button>
-        ))}
-      </div>
-
-      <div className="flex min-h-0 flex-1 max-lg:flex-col">
-        {/* List */}
-        <div className="flex w-1/2 flex-col overflow-auto scrollbar-thin border-r border-border max-lg:max-h-[360px] max-lg:w-full max-lg:border-b max-lg:border-r-0">
-          <table className="min-w-[620px] w-full text-left text-[12px]">
-            <thead className="sticky top-0 bg-panel text-faint-foreground">
-              <tr className="border-b border-border">
-                <th className="px-4 py-2 font-medium">{t('common.document')}</th>
-                <th className="px-2 py-2 font-medium">{t('common.status')}</th>
-                <th className="px-2 py-2 font-medium">{t('common.owner')}</th>
-                <th className="px-2 py-2 font-medium">{t('reviews.reviewer')}</th>
-              </tr>
-            </thead>
-            <tbody>
-              {docs.map((doc) => {
-                const reviewer = doc.members.find((m) => m.role === 'reviewer')
-                return (
-                  <tr
-                    key={doc.id}
-                    onClick={() => setSelectedId(doc.id)}
-                    className={cn(
-                      'cursor-pointer border-b border-border transition-colors',
-                      selected.id === doc.id ? 'bg-primary/10' : 'hover:bg-white/5',
-                    )}
-                  >
-                    <td className="px-4 py-3">
-                      <p className="font-medium text-foreground">{doc.title}</p>
-                      <p className="text-[11px] text-faint-foreground">
-                        {labels.docType(doc.type)} · {doc.updatedAt}
-                      </p>
-                    </td>
-                    <td className="px-2 py-3">
-                      <StatusPill
-                        label={labels.docStatus(doc.status)}
-                        className={DOC_STATUS_CLASS[doc.status]}
-                      />
-                    </td>
-                    <td className="px-2 py-3">
-                      <Avatar member={memberById(doc.ownerId)!} size={22} />
-                    </td>
-                    <td className="px-2 py-3">
-                      {reviewer ? (
-                        <Avatar member={memberById(reviewer.userId)!} size={22} />
-                      ) : (
-                        <span className="text-faint-foreground">—</span>
-                      )}
-                    </td>
-                  </tr>
-                )
-              })}
-            </tbody>
-          </table>
-        </div>
-
-        {/* Detail */}
-        <div className="flex w-1/2 flex-col overflow-y-auto scrollbar-thin p-5 max-lg:w-full max-sm:p-4">
-          <div className="mb-1 flex items-center gap-2">
-            <h2 className="text-[15px] font-semibold text-foreground">{selected.title}</h2>
-            <StatusPill
-              label={labels.docStatus(selected.status)}
-              className={DOC_STATUS_CLASS[selected.status]}
-            />
+      <div className="grid min-h-0 flex-1 lg:grid-cols-[minmax(0,1fr)_380px]">
+        <main className="overflow-y-auto p-5 scrollbar-thin max-sm:p-4">
+          {visibleReviews.length === 0 && <p className="rounded-lg border border-dashed border-border bg-panel p-8 text-center text-sm text-faint-foreground">No reviews match this filter.</p>}
+          <div className="space-y-3">
+            {visibleReviews.map((review) => (
+              <article key={review.id} className="rounded-lg border border-border bg-panel p-4">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className={cn('inline-flex items-center gap-1 rounded px-2 py-1 text-[10px] font-medium', review.state === 'approved' ? 'bg-success/10 text-success' : review.state === 'changesRequested' ? 'bg-warning/10 text-warning' : 'bg-primary/10 text-primary-bright')}>{review.state === 'approved' ? <Check className="size-3" /> : review.state === 'changesRequested' ? <X className="size-3" /> : <MessageSquare className="size-3" />}{review.state ?? 'pending'}</span>
+                  <span className="text-[11px] font-medium text-foreground">{review.reviewer.name}</span>
+                  <span className="ml-auto text-[10px] text-faint-foreground">{new Date(review.createdAt).toLocaleString()}</span>
+                </div>
+                <p className="mt-3 text-sm leading-relaxed text-muted-foreground">{review.summary}</p>
+                <div className="mt-3 rounded-md border border-border bg-background px-3 py-2 font-mono text-[10px] text-faint-foreground">{review.target ? `${review.target.title ?? review.target.artifactId} · revision ${review.target.revisionNumber} · ${review.target.contentHash.slice(0, 12)}` : 'Legacy review without a version target'}</div>
+                {review.state === 'pending' && can('edit') && review.requiredReviewerIds?.includes(session.user.id) && (
+                  <div className="mt-3 flex gap-2">
+                    <button type="button" onClick={() => void decideReview(review.id, 'approve', 'Approved after reviewing this exact revision.')} className="rounded-md bg-success px-2.5 py-1.5 text-[10px] font-semibold text-success-foreground">Approve</button>
+                    <button type="button" onClick={() => { const reason = window.prompt('Describe the required changes')?.trim(); if (reason) void decideReview(review.id, 'request_changes', reason) }} className="rounded-md border border-border px-2.5 py-1.5 text-[10px] text-muted-foreground">Request changes</button>
+                  </div>
+                )}
+              </article>
+            ))}
           </div>
-          <p className="text-[12px] text-muted-foreground">{selected.summary}</p>
+        </main>
 
-          <div className="mt-4 rounded-lg border border-border bg-panel p-3">
-            <p className="mb-1 text-[12px] font-medium text-foreground">{t('reviews.changeSummary')}</p>
-            <p className="text-[12px] leading-relaxed text-muted-foreground">
-              {t('reviews.changeSummaryCopy')}
-            </p>
-          </div>
-
-          {selected.blocking > 0 && (
-            <div className="mt-3 flex items-center gap-2 rounded-lg border border-amber-400/30 bg-amber-400/10 px-3 py-2 text-[12px] text-warning">
-              <RefreshCw className="h-3.5 w-3.5" />
-              {t('reviews.blocksCount', { count: selected.blocking })}
-            </div>
+        <aside className="overflow-y-auto border-l border-border bg-panel p-5 scrollbar-thin max-lg:border-l-0 max-lg:border-t">
+          <h2 className="text-sm font-semibold text-foreground">Submit review</h2>
+          <p className="mt-1 text-[11px] leading-relaxed text-faint-foreground">Only server revisions listed below can be reviewed. A local unsaved document is never a review target.</p>
+          {!can('edit') ? (
+            <p className="mt-4 rounded-md border border-border bg-background p-3 text-[11px] text-muted-foreground">Your {project.role} role cannot submit reviews.</p>
+          ) : reviewTargets.length === 0 ? (
+            <p className="mt-4 rounded-md border border-dashed border-border p-4 text-[11px] text-faint-foreground">No versioned artifacts are available yet.</p>
+          ) : (
+            <form onSubmit={submit} className="mt-4 space-y-3">
+              <label className="block text-[11px] text-muted-foreground">Artifact revision<select value={target?.revisionId ?? ''} onChange={(event) => setTargetRevisionId(event.target.value)} className="mt-1.5 h-9 w-full rounded-md border border-border bg-background px-2 text-[11px] text-foreground">{reviewTargets.map((item) => <option key={item.revisionId} value={item.revisionId}>{item.title ?? item.artifactId} · r{item.revisionNumber}</option>)}</select></label>
+              <label className="block text-[11px] text-muted-foreground">Required reviewer<select value={reviewerId} onChange={(event) => setReviewerId(event.target.value)} className="mt-1.5 h-9 w-full rounded-md border border-border bg-background px-2 text-[11px] text-foreground"><option value="">Select reviewer</option>{members.filter((member) => member.user.id !== session.user.id && ['owner', 'admin', 'editor'].includes(member.role)).map((member) => <option key={member.user.id} value={member.user.id}>{member.user.name} · {member.role}</option>)}</select></label>
+              <label className="block text-[11px] text-muted-foreground">Summary<textarea value={summary} onChange={(event) => setSummary(event.target.value)} rows={6} maxLength={4000} className="mt-1.5 w-full rounded-md border border-border bg-background p-2 text-sm text-foreground" /></label>
+              <button type="submit" disabled={loading || !summary.trim() || !target || !reviewerId} className="inline-flex w-full items-center justify-center gap-1.5 rounded-md bg-primary px-3 py-2 text-[11px] font-semibold text-primary-foreground disabled:opacity-50">{loading && <Loader2 className="size-3.5 animate-spin" />}Request version review</button>
+            </form>
           )}
-
-          {/* Comment thread */}
-          <div className="mt-4">
-            <p className="mb-2 flex items-center gap-1.5 text-[12px] font-medium text-foreground">
-              <MessageSquare className="h-3.5 w-3.5 text-muted-foreground" />
-              {t('reviews.commentThread')}
-            </p>
-            <div className="space-y-3">
-              <Comment
-                memberId="m6"
-                text="边界条件写得清楚，但批量操作上限需要和后端确认性能影响。"
-                time="20m ago"
-              />
-              <Comment
-                memberId="m2"
-                text="已同步 Emma，API 契约会加上 batch 限制的错误码。"
-                time="12m ago"
-              />
-            </div>
-          </div>
-
-          {/* Actions */}
-          <div className="mt-auto flex flex-wrap gap-2 pt-5">
-            <button
-              type="button"
-              onClick={() => updateDocumentStatus(selected.id, 'approved')}
-              className="flex items-center gap-1.5 rounded-md bg-success px-3 py-2 text-[12px] font-semibold text-success-foreground hover:opacity-90"
-            >
-              <Check className="h-3.5 w-3.5" />
-              {t('common.approve')}
-            </button>
-            <button
-              type="button"
-              onClick={() => updateDocumentStatus(selected.id, 'changesRequested')}
-              className="flex items-center gap-1.5 rounded-md border border-border px-3 py-2 text-[12px] font-medium text-muted-foreground hover:bg-white/5 hover:text-foreground"
-            >
-              <X className="h-3.5 w-3.5" />
-              {t('reviews.requestChanges')}
-            </button>
-            <button
-              type="button"
-              onClick={() => updateDocumentStatus(selected.id, 'readyForReview')}
-              className="flex items-center gap-1.5 rounded-md border border-border px-3 py-2 text-[12px] font-medium text-muted-foreground hover:bg-white/5 hover:text-foreground"
-            >
-              <RefreshCw className="h-3.5 w-3.5" />
-              {t('reviews.markSynced')}
-            </button>
-          </div>
-        </div>
+        </aside>
       </div>
     </div>
   )
 }
 
-function Comment({
-  memberId,
-  text,
-  time,
-}: {
-  memberId: string
-  text: string
-  time: string
-}) {
-  const m = memberById(memberId)!
-  return (
-    <div className="flex gap-2.5">
-      <Avatar member={m} size={24} />
-      <div className="flex-1 rounded-lg border border-border bg-panel px-3 py-2">
-        <div className="flex items-center justify-between">
-          <span className="text-[12px] font-medium text-foreground">{m.name}</span>
-          <span className="text-[11px] text-faint-foreground">{time}</span>
-        </div>
-        <p className="mt-0.5 text-[12px] leading-relaxed text-muted-foreground">{text}</p>
-      </div>
-    </div>
-  )
+function ReviewEmpty({ title, detail, action, onAction }: { title: string; detail: string; action: string; onAction: () => void }) {
+  return <div className="flex h-full items-center justify-center bg-canvas p-6 text-center"><div className="max-w-md rounded-lg border border-dashed border-border bg-panel p-6"><MessageSquare className="mx-auto size-8 text-primary-bright" /><h1 className="mt-3 text-base font-semibold text-foreground">{title}</h1><p className="mt-2 text-sm text-muted-foreground">{detail}</p><button type="button" onClick={onAction} className="mt-4 rounded-md bg-primary px-3 py-2 text-sm font-medium text-primary-foreground">{action}</button></div></div>
 }

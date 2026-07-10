@@ -18,3 +18,4 @@ out/
 *.log
 test-results/
 playwright-report/
+.worksflow-data/

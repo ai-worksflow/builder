@@ -8,6 +8,7 @@ import { StatusPill } from '../shared'
 import { DOC_STATUS_CLASS } from '@/lib/worksflow/labels'
 import { useWorksflow } from '@/lib/worksflow/store'
 import { useLocalizedLabels } from '../use-localized-labels'
+import { useCollaboration } from '@/lib/collaboration/provider'
 import {
   Check,
   ChevronRight,
@@ -268,6 +269,7 @@ function Metric({ value, label }: { value: string; label: string }) {
 
 export function LinkedDocsCard() {
   const { documents, linkedDocIds, toggleLinkedDoc, syncWorkbenchBackToDocs } = useWorksflow()
+  const { session, can, authorize } = useCollaboration()
   const { t } = useI18n()
   const labels = useLocalizedLabels()
   const [synced, setSynced] = useState(false)
@@ -278,6 +280,7 @@ export function LinkedDocsCard() {
     .filter((doc): doc is NonNullable<typeof doc> => Boolean(doc))
   const availableDocs = documents.filter((doc) => !linkedDocIds.includes(doc.id))
   const nonApproved = linkedDocs.filter((doc) => doc?.status !== 'approved')
+  const canEdit = session.signedIn && can('edit')
 
   useEffect(() => {
     setOverrideAccepted(false)
@@ -308,8 +311,9 @@ export function LinkedDocsCard() {
               />
               <button
                 type="button"
-                onClick={() => toggleLinkedDoc(doc.id)}
-                className="rounded px-1 text-[10px] text-faint-foreground hover:bg-white/5 hover:text-foreground"
+                onClick={() => void authorize('edit').then((allowed) => allowed && toggleLinkedDoc(doc.id))}
+                disabled={!canEdit}
+                className="min-h-6 rounded px-1 text-[10px] text-faint-foreground hover:bg-white/5 hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40"
               >
                 {t('common.remove')}
               </button>
@@ -324,7 +328,7 @@ export function LinkedDocsCard() {
           <button
             type="button"
             onClick={() => setOverrideAccepted(true)}
-            className="ml-2 rounded bg-amber-400/15 px-1.5 py-0.5 font-medium hover:bg-amber-400/25"
+            className="ml-2 min-h-6 rounded bg-amber-400/15 px-1.5 py-0.5 font-medium hover:bg-amber-400/25"
           >
             {t('common.confirm')}
           </button>
@@ -347,8 +351,9 @@ export function LinkedDocsCard() {
               <button
                 key={doc.id}
                 type="button"
-                onClick={() => toggleLinkedDoc(doc.id)}
-                className="flex w-full items-center justify-between rounded-md px-2 py-1.5 text-left hover:bg-white/5"
+                onClick={() => void authorize('edit').then((allowed) => allowed && toggleLinkedDoc(doc.id))}
+                disabled={!canEdit}
+                className="flex w-full items-center justify-between rounded-md px-2 py-1.5 text-left hover:bg-white/5 disabled:cursor-not-allowed disabled:opacity-40"
               >
                 <span className="text-[12px] text-muted-foreground">{doc.title}</span>
                 <span className="text-[10px] text-faint-foreground">
@@ -363,10 +368,14 @@ export function LinkedDocsCard() {
       <button
         type="button"
         onClick={() => {
-          syncWorkbenchBackToDocs()
-          setSynced(true)
+          void authorize('edit').then((allowed) => {
+            if (!allowed) return
+            syncWorkbenchBackToDocs()
+            setSynced(true)
+          })
         }}
-        className="mt-2 w-full rounded-md border border-border py-1.5 text-[12px] font-medium text-muted-foreground hover:bg-white/5 hover:text-foreground"
+        disabled={!canEdit}
+        className="mt-2 w-full rounded-md border border-border py-1.5 text-[12px] font-medium text-muted-foreground hover:bg-white/5 hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40"
       >
         {synced ? t('chat.syncedSummary') : t('chat.syncBack')}
       </button>

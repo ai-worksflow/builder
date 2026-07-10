@@ -1,215 +1,120 @@
 'use client'
 
-import { useMemo, useState } from 'react'
-import { useI18n } from '@/lib/i18n'
-import { MEMBERS } from '@/lib/worksflow/mock-data'
-import { DOC_STATUS_CLASS } from '@/lib/worksflow/labels'
+import { useState, type FormEvent } from 'react'
+import { useCollaboration } from '@/lib/collaboration/provider'
+import type { ProjectRole } from '@/lib/collaboration/types'
 import { useWorksflow } from '@/lib/worksflow/store'
-import type { DocMemberRole } from '@/lib/worksflow/types'
-import { useLocalizedLabels } from '../use-localized-labels'
-import { Avatar, StatusPill } from '../shared'
-import { Link2, ShieldCheck, UserPlus, Users2 } from 'lucide-react'
+import { cn } from '@/lib/utils'
+import { Loader2, RefreshCw, ShieldCheck, UserPlus, Users2 } from 'lucide-react'
 
-const ROLES: DocMemberRole[] = ['owner', 'assignee', 'downstreamOwner', 'reviewer', 'watcher']
+const ROLES: ProjectRole[] = ['admin', 'editor', 'commenter', 'viewer']
 
 export function MemberSettings() {
-  const { t } = useI18n()
-  const labels = useLocalizedLabels()
   const {
-    documents,
-    selectedDocId,
-    setSelectedDocId,
-    openDoc,
-    addDocumentMember,
-    removeDocumentMember,
-  } = useWorksflow()
-  const [memberId, setMemberId] = useState(MEMBERS[0].id)
-  const [role, setRole] = useState<DocMemberRole>('assignee')
-  const selectedDoc = documents.find((doc) => doc.id === selectedDocId) ?? documents[0]
+    loading,
+    backendStatus,
+    session,
+    project,
+    members,
+    presence,
+    error,
+    can,
+    refresh,
+    addMember,
+    updateMemberRole,
+    removeMember,
+  } = useCollaboration()
+  const { setSurface } = useWorksflow()
+  const [name, setName] = useState('')
+  const [email, setEmail] = useState('')
+  const [role, setRole] = useState<ProjectRole>('viewer')
 
-  const memberStats = useMemo(
-    () =>
-      MEMBERS.map((member) => {
-        const bindings = documents.flatMap((doc) =>
-          doc.members
-            .filter((item) => item.userId === member.id)
-            .map((item) => ({ doc, role: item.role })),
-        )
-        return { member, bindings }
-      }),
-    [documents],
-  )
+  async function invite(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    if (!name.trim() || !validEmail(email)) return
+    if (await addMember({ name: name.trim(), email: email.trim(), role })) {
+      setName('')
+      setEmail('')
+    }
+  }
 
-  if (!selectedDoc) {
+  if (!session.signedIn) {
     return (
-      <div className="flex h-full items-center justify-center bg-canvas p-6 text-center">
-        <div className="max-w-md rounded-lg border border-dashed border-border bg-panel p-5">
-          <Users2 className="mx-auto size-8 text-primary-bright" />
-          <h1 className="mt-3 text-base font-semibold text-foreground">{t('graph.emptyTitle')}</h1>
-          <p className="mt-2 text-sm text-muted-foreground">{t('graph.emptyBody')}</p>
-        </div>
-      </div>
+      <EmptyPanel
+        title="Sign in to manage project members"
+        detail="Membership and roles are loaded from the platform backend, never from local team fixtures."
+        action="Open sign in"
+        onAction={() => setSurface('settings')}
+      />
+    )
+  }
+
+  if (!project) {
+    return (
+      <EmptyPanel
+        title="Select or create a shared project"
+        detail={error ?? 'A project is required before members and roles can be managed.'}
+        action="Retry"
+        onAction={() => void refresh()}
+      />
     )
   }
 
   return (
-    <div className="flex h-full">
-      <main className="min-w-0 flex-1 overflow-y-auto scrollbar-thin bg-canvas">
-        <div className="mx-auto max-w-6xl px-6 py-6 max-sm:px-4">
-          <div className="mb-5 flex items-start justify-between gap-4 max-sm:flex-wrap">
-            <div>
-              <h1 className="text-lg font-semibold text-foreground">{t('members.title')}</h1>
-              <p className="mt-1 text-sm text-muted-foreground">
-                {t('members.description')}
-              </p>
-            </div>
-            <button
-              type="button"
-              onClick={() => addDocumentMember(selectedDoc.id, memberId, role)}
-              className="inline-flex items-center gap-1.5 rounded-lg bg-primary px-3 py-2 text-sm font-medium text-primary-foreground hover:bg-primary-bright"
-            >
-              <UserPlus className="h-4 w-4" />
-              {t('members.addBinding')}
-            </button>
-          </div>
+    <div className="h-full overflow-y-auto bg-canvas p-6 scrollbar-thin max-sm:p-4">
+      <div className="mx-auto max-w-5xl">
+        <header className="flex flex-wrap items-start gap-3">
+          <span className="flex size-10 items-center justify-center rounded-lg bg-primary/15 text-primary-bright"><Users2 className="size-5" /></span>
+          <span className="min-w-0 flex-1">
+            <h1 className="text-lg font-semibold text-foreground">Project members</h1>
+            <p className="mt-1 text-sm text-muted-foreground">{project.name} · {members.length} members · your role is {project.role}</p>
+          </span>
+          <span className={cn('rounded-full border px-2 py-1 text-[10px]', backendStatus === 'online' ? 'border-success/30 text-success' : 'border-destructive/30 text-destructive')}>{backendStatus === 'online' ? 'Platform online' : 'Platform unavailable'}</span>
+          <button type="button" onClick={() => void refresh()} disabled={loading} className="rounded-md border border-border p-2 text-muted-foreground disabled:opacity-50" aria-label="Refresh members"><RefreshCw className={cn('size-4', loading && 'animate-spin')} /></button>
+        </header>
 
-          <section className="mb-5 grid grid-cols-1 gap-3 lg:grid-cols-[1fr_360px]">
-            <div className="rounded-lg border border-border bg-panel p-4">
-              <div className="mb-3 flex items-center gap-2 text-sm font-semibold text-foreground">
-                <Users2 className="h-4 w-4 text-primary-bright" />
-                {t('members.teamWorkload')}
-              </div>
-              <div className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-3">
-                {memberStats.map(({ member, bindings }) => (
-                  <div key={member.id} className="rounded-lg border border-border bg-card p-3">
-                    <div className="flex items-center gap-2">
-                      <Avatar member={member} size={28} />
-                      <div className="min-w-0">
-                        <div className="truncate text-sm font-medium text-foreground">{member.name}</div>
-                        <div className="truncate text-[11px] text-faint-foreground">{member.title}</div>
-                      </div>
-                    </div>
-                    <div className="mt-3 flex items-center justify-between text-[12px]">
-                      <span className="text-muted-foreground">{t('members.bindings')}</span>
-                      <span className="font-medium text-foreground">{bindings.length}</span>
-                    </div>
-                    <div className="mt-2 flex flex-wrap gap-1">
-                      {bindings.slice(0, 3).map((binding) => (
-                        <span
-                          key={`${binding.doc.id}-${binding.role}`}
-                          className="rounded border border-border px-1.5 py-0.5 text-[10px] text-faint-foreground"
-                        >
-                          {labels.role(binding.role)}
-                        </span>
-                      ))}
-                    </div>
-                  </div>
-                ))}
-              </div>
-            </div>
+        {error && <p role="alert" className="mt-4 rounded-md border border-destructive/30 bg-destructive/10 p-3 text-[11px] text-destructive">{error}</p>}
 
-            <div className="rounded-lg border border-border bg-panel p-4">
-              <div className="mb-3 flex items-center gap-2 text-sm font-semibold text-foreground">
-                <ShieldCheck className="h-4 w-4 text-primary-bright" />
-                {t('members.bindMember')}
-              </div>
-              <label className="block text-[12px] text-muted-foreground">
-                {t('common.document')}
-                <select
-                  value={selectedDoc.id}
-                  onChange={(event) => setSelectedDocId(event.target.value)}
-                  className="mt-1.5 w-full rounded-md border border-border bg-background px-2 py-2 text-sm text-foreground outline-none focus:border-primary/60"
-                >
-                  {documents.map((doc) => (
-                    <option key={doc.id} value={doc.id}>
-                      {doc.title}
-                    </option>
-                  ))}
-                </select>
-              </label>
-              <label className="mt-3 block text-[12px] text-muted-foreground">
-                {t('common.member')}
-                <select
-                  value={memberId}
-                  onChange={(event) => setMemberId(event.target.value)}
-                  className="mt-1.5 w-full rounded-md border border-border bg-background px-2 py-2 text-sm text-foreground outline-none focus:border-primary/60"
-                >
-                  {MEMBERS.map((member) => (
-                    <option key={member.id} value={member.id}>
-                      {member.name} · {member.title}
-                    </option>
-                  ))}
-                </select>
-              </label>
-              <label className="mt-3 block text-[12px] text-muted-foreground">
-                {t('common.role')}
-                <select
-                  value={role}
-                  onChange={(event) => setRole(event.target.value as DocMemberRole)}
-                  className="mt-1.5 w-full rounded-md border border-border bg-background px-2 py-2 text-sm text-foreground outline-none focus:border-primary/60"
-                >
-                  {ROLES.map((item) => (
-                    <option key={item} value={item}>
-                      {labels.role(item)}
-                    </option>
-                  ))}
-                </select>
-              </label>
-            </div>
-          </section>
+        {can('admin') && (
+          <form onSubmit={invite} className="mt-5 grid gap-3 rounded-lg border border-border bg-panel p-4 md:grid-cols-[1fr_1fr_150px_auto]">
+            <label className="text-[11px] text-muted-foreground">Display name<input value={name} onChange={(event) => setName(event.target.value)} className="mt-1.5 h-9 w-full rounded-md border border-border bg-background px-2 text-sm text-foreground" /></label>
+            <label className="text-[11px] text-muted-foreground">Email<input value={email} onChange={(event) => setEmail(event.target.value)} type="email" className="mt-1.5 h-9 w-full rounded-md border border-border bg-background px-2 text-sm text-foreground" /></label>
+            <label className="text-[11px] text-muted-foreground">Project role<select value={role} onChange={(event) => setRole(event.target.value as ProjectRole)} className="mt-1.5 h-9 w-full rounded-md border border-border bg-background px-2 text-sm text-foreground">{ROLES.map((item) => <option key={item}>{item}</option>)}</select></label>
+            <button type="submit" disabled={loading || !name.trim() || !validEmail(email)} className="mt-auto inline-flex h-9 items-center justify-center gap-1.5 rounded-md bg-primary px-3 text-[11px] font-semibold text-primary-foreground disabled:opacity-50">{loading ? <Loader2 className="size-3.5 animate-spin" /> : <UserPlus className="size-3.5" />}Invite</button>
+          </form>
+        )}
 
-          <section className="overflow-x-auto rounded-lg border border-border bg-panel scrollbar-thin">
-            <div className="min-w-[720px]">
-              <div className="grid grid-cols-[1fr_150px_180px_120px] border-b border-border px-4 py-2.5 text-[11px] font-semibold uppercase tracking-wide text-faint-foreground">
-                <span>{t('common.document')}</span>
-                <span>{t('common.status')}</span>
-                <span>{t('members.membersColumn')}</span>
-                <span className="text-right">{t('common.actions')}</span>
+        <div className="mt-5 overflow-hidden rounded-lg border border-border bg-panel">
+          {members.map((member) => {
+            const memberPresence = presence.find((item) => item.user.id === member.user.id)
+            return (
+              <div key={member.user.id} className="flex flex-wrap items-center gap-3 border-b border-border px-4 py-3 last:border-b-0">
+                <span className="flex size-8 items-center justify-center rounded-full bg-primary/15 text-[10px] font-semibold text-primary-bright">{initials(member.user.name)}</span>
+                <span className="min-w-0 flex-1"><span className="block truncate text-sm font-medium text-foreground">{member.user.name}</span><span className="block truncate text-[11px] text-faint-foreground">{member.user.email}</span></span>
+                <span className={cn('size-2 rounded-full', memberPresence?.status === 'active' ? 'bg-success' : memberPresence?.status === 'idle' ? 'bg-warning' : 'bg-faint-foreground')} title={memberPresence?.status ?? 'offline'} />
+                {can('admin') && member.role !== 'owner' ? (
+                  <select value={member.role} onChange={(event) => void updateMemberRole(member.user.id, event.target.value as ProjectRole)} className="h-8 rounded-md border border-border bg-background px-2 text-[11px] text-foreground">{ROLES.map((item) => <option key={item}>{item}</option>)}</select>
+                ) : <span className="rounded-md bg-primary/10 px-2 py-1 text-[10px] text-primary-bright">{member.role}</span>}
+                {can('admin') && member.role !== 'owner' && <button type="button" onClick={() => window.confirm(`Remove ${member.user.name} from ${project.name}?`) && void removeMember(member.user.id)} className="text-[10px] text-destructive">Remove</button>}
               </div>
-              {documents.map((doc) => (
-                <div
-                  key={doc.id}
-                  className="grid grid-cols-[1fr_150px_180px_120px] items-center gap-3 border-b border-border px-4 py-3 last:border-b-0"
-                >
-                  <div className="min-w-0">
-                    <div className="truncate text-sm font-medium text-foreground">{doc.title}</div>
-                    <div className="text-[11px] text-faint-foreground">{labels.docType(doc.type)}</div>
-                  </div>
-                  <StatusPill label={labels.docStatus(doc.status)} className={DOC_STATUS_CLASS[doc.status]} />
-                  <div className="flex flex-wrap gap-1">
-                    {doc.members.map((binding) => {
-                      const member = MEMBERS.find((item) => item.id === binding.userId)
-                      if (!member) return null
-                      return (
-                        <button
-                          key={`${binding.userId}-${binding.role}`}
-                          type="button"
-                          onClick={() => removeDocumentMember(doc.id, binding.userId, binding.role)}
-                          className="inline-flex items-center gap-1 rounded border border-border px-1.5 py-0.5 text-[10px] text-muted-foreground hover:bg-white/5"
-                          title={t('members.removeBinding')}
-                        >
-                          {member.initials}
-                          <span className="text-faint-foreground">{labels.role(binding.role)}</span>
-                        </button>
-                      )
-                    })}
-                  </div>
-                  <div className="flex justify-end">
-                    <button
-                      type="button"
-                      onClick={() => openDoc(doc.id)}
-                      className="inline-flex items-center gap-1 rounded-md border border-border px-2 py-1 text-[11px] font-medium text-muted-foreground hover:bg-white/5 hover:text-foreground"
-                    >
-                      <Link2 className="h-3 w-3" />
-                      {t('members.openDoc')}
-                    </button>
-                  </div>
-                </div>
-              ))}
-            </div>
-          </section>
+            )
+          })}
         </div>
-      </main>
+
+        {!can('admin') && <div className="mt-4 flex items-center gap-2 rounded-md border border-border bg-panel p-3 text-[11px] text-muted-foreground"><ShieldCheck className="size-4 text-primary-bright" />Only owners and admins can change project membership.</div>}
+      </div>
     </div>
   )
+}
+
+function EmptyPanel({ title, detail, action, onAction }: { title: string; detail: string; action: string; onAction: () => void }) {
+  return <div className="flex h-full items-center justify-center bg-canvas p-6 text-center"><div className="max-w-md rounded-lg border border-dashed border-border bg-panel p-6"><Users2 className="mx-auto size-8 text-primary-bright" /><h1 className="mt-3 text-base font-semibold text-foreground">{title}</h1><p className="mt-2 text-sm text-muted-foreground">{detail}</p><button type="button" onClick={onAction} className="mt-4 rounded-md bg-primary px-3 py-2 text-sm font-medium text-primary-foreground">{action}</button></div></div>
+}
+
+function validEmail(value: string) {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value.trim())
+}
+
+function initials(name: string) {
+  return name.split(/\s+/).filter(Boolean).slice(0, 2).map((part) => part[0]?.toUpperCase()).join('') || 'U'
 }

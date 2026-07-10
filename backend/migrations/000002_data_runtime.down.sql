@@ -1,0 +1,9 @@
+DROP TABLE IF EXISTS data_connections;
+DROP TABLE IF EXISTS data_migrations;
+DROP TABLE IF EXISTS data_migration_previews;
+DROP TABLE IF EXISTS data_environment_variables;
+DROP TABLE IF EXISTS data_metadata_items;
+DROP TABLE IF EXISTS data_records;
+DROP TABLE IF EXISTS data_columns;
+DROP TABLE IF EXISTS data_tables;
+DROP TABLE IF EXISTS data_project_states;

@@ -3,7 +3,10 @@ import { defineConfig, devices } from '@playwright/test'
 export default defineConfig({
   testDir: './tests',
   testMatch: /.*\.spec\.ts/,
-  fullyParallel: true,
+  // The integration suite exercises one filesystem-backed collaboration/data runtime.
+  // Serialize it so project, session, deployment, and migration assertions stay isolated.
+  fullyParallel: false,
+  workers: 1,
   reporter: 'list',
   use: {
     baseURL: 'http://127.0.0.1:3000',

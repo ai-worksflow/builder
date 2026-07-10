@@ -1,40 +1,69 @@
 'use client'
 
-import { useRef, useState } from 'react'
-import { useI18n } from '@/lib/i18n'
+import { useEffect, useMemo, useRef, useState } from 'react'
+import { useCollaboration } from '@/lib/collaboration/provider'
+import {
+  ArtifactWorkspaceConflictError,
+  type ArtifactDetails,
+} from '@/lib/platform/artifact-workspace'
+import {
+  createEmptyBlueprintContent,
+  useArtifactWorkspace,
+} from '@/lib/platform/artifact-provider'
+import {
+  emptyBlueprintLayout,
+  materializeBlueprintContent,
+  normalizeBlueprintContent,
+  type SemanticBlueprintNode,
+} from '@/lib/platform/blueprint-content'
+import type {
+  ArtifactReviewGateDto,
+  ArtifactRevisionDto,
+  BlueprintContentDto,
+  BlueprintEdgeDto,
+  BlueprintEdgeKind,
+  BlueprintLayoutDto,
+  BlueprintNodeKind,
+  ImpactReportDto,
+  ProposalDto,
+  VersionRefDto,
+} from '@/lib/platform/dto'
 import { cn } from '@/lib/utils'
 import { useWorksflow } from '@/lib/worksflow/store'
-import { MEMBERS, MODULE_LIBRARY } from '@/lib/worksflow/mock-data'
-import { BLUEPRINT_NODE_COLOR } from '@/lib/worksflow/labels'
-import type { BlueprintEdgeType, BlueprintNode, BlueprintNodeType } from '@/lib/worksflow/types'
-import { useLocalizedLabels } from '../use-localized-labels'
-import { Avatar, StatusPill, memberById } from '../shared'
 import {
-  ArrowRight,
-  Boxes,
-  ClipboardCheck,
-  Download,
-  FileText,
+  AlertTriangle,
+  Bot,
+  CheckCircle2,
+  FileClock,
+  FilePlus2,
+  GitBranch,
+  GitFork,
   Link2,
+  Loader2,
+  MessageSquare,
   Move,
   Plus,
+  RefreshCw,
   Save,
-  Search,
-  Sparkles,
+  Send,
   Trash2,
-  TriangleAlert,
   Workflow,
-  Zap,
 } from 'lucide-react'
 
-const NODE_W = 168
-const NODE_H = 62
-const PAD_X = 24
-const PAD_Y = 24
-const CANVAS_W = 1220
-const CANVAS_H = 560
+type EditorTab = 'canvas' | 'pages' | 'versions' | 'proposal' | 'impact' | 'trace' | 'review'
+type SemanticNode = SemanticBlueprintNode
 
-const EDGE_TYPES: BlueprintEdgeType[] = [
+const NODE_KINDS: readonly BlueprintNodeKind[] = [
+  'feature',
+  'page',
+  'component',
+  'api',
+  'dataModel',
+  'permission',
+  'workbenchTarget',
+]
+
+const EDGE_KINDS: readonly BlueprintEdgeKind[] = [
   'contains',
   'uses',
   'calls',
@@ -42,1044 +71,441 @@ const EDGE_TYPES: BlueprintEdgeType[] = [
   'writes',
   'requires',
   'renders',
-  'syncs_with',
-  'generates',
-  'implemented_by',
+  'implements',
 ]
 
-const NODE_TYPES: BlueprintNodeType[] = [
-  'feature',
-  'page',
-  'component',
-  'api',
-  'dataModel',
-  'permission',
-  'prototype',
-  'workbenchTarget',
-]
-
-function uniqueIds(ids: string[]) {
-  return Array.from(new Set(ids))
+const NODE_COLORS: Record<BlueprintNodeKind, string> = {
+  feature: 'border-violet-400/50 bg-violet-400/10',
+  page: 'border-sky-400/50 bg-sky-400/10',
+  component: 'border-cyan-400/50 bg-cyan-400/10',
+  api: 'border-amber-400/50 bg-amber-400/10',
+  dataModel: 'border-emerald-400/50 bg-emerald-400/10',
+  permission: 'border-rose-400/50 bg-rose-400/10',
+  workbenchTarget: 'border-indigo-400/50 bg-indigo-400/10',
 }
+
+const CANVAS_WIDTH = 980
+const CANVAS_HEIGHT = 560
+const NODE_WIDTH = 160
+const NODE_HEIGHT = 58
 
 export function BlueprintEditor() {
-  const { t } = useI18n()
-  const labels = useLocalizedLabels()
-  const {
-    activeTeamProject,
-    blueprint,
-    blueprintOperations,
-    activeBlueprintContext,
-    selectedBlueprintNodeId,
-    setSelectedBlueprintNodeId,
-    documents,
-    importAssets,
-    createBlueprintNode,
-    updateBlueprintNode,
-    moveBlueprintNode,
-    deleteBlueprintNode,
-    createBlueprintEdge,
-    updateBlueprintEdge,
-    deleteBlueprintEdge,
-    saveBlueprint,
-    validateBlueprint,
-    completeBlueprintNode,
-    startBlankBlueprint,
-    generateBlueprintFromProjectBrief,
-    generateBlueprintFromExistingDocs,
-    generateDocsFromBlueprintSelection,
-    createWorkbenchContextFromBlueprint,
-    openDoc,
-  } = useWorksflow()
-  const [query, setQuery] = useState('')
-  const [brief, setBrief] = useState('')
-  const [edgeType, setEdgeType] = useState<BlueprintEdgeType>('contains')
-  const [connectFrom, setConnectFrom] = useState<string | null>(null)
-  const connectFromRef = useRef<string | null>(null)
-  const [notice, setNotice] = useState<string | null>(null)
-  const [docToBind, setDocToBind] = useState('d3')
-  const [memberToBind, setMemberToBind] = useState('m1')
-  const [prototypeToBind, setPrototypeToBind] = useState(importAssets[0]?.id ?? '')
-  const [edgeTargetId, setEdgeTargetId] = useState('b2')
-  const [draggingNodeId, setDraggingNodeId] = useState<string | null>(null)
-  const dragSessionRef = useRef<{
-    id: string
-    pointerId: number
-    offsetX: number
-    offsetY: number
-    lastX: number
-    lastY: number
-    moved: boolean
-  } | null>(null)
-  const scrollLockRef = useRef<
-    Array<{
-      element: HTMLElement
-      overflow: string
-      overflowX: string
-      overflowY: string
-      scrollLeft: number
-      scrollTop: number
-    }>
-  >([])
-  const suppressNodeClickRef = useRef(false)
+  const workspace = useArtifactWorkspace()
+  const collaboration = useCollaboration()
+  const { selectedBlueprintNodeId, setSelectedBlueprintNodeId } = useWorksflow()
+  const [selectedBlueprintId, setSelectedBlueprintId] = useState('')
+  const [tab, setTab] = useState<EditorTab>('canvas')
+  const [content, setContent] = useState<BlueprintContentDto | null>(null)
+  const [details, setDetails] = useState<ArtifactDetails<BlueprintContentDto> | null>(null)
+  const [impact, setImpact] = useState<ImpactReportDto | null>(null)
+  const [saving, setSaving] = useState(false)
+  const [savedAt, setSavedAt] = useState<string | null>(null)
+  const [localError, setLocalError] = useState<string | null>(null)
+  const [conflict, setConflict] = useState(false)
+  const [edgeSourceId, setEdgeSourceId] = useState('')
+  const [edgeTargetId, setEdgeTargetId] = useState('')
+  const [edgeKind, setEdgeKind] = useState<BlueprintEdgeKind>('contains')
+  const [proposalInstruction, setProposalInstruction] = useState('Decompose approved requirements into pages, components and implementation boundaries.')
+  const [selectedOperations, setSelectedOperations] = useState<Record<string, number[]>>({})
+  const [comment, setComment] = useState('')
+  const [reviewSummary, setReviewSummary] = useState('Blueprint is ready for version-level review.')
+  const [reviewerId, setReviewerId] = useState('')
   const canvasRef = useRef<HTMLDivElement | null>(null)
+  const dragRef = useRef<{ id: string; pointerId: number; offsetX: number; offsetY: number } | null>(null)
 
-  const selected = blueprint.nodes.find((node) => node.id === selectedBlueprintNodeId) ?? null
-  const missingCount = blueprint.nodes.reduce((sum, node) => sum + (node.missing?.length ?? 0), 0)
-  const generatedDocs = documents.filter((doc) => blueprint.generatedDocIds.includes(doc.id))
+  const resource = workspace.blueprints.find((item) => item.artifact.id === selectedBlueprintId)
+    ?? workspace.blueprints[0]
+  const serverContent = resource?.draft?.content ?? resource?.latestRevision?.content
+  const serverEtag = resource?.draft?.etag ?? resource?.artifact.etag
+  const normalized = useMemo(() => content ? normalizeBlueprintContent(content) : null, [content])
+  const nodes = normalized?.semantic?.nodes ?? []
+  const edges = normalized?.semantic?.edges ?? []
+  const layout = normalized?.layout ?? emptyBlueprintLayout()
+  const selectedNode = nodes.find((node) => node.id === selectedBlueprintNodeId) ?? null
+  const dirty = Boolean(content && serverContent && JSON.stringify(content) !== JSON.stringify(normalizeBlueprintContent(serverContent)))
+  const proposals = workspace.proposals.filter((proposal) => proposal.targetArtifactId === resource?.artifact.id)
+  const pageSpecs = workspace.pageSpecs.filter((pageSpec) =>
+    nodes.some((node) => node.id === (pageSpec.draft?.content ?? pageSpec.latestRevision?.content)?.blueprintPageNodeId),
+  )
+  const latestVersion = resource?.latestRevision ? versionRef(resource.latestRevision) : undefined
+  const comments = collaboration.comments.filter((thread) => thread.target?.artifactId === resource?.artifact.id)
+  const reviews = collaboration.reviews.filter((review) => review.target?.artifactId === resource?.artifact.id)
+  const currentUserId = collaboration.session.signedIn ? collaboration.session.user.id : null
+  const clientGate = normalized ? blueprintGate(normalized) : []
+  const revisionReady = clientGate.length === 0
+  const gatePassed = revisionReady && Boolean(details?.reviewGate.passed)
 
-  const center = (node: BlueprintNode) => ({
-    x: node.position.x + PAD_X + NODE_W / 2,
-    y: node.position.y + PAD_Y + NODE_H / 2,
-  })
-
-  function addModuleToCanvas(title: string, group: string, x = 120, y = 120) {
-    const type = nodeTypeForModule(group, title)
-    const id = createBlueprintNode(type, title, { x, y })
-    setSelectedBlueprintNodeId(id)
-    setNotice(t('blueprint.nodeTypedAdded', { title, type: labels.blueprintNode(type) }))
-  }
-
-  function setPendingConnection(id: string | null) {
-    connectFromRef.current = id
-    setConnectFrom(id)
-  }
-
-  function beginNodeDrag(event: React.PointerEvent<HTMLDivElement>, node: BlueprintNode) {
-    if ((event.target as HTMLElement).closest('[data-edge-handle]')) return
-    if (event.button !== 0) return
-    event.preventDefault()
-    event.currentTarget.setPointerCapture(event.pointerId)
-    lockDragScroll()
-    const rect = event.currentTarget.getBoundingClientRect()
-    dragSessionRef.current = {
-      id: node.id,
-      pointerId: event.pointerId,
-      offsetX: event.clientX - rect.left,
-      offsetY: event.clientY - rect.top,
-      lastX: node.position.x,
-      lastY: node.position.y,
-      moved: false,
+  useEffect(() => {
+    if (!resource) {
+      setContent(null)
+      return
     }
-    setDraggingNodeId(node.id)
-    setSelectedBlueprintNodeId(node.id)
-  }
+    if (selectedBlueprintId !== resource.artifact.id) setSelectedBlueprintId(resource.artifact.id)
+    if (!conflict) setContent(normalizeBlueprintContent(serverContent ?? createEmptyBlueprintContent()))
+  }, [conflict, resource, selectedBlueprintId, serverContent])
 
-  function moveNodeWithPointer(event: React.PointerEvent<HTMLDivElement>, nodeId: string) {
-    const session = dragSessionRef.current
-    const canvas = canvasRef.current
-    if (!session || session.id !== nodeId || !canvas) return
-    event.preventDefault()
-    const canvasRect = canvas.getBoundingClientRect()
-    const x = Math.max(
-      0,
-      Math.min(
-        CANVAS_W - NODE_W - PAD_X * 2,
-        event.clientX - canvasRect.left + canvas.scrollLeft - session.offsetX - PAD_X,
-      ),
-    )
-    const y = Math.max(
-      0,
-      Math.min(
-        CANVAS_H - NODE_H - PAD_Y * 2,
-        event.clientY - canvasRect.top + canvas.scrollTop - session.offsetY - PAD_Y,
-      ),
-    )
-    if (Math.abs(session.lastX - x) < 0.5 && Math.abs(session.lastY - y) < 0.5) return
-    session.lastX = x
-    session.lastY = y
-    session.moved = true
-    moveBlueprintNode(session.id, { x, y })
-  }
+  useEffect(() => {
+    if (nodes.some((node) => node.id === selectedBlueprintNodeId)) return
+    setSelectedBlueprintNodeId(nodes[0]?.id ?? null)
+  }, [nodes, selectedBlueprintNodeId, setSelectedBlueprintNodeId])
 
-  function finishNodeDrag(event: React.PointerEvent<HTMLDivElement>, nodeId: string) {
-    const session = dragSessionRef.current
-    if (!session || session.id !== nodeId) return
-    if (event.currentTarget.hasPointerCapture(session.pointerId)) {
-      event.currentTarget.releasePointerCapture(session.pointerId)
+  useEffect(() => {
+    if (!resource) {
+      setDetails(null)
+      return
     }
-    if (session.moved) {
-      suppressNodeClickRef.current = true
-      setNotice(t('blueprint.nodePositionUpdated'))
-    }
-    dragSessionRef.current = null
-    setDraggingNodeId(null)
-    unlockDragScroll()
-  }
+    let active = true
+    void workspace.loadDetails<BlueprintContentDto>(resource.artifact.id)
+      .then((next) => { if (active) setDetails(next) })
+      .catch((error) => { if (active) setLocalError(errorMessage(error)) })
+    return () => { active = false }
+  }, [resource?.artifact.id, workspace.loadDetails])
 
-  function lockDragScroll() {
-    unlockDragScroll()
-    const locks: typeof scrollLockRef.current = []
-    let element = canvasRef.current?.parentElement ?? null
-    while (element && element !== document.body) {
-      const style = window.getComputedStyle(element)
-      const scrollsY = /(auto|scroll)/.test(style.overflowY) && element.scrollHeight > element.clientHeight
-      const scrollsX = /(auto|scroll)/.test(style.overflowX) && element.scrollWidth > element.clientWidth
-      if (scrollsY || scrollsX) {
-        locks.push({
-          element,
-          overflow: element.style.overflow,
-          overflowX: element.style.overflowX,
-          overflowY: element.style.overflowY,
-          scrollLeft: element.scrollLeft,
-          scrollTop: element.scrollTop,
+  useEffect(() => {
+    if (!resource || !content || !serverEtag || !dirty || conflict || !collaboration.can('edit')) return
+    const timer = window.setTimeout(() => {
+      setSaving(true)
+      setLocalError(null)
+      void workspace.saveBlueprintDraft(resource.artifact.id, normalizeBlueprintContent(content), serverEtag)
+        .then(() => {
+          setSavedAt(new Date().toLocaleTimeString())
+          setConflict(false)
         })
-        element.style.overflow = 'hidden'
+        .catch((error) => {
+          if (error instanceof ArtifactWorkspaceConflictError) setConflict(true)
+          setLocalError(errorMessage(error))
+        })
+        .finally(() => setSaving(false))
+    }, 700)
+    return () => window.clearTimeout(timer)
+  }, [collaboration, conflict, content, dirty, resource, serverEtag, workspace.saveBlueprintDraft])
+
+  if (!collaboration.session.signedIn) {
+    return <Unavailable title="Sign in to open platform blueprints" detail="Browser blueprint fixtures are not used as a fallback." />
+  }
+  if (workspace.status === 'loading') {
+    return <Unavailable loading title="Loading platform blueprints" detail="Fetching semantic graph, layout, PageSpecs and pinned trace data." />
+  }
+  if (workspace.status === 'error') {
+    return <Unavailable title="Platform blueprints unavailable" detail={workspace.error ?? 'The backend did not return blueprint artifacts.'} onRetry={workspace.refresh} />
+  }
+  if (!resource || !normalized) {
+    return <Unavailable title="No blueprint artifacts" detail="Create a blueprint from approved requirement revisions." action="Create blueprint" onAction={() => void workspace.createBlueprint('Product blueprint')} />
+  }
+
+  const readOnly = !collaboration.can('edit')
+
+  function mutateBlueprint(
+    update: (
+      semanticNodes: readonly SemanticNode[],
+      semanticEdges: readonly BlueprintEdgeDto[],
+      currentLayout: BlueprintLayoutDto,
+    ) => {
+      nodes?: readonly SemanticNode[]
+      edges?: readonly BlueprintEdgeDto[]
+      layout?: BlueprintLayoutDto
+    },
+  ) {
+    setContent((current) => {
+      if (!current) return current
+      const currentNormalized = normalizeBlueprintContent(current)
+      const currentNodes = currentNormalized.semantic?.nodes ?? []
+      const currentEdges = currentNormalized.semantic?.edges ?? []
+      const currentLayout = currentNormalized.layout ?? emptyBlueprintLayout()
+      const next = update(currentNodes, currentEdges, currentLayout)
+      return materializeBlueprintContent(
+        currentNormalized,
+        next.nodes ?? currentNodes,
+        next.edges ?? currentEdges,
+        next.layout ?? currentLayout,
+      )
+    })
+    setConflict(false)
+  }
+
+  function addNode(kind: BlueprintNodeKind = 'feature') {
+    const id = stableId('node')
+    mutateBlueprint((currentNodes, currentEdges, currentLayout) => ({
+      nodes: [...currentNodes, {
+        id,
+        kind,
+        title: `New ${kind}`,
+        description: '',
+        requirementIds: [],
+        assignedMemberIds: [],
+      }],
+      edges: currentEdges,
+      layout: {
+        ...currentLayout,
+        nodePositions: {
+          ...currentLayout.nodePositions,
+          [id]: { x: 48 + (currentNodes.length % 4) * 210, y: 48 + Math.floor(currentNodes.length / 4) * 110 },
+        },
+      },
+    }))
+    setSelectedBlueprintNodeId(id)
+  }
+
+  function updateNode(nodeId: string, patch: Partial<SemanticNode>) {
+    mutateBlueprint((currentNodes) => ({
+      nodes: currentNodes.map((node) => node.id === nodeId ? { ...node, ...patch } : node),
+    }))
+  }
+
+  function deleteNode(nodeId: string) {
+    mutateBlueprint((currentNodes, currentEdges, currentLayout) => {
+      const positions = { ...currentLayout.nodePositions }
+      delete positions[nodeId]
+      return {
+        nodes: currentNodes.filter((node) => node.id !== nodeId),
+        edges: currentEdges.filter((edge) => edge.sourceNodeId !== nodeId && edge.targetNodeId !== nodeId),
+        layout: { ...currentLayout, nodePositions: positions },
       }
-      element = element.parentElement
+    })
+  }
+
+  function moveNode(nodeId: string, x: number, y: number) {
+    mutateBlueprint((_currentNodes, _currentEdges, currentLayout) => ({
+      layout: {
+        ...currentLayout,
+        nodePositions: {
+          ...currentLayout.nodePositions,
+          [nodeId]: {
+            x: Math.max(0, Math.min(CANVAS_WIDTH - NODE_WIDTH, Math.round(x))),
+            y: Math.max(0, Math.min(CANVAS_HEIGHT - NODE_HEIGHT, Math.round(y))),
+          },
+        },
+      },
+    }))
+  }
+
+  function addEdge() {
+    if (!edgeSourceId || !edgeTargetId || edgeSourceId === edgeTargetId) return
+    mutateBlueprint((_currentNodes, currentEdges) => ({
+      edges: [...currentEdges, {
+        id: stableId('edge'),
+        sourceNodeId: edgeSourceId,
+        targetNodeId: edgeTargetId,
+        kind: edgeKind,
+        required: true,
+      }],
+    }))
+  }
+
+  async function createRevision() {
+    if (!content || !revisionReady) return
+    setSaving(true)
+    setLocalError(null)
+    try {
+      await workspace.createBlueprintRevision(resource!.artifact.id, normalizeBlueprintContent(content))
+      setDetails(await workspace.loadDetails<BlueprintContentDto>(resource!.artifact.id))
+    } catch (error) {
+      setLocalError(errorMessage(error))
+    } finally {
+      setSaving(false)
     }
-    scrollLockRef.current = locks
   }
 
-  function unlockDragScroll() {
-    scrollLockRef.current.forEach((lock) => {
-      lock.element.style.overflow = lock.overflow
-      lock.element.style.overflowX = lock.overflowX
-      lock.element.style.overflowY = lock.overflowY
-      lock.element.scrollLeft = lock.scrollLeft
-      lock.element.scrollTop = lock.scrollTop
-    })
-    scrollLockRef.current = []
+  async function reloadServerDraft() {
+    setConflict(false)
+    setLocalError(null)
+    await workspace.refresh()
   }
 
-  function bindDocument() {
-    if (!selected || !docToBind) return
-    updateBlueprintNode(selected.id, {
-      boundDocumentIds: uniqueIds([...selected.boundDocumentIds, docToBind]),
-    })
-    setNotice(t('blueprint.documentBound', { title: selected.title }))
-  }
-
-  function bindMember() {
-    if (!selected || !memberToBind) return
-    updateBlueprintNode(selected.id, {
-      boundMemberIds: uniqueIds([...selected.boundMemberIds, memberToBind]),
-      missing: (selected.missing ?? []).filter((item) => item !== 'No owner assigned'),
-    })
-    setNotice(t('blueprint.memberBound', { title: selected.title }))
-  }
-
-  function bindPrototype() {
-    if (!selected || !prototypeToBind) return
-    updateBlueprintNode(selected.id, {
-      boundPrototypeArtifactIds: uniqueIds([
-        ...selected.boundPrototypeArtifactIds,
-        prototypeToBind,
-      ]),
-      missing: (selected.missing ?? []).filter((item) => item !== 'No imported prototype source'),
-    })
-    setNotice(t('blueprint.prototypeBound', { title: selected.title }))
-  }
-
-  function connectSelectedToTarget() {
-    if (!selected) return
-    const fallbackTarget = blueprint.nodes.find((node) => node.id !== selected.id)
-    const targetId = edgeTargetId !== selected.id ? edgeTargetId : fallbackTarget?.id
-    if (!targetId) return
-    createBlueprintEdge(selected.id, targetId, edgeType)
-    setNotice(t('blueprint.edgeCreated', { type: labels.blueprintEdge(edgeType) }))
-  }
-
-  function generateDocs() {
-    const ids = generateDocsFromBlueprintSelection(selected?.id)
-    setNotice(t('blueprint.generatedOutputs', { count: ids.length }))
+  async function loadImpact() {
+    setSaving(true)
+    setLocalError(null)
+    try {
+      setImpact(await workspace.impact(resource!.artifact.id))
+    } catch (error) {
+      setLocalError(errorMessage(error))
+    } finally {
+      setSaving(false)
+    }
   }
 
   return (
-    <div className="flex h-full max-lg:flex-col max-lg:overflow-y-auto">
-      <aside className="flex w-60 shrink-0 flex-col border-r border-border bg-surface max-lg:h-56 max-lg:w-full max-lg:border-b max-lg:border-r-0">
-        <div className="border-b border-border p-3">
-          <div className="flex items-center gap-1.5 text-xs font-semibold text-foreground">
-            <Boxes className="size-4 text-primary-bright" /> {t('blueprint.library')}
-          </div>
-          <div className="mt-2 flex items-center gap-1.5 rounded-lg border border-border bg-surface-2 px-2 py-1.5">
-            <Search className="size-3.5 text-faint-foreground" />
-            <input
-              value={query}
-              onChange={(event) => setQuery(event.target.value)}
-              placeholder={t('blueprint.searchModules')}
-              className="w-full bg-transparent text-xs text-foreground outline-none placeholder:text-faint-foreground"
-            />
-          </div>
+    <div className="flex h-full min-h-0 bg-canvas max-lg:flex-col">
+      <aside className="w-60 shrink-0 overflow-y-auto border-r border-border bg-panel p-3 scrollbar-thin max-lg:max-h-48 max-lg:w-full max-lg:border-b max-lg:border-r-0">
+        <div className="flex items-center justify-between gap-2">
+          <span className="text-xs font-semibold text-foreground">Platform blueprints</span>
+          <button type="button" onClick={() => void workspace.createBlueprint('Untitled blueprint')} disabled={readOnly} className="rounded border border-border p-1.5 text-primary-bright disabled:opacity-40" aria-label="Create blueprint"><FilePlus2 className="size-3.5" /></button>
         </div>
-        <div className="flex-1 overflow-y-auto scrollbar-thin p-3">
-          {MODULE_LIBRARY.map((group) => {
-            const items = group.items.filter((item) =>
-              item.toLowerCase().includes(query.toLowerCase()),
-            )
-            if (items.length === 0) return null
-            return (
-              <div key={group.group} className="mb-4">
-                <div className="mb-1.5 text-[11px] font-semibold uppercase tracking-wider text-faint-foreground">
-                  {group.group}
-                </div>
-                <div className="space-y-1">
-                  {items.map((item) => (
-                    <div
-                      key={item}
-                      draggable
-                      onDragStart={(event) => {
-                        event.dataTransfer.setData(
-                          'application/worksflow-module',
-                          `${group.group}::${item}`,
-                        )
-                      }}
-                      onClick={() => addModuleToCanvas(item, group.group)}
-                      className="group flex cursor-grab items-center gap-2 rounded-lg border border-border bg-surface-2 px-2.5 py-1.5 text-xs text-muted-foreground hover:border-primary/40 hover:text-foreground"
-                    >
-                      <Plus className="size-3 text-faint-foreground group-hover:text-primary-bright" />
-                      {item}
-                    </div>
-                  ))}
-                </div>
-              </div>
-            )
-          })}
+        <div className="mt-3 space-y-1">
+          {workspace.blueprints.map((item) => (
+            <button key={item.artifact.id} type="button" onClick={() => setSelectedBlueprintId(item.artifact.id)} className={cn('block w-full rounded-md px-2.5 py-2 text-left', item.artifact.id === resource.artifact.id ? 'bg-primary/15' : 'hover:bg-white/5')}>
+              <span className="block truncate text-[11px] font-medium text-foreground">{item.artifact.title}</span>
+              <span className="mt-0.5 block text-[9px] text-faint-foreground">{item.artifact.status} · revision {item.latestRevision?.revisionNumber ?? 0}</span>
+            </button>
+          ))}
         </div>
       </aside>
 
-      <div className="relative flex min-w-0 flex-1 flex-col bg-canvas max-lg:flex-none">
-        <div className="flex items-center justify-between gap-3 border-b border-border bg-surface/80 px-5 py-3 backdrop-blur max-md:flex-wrap max-md:px-4">
-          <div className="flex min-w-0 flex-wrap items-center gap-2">
-            <Workflow className="size-4 text-primary-bright" />
-            <span className="truncate text-sm font-semibold text-foreground">{blueprint.title}</span>
-            <span className="text-xs text-faint-foreground">{activeTeamProject.name}</span>
-            <StatusPill
-              label={blueprint.status}
-              className="border-primary/30 bg-primary/10 text-primary-bright"
-            />
-            <span className="text-xs text-faint-foreground">
-              v{blueprint.version} · {blueprint.updatedAt}
-            </span>
-            {missingCount > 0 && (
-              <span className="inline-flex items-center gap-1 rounded-md bg-amber-400/10 px-2 py-1 text-[11px] font-medium text-warning">
-                <TriangleAlert className="size-3" /> {t('blueprint.pendingIssues', { count: missingCount })}
-              </span>
-            )}
-          </div>
-          <div className="flex max-w-full items-center gap-2 overflow-x-auto scrollbar-thin">
-            <select
-              value={edgeType}
-              onChange={(event) => setEdgeType(event.target.value as BlueprintEdgeType)}
-              aria-label={t('blueprint.edgeType')}
-              className="rounded-lg border border-border bg-surface-2 px-2 py-1.5 text-xs text-muted-foreground outline-none focus:border-primary/60"
-            >
-              {EDGE_TYPES.map((type) => (
-                <option key={type} value={type}>
-                  {labels.blueprintEdge(type)}
-                </option>
-              ))}
-            </select>
-            <ActionButton
-              icon={Link2}
-              onClick={() => {
-                if (!selected) return
-                setPendingConnection(selected.id)
-                setNotice(t('blueprint.chooseTargetNode', { source: selected.title }))
-              }}
-            >
-              {t('blueprint.connectSelected')}
-            </ActionButton>
-            <ActionButton
-              icon={Boxes}
-              onClick={() => {
-                if (!selected) return
-                const id = createBlueprintNode('feature', `Capability: ${selected.title}`, {
-                  x: Math.max(20, selected.position.x - 180),
-                  y: selected.position.y + 100,
-                })
-                createBlueprintEdge(id, selected.id, 'contains', true)
-                setNotice(t('blueprint.capabilityCreated', { title: selected.title, source: selected.title }))
-              }}
-            >
-              {t('blueprint.groupAsCapability')}
-            </ActionButton>
-            <ActionButton
-              icon={Save}
-              onClick={() => {
-                saveBlueprint()
-                setNotice(t('blueprint.saveSnapshot'))
-              }}
-            >
-              {t('blueprint.save')}
-            </ActionButton>
-            <ActionButton
-              icon={ClipboardCheck}
-              onClick={() => {
-                validateBlueprint()
-                setNotice(t('blueprint.validationCompleted'))
-              }}
-            >
-              {t('blueprint.validate')}
-            </ActionButton>
-            <ActionButton icon={FileText} onClick={generateDocs}>
-              {t('blueprint.generateDocs')}
-            </ActionButton>
-            <ActionButton
-              icon={Sparkles}
-              onClick={() => {
-                generateDocs()
-                setNotice(t('blueprint.prototypeBriefGenerated'))
-              }}
-            >
-              {t('blueprint.generatePrototypeBrief')}
-            </ActionButton>
-            <button
-              type="button"
-              onClick={() => createWorkbenchContextFromBlueprint(selected?.id)}
-              className="inline-flex shrink-0 items-center gap-1.5 rounded-lg bg-primary px-3 py-1.5 text-xs font-medium text-white hover:bg-primary/90"
-            >
-              <Zap className="size-3.5" /> {t('blueprint.useInWorkbench')}
-            </button>
-            <ActionButton
-              icon={Download}
-              onClick={() =>
-                setNotice(
-                  t('blueprint.exportReady', {
-                    nodes: blueprint.nodes.length,
-                    edges: blueprint.edges.length,
-                    docs: generatedDocs.length,
-                  }),
-                )
-              }
-            >
-              {t('blueprint.export')}
-            </ActionButton>
-          </div>
-        </div>
+      <main className="flex min-w-0 flex-1 flex-col">
+        <header className="flex flex-wrap items-center gap-3 border-b border-border bg-panel px-4 py-3">
+          <Workflow className="size-4 text-primary-bright" />
+          <span className="min-w-0 flex-1"><span className="block truncate text-sm font-semibold text-foreground">{resource.artifact.title}</span><span className="block text-[9px] text-faint-foreground">{resource.artifact.id} · draft ETag {serverEtag ?? 'missing'} · semantic {nodes.length} / layout {Object.keys(layout.nodePositions).length}</span></span>
+          {resource.artifact.status === 'needsSync' && <span className="rounded bg-warning/10 px-2 py-1 text-[9px] text-warning">needs_sync</span>}
+          <span className={cn('inline-flex items-center gap-1 rounded px-2 py-1 text-[9px]', conflict ? 'bg-warning/10 text-warning' : saving ? 'bg-primary/10 text-primary-bright' : dirty ? 'bg-warning/10 text-warning' : 'bg-success/10 text-success')}>{saving ? <Loader2 className="size-3 animate-spin" /> : conflict ? <AlertTriangle className="size-3" /> : <Save className="size-3" />}{conflict ? 'Conflict' : saving ? 'Saving' : dirty ? 'Pending autosave' : savedAt ? `Saved ${savedAt}` : 'Server draft'}</span>
+          <button type="button" onClick={() => void workspace.refresh()} className="rounded border border-border p-1.5 text-muted-foreground" aria-label="Refresh blueprint"><RefreshCw className="size-3.5" /></button>
+        </header>
 
-        {notice && (
-          <div className="border-b border-border bg-primary/10 px-5 py-2 text-xs text-primary-bright">
-            {notice}
-          </div>
-        )}
+        {(localError || conflict) && <div role="alert" className="border-b border-warning/30 bg-warning/10 px-4 py-2 text-[10px] text-warning">{localError}{conflict && <button type="button" onClick={() => void reloadServerDraft()} className="ml-3 underline">Reload current server draft</button>}</div>}
 
-        <div
-          ref={canvasRef}
-          className="flex-1 overflow-auto scrollbar-thin max-lg:min-h-[560px] max-lg:flex-none"
-          onDragOver={(event) => event.preventDefault()}
-          onDrop={(event) => {
-            event.preventDefault()
-            const modulePayload = event.dataTransfer.getData('application/worksflow-module')
-            if (modulePayload) {
-              const [group, item] = modulePayload.split('::')
-              const rect = event.currentTarget.getBoundingClientRect()
-              addModuleToCanvas(
-                item,
-                group,
-                event.clientX - rect.left - PAD_X,
-                event.clientY - rect.top - PAD_Y,
-              )
-            }
-          }}
-        >
-          <div className="relative" style={{ width: CANVAS_W, height: CANVAS_H }}>
-            {blueprint.nodes.length === 0 && (
-              <div className="absolute inset-0 flex items-center justify-center p-6">
-                <div className="w-full max-w-xl rounded-lg border border-dashed border-border bg-panel p-5 text-center">
-                  <Workflow className="mx-auto size-8 text-primary-bright" />
-                  <h2 className="mt-3 text-base font-semibold text-foreground">
-                    {t('blueprint.emptyTitle')}
-                  </h2>
-                  <p className="mt-2 text-sm leading-relaxed text-muted-foreground">
-                    {t('blueprint.emptyBody')}
-                  </p>
-                  <textarea
-                    value={brief}
-                    onChange={(event) => setBrief(event.target.value)}
-                    placeholder={t('blueprint.briefPlaceholder')}
-                    rows={3}
-                    className="mt-4 w-full resize-none rounded-lg border border-border bg-background px-3 py-2 text-left text-xs text-muted-foreground outline-none placeholder:text-faint-foreground focus:border-primary/60"
-                  />
-                  <div className="mt-4 flex flex-wrap justify-center gap-2">
-                    <button
-                      type="button"
-                      onClick={() => generateBlueprintFromProjectBrief(brief)}
-                      className="rounded-lg bg-primary px-3 py-2 text-xs font-semibold text-primary-foreground hover:bg-primary-bright"
-                    >
-                      {t('blueprint.generateFromBrief')}
-                    </button>
-                    <button
-                      type="button"
-                      onClick={generateBlueprintFromExistingDocs}
-                      className="rounded-lg border border-border px-3 py-2 text-xs font-medium text-muted-foreground hover:bg-white/5 hover:text-foreground"
-                    >
-                      {t('blueprint.generateFromDocs')}
-                    </button>
-                    <button
-                      type="button"
-                      onClick={startBlankBlueprint}
-                      className="rounded-lg border border-border px-3 py-2 text-xs font-medium text-muted-foreground hover:bg-white/5 hover:text-foreground"
-                    >
-                      {t('blueprint.startBlank')}
-                    </button>
-                  </div>
-                  <p className="mt-3 text-[11px] leading-relaxed text-faint-foreground">
-                    {t('blueprint.manualHint')}
-                  </p>
+        <nav className="flex overflow-x-auto border-b border-border bg-panel p-1 scrollbar-thin">
+          {([
+            ['canvas', `Graph ${nodes.length}`],
+            ['pages', `PageSpecs ${pageSpecs.length}`],
+            ['versions', `Versions ${details?.versions.length ?? 0}`],
+            ['proposal', `AI proposals ${proposals.length}`],
+            ['impact', 'Impact lens'],
+            ['trace', `Trace ${workspace.traces.length}`],
+            ['review', `Review ${comments.length + reviews.length}`],
+          ] as const).map(([id, label]) => <button key={id} type="button" onClick={() => setTab(id)} className={cn('shrink-0 rounded px-3 py-1.5 text-[10px] font-medium', tab === id ? 'bg-primary/15 text-primary-bright' : 'text-muted-foreground')}>{label}</button>)}
+        </nav>
+
+        <div className="min-h-0 flex-1 overflow-y-auto scrollbar-thin">
+          {tab === 'canvas' && (
+            <div className="grid min-h-full xl:grid-cols-[1fr_290px]">
+              <section className="min-w-0 p-4">
+                <div className="mb-3 flex flex-wrap items-center gap-2">
+                  <select onChange={(event) => addNode(event.target.value as BlueprintNodeKind)} value="" disabled={readOnly} className="h-8 rounded-md border border-border bg-panel px-2 text-[10px] text-foreground disabled:opacity-50"><option value="" disabled>Add semantic node…</option>{NODE_KINDS.map((kind) => <option key={kind} value={kind}>{kind}</option>)}</select>
+                  <select value={edgeSourceId} onChange={(event) => setEdgeSourceId(event.target.value)} className="h-8 rounded-md border border-border bg-panel px-2 text-[10px] text-foreground"><option value="">Source</option>{nodes.map((node) => <option key={node.id} value={node.id}>{node.title}</option>)}</select>
+                  <select value={edgeKind} onChange={(event) => setEdgeKind(event.target.value as BlueprintEdgeKind)} className="h-8 rounded-md border border-border bg-panel px-2 text-[10px] text-foreground">{EDGE_KINDS.map((kind) => <option key={kind}>{kind}</option>)}</select>
+                  <select value={edgeTargetId} onChange={(event) => setEdgeTargetId(event.target.value)} className="h-8 rounded-md border border-border bg-panel px-2 text-[10px] text-foreground"><option value="">Target</option>{nodes.map((node) => <option key={node.id} value={node.id}>{node.title}</option>)}</select>
+                  <button type="button" onClick={addEdge} disabled={readOnly || !edgeSourceId || !edgeTargetId || edgeSourceId === edgeTargetId} className="h-8 rounded-md bg-primary px-3 text-[10px] font-semibold text-primary-foreground disabled:opacity-40"><Link2 className="mr-1 inline size-3" />Connect</button>
                 </div>
-              </div>
-            )}
-            <svg className="pointer-events-none absolute inset-0" width={CANVAS_W} height={CANVAS_H}>
-              <defs>
-                <marker id="bp-arrow" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto">
-                  <path d="M0,0 L7,3.5 L0,7 z" fill="#5a5a66" />
-                </marker>
-              </defs>
-              {blueprint.edges.map((edge) => {
-                const source = blueprint.nodes.find((node) => node.id === edge.sourceNodeId)
-                const target = blueprint.nodes.find((node) => node.id === edge.targetNodeId)
-                if (!source || !target) return null
-                const a = center(source)
-                const b = center(target)
-                const active =
-                  edge.sourceNodeId === selectedBlueprintNodeId ||
-                  edge.targetNodeId === selectedBlueprintNodeId
-                const mx = (a.x + b.x) / 2
-                return (
-                  <g key={edge.id} opacity={active || !selectedBlueprintNodeId ? 0.9 : 0.2}>
-                    <path
-                      d={`M ${a.x} ${a.y} C ${mx} ${a.y}, ${mx} ${b.y}, ${b.x} ${b.y}`}
-                      fill="none"
-                      stroke={active ? '#1488fc' : '#5a5a66'}
-                      strokeDasharray={edge.isRequired ? undefined : '5 4'}
-                      strokeWidth={active ? 2 : 1.4}
-                      markerEnd="url(#bp-arrow)"
-                    />
-                    {active && (
-                      <text
-                        x={mx}
-                        y={(a.y + b.y) / 2 - 5}
-                        fill="#2ba6ff"
-                        fontSize="9.5"
-                        textAnchor="middle"
-                        className="font-medium"
-                      >
-                        {labels.blueprintEdge(edge.type)}
-                      </text>
-                    )}
-                  </g>
-                )
-              })}
-            </svg>
-
-            {blueprint.nodes.map((node) => {
-              const color = BLUEPRINT_NODE_COLOR[node.type]
-              const isSelected = node.id === selectedBlueprintNodeId
-              const hasMissing = !!node.missing?.length
-              const hasDocs = node.boundDocumentIds.length > 0 || node.generatedDocIds.length > 0
-              return (
-                <div
-                  key={node.id}
-                  role="button"
-                  tabIndex={0}
-                  onClick={() => {
-                    if (suppressNodeClickRef.current) {
-                      suppressNodeClickRef.current = false
-                      return
-                    }
-                    const pendingConnection = connectFromRef.current
-                    if (pendingConnection && pendingConnection !== node.id) {
-                      createBlueprintEdge(pendingConnection, node.id, edgeType)
-                      setPendingConnection(null)
-                      setNotice(t('blueprint.edgeCreated', { type: labels.blueprintEdge(edgeType) }))
-                    } else {
-                      setSelectedBlueprintNodeId(node.id)
-                    }
-                  }}
-                  onKeyDown={(event) => {
-                    if (event.key === 'Enter' || event.key === ' ') setSelectedBlueprintNodeId(node.id)
-                  }}
-                  onPointerDown={(event) => beginNodeDrag(event, node)}
-                  onPointerMove={(event) => moveNodeWithPointer(event, node.id)}
-                  onPointerUp={(event) => finishNodeDrag(event, node.id)}
-                  onPointerCancel={(event) => finishNodeDrag(event, node.id)}
-                  onLostPointerCapture={(event) => finishNodeDrag(event, node.id)}
-                  onDragOver={(event) => {
-                    if (connectFrom && connectFrom !== node.id) event.preventDefault()
-                  }}
-                  onDrop={(event) => {
-                    event.preventDefault()
-                    const sourceNodeId =
-                      event.dataTransfer.getData('application/worksflow-blueprint-node') ||
-                      connectFromRef.current
-                    if (sourceNodeId && sourceNodeId !== node.id) {
-                      createBlueprintEdge(sourceNodeId, node.id, edgeType)
-                      setPendingConnection(null)
-                      setNotice(t('blueprint.edgeCreated', { type: labels.blueprintEdge(edgeType) }))
-                    }
-                  }}
-                  className={cn(
-                    'absolute flex touch-none select-none flex-col justify-center rounded-lg border bg-surface-2 px-3 text-left transition-colors outline-none',
-                    draggingNodeId === node.id ? 'cursor-grabbing' : 'cursor-grab',
-                    isSelected
-                      ? 'border-primary shadow-[0_0_0_1px_var(--color-primary)]'
-                      : connectFrom
-                        ? 'border-border hover:border-primary/60'
-                        : 'border-border hover:border-white/20',
-                  )}
-                  style={{
-                    left: node.position.x + PAD_X,
-                    top: node.position.y + PAD_Y,
-                    width: NODE_W,
-                    height: NODE_H,
-                    borderLeftColor: color,
-                    borderLeftWidth: 3,
-                  }}
-                >
-                  <div className="flex items-center gap-1.5">
-                    <span
-                      className="text-[9px] font-semibold uppercase tracking-wide"
-                      style={{ color }}
-                    >
-                      {labels.blueprintNode(node.type)}
-                    </span>
-                    {hasMissing && <TriangleAlert className="size-3 text-warning" />}
-                    {hasDocs && <FileText className="ml-auto size-3 text-faint-foreground" />}
-                    <button
-                      type="button"
-                      data-edge-handle
-                      draggable
-                      onPointerDown={(event) => {
-                        event.stopPropagation()
-                        setPendingConnection(node.id)
-                        setNotice(t('blueprint.dragConnectionFrom', { source: node.title }))
-                      }}
-                      onClick={(event) => {
-                        event.stopPropagation()
-                        setPendingConnection(node.id)
-                        setNotice(t('blueprint.dragConnectionFrom', { source: node.title }))
-                      }}
-                      onDragStart={(event) => {
-                        event.stopPropagation()
-                        event.dataTransfer.setData('application/worksflow-blueprint-node', node.id)
-                        setPendingConnection(node.id)
-                        setNotice(t('blueprint.dragConnectionFrom', { source: node.title }))
-                      }}
-                      onDragEnd={() => setPendingConnection(null)}
-                      className="flex size-5 items-center justify-center rounded text-faint-foreground hover:bg-white/5 hover:text-primary-bright"
-                      aria-label={t('blueprint.connectFrom', { source: node.title })}
-                      title={t('blueprint.dragToConnect')}
-                    >
-                      <Link2 className="size-3" />
-                    </button>
-                  </div>
-                  <div className="truncate text-xs font-semibold text-foreground">{node.title}</div>
-                  <div className="mt-0.5 flex items-center gap-1 text-[9px] text-faint-foreground">
-                    <Move className="size-2.5" /> {t('blueprint.dragToMove')}
-                  </div>
-                </div>
-              )
-            })}
-          </div>
-        </div>
-      </div>
-
-      <aside className="flex w-80 shrink-0 flex-col border-l border-border bg-surface max-lg:w-full max-lg:max-h-[560px] max-lg:border-l-0 max-lg:border-t">
-        {selected ? (
-          <>
-            <div className="border-b border-border p-4">
-              <span
-                className="text-[10px] font-semibold uppercase tracking-wide"
-                style={{ color: BLUEPRINT_NODE_COLOR[selected.type] }}
-              >
-                {labels.blueprintNode(selected.type)}
-              </span>
-              <input
-                value={selected.title}
-                onChange={(event) => updateBlueprintNode(selected.id, { title: event.target.value })}
-                className="mt-1 w-full rounded-md border border-border bg-background px-2 py-1.5 text-sm font-semibold text-foreground outline-none focus:border-primary/60"
-              />
-              <textarea
-                value={selected.description ?? ''}
-                onChange={(event) =>
-                  updateBlueprintNode(selected.id, { description: event.target.value })
-                }
-                placeholder={t('blueprint.describePlaceholder')}
-                rows={2}
-                className="mt-2 w-full resize-none rounded-md border border-border bg-background px-2 py-1.5 text-xs text-muted-foreground outline-none placeholder:text-faint-foreground focus:border-primary/60"
-              />
-            </div>
-
-            <div className="flex-1 overflow-y-auto scrollbar-thin p-4">
-              <InspLabel>{t('blueprint.nodeType')}</InspLabel>
-              <select
-                value={selected.type}
-                onChange={(event) =>
-                  updateBlueprintNode(selected.id, {
-                    type: event.target.value as BlueprintNodeType,
-                  })
-                }
-                className="mt-2 w-full rounded-md border border-border bg-background px-2 py-1.5 text-xs text-foreground outline-none focus:border-primary/60"
-              >
-                {NODE_TYPES.map((type) => (
-                  <option key={type} value={type}>
-                    {labels.blueprintNode(type)}
-                  </option>
-                ))}
-              </select>
-
-              {selected.missing?.length ? (
-                <div className="mt-4 rounded-lg border border-amber-400/30 bg-amber-400/5 p-3">
-                  <div className="flex items-center gap-1.5 text-xs font-medium text-warning">
-                    <TriangleAlert className="size-3.5" /> {t('blueprint.missingInputs')}
-                  </div>
-                  <ul className="mt-1.5 space-y-1">
-                    {selected.missing.map((item) => (
-                      <li key={item} className="text-[11px] text-muted-foreground">
-                        {item}
-                      </li>
-                    ))}
-                  </ul>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      completeBlueprintNode(selected.id)
-                      setNotice(t('blueprint.aiCompletionApplied', { title: selected.title }))
-                    }}
-                    className="mt-2 inline-flex w-full items-center justify-center gap-1.5 rounded-md border border-border px-2.5 py-1.5 text-[11px] font-medium text-muted-foreground hover:bg-white/5 hover:text-foreground"
-                  >
-                    <Sparkles className="size-3.5 text-primary-bright" /> {t('blueprint.completeNode')}
-                  </button>
-                </div>
-              ) : null}
-
-              <InspLabel className="mt-5">{t('blueprint.inputsOutputs')}</InspLabel>
-              <div className="mt-2 grid grid-cols-[1fr_auto] gap-1.5">
-                <select
-                  value={edgeTargetId}
-                  onChange={(event) => setEdgeTargetId(event.target.value)}
-                  className="min-w-0 rounded-md border border-border bg-background px-2 py-1.5 text-[11px] text-foreground outline-none focus:border-primary/60"
-                >
-                  {blueprint.nodes
-                    .filter((node) => node.id !== selected.id)
-                    .map((node) => (
-                      <option key={node.id} value={node.id}>
-                        {node.title}
-                      </option>
-                    ))}
-                </select>
-                <button
-                  type="button"
-                  onClick={connectSelectedToTarget}
-                  className="rounded-md bg-primary px-2 py-1.5 text-[11px] font-semibold text-primary-foreground hover:bg-primary-bright"
-                >
-                  Connect target
-                </button>
-              </div>
-              <div className="mt-2 space-y-1.5">
-                {blueprint.edges
-                  .filter(
-                    (edge) =>
-                      edge.sourceNodeId === selected.id || edge.targetNodeId === selected.id,
-                  )
-                  .map((edge) => {
-                    const outgoing = edge.sourceNodeId === selected.id
-                    const other = blueprint.nodes.find(
-                      (node) => node.id === (outgoing ? edge.targetNodeId : edge.sourceNodeId),
-                    )
-                    return (
-                      <div key={edge.id} className="rounded-lg border border-border bg-surface-2 p-2">
-                        <button
-                          type="button"
-                          onClick={() => other && setSelectedBlueprintNodeId(other.id)}
-                          className="flex w-full items-center gap-2 text-left"
-                        >
-                          <span className="rounded bg-white/5 px-1.5 py-0.5 text-[10px] text-faint-foreground">
-                            {outgoing ? t('blueprint.output') : t('blueprint.input')}
-                          </span>
-                          <span className="min-w-0 flex-1 truncate text-xs font-medium text-foreground">
-                            {other?.title}
-                          </span>
-                          <ArrowRight className="size-3 text-faint-foreground" />
-                        </button>
-                        <div className="mt-2 grid grid-cols-[1fr_auto_auto] gap-1.5">
-                          <select
-                            value={edge.type}
-                            onChange={(event) =>
-                              updateBlueprintEdge(edge.id, {
-                                type: event.target.value as BlueprintEdgeType,
-                              })
-                            }
-                            className="min-w-0 rounded-md border border-border bg-background px-2 py-1 text-[11px] text-foreground outline-none focus:border-primary/60"
-                          >
-                            {EDGE_TYPES.map((type) => (
-                              <option key={type} value={type}>
-                                {labels.blueprintEdge(type)}
-                              </option>
-                            ))}
-                          </select>
-                          <button
-                            type="button"
-                            onClick={() =>
-                              updateBlueprintEdge(edge.id, { isRequired: !edge.isRequired })
-                            }
-                            className={cn(
-                              'rounded-md border px-2 py-1 text-[10px] font-medium',
-                              edge.isRequired
-                                ? 'border-warning/40 bg-warning/10 text-warning'
-                                : 'border-border text-faint-foreground hover:bg-white/5',
-                            )}
-                          >
-                            {t('blueprint.required')}
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => deleteBlueprintEdge(edge.id)}
-                            className="rounded-md border border-border px-2 py-1 text-[10px] text-faint-foreground hover:bg-white/5 hover:text-destructive"
-                            aria-label={t('blueprint.deleteEdge', { id: edge.id })}
-                          >
-                            <Trash2 className="size-3" />
-                          </button>
-                        </div>
-                      </div>
-                    )
-                  })}
-              </div>
-
-              <InspLabel className="mt-5">{t('blueprint.boundDocs')}</InspLabel>
-              <div className="mt-2 space-y-1.5">
-                {uniqueIds([...selected.boundDocumentIds, ...selected.generatedDocIds]).map((docId) => {
-                  const doc = documents.find((item) => item.id === docId)
-                  return doc ? (
-                    <button
-                      key={docId}
-                      type="button"
-                      onClick={() => openDoc(doc.id)}
-                      className="flex w-full items-center gap-2 rounded-lg border border-border bg-surface-2 px-2.5 py-2 text-left hover:border-white/20"
-                    >
-                      <FileText className="size-3.5 text-primary-bright" />
-                      <span className="min-w-0 flex-1 truncate text-xs font-medium text-foreground">
-                        {doc.title}
-                      </span>
-                    </button>
-                  ) : null
-                })}
-                <div className="grid grid-cols-[1fr_auto] gap-1.5">
-                  <select
-                    value={docToBind}
-                    onChange={(event) => setDocToBind(event.target.value)}
-                    className="min-w-0 rounded-md border border-border bg-background px-2 py-1.5 text-[11px] text-foreground outline-none focus:border-primary/60"
-                  >
-                    {documents.map((doc) => (
-                      <option key={doc.id} value={doc.id}>
-                        {doc.title}
-                      </option>
-                    ))}
-                  </select>
-                  <button
-                    type="button"
-                    onClick={bindDocument}
-                    className="rounded-md bg-primary px-2 py-1.5 text-[11px] font-semibold text-primary-foreground hover:bg-primary-bright"
-                  >
-                    {t('blueprint.bind')}
-                  </button>
-                </div>
-              </div>
-
-              <InspLabel className="mt-5">{t('blueprint.members')}</InspLabel>
-              <div className="mt-2 space-y-1.5">
-                {selected.boundMemberIds.map((memberId) => {
-                  const member = memberById(memberId)
-                  return member ? (
-                    <div key={memberId} className="flex items-center gap-2 rounded-md px-1 py-1">
-                      <Avatar member={member} size={22} />
-                      <span className="min-w-0 flex-1 truncate text-xs text-foreground">
-                        {member.name}
-                      </span>
-                      <button
+                <div ref={canvasRef} className="relative overflow-auto rounded-lg border border-border bg-background" style={{ minHeight: CANVAS_HEIGHT }}>
+                  <div className="relative" style={{ width: CANVAS_WIDTH, height: CANVAS_HEIGHT, backgroundImage: 'radial-gradient(circle, rgb(148 163 184 / 0.15) 1px, transparent 1px)', backgroundSize: '20px 20px' }}>
+                    <svg aria-hidden className="pointer-events-none absolute inset-0 size-full">
+                      {edges.map((edge) => {
+                        const source = layout.nodePositions[edge.sourceNodeId]
+                        const target = layout.nodePositions[edge.targetNodeId]
+                        if (!source || !target) return null
+                        return <g key={edge.id}><line x1={source.x + NODE_WIDTH / 2} y1={source.y + NODE_HEIGHT / 2} x2={target.x + NODE_WIDTH / 2} y2={target.y + NODE_HEIGHT / 2} stroke="rgb(129 140 248 / 0.55)" strokeWidth="1.5" /><text x={(source.x + target.x + NODE_WIDTH) / 2} y={(source.y + target.y + NODE_HEIGHT) / 2 - 5} fill="rgb(148 163 184)" fontSize="9">{edge.kind}</text></g>
+                      })}
+                    </svg>
+                    {nodes.map((node) => {
+                      const position = layout.nodePositions[node.id] ?? { x: 0, y: 0 }
+                      return <button
+                        key={node.id}
                         type="button"
-                        onClick={() =>
-                          updateBlueprintNode(selected.id, {
-                            boundMemberIds: selected.boundMemberIds.filter((id) => id !== memberId),
-                          })
-                        }
-                        className="rounded px-1 text-[10px] text-faint-foreground hover:bg-white/5"
-                      >
-                        {t('common.remove')}
-                      </button>
-                    </div>
-                  ) : null
-                })}
-                <div className="grid grid-cols-[1fr_auto] gap-1.5">
-                  <select
-                    value={memberToBind}
-                    onChange={(event) => setMemberToBind(event.target.value)}
-                    className="min-w-0 rounded-md border border-border bg-background px-2 py-1.5 text-[11px] text-foreground outline-none focus:border-primary/60"
-                  >
-                    {MEMBERS.map((member) => (
-                      <option key={member.id} value={member.id}>
-                        {member.name}
-                      </option>
-                    ))}
-                  </select>
-                  <button
-                    type="button"
-                    onClick={bindMember}
-                    className="rounded-md bg-primary px-2 py-1.5 text-[11px] font-semibold text-primary-foreground hover:bg-primary-bright"
-                  >
-                    {t('blueprint.bind')}
-                  </button>
-                </div>
-              </div>
-
-              <InspLabel className="mt-5">{t('blueprint.prototypeAssets')}</InspLabel>
-              <div className="mt-2 space-y-1.5">
-                {selected.boundPrototypeArtifactIds.map((assetId) => {
-                  const asset = importAssets.find((item) => item.id === assetId)
-                  return (
-                    <div key={assetId} className="rounded-lg border border-border bg-surface-2 px-2.5 py-2">
-                      <div className="truncate text-xs font-medium text-foreground">
-                        {asset?.name ?? assetId}
-                      </div>
-                      <div className="mt-0.5 text-[10px] text-faint-foreground">
-                        {asset?.source ?? t('blueprint.node.prototype')} · {labels.blueprintEdge('syncs_with')}
-                      </div>
-                    </div>
-                  )
-                })}
-                <div className="grid grid-cols-[1fr_auto] gap-1.5">
-                  <select
-                    value={prototypeToBind}
-                    onChange={(event) => setPrototypeToBind(event.target.value)}
-                    className="min-w-0 rounded-md border border-border bg-background px-2 py-1.5 text-[11px] text-foreground outline-none focus:border-primary/60"
-                  >
-                    {importAssets.map((asset) => (
-                      <option key={asset.id} value={asset.id}>
-                        {asset.name}
-                      </option>
-                    ))}
-                  </select>
-                  <button
-                    type="button"
-                    onClick={bindPrototype}
-                    className="rounded-md bg-primary px-2 py-1.5 text-[11px] font-semibold text-primary-foreground hover:bg-primary-bright"
-                  >
-                    {t('blueprint.bind')}
-                  </button>
-                </div>
-              </div>
-
-              {activeBlueprintContext?.selectedNodeId === selected.id && (
-                <>
-                  <InspLabel className="mt-5">{t('blueprint.workbenchTarget')}</InspLabel>
-                  <div className="mt-2 rounded-lg border border-primary/30 bg-primary/10 p-3 text-[11px] leading-relaxed text-primary-bright">
-                    {t('blueprint.contextSummary', {
-                      status: activeBlueprintContext.status,
-                      nodes: activeBlueprintContext.nodeIds.length,
-                      docs: activeBlueprintContext.linkedDocIds.length,
+                        onPointerDown={(event) => {
+                          if (readOnly || event.button !== 0) return
+                          const rect = event.currentTarget.getBoundingClientRect()
+                          event.currentTarget.setPointerCapture(event.pointerId)
+                          dragRef.current = { id: node.id, pointerId: event.pointerId, offsetX: event.clientX - rect.left, offsetY: event.clientY - rect.top }
+                        }}
+                        onPointerMove={(event) => {
+                          const drag = dragRef.current
+                          const canvas = canvasRef.current
+                          if (!drag || drag.id !== node.id || !canvas) return
+                          const rect = canvas.getBoundingClientRect()
+                          moveNode(node.id, event.clientX - rect.left + canvas.scrollLeft - drag.offsetX, event.clientY - rect.top + canvas.scrollTop - drag.offsetY)
+                        }}
+                        onPointerUp={(event) => {
+                          if (dragRef.current?.id === node.id && event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId)
+                          dragRef.current = null
+                        }}
+                        onClick={() => setSelectedBlueprintNodeId(node.id)}
+                        className={cn('absolute cursor-move rounded-lg border p-2 text-left shadow-sm touch-none', NODE_COLORS[node.kind], selectedBlueprintNodeId === node.id && 'ring-2 ring-primary')}
+                        style={{ width: NODE_WIDTH, height: NODE_HEIGHT, transform: `translate(${position.x}px, ${position.y}px)` }}
+                      ><span className="block truncate text-[9px] uppercase tracking-wide text-faint-foreground">{node.kind}</span><span className="block truncate text-[11px] font-semibold text-foreground">{node.title}</span></button>
                     })}
                   </div>
-                </>
-              )}
+                </div>
+                <div className="mt-3 space-y-1">
+                  {edges.map((edge) => <div key={edge.id} className="flex items-center gap-2 rounded border border-border bg-panel px-2 py-1.5 text-[9px] text-muted-foreground"><GitFork className="size-3 text-primary-bright" /><code>{edge.sourceNodeId}</code><b>{edge.kind}</b><code>{edge.targetNodeId}</code><label className="ml-auto flex items-center gap-1"><input type="checkbox" checked={edge.required} disabled={readOnly} onChange={(event) => mutateBlueprint((_nodes, currentEdges) => ({ edges: currentEdges.map((item) => item.id === edge.id ? { ...item, required: event.target.checked } : item) }))} />required</label><button type="button" disabled={readOnly} onClick={() => mutateBlueprint((_nodes, currentEdges) => ({ edges: currentEdges.filter((item) => item.id !== edge.id) }))}><Trash2 className="size-3 text-destructive" /></button></div>)}
+                </div>
+              </section>
 
-              <div className="mt-5 grid grid-cols-2 gap-2">
-                <button
-                  type="button"
-                  onClick={generateDocs}
-                  className="inline-flex items-center justify-center gap-1.5 rounded-lg border border-border px-2.5 py-2 text-xs font-medium text-muted-foreground hover:bg-white/5"
-                >
-                  <FileText className="size-3.5" /> {t('blueprint.docs')}
-                </button>
-                <button
-                  type="button"
-                  onClick={() => createWorkbenchContextFromBlueprint(selected.id)}
-                  className="inline-flex items-center justify-center gap-1.5 rounded-lg bg-primary px-2.5 py-2 text-xs font-medium text-primary-foreground hover:bg-primary-bright"
-                >
-                  <Zap className="size-3.5" /> Workbench
-                </button>
-                <button
-                  type="button"
-                  onClick={() => {
-                    completeBlueprintNode(selected.id)
-                    setNotice(t('blueprint.aiCompletionApplied', { title: selected.title }))
-                  }}
-                  className="inline-flex items-center justify-center gap-1.5 rounded-lg border border-dashed border-border px-2.5 py-2 text-xs text-muted-foreground hover:border-primary/40 hover:text-foreground"
-                >
-                  <Sparkles className="size-3.5 text-primary-bright" /> {t('blueprint.complete')}
-                </button>
-                <button
-                  type="button"
-                  onClick={() => deleteBlueprintNode(selected.id)}
-                  className="inline-flex items-center justify-center gap-1.5 rounded-lg border border-border px-2.5 py-2 text-xs text-faint-foreground hover:bg-white/5 hover:text-destructive"
-                >
-                  <Trash2 className="size-3.5" /> {t('common.delete')}
-                </button>
-              </div>
-
-              <InspLabel className="mt-5">{t('blueprint.operationLog')}</InspLabel>
-              <div className="mt-2 space-y-1.5">
-                {blueprintOperations.slice(0, 4).map((operation) => (
-                  <div key={operation.id} className="rounded-md border border-border bg-surface-2 px-2 py-1.5">
-                    <div className="text-[10px] font-medium text-primary-bright">
-                      {operation.type}
-                    </div>
-                    <div className="mt-0.5 text-[11px] text-muted-foreground">
-                      {operation.summary}
-                    </div>
-                  </div>
-                ))}
-              </div>
+              <aside className="border-l border-border bg-panel p-4 max-xl:border-l-0 max-xl:border-t">
+                {!selectedNode ? <p className="rounded border border-dashed border-border p-4 text-[10px] text-faint-foreground">Select a semantic node to edit it. Positions live only in the layout section.</p> : <NodeInspector node={selectedNode} position={layout.nodePositions[selectedNode.id] ?? { x: 0, y: 0 }} readOnly={readOnly} onChange={(patch) => updateNode(selectedNode.id, patch)} onMove={(x, y) => moveNode(selectedNode.id, x, y)} onDelete={() => deleteNode(selectedNode.id)} />}
+              </aside>
             </div>
-          </>
-        ) : (
-          <div className="flex flex-1 items-center justify-center p-6 text-center text-sm text-faint-foreground">
-            {t('blueprint.emptyEditor')}
-          </div>
-        )}
-      </aside>
+          )}
+
+          {tab === 'pages' && <PageSpecsPanel resourceId={resource.artifact.id} nodes={nodes} pageSpecs={workspace.pageSpecs} hasRevision={Boolean(resource.latestRevision)} readOnly={readOnly} onCreate={async (node, route) => {
+            try {
+              const artifactId = await workspace.createPageSpec(resource.artifact.id, node.id, `${node.title} PageSpec`, route)
+              if (artifactId) updateNode(node.id, { pageSpecArtifactId: artifactId })
+            } catch (error) {
+              setLocalError(errorMessage(error))
+            }
+          }} />}
+
+          {tab === 'versions' && <section className="mx-auto max-w-4xl space-y-3 p-5"><GatePanel clientIssues={clientGate} serverGate={details?.reviewGate} /><button type="button" onClick={() => void createRevision()} disabled={readOnly || !revisionReady || saving} className="inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-2 text-[11px] font-semibold text-primary-foreground disabled:opacity-50"><GitBranch className="size-3.5" />Create immutable revision</button>{details?.versions.map((version) => <div key={version.id} className="rounded-lg border border-border bg-panel p-3"><div className="flex items-center gap-2"><FileClock className="size-4 text-primary-bright" /><span className="text-[11px] font-medium text-foreground">Revision {version.revisionNumber}</span><code className="ml-auto text-[9px] text-faint-foreground">{version.contentHash.slice(0, 16)}</code></div><p className="mt-1 text-[10px] text-muted-foreground">{new Date(version.createdAt).toLocaleString()} · {version.sourceVersions?.length ?? 0} pinned requirement revisions</p></div>)}</section>}
+
+          {tab === 'proposal' && <ProposalPanel proposals={proposals} selected={selectedOperations} onSelected={setSelectedOperations} instruction={proposalInstruction} onInstruction={setProposalInstruction} canEdit={!readOnly} canCreate={Boolean(resource.draft?.contentHash)} onCreate={() => void workspace.createProposal({ kind: 'blueprint.patch', targetArtifactId: resource.artifact.id, baseDraftHash: resource.draft?.contentHash ?? '', instruction: proposalInstruction, inputVersions: resource.draft?.sourceVersions ?? [], outputSchemaVersion: 'blueprint.patch.v1' }).catch((error) => setLocalError(errorMessage(error)))} onApply={(proposal) => void workspace.applyProposal(proposal.id, selectedOperations[proposal.id] ?? [], serverEtag ?? '').catch((error) => setLocalError(errorMessage(error)))} />}
+
+          {tab === 'impact' && <section className="mx-auto max-w-4xl space-y-3 p-5"><div className="flex items-center justify-between gap-3"><div><h2 className="text-sm font-semibold text-foreground">Downstream impact lens</h2><p className="mt-1 text-[10px] text-muted-foreground">Compares pinned blueprint versions with PageSpecs, prototypes and workbench outputs.</p></div><button type="button" onClick={() => void loadImpact()} className="rounded-md bg-primary px-3 py-2 text-[10px] font-semibold text-primary-foreground"><RefreshCw className="mr-1 inline size-3" />Analyze impact</button></div>{resource.artifact.status === 'needsSync' && <div className="rounded-md border border-warning/30 bg-warning/10 p-3 text-[10px] text-warning"><AlertTriangle className="mr-1 inline size-3" />The server marked this blueprint or a dependent artifact as needs_sync.</div>}{impact?.items.length === 0 && <p className="rounded border border-dashed border-border p-4 text-[10px] text-faint-foreground">No downstream impact was reported.</p>}{impact?.items.map((item, index) => <div key={`${item.targetArtifactId}-${index}`} className={cn('rounded-md border bg-panel p-3 text-[10px]', item.needsSync ? 'border-warning/40' : 'border-border')}><div className="flex items-center gap-2"><code className="text-primary-bright">{item.targetKind}:{item.targetArtifactId}</code><span className="ml-auto rounded bg-white/5 px-1.5 py-0.5">{item.severity}</span>{item.needsSync && <span className="rounded bg-warning/10 px-1.5 py-0.5 text-warning">needs_sync</span>}</div><p className="mt-1 text-muted-foreground">{item.reason}</p><p className="mt-1 text-faint-foreground">source {item.source.artifactId}@{item.source.revisionNumber} · {item.source.contentHash.slice(0, 12)}</p></div>)}</section>}
+
+          {tab === 'trace' && <section className="mx-auto max-w-4xl space-y-2 p-5">{details?.dependencies.map((dependency) => <div key={dependency.id} className="rounded-md border border-border bg-panel p-3 text-[10px]"><Link2 className="mr-2 inline size-3.5 text-primary-bright" />{dependency.source.artifactId}@{dependency.source.revisionNumber} <b>{dependency.relation}</b> {dependency.target.artifactId}@{dependency.target.revisionNumber}{dependency.blocking && <span className="ml-2 text-warning">blocking</span>}</div>)}{workspace.traces.filter((trace) => trace.source.id === resource.artifact.id || trace.target.id === resource.artifact.id).map((trace) => <div key={trace.id} className="rounded-md border border-border bg-panel p-3 text-[10px]"><code>{trace.source.kind}:{trace.source.id}</code> → {trace.relation} → <code>{trace.target.kind}:{trace.target.id}</code></div>)}</section>}
+
+          {tab === 'review' && <section className="mx-auto max-w-4xl space-y-3 p-5"><GatePanel clientIssues={clientGate} serverGate={details?.reviewGate} />{!latestVersion && <p className="rounded-md border border-dashed border-border p-4 text-[10px] text-faint-foreground">Create a revision before commenting or requesting review.</p>}{latestVersion && <div className="grid gap-2 sm:grid-cols-[1fr_auto]"><input value={comment} onChange={(event) => setComment(event.target.value)} placeholder="Comment on this exact blueprint revision" className="h-9 rounded-md border border-border bg-background px-2 text-[10px] text-foreground" /><button type="button" onClick={() => void collaboration.addComment(comment, undefined, latestVersion).then((ok) => ok && setComment(''))} disabled={!comment.trim() || !collaboration.can('comment')} className="rounded-md bg-primary px-3 text-[10px] font-semibold text-primary-foreground disabled:opacity-50"><MessageSquare className="mr-1 inline size-3" />Comment</button></div>}{latestVersion && <div className="grid gap-2 sm:grid-cols-[1fr_180px_auto]"><input value={reviewSummary} onChange={(event) => setReviewSummary(event.target.value)} className="h-9 rounded-md border border-border bg-background px-2 text-[10px] text-foreground" /><select value={reviewerId} onChange={(event) => setReviewerId(event.target.value)} className="h-9 rounded-md border border-border bg-background px-2 text-[10px] text-foreground"><option value="">Reviewer</option>{collaboration.members.filter((member) => member.user.id !== currentUserId && ['owner', 'admin', 'editor'].includes(member.role)).map((member) => <option key={member.user.id} value={member.user.id}>{member.user.name}</option>)}</select><button type="button" onClick={() => void collaboration.requestReview(reviewSummary, latestVersion, [reviewerId])} disabled={!gatePassed || !reviewerId || !reviewSummary.trim()} className="rounded-md bg-primary px-3 text-[10px] font-semibold text-primary-foreground disabled:opacity-50"><Send className="mr-1 inline size-3" />Request review</button></div>}{comments.map((thread) => <div key={thread.id} className="rounded-md border border-border bg-panel p-3"><span className="text-[10px] font-medium text-foreground">{thread.author.name}</span><p className="mt-1 text-[10px] text-muted-foreground">{thread.body}</p><p className="mt-1 text-[9px] text-faint-foreground">Pinned to revision {thread.target?.revisionNumber}</p></div>)}{reviews.map((review) => <div key={review.id} className="rounded-md border border-border bg-panel p-3 text-[10px]"><span className="font-medium text-foreground">{review.state}</span><span className="ml-2 text-muted-foreground">{review.summary}</span><span className="ml-2 text-faint-foreground">revision {review.target?.revisionNumber ?? 'unknown'}</span></div>)}</section>}
+        </div>
+      </main>
     </div>
   )
 }
 
-function nodeTypeForModule(group: string, title: string): BlueprintNodeType {
-  if (group === 'Feature packs') return 'feature'
-  if (group === 'Page patterns') return 'page'
-  if (group === 'API patterns') return 'api'
-  if (group === 'Data models') return 'dataModel'
-  if (group === 'Permissions') return 'permission'
-  if (group === 'Prototype assets') return 'prototype'
-  if (group === 'Workbench targets') return 'workbenchTarget'
-  if (title.toLowerCase().includes('permission')) return 'permission'
-  return 'component'
+function NodeInspector({ node, position, readOnly, onChange, onMove, onDelete }: { node: SemanticNode; position: { readonly x: number; readonly y: number }; readOnly: boolean; onChange: (patch: Partial<SemanticNode>) => void; onMove: (x: number, y: number) => void; onDelete: () => void }) {
+  return <div className="space-y-3"><div className="flex items-center gap-2"><Move className="size-4 text-primary-bright" /><h2 className="text-xs font-semibold text-foreground">Semantic node</h2><button type="button" onClick={onDelete} disabled={readOnly} className="ml-auto text-destructive disabled:opacity-40"><Trash2 className="size-4" /></button></div><code className="block truncate text-[9px] text-faint-foreground">{node.id}</code><label className="block text-[10px] text-muted-foreground">Kind<select value={node.kind} disabled={readOnly} onChange={(event) => onChange({ kind: event.target.value as BlueprintNodeKind })} className="mt-1 h-8 w-full rounded border border-border bg-background px-2 text-[10px] text-foreground">{NODE_KINDS.map((kind) => <option key={kind}>{kind}</option>)}</select></label><label className="block text-[10px] text-muted-foreground">Title<input value={node.title} readOnly={readOnly} onChange={(event) => onChange({ title: event.target.value })} className="mt-1 h-8 w-full rounded border border-border bg-background px-2 text-[10px] text-foreground" /></label><label className="block text-[10px] text-muted-foreground">Description<textarea value={node.description ?? ''} readOnly={readOnly} onChange={(event) => onChange({ description: event.target.value })} rows={4} className="mt-1 w-full rounded border border-border bg-background p-2 text-[10px] text-foreground" /></label><label className="block text-[10px] text-muted-foreground">Stable requirement IDs<input value={node.requirementIds.join(', ')} readOnly={readOnly} onChange={(event) => onChange({ requirementIds: commaList(event.target.value) })} className="mt-1 h-8 w-full rounded border border-border bg-background px-2 text-[10px] text-foreground" /></label><label className="block text-[10px] text-muted-foreground">Assigned member IDs<input value={node.assignedMemberIds.join(', ')} readOnly={readOnly} onChange={(event) => onChange({ assignedMemberIds: commaList(event.target.value) })} className="mt-1 h-8 w-full rounded border border-border bg-background px-2 text-[10px] text-foreground" /></label><div className="rounded border border-border bg-background p-2"><span className="text-[9px] font-medium uppercase text-faint-foreground">Layout only</span><div className="mt-2 grid grid-cols-2 gap-2"><label className="text-[9px] text-muted-foreground">X<input type="number" value={position.x} disabled={readOnly} onChange={(event) => onMove(Number(event.target.value), position.y)} className="mt-1 h-8 w-full rounded border border-border bg-panel px-2 text-[10px] text-foreground" /></label><label className="text-[9px] text-muted-foreground">Y<input type="number" value={position.y} disabled={readOnly} onChange={(event) => onMove(position.x, Number(event.target.value))} className="mt-1 h-8 w-full rounded border border-border bg-panel px-2 text-[10px] text-foreground" /></label></div></div>{node.pageSpecArtifactId && <p className="rounded border border-success/30 bg-success/10 p-2 text-[9px] text-success">PageSpec {node.pageSpecArtifactId}</p>}</div>
 }
 
-function ActionButton({
-  children,
-  icon: Icon,
-  onClick,
-}: {
-  children: React.ReactNode
-  icon: typeof Save
-  onClick: () => void
-}) {
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      className="inline-flex shrink-0 items-center gap-1.5 rounded-lg border border-border px-3 py-1.5 text-xs font-medium text-muted-foreground hover:bg-white/5 hover:text-foreground"
-    >
-      <Icon className="size-3.5" />
-      {children}
-    </button>
-  )
+function PageSpecsPanel({ nodes, pageSpecs, hasRevision, readOnly, onCreate }: { resourceId: string; nodes: readonly SemanticNode[]; pageSpecs: ReturnType<typeof useArtifactWorkspace>['pageSpecs']; hasRevision: boolean; readOnly: boolean; onCreate: (node: SemanticNode, route: string) => Promise<void> }) {
+  const pages = nodes.filter((node) => node.kind === 'page')
+  return <section className="mx-auto max-w-4xl space-y-3 p-5"><div><h2 className="text-sm font-semibold text-foreground">PageSpec outputs</h2><p className="mt-1 text-[10px] text-muted-foreground">Every PageSpec pins an immutable blueprint revision and a stable page node ID.</p></div>{!hasRevision && <p className="rounded-md border border-warning/30 bg-warning/10 p-3 text-[10px] text-warning">Create a blueprint revision before creating PageSpecs.</p>}{pages.length === 0 && <p className="rounded border border-dashed border-border p-4 text-[10px] text-faint-foreground">Add at least one page node to split the product into functional pages.</p>}{pages.map((node) => {
+    const existing = pageSpecs.find((item) => (item.draft?.content ?? item.latestRevision?.content)?.blueprintPageNodeId === node.id)
+    const route = `/${slug(node.title)}`
+    return <div key={node.id} className="rounded-lg border border-border bg-panel p-3"><div className="flex flex-wrap items-center gap-2"><span className="text-[11px] font-semibold text-foreground">{node.title}</span><code className="text-[9px] text-faint-foreground">{node.id}</code>{existing ? <span className="ml-auto rounded bg-success/10 px-2 py-1 text-[9px] text-success"><CheckCircle2 className="mr-1 inline size-3" />{existing.artifact.id}</span> : <button type="button" onClick={() => void onCreate(node, route)} disabled={readOnly || !hasRevision} className="ml-auto rounded bg-primary px-2.5 py-1.5 text-[9px] font-semibold text-primary-foreground disabled:opacity-40"><Plus className="mr-1 inline size-3" />Create {route}</button>}</div><p className="mt-2 text-[10px] text-muted-foreground">{node.description || 'Define goal, states, data bindings and interactions in the PageSpec.'}</p></div>
+  })}</section>
 }
 
-function InspLabel({
-  children,
-  className,
-}: {
-  children: React.ReactNode
-  className?: string
-}) {
-  return (
-    <div
-      className={cn(
-        'text-[11px] font-semibold uppercase tracking-wider text-faint-foreground',
-        className,
-      )}
-    >
-      {children}
-    </div>
-  )
+function GatePanel({ clientIssues, serverGate }: { clientIssues: string[]; serverGate?: ArtifactReviewGateDto }) {
+  const serverErrors = serverGate?.checks.filter((check) => check.severity === 'error').map((check) => check.message) ?? []
+  const issues = [...clientIssues, ...serverErrors]
+  return <div className={cn('rounded-lg border p-3', issues.length === 0 && serverGate?.passed ? 'border-success/30 bg-success/10' : 'border-warning/30 bg-warning/10')}><div className="flex items-center gap-2 text-[11px] font-semibold text-foreground">{issues.length === 0 && serverGate?.passed ? <CheckCircle2 className="size-4 text-success" /> : <AlertTriangle className="size-4 text-warning" />}Review gate {issues.length === 0 && serverGate?.passed ? 'passed' : 'blocked'}</div>{issues.map((issue) => <p key={issue} className="mt-1 text-[10px] text-muted-foreground">• {issue}</p>)}{serverGate && <p className="mt-2 text-[9px] text-faint-foreground">Trace coverage {Math.round(serverGate.traceCoverage * 100)}% · {serverGate.unresolvedBlockingCommentIds.length} unresolved blocking comments</p>}</div>
+}
+
+function ProposalPanel({ proposals, selected, onSelected, instruction, onInstruction, canEdit, canCreate, onCreate, onApply }: { proposals: readonly ProposalDto[]; selected: Record<string, number[]>; onSelected: (next: Record<string, number[]>) => void; instruction: string; onInstruction: (value: string) => void; canEdit: boolean; canCreate: boolean; onCreate: () => void; onApply: (proposal: ProposalDto) => void }) {
+  return <section className="mx-auto max-w-4xl space-y-3 p-5"><div className="rounded-lg border border-border bg-panel p-3"><textarea value={instruction} onChange={(event) => onInstruction(event.target.value)} rows={3} className="w-full rounded border border-border bg-background p-2 text-[11px] text-foreground" /><button type="button" onClick={onCreate} disabled={!canEdit || !canCreate || !instruction.trim()} className="mt-2 rounded bg-primary px-3 py-2 text-[10px] font-semibold text-primary-foreground disabled:opacity-50"><Bot className="mr-1 inline size-3" />Ask AI for proposal</button>{!canCreate && <p className="mt-2 text-[9px] text-warning">Save a server draft before creating a hash-pinned proposal.</p>}</div>{proposals.map((proposal) => <div key={proposal.id} className="rounded-lg border border-border bg-panel p-3"><div className="flex items-center gap-2"><span className="text-[11px] font-semibold text-foreground">{proposal.kind}</span><span className="rounded bg-primary/10 px-1.5 py-0.5 text-[9px] text-primary-bright">{proposal.status}</span><code className="ml-auto text-[9px] text-faint-foreground">base {proposal.baseDraftHash?.slice(0, 12) ?? 'none'}</code></div><div className="mt-2 space-y-1">{proposal.operations.map((operation, index) => <label key={index} className="flex gap-2 rounded border border-border bg-background p-2 text-[9px] text-muted-foreground"><input type="checkbox" checked={(selected[proposal.id] ?? []).includes(index)} onChange={(event) => onSelected({ ...selected, [proposal.id]: event.target.checked ? [...(selected[proposal.id] ?? []), index] : (selected[proposal.id] ?? []).filter((item) => item !== index) })} /><pre className="overflow-auto whitespace-pre-wrap">{JSON.stringify(operation, null, 2)}</pre></label>)}</div><button type="button" onClick={() => onApply(proposal)} disabled={!canEdit || (selected[proposal.id]?.length ?? 0) === 0 || proposal.status === 'applied' || proposal.status === 'rejected'} className="mt-2 rounded bg-primary px-2.5 py-1.5 text-[9px] font-semibold text-primary-foreground disabled:opacity-50">Apply selected operations</button></div>)}</section>
+}
+
+function Unavailable({ title, detail, loading, action, onAction, onRetry }: { title: string; detail: string; loading?: boolean; action?: string; onAction?: () => void; onRetry?: () => Promise<void> }) {
+  return <div className="flex h-full items-center justify-center bg-canvas p-6 text-center"><div className="max-w-md rounded-lg border border-dashed border-border bg-panel p-6">{loading ? <Loader2 className="mx-auto size-7 animate-spin text-primary-bright" /> : <AlertTriangle className="mx-auto size-7 text-warning" />}<h1 className="mt-3 text-base font-semibold text-foreground">{title}</h1><p className="mt-2 text-sm text-muted-foreground">{detail}</p>{action && onAction && <button type="button" onClick={onAction} className="mt-4 rounded-md bg-primary px-3 py-2 text-sm font-medium text-primary-foreground">{action}</button>}{onRetry && <button type="button" onClick={() => void onRetry()} className="mt-4 rounded-md bg-primary px-3 py-2 text-sm font-medium text-primary-foreground"><RefreshCw className="mr-1 inline size-4" />Retry</button>}</div></div>
+}
+
+function blueprintGate(content: BlueprintContentDto) {
+  const nodes = content.semantic?.nodes ?? []
+  const edges = content.semantic?.edges ?? []
+  const issues: string[] = []
+  if (nodes.length === 0) issues.push('At least one semantic node is required.')
+  if (nodes.some((node) => !node.id || !node.title.trim())) issues.push('Every node needs a stable ID and title.')
+  if (nodes.some((node) => !content.layout?.nodePositions[node.id])) issues.push('Every semantic node needs a separate layout position.')
+  const ids = new Set(nodes.map((node) => node.id))
+  if (edges.some((edge) => !ids.has(edge.sourceNodeId) || !ids.has(edge.targetNodeId))) issues.push('Every edge must reference existing semantic nodes.')
+  if (nodes.filter((node) => node.kind === 'page').some((node) => node.requirementIds.length === 0)) issues.push('Every page node must trace to at least one stable requirement ID.')
+  return issues
+}
+
+function versionRef(revision: ArtifactRevisionDto<BlueprintContentDto>): VersionRefDto {
+  return { artifactId: revision.artifactId, revisionId: revision.id, revisionNumber: revision.revisionNumber, contentHash: revision.contentHash }
+}
+
+function stableId(prefix: string) {
+  const id = typeof crypto !== 'undefined' && crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(36).slice(2)}`
+  return `${prefix}-${id}`
+}
+
+function commaList(value: string) {
+  return Array.from(new Set(value.split(',').map((item) => item.trim()).filter(Boolean)))
+}
+
+function slug(value: string) {
+  return value.trim().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'page'
+}
+
+function errorMessage(error: unknown) {
+  return error instanceof Error ? error.message : 'Blueprint operation failed.'
 }

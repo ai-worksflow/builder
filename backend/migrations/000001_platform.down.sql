@@ -1,0 +1,47 @@
+DROP TRIGGER IF EXISTS artifact_revisions_immutable_update ON artifact_revisions;
+DROP FUNCTION IF EXISTS reject_artifact_revision_mutation();
+DROP TABLE IF EXISTS outbox_events;
+DROP TABLE IF EXISTS audit_events;
+DROP TABLE IF EXISTS idempotency_records;
+DROP TABLE IF EXISTS notifications;
+DROP TABLE IF EXISTS implementation_operation_decisions;
+ALTER TABLE IF EXISTS artifact_revisions
+  DROP CONSTRAINT IF EXISTS artifact_revisions_implementation_proposal_fk,
+  DROP COLUMN IF EXISTS implementation_proposal_id;
+DROP TABLE IF EXISTS implementation_proposals;
+DROP TABLE IF EXISTS application_build_manifests;
+DROP TABLE IF EXISTS workflow_run_events;
+DROP TABLE IF EXISTS workflow_node_runs;
+DROP TABLE IF EXISTS workflow_runs;
+DROP TABLE IF EXISTS workflow_definition_versions;
+DROP TABLE IF EXISTS workflow_definitions;
+DROP TABLE IF EXISTS impact_reports;
+DROP TABLE IF EXISTS delivery_slices;
+DROP TABLE IF EXISTS blueprint_layouts;
+DROP TABLE IF EXISTS proposal_operation_decisions;
+ALTER TABLE IF EXISTS artifact_revisions
+  DROP CONSTRAINT IF EXISTS artifact_revisions_proposal_fk,
+  DROP CONSTRAINT IF EXISTS artifact_revisions_source_manifest_fk;
+DROP TABLE IF EXISTS output_proposals;
+DROP TABLE IF EXISTS input_manifests;
+DROP TABLE IF EXISTS comment_messages;
+DROP TABLE IF EXISTS comment_threads;
+DROP TABLE IF EXISTS review_decisions;
+DROP TABLE IF EXISTS review_requests;
+DROP TABLE IF EXISTS artifact_health;
+DROP TABLE IF EXISTS trace_links;
+DROP TABLE IF EXISTS artifact_dependencies;
+DROP TABLE IF EXISTS artifact_responsibilities;
+ALTER TABLE IF EXISTS artifacts
+  DROP CONSTRAINT IF EXISTS artifacts_latest_draft_fk,
+  DROP CONSTRAINT IF EXISTS artifacts_latest_revision_fk,
+  DROP CONSTRAINT IF EXISTS artifacts_approved_revision_fk;
+DROP TABLE IF EXISTS artifact_draft_sources;
+DROP TABLE IF EXISTS artifact_drafts;
+DROP TABLE IF EXISTS artifact_revisions;
+DROP TABLE IF EXISTS artifacts;
+DROP TABLE IF EXISTS project_invitations;
+DROP TABLE IF EXISTS project_members;
+DROP TABLE IF EXISTS projects;
+DROP TABLE IF EXISTS auth_sessions;
+DROP TABLE IF EXISTS users;

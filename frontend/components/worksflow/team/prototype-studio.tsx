@@ -1,2401 +1,647 @@
 'use client'
 
-import { useMemo, useState, type CSSProperties } from 'react'
-import { useI18n, type MessageKey } from '@/lib/i18n'
-import { cn } from '@/lib/utils'
-import { useWorksflow } from '@/lib/worksflow/store'
-import type { DocType } from '@/lib/worksflow/types'
-import { useLocalizedLabels } from '../use-localized-labels'
-import { clamp, cloneItems, parsedNumber } from './prototype-studio-helpers'
 import {
-  ArrowDown,
-  ArrowLeft,
-  ArrowRight,
-  ArrowUp,
-  ArrowUpRight,
-  Badge,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type PointerEvent as ReactPointerEvent,
+} from 'react'
+import {
   Box,
   Braces,
   CheckCircle2,
+  CircleAlert,
+  CircleDashed,
   Component,
-  Copy,
   Database,
-  Download,
   Eye,
   EyeOff,
-  FileCode2,
+  FileClock,
   FormInput,
   Frame,
-  Grid3X3,
-  History,
   ImageIcon,
   Layers,
-  LayoutTemplate,
-  Link2,
-  ListTree,
+  LoaderCircle,
   Lock,
-  Maximize2,
-  Menu,
   MonitorSmartphone,
-  MousePointer2,
-  Move,
+  PackageCheck,
   PanelRight,
-  Play,
   Plus,
-  RotateCcw,
+  RefreshCw,
   Save,
-  Search,
-  Settings2,
-  Shapes,
-  SlidersHorizontal,
+  Send,
+  ShieldCheck,
   Sparkles,
-  Table2,
-  TabletSmartphone,
-  ToggleLeft,
+  Trash2,
   Type,
   Unlock,
   Wand2,
+  X,
   ZoomIn,
   ZoomOut,
 } from 'lucide-react'
+import { useCollaboration } from '@/lib/collaboration/provider'
+import { useArtifactWorkspace } from '@/lib/platform/artifact-provider'
+import { ArtifactWorkspaceConflictError } from '@/lib/platform/artifact-workspace'
+import type {
+  JsonObject,
+  JsonValue,
+  PrototypeContentDto,
+  PrototypeFixtureDto,
+  PrototypeLayerDto,
+  PrototypeLayerKind,
+  VersionedArtifactDto,
+} from '@/lib/platform/dto'
+import { useWorksflow } from '@/lib/worksflow/store'
+import { cn } from '@/lib/utils'
 
-type StateKey = 'empty' | 'loading' | 'ready' | 'error'
 type PrototypeMode = 'wireframe' | 'design' | 'component' | 'handoff'
-type StudioPanel = 'properties' | 'data' | 'handoff'
-type DevicePreset = 'desktop' | 'tablet' | 'mobile'
-type LayerKind = 'frame' | 'text' | 'card' | 'button' | 'input' | 'image' | 'badge'
-type UiLibraryId = 'shadcn' | 'mui' | 'ant' | 'chakra' | 'headless' | 'custom'
+type Panel = 'properties' | 'data' | 'trace'
+type SaveState = 'idle' | 'dirty' | 'saving' | 'saved' | 'conflict' | 'error'
 
-interface PrototypeLayer {
-  id: string
+const MODES: readonly { id: PrototypeMode; label: string; icon: typeof Frame }[] = [
+  { id: 'wireframe', label: 'Wireframe', icon: Frame },
+  { id: 'design', label: 'Visual design', icon: ImageIcon },
+  { id: 'component', label: 'Components', icon: Component },
+  { id: 'handoff', label: 'Handoff', icon: PanelRight },
+]
+
+const LAYER_TEMPLATES: readonly {
+  kind: PrototypeLayerKind
   name: string
-  kind: LayerKind
-  x: number
-  y: number
-  w: number
-  h: number
-  radius: number
-  opacity: number
-  rotation: number
-  fill: string
-  stroke: string
-  text?: string
-  textSize?: number
-  cropX?: number
-  cropY?: number
-  imageScale?: number
-  brightness?: number
-  contrast?: number
-  saturation?: number
-  blur?: number
-  visible: boolean
-  locked: boolean
-}
-
-interface PrototypePage {
-  id: string
-  name: string
-  docType: DocType
-  states: StateKey[]
-  owner: string
-  updatedAt: string
-  viewport: { width: number; height: number }
-  layers: PrototypeLayer[]
-  componentStories: string[]
-  sourceDocs: string[]
-  apiContract: string
-}
-
-interface MockFixture {
-  id: string
-  state: StateKey
-  endpoint: string
-  fixture: string
-  method: 'GET' | 'POST'
-  status: number
-  latency: number
-  rows: number
-  schema: string
-  sample: string
-}
-
-interface UiLibrary {
-  id: UiLibraryId
-  name: string
-  descriptionKey: MessageKey
-  token: string
-}
-
-interface ComponentTemplate {
-  id: string
-  libraryId: UiLibraryId
-  name: string
-  category: string
-  kind: LayerKind
   width: number
   height: number
-  fill?: string
-  stroke?: string
-  text?: string
   icon: typeof Frame
-}
+  style?: JsonObject
+  properties?: JsonObject
+}[] = [
+  { kind: 'frame', name: 'Section', width: 360, height: 160, icon: Frame, style: { fill: '#171719', borderRadius: 12 } },
+  { kind: 'text', name: 'Heading', width: 240, height: 36, icon: Type, style: { color: '#ffffff', fontSize: 24 }, properties: { text: 'Heading' } },
+  { kind: 'button', name: 'Primary button', width: 144, height: 44, icon: Sparkles, style: { fill: '#1488fc', borderRadius: 10 }, properties: { text: 'Continue' } },
+  { kind: 'input', name: 'Text input', width: 260, height: 44, icon: FormInput, style: { fill: '#26262a', borderRadius: 8 }, properties: { placeholder: 'Enter value' } },
+  { kind: 'componentInstance', name: 'Card', width: 300, height: 104, icon: Box, style: { fill: '#1e1e21', borderRadius: 12 } },
+  { kind: 'image', name: 'Image', width: 300, height: 160, icon: ImageIcon, style: { fill: '#20252b', borderRadius: 12 } },
+  { kind: 'list', name: 'List', width: 320, height: 180, icon: Layers, style: { fill: '#1e1e21', borderRadius: 10 } },
+]
 
-const STATE_ORDER: StateKey[] = ['empty', 'loading', 'ready', 'error']
-
-const STATE_LABEL_KEY: Record<StateKey, MessageKey> = {
-  empty: 'prototype.emptyState',
-  loading: 'prototype.loadingState',
-  ready: 'prototype.readyState',
-  error: 'prototype.errorState',
-}
-
-const MODE_LABEL_KEY: Record<PrototypeMode, MessageKey> = {
-  wireframe: 'prototype.mode.wireframe',
-  design: 'prototype.mode.design',
-  component: 'prototype.mode.component',
-  handoff: 'prototype.mode.handoff',
-}
-
-const PANEL_LABEL_KEY: Record<StudioPanel, MessageKey> = {
-  properties: 'prototype.panel.properties',
-  data: 'prototype.panel.data',
-  handoff: 'prototype.panel.handoff',
-}
-
-const DEVICE_PRESETS: Record<
-  DevicePreset,
-  { labelKey: MessageKey; width: number; height: number; icon: typeof MonitorSmartphone }
-> = {
-  desktop: { labelKey: 'prototype.device.desktop', width: 430, height: 560, icon: MonitorSmartphone },
-  tablet: { labelKey: 'prototype.device.tablet', width: 390, height: 540, icon: TabletSmartphone },
-  mobile: { labelKey: 'prototype.device.mobile', width: 320, height: 560, icon: MonitorSmartphone },
-}
-
-const MODE_ICON: Record<PrototypeMode, typeof Frame> = {
-  wireframe: Frame,
-  design: ImageIcon,
-  component: Component,
-  handoff: PanelRight,
-}
-
-const PANEL_ICON: Record<StudioPanel, typeof SlidersHorizontal> = {
-  properties: SlidersHorizontal,
-  data: Database,
-  handoff: FileCode2,
-}
-
-const LAYER_ICON: Record<LayerKind, typeof Frame> = {
+const LAYER_ICONS: Record<PrototypeLayerKind, typeof Frame> = {
   frame: Frame,
-  text: MousePointer2,
-  card: Layers,
-  button: Sparkles,
-  input: Maximize2,
+  group: Layers,
+  text: Type,
   image: ImageIcon,
-  badge: Component,
-}
-
-const COLOR_SWATCHES = [
-  '#1488fc',
-  '#2ba6ff',
-  '#4ade80',
-  '#fbbf24',
-  '#ef4444',
-  '#1e1e21',
-  '#26262a',
-  '#ffffff',
-]
-
-const UI_LIBRARIES: UiLibrary[] = [
-  { id: 'shadcn', name: 'shadcn/ui', descriptionKey: 'prototype.library.shadcn', token: 'Radix + Tailwind' },
-  { id: 'mui', name: 'Material UI', descriptionKey: 'prototype.library.mui', token: 'Material Design' },
-  { id: 'ant', name: 'Ant Design', descriptionKey: 'prototype.library.ant', token: 'Enterprise' },
-  { id: 'chakra', name: 'Chakra UI', descriptionKey: 'prototype.library.chakra', token: 'Composable' },
-  { id: 'headless', name: 'Headless UI', descriptionKey: 'prototype.library.headless', token: 'Unstyled' },
-  { id: 'custom', name: 'Custom', descriptionKey: 'prototype.library.custom', token: 'Team system' },
-]
-
-const COMPONENT_TEMPLATES: ComponentTemplate[] = [
-  {
-    id: 'shadcn-card',
-    libraryId: 'shadcn',
-    name: 'Card',
-    category: 'Layout',
-    kind: 'card',
-    width: 280,
-    height: 92,
-    fill: '#1e1e21',
-    icon: LayoutTemplate,
-  },
-  {
-    id: 'shadcn-button',
-    libraryId: 'shadcn',
-    name: 'Button',
-    category: 'Actions',
-    kind: 'button',
-    width: 128,
-    height: 42,
-    fill: '#1488fc',
-    text: 'Submit',
-    icon: Sparkles,
-  },
-  {
-    id: 'shadcn-input',
-    libraryId: 'shadcn',
-    name: 'Input',
-    category: 'Forms',
-    kind: 'input',
-    width: 240,
-    height: 44,
-    fill: '#26262a',
-    icon: FormInput,
-  },
-  {
-    id: 'shadcn-tabs',
-    libraryId: 'shadcn',
-    name: 'Tabs',
-    category: 'Navigation',
-    kind: 'input',
-    width: 220,
-    height: 40,
-    fill: '#26262a',
-    icon: ListTree,
-  },
-  {
-    id: 'mui-appbar',
-    libraryId: 'mui',
-    name: 'AppBar',
-    category: 'Navigation',
-    kind: 'frame',
-    width: 340,
-    height: 54,
-    fill: '#1976d2',
-    icon: Menu,
-  },
-  {
-    id: 'mui-card',
-    libraryId: 'mui',
-    name: 'Paper Card',
-    category: 'Surface',
-    kind: 'card',
-    width: 300,
-    height: 96,
-    fill: '#202124',
-    icon: Box,
-  },
-  {
-    id: 'mui-switch',
-    libraryId: 'mui',
-    name: 'Switch Row',
-    category: 'Forms',
-    kind: 'input',
-    width: 240,
-    height: 48,
-    fill: '#26262a',
-    icon: ToggleLeft,
-  },
-  {
-    id: 'ant-table',
-    libraryId: 'ant',
-    name: 'Table',
-    category: 'Data Display',
-    kind: 'card',
-    width: 360,
-    height: 150,
-    fill: '#1e1e21',
-    icon: Table2,
-  },
-  {
-    id: 'ant-form',
-    libraryId: 'ant',
-    name: 'Form Item',
-    category: 'Data Entry',
-    kind: 'input',
-    width: 300,
-    height: 56,
-    fill: '#26262a',
-    icon: FormInput,
-  },
-  {
-    id: 'ant-tag',
-    libraryId: 'ant',
-    name: 'Tag',
-    category: 'Feedback',
-    kind: 'badge',
-    width: 110,
-    height: 30,
-    fill: 'rgba(20,136,252,0.12)',
-    text: 'Active',
-    icon: Badge,
-  },
-  {
-    id: 'chakra-stack',
-    libraryId: 'chakra',
-    name: 'Stack',
-    category: 'Layout',
-    kind: 'frame',
-    width: 260,
-    height: 120,
-    fill: '#171719',
-    icon: Layers,
-  },
-  {
-    id: 'chakra-alert',
-    libraryId: 'chakra',
-    name: 'Alert',
-    category: 'Feedback',
-    kind: 'card',
-    width: 300,
-    height: 64,
-    fill: 'rgba(74,222,128,0.12)',
-    stroke: 'rgba(74,222,128,0.35)',
-    icon: Component,
-  },
-  {
-    id: 'chakra-badge',
-    libraryId: 'chakra',
-    name: 'Badge',
-    category: 'Data Display',
-    kind: 'badge',
-    width: 104,
-    height: 30,
-    fill: 'rgba(251,191,36,0.12)',
-    text: 'New',
-    icon: Badge,
-  },
-  {
-    id: 'headless-combobox',
-    libraryId: 'headless',
-    name: 'Combobox',
-    category: 'Forms',
-    kind: 'input',
-    width: 280,
-    height: 44,
-    fill: '#26262a',
-    icon: Search,
-  },
-  {
-    id: 'headless-dialog',
-    libraryId: 'headless',
-    name: 'Dialog',
-    category: 'Overlay',
-    kind: 'card',
-    width: 320,
-    height: 180,
-    fill: '#1e1e21',
-    icon: PanelRight,
-  },
-  {
-    id: 'headless-menu',
-    libraryId: 'headless',
-    name: 'Menu',
-    category: 'Navigation',
-    kind: 'card',
-    width: 180,
-    height: 132,
-    fill: '#1e1e21',
-    icon: Menu,
-  },
-]
-
-function layer(input: Partial<PrototypeLayer> & Pick<PrototypeLayer, 'id' | 'name' | 'kind' | 'x' | 'y' | 'w' | 'h'>): PrototypeLayer {
-  return {
-    radius: 8,
-    opacity: 100,
-    rotation: 0,
-    fill: '#1e1e21',
-    stroke: 'rgba(255,255,255,0.12)',
-    textSize: 14,
-    cropX: 50,
-    cropY: 50,
-    imageScale: 118,
-    brightness: 100,
-    contrast: 100,
-    saturation: 100,
-    blur: 0,
-    visible: true,
-    locked: false,
-    ...input,
-  }
-}
-
-const PAGES: PrototypePage[] = [
-  {
-    id: 'p1',
-    name: '/tasks',
-    docType: 'uiPrototype',
-    states: ['empty', 'loading', 'ready', 'error'],
-    owner: 'Mia Chen',
-    updatedAt: '40m ago',
-    viewport: { width: 430, height: 560 },
-    sourceDocs: ['CRM requirement v3', 'Feature list draft', 'UI state matrix'],
-    apiContract: 'GET /api/tasks',
-    componentStories: ['TaskCard / ready', 'TaskCard / completed', 'FilterBar / active', 'EmptyState'],
-    layers: [
-      layer({
-        id: 'p1-shell',
-        name: 'App frame',
-        kind: 'frame',
-        x: 0,
-        y: 0,
-        w: 430,
-        h: 560,
-        radius: 18,
-        fill: '#171719',
-        locked: true,
-      }),
-      layer({
-        id: 'p1-hero',
-        name: 'Header image',
-        kind: 'image',
-        x: 24,
-        y: 24,
-        w: 382,
-        h: 132,
-        radius: 14,
-        stroke: 'rgba(43,166,255,0.35)',
-        brightness: 92,
-        contrast: 112,
-        saturation: 118,
-      }),
-      layer({
-        id: 'p1-title',
-        name: 'Page title',
-        kind: 'text',
-        x: 32,
-        y: 178,
-        w: 190,
-        h: 30,
-        fill: 'transparent',
-        stroke: 'transparent',
-        text: 'Tasks',
-        textSize: 24,
-      }),
-      layer({
-        id: 'p1-filter',
-        name: 'Filter segmented control',
-        kind: 'input',
-        x: 248,
-        y: 176,
-        w: 148,
-        h: 36,
-        radius: 10,
-        fill: '#26262a',
-      }),
-      layer({
-        id: 'p1-card-1',
-        name: 'High priority task',
-        kind: 'card',
-        x: 24,
-        y: 236,
-        w: 382,
-        h: 76,
-        fill: '#1e1e21',
-      }),
-      layer({
-        id: 'p1-card-2',
-        name: 'Design review task',
-        kind: 'card',
-        x: 24,
-        y: 326,
-        w: 382,
-        h: 76,
-        fill: '#1e1e21',
-      }),
-      layer({
-        id: 'p1-cta',
-        name: 'Add task button',
-        kind: 'button',
-        x: 270,
-        y: 488,
-        w: 136,
-        h: 44,
-        radius: 12,
-        fill: '#1488fc',
-        stroke: 'rgba(20,136,252,0.65)',
-        text: 'New task',
-      }),
-      layer({
-        id: 'p1-badge',
-        name: 'Sync badge',
-        kind: 'badge',
-        x: 32,
-        y: 492,
-        w: 112,
-        h: 34,
-        radius: 999,
-        fill: 'rgba(74,222,128,0.12)',
-        stroke: 'rgba(74,222,128,0.35)',
-        text: '4 states',
-      }),
-    ],
-  },
-  {
-    id: 'p2',
-    name: '/tasks/:id',
-    docType: 'uiPrototype',
-    states: ['loading', 'ready', 'error'],
-    owner: 'Noah Kim',
-    updatedAt: '1h ago',
-    viewport: { width: 430, height: 560 },
-    sourceDocs: ['Task detail requirement', 'Activity feed contract'],
-    apiContract: 'GET /api/tasks/:id',
-    componentStories: ['TaskDetail / ready', 'AssigneeMenu / open', 'ActivityFeed / loading'],
-    layers: [
-      layer({
-        id: 'p2-shell',
-        name: 'Detail frame',
-        kind: 'frame',
-        x: 0,
-        y: 0,
-        w: 430,
-        h: 560,
-        radius: 18,
-        fill: '#171719',
-        locked: true,
-      }),
-      layer({
-        id: 'p2-title',
-        name: 'Detail header',
-        kind: 'text',
-        x: 28,
-        y: 34,
-        w: 260,
-        h: 32,
-        fill: 'transparent',
-        stroke: 'transparent',
-        text: 'Review roadmap',
-        textSize: 22,
-      }),
-      layer({
-        id: 'p2-status',
-        name: 'Status badge',
-        kind: 'badge',
-        x: 292,
-        y: 34,
-        w: 104,
-        h: 30,
-        fill: 'rgba(251,191,36,0.12)',
-        stroke: 'rgba(251,191,36,0.35)',
-        text: 'High',
-      }),
-      layer({
-        id: 'p2-cover',
-        name: 'Activity snapshot',
-        kind: 'image',
-        x: 24,
-        y: 96,
-        w: 382,
-        h: 164,
-        radius: 14,
-        brightness: 98,
-        contrast: 106,
-        saturation: 92,
-      }),
-      layer({
-        id: 'p2-form',
-        name: 'Edit form',
-        kind: 'input',
-        x: 24,
-        y: 286,
-        w: 382,
-        h: 132,
-        radius: 14,
-        fill: '#1e1e21',
-      }),
-      layer({
-        id: 'p2-save',
-        name: 'Save change button',
-        kind: 'button',
-        x: 250,
-        y: 486,
-        w: 156,
-        h: 44,
-        radius: 12,
-        fill: '#1488fc',
-        text: 'Save changes',
-      }),
-    ],
-  },
-  {
-    id: 'p3',
-    name: '/members',
-    docType: 'pageSplit',
-    states: ['empty', 'ready'],
-    owner: 'Ava Patel',
-    updatedAt: 'Yesterday',
-    viewport: { width: 430, height: 560 },
-    sourceDocs: ['Member roles doc', 'Permission matrix'],
-    apiContract: 'GET /api/members',
-    componentStories: ['MemberCard / owner', 'RolePicker / editor', 'InvitePanel / empty'],
-    layers: [
-      layer({
-        id: 'p3-shell',
-        name: 'Members frame',
-        kind: 'frame',
-        x: 0,
-        y: 0,
-        w: 430,
-        h: 560,
-        radius: 18,
-        fill: '#171719',
-        locked: true,
-      }),
-      layer({
-        id: 'p3-title',
-        name: 'Team title',
-        kind: 'text',
-        x: 28,
-        y: 34,
-        w: 220,
-        h: 32,
-        fill: 'transparent',
-        stroke: 'transparent',
-        text: 'Members',
-        textSize: 22,
-      }),
-      layer({
-        id: 'p3-search',
-        name: 'Member search',
-        kind: 'input',
-        x: 28,
-        y: 88,
-        w: 374,
-        h: 42,
-        radius: 12,
-        fill: '#26262a',
-      }),
-      layer({
-        id: 'p3-member-1',
-        name: 'Owner member card',
-        kind: 'card',
-        x: 24,
-        y: 158,
-        w: 382,
-        h: 86,
-        fill: '#1e1e21',
-      }),
-      layer({
-        id: 'p3-member-2',
-        name: 'Reviewer member card',
-        kind: 'card',
-        x: 24,
-        y: 260,
-        w: 382,
-        h: 86,
-        fill: '#1e1e21',
-      }),
-      layer({
-        id: 'p3-invite',
-        name: 'Invite button',
-        kind: 'button',
-        x: 268,
-        y: 488,
-        w: 138,
-        h: 44,
-        radius: 12,
-        fill: '#1488fc',
-        text: 'Invite',
-      }),
-    ],
-  },
-]
-
-const HANDOFF_PINS = [
-  { id: 'c1', x: 366, y: 92, label: '1', text: 'Confirm crop ratio before approval' },
-  { id: 'c2', x: 54, y: 312, label: '2', text: 'Empty state needs reviewer sign-off' },
-  { id: 'c3', x: 348, y: 508, label: '3', text: 'Button copy synced to frontend doc' },
-]
-
-const DESIGN_DIFFS = [
-  { id: 'color', labelKey: 'prototype.diff.color', status: '+2' },
-  { id: 'spacing', labelKey: 'prototype.diff.spacing', status: '-4px' },
-  { id: 'asset', labelKey: 'prototype.diff.asset', status: '1' },
-] as const
-
-const MOCK_FIXTURES: MockFixture[] = [
-  {
-    id: 'tasks-ready',
-    endpoint: '/api/tasks',
-    fixture: 'tasks.ready.json',
-    method: 'GET',
-    status: 200,
-    latency: 140,
-    rows: 4,
-    state: 'ready',
-    schema: 'Task[]',
-    sample: '{ "tasks": [{ "id": "t1", "title": "Review roadmap", "priority": "High" }] }',
-  },
-  {
-    id: 'tasks-empty',
-    endpoint: '/api/tasks?filter=done',
-    fixture: 'tasks.empty.json',
-    method: 'GET',
-    status: 200,
-    latency: 90,
-    rows: 0,
-    state: 'empty',
-    schema: 'Task[]',
-    sample: '{ "tasks": [] }',
-  },
-  {
-    id: 'tasks-loading',
-    endpoint: '/api/tasks',
-    fixture: 'tasks.loading.json',
-    method: 'GET',
-    status: 202,
-    latency: 1200,
-    rows: 0,
-    state: 'loading',
-    schema: 'PendingResponse',
-    sample: '{ "status": "pending", "retryAfter": 1 }',
-  },
-  {
-    id: 'tasks-error',
-    endpoint: '/api/tasks',
-    fixture: 'tasks.error.json',
-    method: 'POST',
-    status: 422,
-    latency: 220,
-    rows: 1,
-    state: 'error',
-    schema: 'ApiError',
-    sample: '{ "error": { "code": "TASK_LIMIT", "message": "Task limit reached" } }',
-  },
-]
-
-const ACCEPTANCE_CHECKS = [
-  { id: 'states', labelKey: 'prototype.acceptance.states', passed: true },
-  { id: 'responsive', labelKey: 'prototype.acceptance.responsive', passed: true },
-  { id: 'fixtures', labelKey: 'prototype.acceptance.fixtures', passed: true },
-  { id: 'tokens', labelKey: 'prototype.acceptance.tokens', passed: true },
-] as const satisfies readonly {
-  id: string
-  labelKey: MessageKey
-  passed: boolean
-}[]
-
-const EXPORT_TARGETS = [
-  { id: 'context', labelKey: 'prototype.export.context', icon: Braces },
-  { id: 'fixtures', labelKey: 'prototype.export.fixtures', icon: Database },
-  { id: 'spec', labelKey: 'prototype.export.spec', icon: FileCode2 },
-] as const satisfies readonly {
-  id: string
-  labelKey: MessageKey
-  icon: typeof Frame
-}[]
-
-function createInitialLayers() {
-  return Object.fromEntries(PAGES.map((page) => [page.id, cloneItems(page.layers)])) as Record<string, PrototypeLayer[]>
+  componentInstance: Component,
+  input: FormInput,
+  button: Sparkles,
+  list: Layers,
+  overlay: PanelRight,
+  slot: Box,
 }
 
 export function PrototypeStudio() {
-  const { t } = useI18n()
-  const labels = useLocalizedLabels()
-  const { setSurface, openDoc, createDocument } = useWorksflow()
-  const [activePage, setActivePage] = useState('p1')
-  const [state, setState] = useState<StateKey>('ready')
+  const workspace = useArtifactWorkspace()
+  const collaboration = useCollaboration()
+  const { setSurface } = useWorksflow()
+  const [activeArtifactId, setActiveArtifactId] = useState('')
+  const [content, setContent] = useState<PrototypeContentDto | null>(null)
+  const [draftEtag, setDraftEtag] = useState('')
+  const [saveState, setSaveState] = useState<SaveState>('idle')
+  const [error, setError] = useState<string | null>(null)
   const [mode, setMode] = useState<PrototypeMode>('wireframe')
-  const [activePanel, setActivePanel] = useState<StudioPanel>('properties')
-  const [device, setDevice] = useState<DevicePreset>('desktop')
-  const [zoom, setZoom] = useState(92)
+  const [panel, setPanel] = useState<Panel>('properties')
+  const [selectedLayerId, setSelectedLayerId] = useState('')
+  const [selectedStateId, setSelectedStateId] = useState('')
+  const [selectedBreakpointId, setSelectedBreakpointId] = useState('')
+  const [zoom, setZoom] = useState(82)
   const [showGrid, setShowGrid] = useState(true)
-  const [snapToGrid, setSnapToGrid] = useState(true)
-  const [activeFixtureId, setActiveFixtureId] = useState('tasks-ready')
-  const [activeLibraryId, setActiveLibraryId] = useState<UiLibraryId>('shadcn')
-  const [componentSearch, setComponentSearch] = useState('')
-  const [customComponentName, setCustomComponentName] = useState('Team metric card')
-  const [customComponentKind, setCustomComponentKind] = useState<LayerKind>('card')
-  const [customTemplates, setCustomTemplates] = useState<ComponentTemplate[]>([
-    {
-      id: 'custom-metric-card',
-      libraryId: 'custom',
-      name: 'Metric card',
-      category: 'Team',
-      kind: 'card',
-      width: 260,
-      height: 96,
-      fill: '#1e1e21',
-      icon: Settings2,
-    },
-    {
-      id: 'custom-empty-state',
-      libraryId: 'custom',
-      name: 'Empty state',
-      category: 'Team',
-      kind: 'frame',
-      width: 300,
-      height: 150,
-      fill: '#171719',
-      icon: Shapes,
-    },
-  ])
-  const [layersByPage, setLayersByPage] = useState(createInitialLayers)
-  const [selectedLayerId, setSelectedLayerId] = useState('p1-hero')
-  const [dragging, setDragging] = useState<{
+  const [details, setDetails] = useState<Awaited<ReturnType<typeof workspace.loadDetails<PrototypeContentDto>>> | null>(null)
+  const [selectedPageSpecId, setSelectedPageSpecId] = useState('')
+  const [newPrototypeTitle, setNewPrototypeTitle] = useState('')
+  const [drag, setDrag] = useState<{
     id: string
-    startX: number
-    startY: number
+    pointerX: number
+    pointerY: number
     originX: number
     originY: number
   } | null>(null)
-  const [layerCounter, setLayerCounter] = useState(1)
-  const [snapshotCount, setSnapshotCount] = useState(3)
-  const [notice, setNotice] = useState<string | null>(null)
+  const saveSequence = useRef(0)
+  const activeResource = workspace.prototypes.find((item) => item.artifact.id === activeArtifactId)
+    ?? workspace.prototypes[0]
+  const activeId = activeResource?.artifact.id ?? ''
+  const canEdit = collaboration.session.signedIn && collaboration.can('edit')
+  const canReview = collaboration.session.signedIn && collaboration.can('publish')
 
-  const page = PAGES.find((item) => item.id === activePage) ?? PAGES[0]
-  const layers = layersByPage[page.id] ?? []
-  const selectedLayer = layers.find((item) => item.id === selectedLayerId) ?? layers.find((item) => !item.locked) ?? layers[0]
-  const activeViewport = DEVICE_PRESETS[device]
-  const activeFixture = MOCK_FIXTURES.find((item) => item.id === activeFixtureId) ?? MOCK_FIXTURES[0]
-  const allComponentTemplates = useMemo(
-    () => [...COMPONENT_TEMPLATES, ...customTemplates],
-    [customTemplates],
-  )
-  const activeLibrary = UI_LIBRARIES.find((item) => item.id === activeLibraryId) ?? UI_LIBRARIES[0]
-  const visibleComponentTemplates = useMemo(() => {
-    const normalizedSearch = componentSearch.trim().toLowerCase()
-    return allComponentTemplates.filter((item) => {
-      const libraryMatched = item.libraryId === activeLibraryId
-      const searchMatched =
-        normalizedSearch.length === 0 ||
-        item.name.toLowerCase().includes(normalizedSearch) ||
-        item.category.toLowerCase().includes(normalizedSearch)
-      return libraryMatched && searchMatched
-    })
-  }, [activeLibraryId, allComponentTemplates, componentSearch])
-  const scale = zoom / 100
-  const availableStates = page.states
+  useEffect(() => {
+    if (!activeArtifactId && activeId) setActiveArtifactId(activeId)
+  }, [activeArtifactId, activeId])
 
-  const coveredStates = useMemo(
-    () => STATE_ORDER.filter((item) => availableStates.includes(item)).length,
-    [availableStates],
-  )
+  const serverContent = activeResource?.draft?.content
+    ?? activeResource?.latestRevision?.content
+    ?? activeResource?.approvedRevision?.content
 
-  function selectPage(pageId: string) {
-    const nextPage = PAGES.find((item) => item.id === pageId)
-    if (!nextPage) return
-
-    setActivePage(nextPage.id)
-    setState(nextPage.states.includes('ready') ? 'ready' : nextPage.states[0])
-    setActiveFixtureId(nextPage.states.includes('ready') ? 'tasks-ready' : MOCK_FIXTURES.find((item) => item.state === nextPage.states[0])?.id ?? 'tasks-ready')
-    setSelectedLayerId(nextPage.layers.find((item) => !item.locked)?.id ?? nextPage.layers[0].id)
-    setNotice(null)
-  }
-
-  function updateLayer(layerId: string, updates: Partial<PrototypeLayer>) {
-    setLayersByPage((current) => ({
-      ...current,
-      [page.id]: (current[page.id] ?? []).map((item) =>
-        item.id === layerId ? { ...item, ...updates } : item,
-      ),
-    }))
-  }
-
-  function updateSelectedLayer(updates: Partial<PrototypeLayer>) {
-    if (!selectedLayer || selectedLayer.locked) return
-    updateLayer(selectedLayer.id, updates)
-  }
-
-  function addComponentTemplate(template: ComponentTemplate) {
-    const id = `${template.id}-${layerCounter}`
-    const nextLayer = layer({
-      id,
-      name: template.name,
-      kind: template.kind,
-      x: 52 + layerCounter * 8,
-      y: 92 + layerCounter * 8,
-      w: template.width,
-      h: template.height,
-      radius: template.kind === 'badge' ? 999 : 10,
-      fill: template.fill ?? (template.kind === 'button' ? '#1488fc' : '#1e1e21'),
-      stroke: template.stroke ?? (template.kind === 'text' ? 'transparent' : 'rgba(255,255,255,0.12)'),
-      text:
-        template.text ??
-        (template.kind === 'text' ? template.name : template.kind === 'button' ? template.name : undefined),
-    })
-
-    setLayersByPage((current) => ({
-      ...current,
-      [page.id]: [...(current[page.id] ?? []), nextLayer],
-    }))
-    setSelectedLayerId(id)
-    setLayerCounter((value) => value + 1)
-    setNotice(t('prototype.componentInserted', { component: template.name, library: activeLibrary.name }))
-  }
-
-  function insertActiveComponent() {
-    const template = visibleComponentTemplates[0] ?? allComponentTemplates.find((item) => item.libraryId === activeLibraryId)
-    if (template) addComponentTemplate(template)
-  }
-
-  function addCustomComponent() {
-    const name = customComponentName.trim()
-    if (!name) return
-
-    const icon = customComponentKind === 'text'
-      ? Type
-      : customComponentKind === 'input'
-        ? FormInput
-        : customComponentKind === 'badge'
-          ? Badge
-          : customComponentKind === 'image'
-            ? ImageIcon
-            : customComponentKind === 'button'
-              ? Sparkles
-              : customComponentKind === 'frame'
-                ? Frame
-                : Settings2
-    const template: ComponentTemplate = {
-      id: `custom-${name.toLowerCase().replace(/[^a-z0-9]+/g, '-')}-${layerCounter}`,
-      libraryId: 'custom',
-      name,
-      category: 'Custom',
-      kind: customComponentKind,
-      width: customComponentKind === 'badge' || customComponentKind === 'button' ? 128 : 260,
-      height: customComponentKind === 'text' ? 34 : customComponentKind === 'badge' || customComponentKind === 'button' ? 42 : 96,
-      fill: customComponentKind === 'button' ? '#1488fc' : customComponentKind === 'text' ? 'transparent' : '#1e1e21',
-      text: customComponentKind === 'text' || customComponentKind === 'button' || customComponentKind === 'badge' ? name : undefined,
-      icon,
+  useEffect(() => {
+    if (!activeResource || !serverContent) {
+      setContent(null)
+      setDraftEtag('')
+      setSelectedLayerId('')
+      setSelectedStateId('')
+      setSelectedBreakpointId('')
+      setDetails(null)
+      return
     }
+    if (saveState === 'dirty' || saveState === 'saving' || saveState === 'conflict') return
+    setContent(cloneContent(serverContent))
+    setDraftEtag(activeResource.draft?.etag ?? activeResource.artifact.etag)
+    setSelectedLayerId((current) => current && serverContent.layers[current]
+      ? current
+      : serverContent.frames[0]?.rootLayerId ?? Object.keys(serverContent.layers)[0] ?? '')
+    setSelectedStateId((current) => serverContent.states.some((item) => item.id === current)
+      ? current
+      : serverContent.states[0]?.id ?? '')
+    setSelectedBreakpointId((current) => serverContent.breakpoints.some((item) => item.id === current)
+      ? current
+      : serverContent.breakpoints[0]?.id ?? '')
+    setSaveState('idle')
+    void workspace.loadDetails<PrototypeContentDto>(activeResource.artifact.id)
+      .then(setDetails)
+      .catch((cause) => setError(message(cause)))
+  }, [activeResource, saveState, serverContent, workspace])
 
-    setCustomTemplates((current) => [...current, template])
-    setActiveLibraryId('custom')
-    setComponentSearch('')
-    setCustomComponentName('')
-    setNotice(t('prototype.customComponentAdded', { component: template.name }))
-  }
+  const saveDraft = useCallback(async (nextContent = content) => {
+    if (!activeResource || !nextContent || !draftEtag || !canEdit) return null
+    const sequence = ++saveSequence.current
+    setSaveState('saving')
+    setError(null)
+    try {
+      const result = await workspace.savePrototypeDraft(activeResource.artifact.id, nextContent, draftEtag)
+      if (sequence !== saveSequence.current) return result
+      const nextEtag = result.data.draft?.etag ?? result.etag
+      if (nextEtag) setDraftEtag(nextEtag)
+      setSaveState('saved')
+      return result
+    } catch (cause) {
+      if (sequence !== saveSequence.current) return null
+      if (cause instanceof ArtifactWorkspaceConflictError) {
+        setSaveState('conflict')
+        setError('The server draft changed. Your local prototype is preserved; reload or retry after reviewing the latest revision.')
+      } else {
+        setSaveState('error')
+        setError(message(cause))
+      }
+      return null
+    }
+  }, [activeResource, canEdit, content, draftEtag, workspace])
 
-  function duplicateSelectedLayer() {
+  useEffect(() => {
+    if (saveState !== 'dirty' || !content || !canEdit) return
+    const timer = window.setTimeout(() => void saveDraft(content), 750)
+    return () => window.clearTimeout(timer)
+  }, [canEdit, content, saveDraft, saveState])
+
+  const updateContent = useCallback((updater: (current: PrototypeContentDto) => PrototypeContentDto) => {
+    if (!canEdit) return
+    setContent((current) => current ? updater(current) : current)
+    setSaveState('dirty')
+    setError(null)
+  }, [canEdit])
+
+  const selectedLayer = content?.layers[selectedLayerId]
+  const breakpoint = content?.breakpoints.find((item) => item.id === selectedBreakpointId)
+    ?? content?.breakpoints[0]
+  const state = content?.states.find((item) => item.id === selectedStateId)
+    ?? content?.states[0]
+  const frame = content?.frames.find((item) =>
+    item.stateId === state?.id && item.breakpointId === breakpoint?.id,
+  ) ?? content?.frames[0]
+  const visibleLayers = useMemo(
+    () => content ? layerTree(content.layers, frame?.rootLayerId) : [],
+    [content, frame?.rootLayerId],
+  )
+  const proposals = workspace.proposals.filter((item) => item.targetArtifactId === activeId)
+  const review = collaboration.reviews.find((item) => item.target?.artifactId === activeId)
+
+  function updateLayer(updates: Partial<PrototypeLayerDto>) {
     if (!selectedLayer) return
-
-    const id = `${selectedLayer.kind}-${layerCounter}`
-    const duplicate = {
-      ...selectedLayer,
-      id,
-      name: `${selectedLayer.name} copy`,
-      x: selectedLayer.x + 16,
-      y: selectedLayer.y + 16,
-      locked: false,
-    }
-
-    setLayersByPage((current) => ({
+    updateContent((current) => ({
       ...current,
-      [page.id]: [...(current[page.id] ?? []), duplicate],
+      layers: {
+        ...current.layers,
+        [selectedLayer.id]: {
+          ...selectedLayer,
+          ...updates,
+          fieldMetadata: {
+            ...selectedLayer.fieldMetadata,
+            ...fieldMetadataFor(updates, collaboration.session.signedIn ? collaboration.session.user.id : ''),
+          },
+        },
+      },
+    }))
+  }
+
+  function updateLayerLayout(updates: Record<string, JsonValue>) {
+    if (!selectedLayer) return
+    updateLayer({ layout: { ...selectedLayer.layout, ...updates } })
+  }
+
+  function updateLayerStyle(updates: Record<string, JsonValue>) {
+    if (!selectedLayer) return
+    updateLayer({ style: { ...selectedLayer.style, ...updates } })
+  }
+
+  function addLayer(template: (typeof LAYER_TEMPLATES)[number]) {
+    if (!content) return
+    const id = stableId('layer')
+    const root = frame?.rootLayerId ? content.layers[frame.rootLayerId] : undefined
+    const next: PrototypeLayerDto = {
+      id,
+      parentId: root?.id,
+      childIds: [],
+      kind: template.kind,
+      name: template.name,
+      semanticRole: template.kind === 'button' ? 'button' : undefined,
+      layout: { x: 40, y: 40 + Object.keys(content.layers).length * 8, width: template.width, height: template.height },
+      style: template.style ?? {},
+      properties: template.properties ?? {},
+      requirementIds: [],
+      acceptanceCriterionIds: [],
+      fieldMetadata: fieldMetadataFor({ layout: {}, style: {}, properties: {} }, collaboration.session.signedIn ? collaboration.session.user.id : ''),
+    }
+    updateContent((current) => ({
+      ...current,
+      layers: {
+        ...current.layers,
+        ...(root ? { [root.id]: { ...root, childIds: [...root.childIds, id] } } : {}),
+        [id]: next,
+      },
     }))
     setSelectedLayerId(id)
-    setLayerCounter((value) => value + 1)
-    setNotice(t('prototype.layerDuplicated'))
   }
 
-  function deleteSelectedLayer() {
-    if (!selectedLayer || selectedLayer.locked) return
-
-    const nextLayers = layers.filter((item) => item.id !== selectedLayer.id)
-    setLayersByPage((current) => ({
-      ...current,
-      [page.id]: nextLayers,
-    }))
-    setSelectedLayerId(nextLayers.find((item) => !item.locked)?.id ?? nextLayers[0]?.id ?? '')
-    setNotice(t('prototype.layerDeleted'))
-  }
-
-  function resetSelectedLayer() {
-    if (!selectedLayer || selectedLayer.locked) return
-
-    const original = page.layers.find((item) => item.id === selectedLayer.id)
-    if (!original) return
-
-    updateLayer(selectedLayer.id, { ...original })
-    setNotice(t('prototype.layerReset'))
-  }
-
-  function nudgeSelectedLayer(dx: number, dy: number) {
-    if (!selectedLayer || selectedLayer.locked) return
-
-    updateLayer(selectedLayer.id, {
-      x: clamp(selectedLayer.x + dx, -80, activeViewport.width + 80),
-      y: clamp(selectedLayer.y + dy, -80, activeViewport.height + 80),
+  function duplicateLayer() {
+    if (!content || !selectedLayer) return
+    const id = stableId('layer')
+    const cloned = cloneLayer(selectedLayer, id)
+    const next = {
+      ...cloned,
+      layout: {
+        ...cloned.layout,
+        x: numberValue(cloned.layout.x, 0) + 16,
+        y: numberValue(cloned.layout.y, 0) + 16,
+      },
+    }
+    updateContent((current) => {
+      const parent = selectedLayer.parentId ? current.layers[selectedLayer.parentId] : undefined
+      return {
+        ...current,
+        layers: {
+          ...current.layers,
+          ...(parent ? { [parent.id]: { ...parent, childIds: [...parent.childIds, id] } } : {}),
+          [id]: next,
+        },
+      }
     })
+    setSelectedLayerId(id)
   }
 
-  function beginLayerDrag(event: React.PointerEvent<HTMLButtonElement>, item: PrototypeLayer) {
-    setSelectedLayerId(item.id)
-    if (item.locked) return
+  function deleteLayer() {
+    if (!content || !selectedLayer || selectedLayer.id === frame?.rootLayerId) return
+    updateContent((current) => {
+      const layers = { ...current.layers }
+      const remove = new Set(descendantIds(layers, selectedLayer.id))
+      remove.add(selectedLayer.id)
+      for (const id of remove) delete layers[id]
+      for (const [id, item] of Object.entries(layers)) {
+        layers[id] = { ...item, childIds: item.childIds.filter((childId) => !remove.has(childId)) }
+      }
+      return {
+        ...current,
+        layers,
+        interactions: current.interactions.filter((item) => !remove.has(item.sourceLayerId)),
+        overrides: current.overrides.filter((item) => !remove.has(item.layerId)),
+        tokenBindings: current.tokenBindings.filter((item) => !remove.has(item.layerId)),
+        componentBindings: current.componentBindings.filter((item) => !remove.has(item.layerId)),
+      }
+    })
+    setSelectedLayerId(frame?.rootLayerId ?? '')
+  }
 
-    event.preventDefault()
+  function startDrag(event: ReactPointerEvent<HTMLButtonElement>, item: PrototypeLayerDto) {
+    if (!canEdit || booleanValue(item.properties.locked)) return
     event.currentTarget.setPointerCapture(event.pointerId)
-    setDragging({
+    setSelectedLayerId(item.id)
+    setDrag({
       id: item.id,
-      startX: event.clientX,
-      startY: event.clientY,
-      originX: item.x,
-      originY: item.y,
+      pointerX: event.clientX,
+      pointerY: event.clientY,
+      originX: numberValue(item.layout.x, 0),
+      originY: numberValue(item.layout.y, 0),
     })
   }
 
-  function handleCanvasPointerMove(event: React.PointerEvent<HTMLDivElement>) {
-    if (!dragging) return
-
-    const deltaX = (event.clientX - dragging.startX) / scale
-    const deltaY = (event.clientY - dragging.startY) / scale
-    const nextX = dragging.originX + deltaX
-    const nextY = dragging.originY + deltaY
-    const snappedX = snapToGrid ? Math.round(nextX / 8) * 8 : nextX
-    const snappedY = snapToGrid ? Math.round(nextY / 8) * 8 : nextY
-
-    updateLayer(dragging.id, {
-      x: clamp(Math.round(snappedX), -80, activeViewport.width + 80),
-      y: clamp(Math.round(snappedY), -80, activeViewport.height + 80),
-    })
+  function moveDrag(event: ReactPointerEvent<HTMLDivElement>) {
+    if (!drag || !content) return
+    const item = content.layers[drag.id]
+    if (!item) return
+    const scale = zoom / 100
+    const x = Math.round((drag.originX + (event.clientX - drag.pointerX) / scale) / 8) * 8
+    const y = Math.round((drag.originY + (event.clientY - drag.pointerY) / scale) / 8) * 8
+    updateContent((current) => ({
+      ...current,
+      layers: {
+        ...current.layers,
+        [item.id]: { ...item, layout: { ...item.layout, x, y } },
+      },
+    }))
   }
 
-  function saveSnapshot() {
-    setSnapshotCount((value) => value + 1)
-    setNotice(t('prototype.snapshotSaved'))
+  async function createPrototype() {
+    const pageSpec = workspace.pageSpecs.find((item) => item.artifact.id === selectedPageSpecId)
+      ?? workspace.pageSpecs.find((item) => item.approvedRevision)
+      ?? workspace.pageSpecs[0]
+    if (!pageSpec) return
+    if (!pageSpec.approvedRevision) {
+      setError('Approve the PageSpec revision before creating a formal prototype.')
+      return
+    }
+    setError(null)
+    try {
+      const id = await workspace.createPrototype(
+        pageSpec.artifact.id,
+        newPrototypeTitle.trim() || `${pageSpec.artifact.title} Prototype`,
+        false,
+      )
+      if (id) {
+        setActiveArtifactId(id)
+        setNewPrototypeTitle('')
+      }
+    } catch (cause) {
+      setError(message(cause))
+    }
   }
 
-  function createFrontendDoc() {
-    const docId = createDocument(
-      'frontendDev',
-      t('prototype.frontendDocTitle', { page: page.name }),
-      'readyForReview',
-    )
-    openDoc(docId)
+  async function createRevisionAndRequestReview() {
+    if (!activeResource || !content || !draftEtag || !canEdit) return
+    setSaveState('saving')
+    setError(null)
+    try {
+      const saved = await workspace.savePrototypeDraft(activeResource.artifact.id, content, draftEtag)
+      const etag = saved.data.draft?.etag ?? saved.etag
+      if (!etag) throw new Error('The Go service did not return a draft ETag.')
+      const revisionResult = await collaboration.platformClient.prototypes.createRevision(
+        activeResource.artifact.id,
+        { changeSummary: 'Prototype checkpoint for review', changeSource: 'human' },
+        { ifMatch: etag, idempotencyKey: true },
+      )
+      const revision = revisionResult.data
+      const currentUserId = collaboration.session.signedIn ? collaboration.session.user.id : ''
+      const reviewerIds = collaboration.members
+        .filter((member) => member.user.id !== currentUserId && ['owner', 'admin', 'editor'].includes(member.role))
+        .map((member) => member.user.id)
+      if (reviewerIds.length === 0) {
+        setError('Revision created. Add another owner, admin, or editor before requesting review.')
+      } else {
+        await collaboration.requestReview(
+          'Review prototype states, responsive frames, fixtures, interactions, tokens, and trace coverage.',
+          {
+            artifactId: revision.artifactId,
+            revisionId: revision.id,
+            revisionNumber: revision.revisionNumber,
+            contentHash: revision.contentHash,
+            title: activeResource.artifact.title,
+          },
+          reviewerIds,
+        )
+      }
+      await workspace.refresh()
+      setSaveState('saved')
+    } catch (cause) {
+      setSaveState('error')
+      setError(message(cause))
+    }
+  }
+
+  if (!collaboration.session.signedIn || !collaboration.project) {
+    return <StudioGate title="Sign in and select a server project" description="Prototype Studio never opens browser fixtures as team facts." />
+  }
+  if (collaboration.backendStatus === 'error' || workspace.status === 'error') {
+    return <StudioGate title="Artifact service unavailable" description={workspace.error ?? 'Prototype editing is disabled until the Go service recovers.'} onRetry={workspace.refresh} />
+  }
+  if (workspace.status === 'loading') {
+    return <StudioGate loading title="Loading prototypes" description="Reading exact server drafts, revisions, sources, and review state…" />
   }
 
   return (
-    <div className="flex h-full max-lg:flex-col max-lg:overflow-y-auto">
-      <aside className="flex w-64 shrink-0 flex-col border-r border-border bg-surface max-lg:max-h-[360px] max-lg:w-full max-lg:border-b max-lg:border-r-0">
+    <div className="flex h-full min-h-0 bg-canvas max-lg:flex-col max-lg:overflow-y-auto">
+      <aside className="flex w-64 shrink-0 flex-col border-r border-border bg-panel max-lg:max-h-[380px] max-lg:w-full max-lg:border-b max-lg:border-r-0">
         <div className="border-b border-border p-3">
-          <div className="flex items-center justify-between gap-2">
-            <span className="flex items-center gap-1.5 text-xs font-semibold text-foreground">
-              <MonitorSmartphone className="size-4 text-primary-bright" />
-              {t('prototype.pages')}
-            </span>
-            <span className="rounded bg-white/5 px-1.5 py-0.5 text-[10px] text-faint-foreground">
-              {PAGES.length}
-            </span>
+          <div className="flex items-center gap-2">
+            <MonitorSmartphone className="size-4 text-primary-bright" />
+            <div className="min-w-0 flex-1">
+              <h2 className="text-xs font-semibold text-foreground">Prototype artifacts</h2>
+              <p className="mt-0.5 text-[9px] text-faint-foreground">Server drafts and immutable revisions</p>
+            </div>
+            <span className="rounded bg-white/5 px-1.5 py-0.5 text-[9px] text-faint-foreground">{workspace.prototypes.length}</span>
           </div>
-          <p className="mt-1 text-[11px] leading-relaxed text-faint-foreground">
-            {t('prototype.studioSubtitle')}
-          </p>
         </div>
-
         <div className="border-b border-border p-2">
-          {PAGES.map((item) => (
+          {workspace.prototypes.length === 0 && <p className="rounded border border-dashed border-border p-3 text-center text-[9px] text-faint-foreground">No prototype artifact yet.</p>}
+          {workspace.prototypes.map((prototype) => (
             <button
-              key={item.id}
+              key={prototype.artifact.id}
               type="button"
-              onClick={() => selectPage(item.id)}
-              className={cn(
-                'flex w-full flex-col gap-1 rounded-lg px-2.5 py-2 text-left transition-colors',
-                activePage === item.id ? 'bg-white/10' : 'hover:bg-white/5',
-              )}
+              onClick={() => {
+                setSaveState('idle')
+                setActiveArtifactId(prototype.artifact.id)
+                setError(null)
+              }}
+              className={cn('mb-1 block w-full rounded-md border px-2.5 py-2 text-left', activeId === prototype.artifact.id ? 'border-primary/40 bg-primary/10' : 'border-transparent hover:border-border hover:bg-white/5')}
             >
-              <span className="flex items-center gap-1.5">
-                <span className="font-mono text-xs font-medium text-foreground">{item.name}</span>
-                <span className="ml-auto text-[10px] text-faint-foreground">
-                  {t('prototype.statesCount', { count: item.states.length })}
-                </span>
-              </span>
-              <span className="text-[10px] text-faint-foreground">
-                {labels.docType(item.docType)} · {item.updatedAt}
+              <span className="block truncate text-[11px] font-medium text-foreground">{prototype.artifact.title}</span>
+              <span className="mt-1 flex items-center gap-1.5 text-[8px] text-faint-foreground">
+                <span>{prototype.artifact.status}</span>
+                <span>draft {prototype.draft?.revision ?? '—'}</span>
+                <span>revision {prototype.latestRevision?.revisionNumber ?? '—'}</span>
               </span>
             </button>
           ))}
         </div>
-
-        <div className="flex min-h-0 flex-1 flex-col">
-          <div className="flex items-center justify-between gap-2 border-b border-border px-3 py-2">
-            <span className="flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wider text-faint-foreground">
-              <Layers className="size-3.5" />
-              {t('prototype.layers')}
-            </span>
-            <span className="text-[10px] text-faint-foreground">
-              {t('prototype.layerCount', { count: layers.length })}
-            </span>
+        {canEdit && (
+          <div className="border-b border-border p-2">
+            <select value={selectedPageSpecId} onChange={(event) => setSelectedPageSpecId(event.target.value)} className="h-7 w-full rounded border border-border bg-background px-1.5 text-[9px] text-foreground outline-none" aria-label="PageSpec source">
+              <option value="">Select PageSpec source</option>
+              {workspace.pageSpecs.map((pageSpec) => <option key={pageSpec.artifact.id} value={pageSpec.artifact.id}>{pageSpec.artifact.title} · {pageSpec.approvedRevision ? `approved r${pageSpec.approvedRevision.revisionNumber}` : 'latest revision'}</option>)}
+            </select>
+            <div className="mt-1.5 flex gap-1">
+              <input value={newPrototypeTitle} onChange={(event) => setNewPrototypeTitle(event.target.value)} placeholder="Prototype title" className="h-7 min-w-0 flex-1 rounded border border-border bg-background px-1.5 text-[9px] text-foreground outline-none" />
+              <button type="button" onClick={() => void createPrototype()} disabled={workspace.pageSpecs.length === 0} className="flex size-7 items-center justify-center rounded bg-primary text-primary-foreground disabled:opacity-35" aria-label="Create server prototype"><Plus className="size-3.5" /></button>
+            </div>
           </div>
-
-          <div className="flex-1 overflow-y-auto scrollbar-thin p-2">
-            {layers.toReversed().map((item) => {
-              const Icon = LAYER_ICON[item.kind]
-              const selected = selectedLayerId === item.id
-
-              return (
-                <button
-                  key={item.id}
-                  type="button"
-                  onClick={() => setSelectedLayerId(item.id)}
-                  className={cn(
-                    'mb-1 flex w-full items-center gap-2 rounded-lg border px-2 py-2 text-left text-xs transition-colors',
-                    selected
-                      ? 'border-primary/45 bg-primary/10 text-foreground'
-                      : 'border-transparent text-muted-foreground hover:border-border hover:bg-white/5',
-                  )}
-                >
-                  <Icon className="size-3.5 shrink-0 text-faint-foreground" />
-                  <span className="min-w-0 flex-1 truncate">{item.name}</span>
-                  {item.locked ? <Lock className="size-3 text-faint-foreground" /> : null}
-                  {item.visible ? (
-                    <Eye className="size-3 text-faint-foreground" />
-                  ) : (
-                    <EyeOff className="size-3 text-faint-foreground" />
-                  )}
-                </button>
-              )
-            })}
-          </div>
-
-          <div className="border-t border-border p-2">
-            <div className="mb-2 flex items-center justify-between gap-2 px-1">
-              <span className="flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wider text-faint-foreground">
-                <Component className="size-3.5" />
-                {t('prototype.componentLibrary')}
-              </span>
-              <span className="text-[10px] text-faint-foreground">{visibleComponentTemplates.length}</span>
+        )}
+        {content && (
+          <>
+            <div className="flex items-center gap-2 border-b border-border px-3 py-2 text-[9px] font-semibold uppercase tracking-wider text-faint-foreground"><Layers className="size-3" />Layers<span className="ml-auto font-mono">{Object.keys(content.layers).length}</span></div>
+            <div className="min-h-0 flex-1 overflow-y-auto p-2 scrollbar-thin">
+              {visibleLayers.toReversed().map((item) => {
+                const Icon = LAYER_ICONS[item.kind]
+                return <button key={item.id} type="button" onClick={() => setSelectedLayerId(item.id)} className={cn('mb-0.5 flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-[10px]', selectedLayerId === item.id ? 'bg-primary/10 text-primary-bright' : 'text-muted-foreground hover:bg-white/5 hover:text-foreground')}><Icon className="size-3 shrink-0" /><span className="min-w-0 flex-1 truncate">{item.name}</span>{booleanValue(item.properties.locked) && <Lock className="size-2.5" />}{booleanValue(item.properties.hidden) && <EyeOff className="size-2.5" />}</button>
+              })}
             </div>
-
-            <div className="mb-2 flex gap-1 overflow-x-auto pb-1 scrollbar-thin">
-              {UI_LIBRARIES.map((library) => (
-                <button
-                  key={library.id}
-                  type="button"
-                  onClick={() => {
-                    setActiveLibraryId(library.id)
-                    setComponentSearch('')
-                  }}
-                  className={cn(
-                    'shrink-0 rounded-md border px-2 py-1 text-[10px] font-medium transition-colors',
-                    activeLibraryId === library.id
-                      ? 'border-primary/45 bg-primary/10 text-primary-bright'
-                      : 'border-border bg-surface-2 text-faint-foreground hover:text-foreground',
-                  )}
-                  title={t(library.descriptionKey)}
-                >
-                  {library.name}
-                </button>
-              ))}
-            </div>
-
-            <label className="mb-2 flex h-8 items-center gap-2 rounded-md border border-border bg-surface-2 px-2 text-[11px] text-faint-foreground">
-              <Search className="size-3.5" />
-              <input
-                value={componentSearch}
-                onChange={(event) => setComponentSearch(event.target.value)}
-                placeholder={t('prototype.componentSearchPlaceholder')}
-                className="min-w-0 flex-1 bg-transparent text-xs text-foreground outline-none placeholder:text-faint-foreground"
-                aria-label={t('prototype.componentSearch')}
-              />
-            </label>
-
-            <div className="mb-2 rounded-md border border-border bg-surface-2 px-2 py-1.5">
-              <div className="flex items-center justify-between gap-2">
-                <span className="truncate text-[11px] font-medium text-foreground">{activeLibrary.name}</span>
-                <span className="shrink-0 rounded bg-white/5 px-1.5 py-0.5 text-[10px] text-faint-foreground">
-                  {activeLibrary.token}
-                </span>
-              </div>
-              <p className="mt-1 text-[10px] leading-relaxed text-faint-foreground">
-                {t(activeLibrary.descriptionKey)}
-              </p>
-            </div>
-
-            {activeLibraryId === 'custom' && (
-              <div className="mb-2 rounded-md border border-border bg-surface-2 p-2">
-                <div className="text-[11px] font-medium text-foreground">{t('prototype.customLibrary')}</div>
-                <div className="mt-2 flex gap-1.5">
-                  <input
-                    value={customComponentName}
-                    onChange={(event) => setCustomComponentName(event.target.value)}
-                    placeholder={t('prototype.customComponentName')}
-                    className="min-w-0 flex-1 rounded-md border border-border bg-canvas px-2 py-1.5 text-xs text-foreground outline-none placeholder:text-faint-foreground"
-                    aria-label={t('prototype.customComponentName')}
-                  />
-                  <button
-                    type="button"
-                    onClick={addCustomComponent}
-                    className="flex size-8 shrink-0 items-center justify-center rounded-md bg-primary text-white hover:bg-primary/90"
-                    aria-label={t('prototype.addCustomComponent')}
-                    title={t('prototype.addCustomComponent')}
-                  >
-                    <Plus className="size-4" />
-                  </button>
-                </div>
-                <div className="mt-2 flex flex-wrap gap-1">
-                  {(['card', 'button', 'input', 'badge', 'frame', 'text'] as LayerKind[]).map((kind) => (
-                    <button
-                      key={kind}
-                      type="button"
-                      onClick={() => setCustomComponentKind(kind)}
-                      className={cn(
-                        'rounded border px-1.5 py-1 text-[10px] font-medium',
-                        customComponentKind === kind
-                          ? 'border-primary/45 bg-primary/10 text-primary-bright'
-                          : 'border-border text-faint-foreground hover:text-foreground',
-                      )}
-                    >
-                      {kind}
-                    </button>
-                  ))}
+            {canEdit && (
+              <div className="border-t border-border p-2">
+                <div className="grid grid-cols-4 gap-1">
+                  {LAYER_TEMPLATES.map((template) => { const Icon = template.icon; return <button key={`${template.kind}-${template.name}`} type="button" onClick={() => addLayer(template)} className="flex h-12 flex-col items-center justify-center gap-1 rounded border border-border text-[8px] text-faint-foreground hover:border-primary/40 hover:text-foreground" title={`Add ${template.name}`}><Icon className="size-3.5" /><span className="max-w-full truncate px-1">{template.name}</span></button> })}
                 </div>
               </div>
             )}
+          </>
+        )}
+      </aside>
 
-            <div className="max-h-52 space-y-1.5 overflow-y-auto pr-1 scrollbar-thin">
-              {visibleComponentTemplates.map((template) => (
-                <ComponentTemplateButton
-                  key={template.id}
-                  template={template}
-                  onClick={() => addComponentTemplate(template)}
-                />
-              ))}
-              {visibleComponentTemplates.length === 0 && (
-                <div className="rounded-md border border-dashed border-border bg-surface-2 p-3 text-center text-[11px] text-faint-foreground">
-                  {t('prototype.noComponents')}
+      {!content || !activeResource ? (
+        <div className="min-w-0 flex-1"><StudioGate title="Create a prototype from a PageSpec" description="A formal prototype starts from an exact PageSpec revision. Local sample pages are not used." /></div>
+      ) : (
+        <>
+          <main className="flex min-w-0 flex-1 flex-col">
+            <header className="flex min-h-11 shrink-0 flex-wrap items-center gap-2 border-b border-border bg-panel px-3 py-1.5">
+              <div className="flex items-center gap-1 rounded border border-border bg-background p-0.5">
+                {MODES.map((item) => { const Icon = item.icon; return <button key={item.id} type="button" onClick={() => setMode(item.id)} className={cn('inline-flex h-7 items-center gap-1 rounded px-2 text-[9px]', mode === item.id ? 'bg-primary/15 text-primary-bright' : 'text-faint-foreground hover:text-foreground')}><Icon className="size-3" />{item.label}</button> })}
+              </div>
+              <select value={selectedStateId} onChange={(event) => setSelectedStateId(event.target.value)} className="h-7 rounded border border-border bg-background px-2 text-[9px] text-foreground outline-none" aria-label="Prototype state">{content.states.map((item) => <option key={item.id} value={item.id}>{item.title}{item.required ? ' · required' : ''}</option>)}</select>
+              <select value={selectedBreakpointId} onChange={(event) => setSelectedBreakpointId(event.target.value)} className="h-7 rounded border border-border bg-background px-2 text-[9px] text-foreground outline-none" aria-label="Prototype breakpoint">{content.breakpoints.map((item) => <option key={item.id} value={item.id}>{item.name} · {item.viewportWidth}×{item.viewportHeight}</option>)}</select>
+              <div className="ml-auto flex items-center gap-1">
+                <button type="button" onClick={() => setShowGrid((value) => !value)} className={cn('rounded p-1.5 text-faint-foreground hover:text-foreground', showGrid && 'bg-primary/10 text-primary-bright')} aria-label="Toggle grid"><Braces className="size-3.5" /></button>
+                <button type="button" onClick={() => setZoom((value) => Math.max(25, value - 10))} className="rounded p-1.5 text-faint-foreground hover:text-foreground" aria-label="Zoom out"><ZoomOut className="size-3.5" /></button>
+                <span className="w-9 text-center font-mono text-[9px] text-faint-foreground">{zoom}%</span>
+                <button type="button" onClick={() => setZoom((value) => Math.min(160, value + 10))} className="rounded p-1.5 text-faint-foreground hover:text-foreground" aria-label="Zoom in"><ZoomIn className="size-3.5" /></button>
+                <SaveIndicator state={saveState} />
+              </div>
+            </header>
+
+            {error && <div role="alert" className="flex items-center gap-2 border-b border-destructive/30 bg-destructive/10 px-3 py-2 text-[9px] text-destructive"><CircleAlert className="size-3 shrink-0" /><span className="min-w-0 flex-1">{error}</span>{saveState === 'conflict' && <button type="button" onClick={() => { setSaveState('idle'); void workspace.refresh() }} className="rounded border border-destructive/30 px-2 py-1">Load server draft</button>}<button type="button" onClick={() => setError(null)} aria-label="Dismiss"><X className="size-3" /></button></div>}
+
+            <div className="relative min-h-0 flex-1 overflow-auto bg-[#0b0b0d] p-8 scrollbar-thin" onPointerMove={moveDrag} onPointerUp={() => setDrag(null)} onPointerCancel={() => setDrag(null)}>
+              {mode === 'design' && <div className="absolute left-3 top-3 z-20 rounded border border-primary/30 bg-primary/10 px-2 py-1 text-[8px] text-primary-bright">Design mode · token bindings {content.tokenBindings.length}</div>}
+              {mode === 'component' && <div className="absolute left-3 top-3 z-20 rounded border border-primary/30 bg-primary/10 px-2 py-1 text-[8px] text-primary-bright">Component mappings {content.componentBindings.length}</div>}
+              {mode === 'handoff' && <div className="absolute left-3 top-3 z-20 rounded border border-success/30 bg-success/10 px-2 py-1 text-[8px] text-success">Exact source trace · {content.traceLinks.length} links</div>}
+              {breakpoint && frame && (
+                <div className="relative mx-auto origin-top-left overflow-hidden rounded-xl border border-white/15 bg-[#171719] shadow-2xl" style={{ width: breakpoint.viewportWidth, height: breakpoint.viewportHeight, transform: `scale(${zoom / 100})`, marginBottom: `${breakpoint.viewportHeight * (zoom / 100 - 1)}px`, backgroundImage: showGrid ? 'linear-gradient(rgba(255,255,255,.035) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,.035) 1px, transparent 1px)' : undefined, backgroundSize: showGrid ? '8px 8px' : undefined }}>
+                  {visibleLayers.map((item) => <CanvasLayer key={item.id} layer={item} selected={item.id === selectedLayerId} onSelect={() => setSelectedLayerId(item.id)} onPointerDown={(event) => startDrag(event, item)} />)}
+                  {state && state.key !== 'ready' && <div className="pointer-events-none absolute inset-0 z-50 flex items-center justify-center bg-black/35"><div className="rounded-lg border border-border bg-panel/95 px-5 py-3 text-center shadow-xl"><p className="text-xs font-semibold text-foreground">{state.title}</p><p className="mt-1 text-[9px] text-faint-foreground">Fixture state · {state.fixtureIds.length} pinned fixture(s)</p></div></div>}
                 </div>
               )}
             </div>
-          </div>
-        </div>
-      </aside>
 
-      <main className="flex min-w-0 flex-1 flex-col bg-canvas max-lg:min-h-[680px]">
-        <div className="flex min-h-[58px] items-center justify-between gap-3 border-b border-border bg-surface/85 px-4 py-2 backdrop-blur max-xl:flex-wrap">
-          <div className="min-w-0">
-            <div className="flex items-center gap-2">
-              <h1 className="truncate text-sm font-semibold text-foreground">{t('prototype.studioTitle')}</h1>
-              <span className="font-mono text-xs text-muted-foreground">{page.name}</span>
-              <span className="inline-flex items-center gap-1 rounded bg-primary/10 px-1.5 py-0.5 text-[10px] font-medium text-primary-bright">
-                <Frame className="size-3" />
-                {t('prototype.figmaSynced')}
-              </span>
-            </div>
-          <div className="mt-1 text-[11px] text-faint-foreground">
-              {page.owner} · {coveredStates}/{STATE_ORDER.length} {t('prototype.componentStates')} · {activeFixture.fixture}
-          </div>
-          </div>
-
-          <div className="flex max-w-full items-center gap-1.5 overflow-x-auto rounded-lg border border-border bg-surface-2 p-0.5 scrollbar-thin">
-            {(['wireframe', 'design', 'component', 'handoff'] as PrototypeMode[]).map((item) => {
-              const Icon = MODE_ICON[item]
-              return (
-                <button
-                  key={item}
-                  type="button"
-                  onClick={() => setMode(item)}
-                  className={cn(
-                    'inline-flex h-7 shrink-0 items-center gap-1.5 rounded-md px-2 text-[11px] font-medium transition-colors',
-                    mode === item
-                      ? 'bg-white/10 text-foreground'
-                      : 'text-faint-foreground hover:text-muted-foreground',
-                  )}
-                >
-                  <Icon className="size-3.5" />
-                  {t(MODE_LABEL_KEY[item])}
-                </button>
-              )
-            })}
-          </div>
-
-          <div className="flex max-w-full items-center gap-1.5 overflow-x-auto rounded-lg border border-border bg-surface-2 p-0.5 scrollbar-thin">
-            {page.states.map((item) => (
-              <button
-                key={item}
-                type="button"
-                onClick={() => setState(item)}
-                className={cn(
-                  'h-7 shrink-0 rounded-md px-2.5 text-[11px] font-medium transition-colors',
-                  state === item
-                    ? 'bg-white/10 text-foreground'
-                    : 'text-faint-foreground hover:text-muted-foreground',
-                )}
-              >
-                {t(STATE_LABEL_KEY[item])}
-              </button>
-            ))}
-          </div>
-        </div>
-
-        <div className="flex min-h-[46px] items-center justify-between gap-3 border-b border-border bg-panel px-4 py-2 max-xl:flex-wrap">
-          <div className="flex items-center gap-1.5">
-            <ToolbarButton
-              active
-              icon={MousePointer2}
-              label={t('prototype.selectTool')}
-            />
-            <ToolbarButton
-              icon={Move}
-              label={t('prototype.moveTool')}
-              onClick={() => nudgeSelectedLayer(8, 0)}
-            />
-            <ToolbarButton
-              icon={Grid3X3}
-              label={t('prototype.showGrid')}
-              active={showGrid}
-              onClick={() => setShowGrid((value) => !value)}
-            />
-            <ToolbarButton
-              icon={Wand2}
-              label={t('prototype.snap')}
-              active={snapToGrid}
-              onClick={() => setSnapToGrid((value) => !value)}
-            />
-            <ToolbarButton
-              icon={Plus}
-              label={t('prototype.insertComponent')}
-              onClick={insertActiveComponent}
-            />
-          </div>
-
-          <div className="flex items-center gap-1.5">
-            {(['desktop', 'tablet', 'mobile'] as DevicePreset[]).map((item) => {
-              const Icon = DEVICE_PRESETS[item].icon
-              return (
-                <button
-                  key={item}
-                  type="button"
-                  onClick={() => setDevice(item)}
-                  className={cn(
-                    'inline-flex h-8 items-center gap-1.5 rounded-md px-2 text-[11px] font-medium transition-colors',
-                    device === item
-                      ? 'bg-primary/15 text-primary-bright'
-                      : 'text-faint-foreground hover:bg-white/5 hover:text-foreground',
-                  )}
-                >
-                  <Icon className="size-3.5" />
-                  {t(DEVICE_PRESETS[item].labelKey)}
-                </button>
-              )
-            })}
-          </div>
-
-          <div className="flex items-center gap-1.5">
-            <IconOnlyButton
-              icon={ZoomOut}
-              label={t('prototype.zoomOut')}
-              onClick={() => setZoom((value) => clamp(value - 8, 48, 140))}
-            />
-            <span className="w-12 text-center text-[11px] text-muted-foreground">{zoom}%</span>
-            <IconOnlyButton
-              icon={ZoomIn}
-              label={t('prototype.zoomIn')}
-              onClick={() => setZoom((value) => clamp(value + 8, 48, 140))}
-            />
-          </div>
-        </div>
-
-        {notice && (
-          <div className="border-b border-primary/25 bg-primary/10 px-4 py-2 text-xs text-primary-bright">
-            {notice}
-          </div>
-        )}
-
-        <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
-          <div
-            className="flex min-h-0 flex-1 items-center justify-center overflow-auto p-8 scrollbar-thin max-sm:p-4"
-            onPointerMove={handleCanvasPointerMove}
-            onPointerUp={() => setDragging(null)}
-            onPointerCancel={() => setDragging(null)}
-          >
-            <div
-              className="relative shrink-0"
-              style={{
-                width: activeViewport.width * scale,
-                height: activeViewport.height * scale,
-              }}
-            >
-              <div
-                className="absolute left-0 top-0 origin-top-left overflow-hidden rounded-[18px] border border-border bg-surface shadow-2xl"
-                style={{
-                  width: activeViewport.width,
-                  height: activeViewport.height,
-                  transform: `scale(${scale})`,
-                  backgroundImage: showGrid
-                    ? 'linear-gradient(rgba(255,255,255,0.05) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,0.05) 1px, transparent 1px)'
-                    : undefined,
-                  backgroundSize: showGrid ? '16px 16px' : undefined,
-                }}
-              >
-                <CanvasStateOverlay state={state} />
-
-                {layers.map((item, index) => (
-                  <PrototypeLayerView
-                    key={item.id}
-                    layer={item}
-                    selected={selectedLayerId === item.id}
-                    zIndex={index + 2}
-                    onPointerDown={(event) => beginLayerDrag(event, item)}
-                  />
-                ))}
-
-                {mode === 'design' && <DesignDiffOverlay />}
-                {mode === 'handoff' && <HandoffPins />}
+            <footer className="flex min-h-11 shrink-0 flex-wrap items-center gap-2 border-t border-border bg-panel px-3 py-2">
+              <div className="flex items-center gap-2 text-[9px] text-faint-foreground"><ShieldCheck className="size-3 text-success" />PageSpec {shortRef(content.pageSpecRevision)} · {content.exploratory ? 'exploratory' : 'formal'}</div>
+              <div className="ml-auto flex items-center gap-1.5">
+                <button type="button" onClick={() => void saveDraft()} disabled={!canEdit || saveState === 'saving'} className="inline-flex h-7 items-center gap-1 rounded border border-border px-2 text-[9px] text-muted-foreground hover:text-foreground disabled:opacity-35"><Save className="size-3" />Save draft</button>
+                <button type="button" onClick={() => void createRevisionAndRequestReview()} disabled={!canEdit || saveState === 'saving'} className="inline-flex h-7 items-center gap-1 rounded border border-primary/35 bg-primary/10 px-2 text-[9px] text-primary-bright disabled:opacity-35"><Send className="size-3" />Revision + review</button>
+                <button type="button" onClick={() => setSurface('workbench')} disabled={!activeResource.approvedRevision} className="inline-flex h-7 items-center gap-1 rounded bg-primary px-2 text-[9px] font-semibold text-primary-foreground disabled:opacity-35" title="Only approved prototype revisions can become build input"><PackageCheck className="size-3" />Open Workbench</button>
               </div>
+            </footer>
+          </main>
+
+          <aside className="flex w-72 shrink-0 flex-col border-l border-border bg-panel max-xl:w-64 max-lg:max-h-[440px] max-lg:w-full max-lg:border-l-0 max-lg:border-t">
+            <div className="grid grid-cols-3 border-b border-border p-1">
+              {(['properties', 'data', 'trace'] as Panel[]).map((item) => <button key={item} type="button" onClick={() => setPanel(item)} className={cn('rounded px-2 py-1.5 text-[9px] capitalize', panel === item ? 'bg-primary/10 text-primary-bright' : 'text-faint-foreground hover:text-foreground')}>{item}</button>)}
             </div>
-          </div>
-
-          <ModeShelf
-            mode={mode}
-            page={page}
-            selectedLayer={selectedLayer}
-            activeFixture={activeFixture}
-            onSelectFixture={(fixture) => {
-              setActiveFixtureId(fixture.id)
-              setState(fixture.state)
-            }}
-            snapshotCount={snapshotCount}
-            onSaveSnapshot={saveSnapshot}
-          />
-        </div>
-      </main>
-
-      <aside className="flex w-80 shrink-0 flex-col border-l border-border bg-surface max-lg:w-full max-lg:max-h-[620px] max-lg:border-l-0 max-lg:border-t">
-        <div className="border-b border-border p-3">
-          <div className="grid grid-cols-3 gap-1 rounded-lg border border-border bg-surface-2 p-0.5">
-            {(['properties', 'data', 'handoff'] as StudioPanel[]).map((item) => {
-              const Icon = PANEL_ICON[item]
-              return (
-                <button
-                  key={item}
-                  type="button"
-                  onClick={() => setActivePanel(item)}
-                  className={cn(
-                    'inline-flex h-8 items-center justify-center gap-1.5 rounded-md text-[11px] font-medium transition-colors',
-                    activePanel === item
-                      ? 'bg-white/10 text-foreground'
-                      : 'text-faint-foreground hover:text-muted-foreground',
-                  )}
-                >
-                  <Icon className="size-3.5" />
-                  {t(PANEL_LABEL_KEY[item])}
-                </button>
-              )
-            })}
-          </div>
-        </div>
-
-        <div className="flex-1 overflow-y-auto scrollbar-thin p-4">
-          {activePanel === 'properties' && selectedLayer && (
-            <PropertiesPanel
-              layer={selectedLayer}
-              page={page}
-              mode={mode}
-              snapshotCount={snapshotCount}
-              disabled={selectedLayer.locked}
-              onChange={updateSelectedLayer}
-              onToggleVisible={() => updateLayer(selectedLayer.id, { visible: !selectedLayer.visible })}
-              onToggleLocked={() => updateLayer(selectedLayer.id, { locked: !selectedLayer.locked })}
-              onDuplicate={duplicateSelectedLayer}
-              onDelete={deleteSelectedLayer}
-              onReset={resetSelectedLayer}
-              onNudge={nudgeSelectedLayer}
-            />
-          )}
-          {activePanel === 'properties' && !selectedLayer && <EmptyInspector />}
-          {activePanel === 'data' && (
-            <DataPanel
-              activeFixture={activeFixture}
-              fixtures={MOCK_FIXTURES}
-              onSelectFixture={(fixture) => {
-                setActiveFixtureId(fixture.id)
-                setState(fixture.state)
-              }}
-            />
-          )}
-          {activePanel === 'handoff' && (
-            <HandoffPanel
-              page={page}
-              mode={mode}
-              snapshotCount={snapshotCount}
-              onOpenDoc={() => openDoc('d6')}
-              onGenerate={() => setSurface('workbench')}
-              onCreateFrontendDoc={createFrontendDoc}
-              onSaveSnapshot={saveSnapshot}
-            />
-          )}
-        </div>
-      </aside>
-    </div>
-  )
-}
-
-function ComponentTemplateButton({
-  template,
-  onClick,
-}: {
-  template: ComponentTemplate
-  onClick: () => void
-}) {
-  const Icon = template.icon
-
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      className="flex w-full items-center gap-2 rounded-md border border-border bg-surface-2 px-2.5 py-2 text-left hover:border-primary/35 hover:text-foreground"
-    >
-      <span className="flex size-7 shrink-0 items-center justify-center rounded-md bg-white/5">
-        <Icon className="size-3.5 text-primary-bright" />
-      </span>
-      <span className="min-w-0 flex-1">
-        <span className="block truncate text-xs font-medium text-foreground">{template.name}</span>
-        <span className="block truncate text-[10px] text-faint-foreground">
-          {template.category} · {template.width}x{template.height}
-        </span>
-      </span>
-      <Plus className="size-3.5 shrink-0 text-faint-foreground" />
-    </button>
-  )
-}
-
-function ToolbarButton({
-  icon: Icon,
-  label,
-  active,
-  onClick,
-}: {
-  icon: typeof Frame
-  label: string
-  active?: boolean
-  onClick?: () => void
-}) {
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      className={cn(
-        'inline-flex h-8 items-center gap-1.5 rounded-md px-2 text-[11px] font-medium transition-colors',
-        active
-          ? 'bg-white/10 text-foreground'
-          : 'text-faint-foreground hover:bg-white/5 hover:text-foreground',
+            <div className="min-h-0 flex-1 overflow-y-auto p-3 scrollbar-thin">
+              {panel === 'properties' && <PropertiesPanel layer={selectedLayer} rootLayerId={frame?.rootLayerId} canEdit={canEdit} onUpdate={updateLayer} onLayout={updateLayerLayout} onStyle={updateLayerStyle} onDuplicate={duplicateLayer} onDelete={deleteLayer} />}
+              {panel === 'data' && <DataPanel content={content} stateId={state?.id} canEdit={canEdit} onChange={updateContent} />}
+              {panel === 'trace' && <TracePanel resource={activeResource} content={content} details={details} proposals={proposals} review={review} canReview={canReview} onRefresh={() => void workspace.refresh()} />}
+            </div>
+          </aside>
+        </>
       )}
-      title={label}
-    >
-      <Icon className="size-3.5" />
-      {label}
+    </div>
+  )
+}
+
+function CanvasLayer({ layer, selected, onSelect, onPointerDown }: { layer: PrototypeLayerDto; selected: boolean; onSelect: () => void; onPointerDown: (event: ReactPointerEvent<HTMLButtonElement>) => void }) {
+  const hidden = booleanValue(layer.properties.hidden)
+  const locked = booleanValue(layer.properties.locked)
+  if (hidden) return null
+  const x = numberValue(layer.layout.x, 0)
+  const y = numberValue(layer.layout.y, 0)
+  const width = numberValue(layer.layout.width, 120)
+  const height = numberValue(layer.layout.height, 44)
+  const fill = stringValue(layer.style.fill, layer.kind === 'text' ? 'transparent' : '#1e1e21')
+  const color = stringValue(layer.style.color, '#ffffff')
+  const radius = numberValue(layer.style.borderRadius, 8)
+  const opacity = numberValue(layer.style.opacity, 1)
+  const text = stringValue(layer.properties.text, layer.name)
+  return (
+    <button type="button" onClick={(event) => { event.stopPropagation(); onSelect() }} onPointerDown={onPointerDown} className={cn('absolute overflow-hidden border text-left', selected ? 'z-20 border-primary shadow-[0_0_0_1px_rgba(20,136,252,.5)]' : 'border-white/10', locked ? 'cursor-default' : 'cursor-move')} style={{ left: x, top: y, width, height, background: fill, color, borderRadius: radius, opacity }} title={layer.name}>
+      {layer.kind === 'text' || layer.kind === 'button' ? <span className={cn('flex h-full items-center', layer.kind === 'button' ? 'justify-center px-3 text-xs font-semibold' : 'px-1 font-semibold')} style={{ fontSize: numberValue(layer.style.fontSize, 16) }}>{text}</span> : layer.kind === 'input' ? <span className="flex h-full items-center px-3 text-xs text-white/45">{stringValue(layer.properties.placeholder, 'Input')}</span> : layer.kind === 'image' ? <span className="flex h-full items-center justify-center text-white/30"><ImageIcon className="size-8" /></span> : <span className="flex h-full items-center gap-3 px-4"><span className="size-8 rounded-full border border-white/10 bg-white/5" /><span className="flex-1 space-y-2"><span className="block h-2 w-2/3 rounded bg-white/15" /><span className="block h-2 w-1/2 rounded bg-white/8" /></span></span>}
+      {selected && <span className="pointer-events-none absolute left-1 top-1 rounded bg-primary px-1 py-0.5 text-[7px] text-white">{layer.name}</span>}
     </button>
   )
 }
 
-function IconOnlyButton({
-  icon: Icon,
-  label,
-  onClick,
-}: {
-  icon: typeof Frame
-  label: string
-  onClick: () => void
-}) {
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      className="flex size-8 items-center justify-center rounded-md text-faint-foreground hover:bg-white/5 hover:text-foreground"
-      aria-label={label}
-      title={label}
-    >
-      <Icon className="size-4" />
-    </button>
-  )
+function PropertiesPanel({ layer, rootLayerId, canEdit, onUpdate, onLayout, onStyle, onDuplicate, onDelete }: { layer?: PrototypeLayerDto; rootLayerId?: string; canEdit: boolean; onUpdate: (value: Partial<PrototypeLayerDto>) => void; onLayout: (value: Record<string, JsonValue>) => void; onStyle: (value: Record<string, JsonValue>) => void; onDuplicate: () => void; onDelete: () => void }) {
+  if (!layer) return <PanelEmpty text="Select a layer on the canvas." />
+  const locked = booleanValue(layer.properties.locked)
+  const hidden = booleanValue(layer.properties.hidden)
+  return <div className="space-y-4">
+    <section><PanelLabel>Layer</PanelLabel><input value={layer.name} onChange={(event) => onUpdate({ name: event.target.value })} disabled={!canEdit} className="mt-2 h-8 w-full rounded border border-border bg-background px-2 text-[10px] text-foreground outline-none disabled:opacity-50" /><div className="mt-2 grid grid-cols-4 gap-1"><IconButton icon={hidden ? EyeOff : Eye} label={hidden ? 'Show' : 'Hide'} onClick={() => onUpdate({ properties: { ...layer.properties, hidden: !hidden } })} disabled={!canEdit} /><IconButton icon={locked ? Unlock : Lock} label={locked ? 'Unlock' : 'Lock'} onClick={() => onUpdate({ properties: { ...layer.properties, locked: !locked } })} disabled={!canEdit} /><IconButton icon={FileClock} label="Duplicate" onClick={onDuplicate} disabled={!canEdit} /><IconButton icon={Trash2} label="Delete" onClick={onDelete} disabled={!canEdit || layer.id === rootLayerId} /></div></section>
+    <section><PanelLabel>Layout</PanelLabel><div className="mt-2 grid grid-cols-2 gap-2"><NumberInput label="X" value={numberValue(layer.layout.x, 0)} onChange={(value) => onLayout({ x: value })} disabled={!canEdit || locked} /><NumberInput label="Y" value={numberValue(layer.layout.y, 0)} onChange={(value) => onLayout({ y: value })} disabled={!canEdit || locked} /><NumberInput label="Width" value={numberValue(layer.layout.width, 120)} onChange={(value) => onLayout({ width: Math.max(1, value) })} disabled={!canEdit || locked} /><NumberInput label="Height" value={numberValue(layer.layout.height, 44)} onChange={(value) => onLayout({ height: Math.max(1, value) })} disabled={!canEdit || locked} /></div></section>
+    <section><PanelLabel>Style</PanelLabel><div className="mt-2 grid grid-cols-2 gap-2"><label className="text-[8px] text-faint-foreground">Fill<input type="color" value={normalizeColor(stringValue(layer.style.fill, '#1e1e21'))} onChange={(event) => onStyle({ fill: event.target.value })} disabled={!canEdit} className="mt-1 h-8 w-full rounded border border-border bg-background p-1" /></label><NumberInput label="Radius" value={numberValue(layer.style.borderRadius, 8)} onChange={(value) => onStyle({ borderRadius: Math.max(0, value) })} disabled={!canEdit} /></div></section>
+    {(layer.kind === 'text' || layer.kind === 'button') && <section><PanelLabel>Content</PanelLabel><textarea value={stringValue(layer.properties.text, '')} onChange={(event) => onUpdate({ properties: { ...layer.properties, text: event.target.value } })} disabled={!canEdit} className="mt-2 h-20 w-full resize-none rounded border border-border bg-background p-2 text-[10px] text-foreground outline-none" /></section>}
+    <section><PanelLabel>Stable identity</PanelLabel><div className="mt-2 rounded border border-border bg-background p-2 font-mono text-[8px] leading-relaxed text-faint-foreground">{layer.id}<br />role: {layer.semanticRole ?? 'unassigned'}<br />AI policy fields: {Object.keys(layer.fieldMetadata).length}</div></section>
+  </div>
 }
 
-function PrototypeLayerView({
-  layer,
-  selected,
-  zIndex,
-  onPointerDown,
-}: {
-  layer: PrototypeLayer
-  selected: boolean
-  zIndex: number
-  onPointerDown: (event: React.PointerEvent<HTMLButtonElement>) => void
-}) {
-  if (!layer.visible) return null
-
-  const style: CSSProperties = {
-    left: layer.x,
-    top: layer.y,
-    width: layer.w,
-    height: layer.h,
-    borderRadius: layer.radius,
-    opacity: layer.opacity / 100,
-    transform: `rotate(${layer.rotation}deg)`,
-    zIndex,
-    backgroundColor: layer.kind === 'image' ? undefined : layer.fill,
-    borderColor: layer.stroke,
+function DataPanel({ content, stateId, canEdit, onChange }: { content: PrototypeContentDto; stateId?: string; canEdit: boolean; onChange: (updater: (content: PrototypeContentDto) => PrototypeContentDto) => void }) {
+  const [fixtureName, setFixtureName] = useState('Ready response')
+  const [endpoint, setEndpoint] = useState('/api/resource')
+  const [response, setResponse] = useState('{"items":[]}')
+  const [fixtureError, setFixtureError] = useState<string | null>(null)
+  function addFixture() {
+    if (!stateId) return
+    try {
+      const parsed = JSON.parse(response) as JsonValue
+      const id = stableId('fixture')
+      const fixture: PrototypeFixtureDto = { id, name: fixtureName.trim() || 'Fixture', stateId, operationId: endpoint.trim(), response: parsed, statusCode: 200, latencyMs: 120, sanitized: true, contentHash: 'pending-server-hash' }
+      onChange((current) => ({ ...current, fixtures: [...current.fixtures, fixture], states: current.states.map((item) => item.id === stateId ? { ...item, fixtureIds: [...item.fixtureIds, id] } : item) }))
+      setFixtureError(null)
+    } catch { setFixtureError('Fixture response must be valid JSON.') }
   }
-
-  if (layer.kind === 'image') {
-    style.backgroundImage = "url('/placeholder.jpg')"
-    style.backgroundSize = `${layer.imageScale ?? 118}%`
-    style.backgroundPosition = `${layer.cropX ?? 50}% ${layer.cropY ?? 50}%`
-    style.filter = `brightness(${layer.brightness ?? 100}%) contrast(${layer.contrast ?? 100}%) saturate(${layer.saturation ?? 100}%) blur(${layer.blur ?? 0}px)`
-  }
-
-  return (
-    <button
-      type="button"
-      onPointerDown={onPointerDown}
-      className={cn(
-        'absolute overflow-hidden border text-left transition-shadow',
-        layer.locked ? 'cursor-not-allowed' : 'cursor-move',
-        selected && 'ring-2 ring-primary ring-offset-2 ring-offset-background',
-      )}
-      style={style}
-      aria-pressed={selected}
-    >
-      <LayerContent layer={layer} />
-    </button>
-  )
+  return <div className="space-y-4">
+    <section><PanelLabel>State fixtures</PanelLabel><div className="mt-2 space-y-1.5">{content.fixtures.map((fixture) => <div key={fixture.id} className="rounded border border-border bg-background p-2"><div className="flex items-center gap-2"><Database className="size-3 text-primary-bright" /><span className="min-w-0 flex-1 truncate text-[9px] text-foreground">{fixture.name}</span><span className="font-mono text-[8px] text-faint-foreground">{fixture.statusCode}</span></div><div className="mt-1 truncate font-mono text-[8px] text-faint-foreground">{fixture.operationId ?? 'local fixture'} · {fixture.latencyMs}ms · {fixture.sanitized ? 'sanitized' : 'unsafe'}</div></div>)}{content.fixtures.length === 0 && <PanelEmpty text="No server fixture in this draft." />}</div></section>
+    {canEdit && <section><PanelLabel>Add sanitized fixture</PanelLabel><div className="mt-2 space-y-1.5"><input value={fixtureName} onChange={(event) => setFixtureName(event.target.value)} className="h-8 w-full rounded border border-border bg-background px-2 text-[9px] text-foreground outline-none" placeholder="Fixture name" /><input value={endpoint} onChange={(event) => setEndpoint(event.target.value)} className="h-8 w-full rounded border border-border bg-background px-2 font-mono text-[9px] text-foreground outline-none" placeholder="operationId or endpoint" /><textarea value={response} onChange={(event) => setResponse(event.target.value)} className="h-24 w-full resize-none rounded border border-border bg-background p-2 font-mono text-[9px] text-foreground outline-none" />{fixtureError && <p className="text-[8px] text-destructive">{fixtureError}</p>}<button type="button" onClick={addFixture} className="inline-flex h-7 w-full items-center justify-center gap-1 rounded bg-primary text-[9px] font-semibold text-primary-foreground"><Plus className="size-3" />Add fixture to draft</button></div></section>}
+    <section><PanelLabel>Interaction manifest</PanelLabel><div className="mt-2 grid grid-cols-2 gap-2"><Info label="Interactions" value={content.interactions.length} /><Info label="Overrides" value={content.overrides.length} /><Info label="Token bindings" value={content.tokenBindings.length} /><Info label="Components" value={content.componentBindings.length} /></div></section>
+  </div>
 }
 
-function LayerContent({ layer }: { layer: PrototypeLayer }) {
-  if (layer.kind === 'frame') {
-    return (
-      <div className="pointer-events-none flex h-full flex-col">
-        <div className="flex h-8 items-center gap-1.5 border-b border-white/10 bg-white/[0.03] px-3">
-          <span className="size-2.5 rounded-full bg-white/15" />
-          <span className="size-2.5 rounded-full bg-white/15" />
-          <span className="size-2.5 rounded-full bg-white/15" />
-        </div>
-      </div>
-    )
-  }
-
-  if (layer.kind === 'text') {
-    return (
-      <div
-        className="pointer-events-none flex h-full items-center font-semibold leading-none text-foreground"
-        style={{ fontSize: layer.textSize }}
-      >
-        {layer.text}
-      </div>
-    )
-  }
-
-  if (layer.kind === 'button') {
-    return (
-      <div className="pointer-events-none flex h-full items-center justify-center text-xs font-semibold text-white">
-        {layer.text}
-      </div>
-    )
-  }
-
-  if (layer.kind === 'badge') {
-    return (
-      <div className="pointer-events-none flex h-full items-center justify-center gap-1.5 px-3 text-[11px] font-medium text-success">
-        <CheckCircle2 className="size-3.5" />
-        <span className="truncate">{layer.text}</span>
-      </div>
-    )
-  }
-
-  if (layer.kind === 'input') {
-    return (
-      <div className="pointer-events-none flex h-full flex-col justify-center gap-2 px-4">
-        <div className="h-2 w-2/3 rounded bg-white/18" />
-        <div className="h-2 w-1/2 rounded bg-white/8" />
-      </div>
-    )
-  }
-
-  if (layer.kind === 'card') {
-    return (
-      <div className="pointer-events-none flex h-full items-center gap-3 px-4">
-        <span className="size-8 rounded-full border border-white/15 bg-white/5" />
-        <span className="min-w-0 flex-1 space-y-2">
-          <span className="block h-2.5 w-2/3 rounded bg-white/20" />
-          <span className="block h-2 w-1/2 rounded bg-white/10" />
-        </span>
-        <span className="h-5 w-12 rounded bg-primary/15" />
-      </div>
-    )
-  }
-
-  return (
-    <div className="pointer-events-none flex h-full items-end bg-black/20 p-3">
-      <span className="rounded bg-black/40 px-2 py-1 text-[10px] font-medium text-white">
-        {layer.name}
-      </span>
-    </div>
-  )
+function TracePanel({ resource, content, details, proposals, review, canReview, onRefresh }: { resource: VersionedArtifactDto<PrototypeContentDto>; content: PrototypeContentDto; details: Awaited<ReturnType<ReturnType<typeof useArtifactWorkspace>['loadDetails']>> | null; proposals: ReturnType<typeof useArtifactWorkspace>['proposals']; review?: ReturnType<typeof useCollaboration>['reviews'][number]; canReview: boolean; onRefresh: () => void }) {
+  return <div className="space-y-4">
+    <section><div className="flex items-center justify-between"><PanelLabel>Exact source</PanelLabel><button type="button" onClick={onRefresh} className="rounded p-1 text-faint-foreground hover:text-foreground" aria-label="Refresh trace"><RefreshCw className="size-3" /></button></div><div className="mt-2 rounded border border-border bg-background p-2 font-mono text-[8px] leading-relaxed text-faint-foreground">PageSpec<br />{content.pageSpecRevision.artifactId}<br />{content.pageSpecRevision.revisionId}<br />{content.pageSpecRevision.contentHash}</div></section>
+    <section><PanelLabel>Revision and dependency evidence</PanelLabel><div className="mt-2 grid grid-cols-2 gap-2"><Info label="Revisions" value={details?.versions.length ?? 0} /><Info label="Dependencies" value={details?.dependencies.length ?? 0} /><Info label="Trace links" value={content.traceLinks.length} /><Info label="Coverage" value={`${Math.round((details?.reviewGate.traceCoverage ?? 0) * 100)}%`} /></div></section>
+    <section><PanelLabel>Review gate</PanelLabel><div className={cn('mt-2 rounded border p-2 text-[9px]', review?.decision === 'approve' ? 'border-success/30 bg-success/10 text-success' : review?.decision === 'request_changes' ? 'border-destructive/30 bg-destructive/10 text-destructive' : 'border-warning/30 bg-warning/10 text-warning')}><div className="flex items-center gap-2"><CheckCircle2 className="size-3" /><span className="flex-1">{review?.decision ?? resource.artifact.status}</span></div><p className="mt-1 text-[8px] leading-relaxed opacity-80">{review?.summary ?? 'Create an immutable revision and request another project member to review it.'}</p></div>{canReview && <p className="mt-1 text-[8px] text-faint-foreground">Use Review Center for canonical reviewer decisions and blocking comment resolution.</p>}</section>
+    <section><PanelLabel>AI output proposals</PanelLabel><div className="mt-2 space-y-1.5">{proposals.map((proposal) => <div key={proposal.id} className="rounded border border-border bg-background p-2"><div className="flex items-center gap-2"><Wand2 className="size-3 text-primary-bright" /><span className="min-w-0 flex-1 truncate font-mono text-[8px] text-foreground">{proposal.id}</span><span className="text-[8px] text-faint-foreground">{proposal.status}</span></div><p className="mt-1 text-[8px] text-faint-foreground">{proposal.operations.length} reviewable operation(s); apply through the proposal decision flow.</p></div>)}{proposals.length === 0 && <PanelEmpty text="No AI proposal targets this prototype." />}</div></section>
+    <section><PanelLabel>Formal delivery readiness</PanelLabel><div className="mt-2 space-y-1"><Readiness passed={Boolean(resource.approvedRevision)} label="Approved immutable revision" /><Readiness passed={!content.exploratory} label="Formal, non-exploratory prototype" /><Readiness passed={content.states.some((item) => item.required)} label="Required state coverage" /><Readiness passed={content.breakpoints.length > 0} label="Responsive breakpoint" /><Readiness passed={content.fixtures.every((item) => item.sanitized)} label="Sanitized fixtures" /></div></section>
+  </div>
 }
 
-function CanvasStateOverlay({ state }: { state: StateKey }) {
-  const { t } = useI18n()
+function StudioGate({ title, description, loading, onRetry }: { title: string; description: string; loading?: boolean; onRetry?: () => Promise<void> }) { return <div className="flex h-full items-center justify-center bg-canvas p-6"><div className="max-w-md rounded-xl border border-dashed border-border bg-panel p-7 text-center">{loading ? <LoaderCircle className="mx-auto mb-3 size-6 animate-spin text-primary-bright" /> : <MonitorSmartphone className="mx-auto mb-3 size-6 text-faint-foreground" />}<h2 className="text-sm font-semibold text-foreground">{title}</h2><p className="mt-2 text-[10px] leading-relaxed text-faint-foreground">{description}</p>{onRetry && <button type="button" onClick={() => void onRetry()} className="mt-4 inline-flex items-center gap-1 rounded bg-primary px-3 py-2 text-[10px] font-semibold text-primary-foreground"><RefreshCw className="size-3" />Retry</button>}</div></div> }
+function SaveIndicator({ state }: { state: SaveState }) { const config = state === 'saving' ? [LoaderCircle, 'Saving exact draft…', 'animate-spin text-primary-bright'] as const : state === 'dirty' ? [CircleDashed, 'Unsaved changes', 'text-warning'] as const : state === 'conflict' || state === 'error' ? [CircleAlert, state === 'conflict' ? 'Conflict' : 'Save failed', 'text-destructive'] as const : [CheckCircle2, state === 'saved' ? 'Saved' : 'Server draft', 'text-success'] as const; const Icon = config[0]; return <span className={cn('ml-1 inline-flex items-center gap-1 text-[8px]', config[2])}><Icon className={cn('size-3', state === 'saving' && 'animate-spin')} />{config[1]}</span> }
+function PanelLabel({ children }: { children: React.ReactNode }) { return <h3 className="text-[8px] font-semibold uppercase tracking-wider text-faint-foreground">{children}</h3> }
+function PanelEmpty({ text }: { text: string }) { return <p className="rounded border border-dashed border-border p-3 text-center text-[8px] leading-relaxed text-faint-foreground">{text}</p> }
+function Info({ label, value }: { label: string; value: string | number }) { return <div className="rounded border border-border bg-background p-2"><div className="text-[7px] uppercase tracking-wider text-faint-foreground">{label}</div><div className="mt-1 truncate text-[9px] font-medium text-muted-foreground">{value}</div></div> }
+function Readiness({ passed, label }: { passed: boolean; label: string }) { return <div className="flex items-center gap-2 rounded border border-border bg-background px-2 py-1.5 text-[8px] text-muted-foreground">{passed ? <CheckCircle2 className="size-3 text-success" /> : <CircleAlert className="size-3 text-warning" />}<span>{label}</span></div> }
+function IconButton({ icon: Icon, label, onClick, disabled }: { icon: typeof Frame; label: string; onClick: () => void; disabled?: boolean }) { return <button type="button" onClick={onClick} disabled={disabled} className="flex h-12 flex-col items-center justify-center gap-1 rounded border border-border text-[7px] text-faint-foreground hover:text-foreground disabled:opacity-35"><Icon className="size-3" />{label}</button> }
+function NumberInput({ label, value, onChange, disabled }: { label: string; value: number; onChange: (value: number) => void; disabled?: boolean }) { return <label className="text-[8px] text-faint-foreground">{label}<input type="number" value={value} onChange={(event) => onChange(Number(event.target.value) || 0)} disabled={disabled} className="mt-1 h-8 w-full rounded border border-border bg-background px-2 font-mono text-[9px] text-foreground outline-none disabled:opacity-40" /></label> }
 
-  if (state === 'ready') return null
-
-  return (
-    <div className="pointer-events-none absolute inset-0 z-[1] flex items-center justify-center bg-black/20">
-      <div className="rounded-lg border border-border bg-surface/95 px-4 py-3 text-center shadow-xl">
-        <div className="text-xs font-semibold text-foreground">{t(STATE_LABEL_KEY[state])}</div>
-        <div className="mt-1 text-[11px] text-faint-foreground">
-          {state === 'empty' && t('prototype.noTasksCopy')}
-          {state === 'loading' && t('prototype.loadingState')}
-          {state === 'error' && t('prototype.loadFailedCopy')}
-        </div>
-      </div>
-    </div>
-  )
-}
-
-function DesignDiffOverlay() {
-  const { t } = useI18n()
-
-  return (
-    <div className="pointer-events-none absolute left-4 top-12 z-30 flex flex-wrap gap-1.5">
-      {DESIGN_DIFFS.map((item) => (
-        <span
-          key={item.id}
-          className="rounded-md border border-primary/30 bg-primary/15 px-2 py-1 text-[10px] font-medium text-primary-bright"
-        >
-          {t(item.labelKey)} {item.status}
-        </span>
-      ))}
-    </div>
-  )
-}
-
-function HandoffPins() {
-  return (
-    <>
-      {HANDOFF_PINS.map((pin) => (
-        <button
-          key={pin.id}
-          type="button"
-          className="absolute z-40 flex size-6 items-center justify-center rounded-full border border-white/40 bg-primary text-[11px] font-semibold text-white shadow-lg"
-          style={{ left: pin.x, top: pin.y }}
-          title={pin.text}
-        >
-          {pin.label}
-        </button>
-      ))}
-    </>
-  )
-}
-
-function ModeShelf({
-  mode,
-  page,
-  selectedLayer,
-  activeFixture,
-  onSelectFixture,
-  snapshotCount,
-  onSaveSnapshot,
-}: {
-  mode: PrototypeMode
-  page: PrototypePage
-  selectedLayer?: PrototypeLayer
-  activeFixture: MockFixture
-  onSelectFixture: (fixture: MockFixture) => void
-  snapshotCount: number
-  onSaveSnapshot: () => void
-}) {
-  const { t } = useI18n()
-
-  if (mode === 'design') {
-    return (
-      <div className="border-t border-border bg-surface px-4 py-3">
-        <div className="flex items-center justify-between gap-3 max-lg:flex-col max-lg:items-stretch">
-          <div className="min-w-0">
-            <div className="text-xs font-semibold text-foreground">{t('prototype.importedFrames')}</div>
-            <div className="mt-1 text-[11px] text-faint-foreground">{t('prototype.importedFramesCopy')}</div>
-          </div>
-          <div className="flex items-center gap-3 overflow-x-auto scrollbar-thin">
-          {['Task List Frame', 'Task Detail Frame', 'Empty State Frame', 'Error State Frame'].map((frameName, index) => (
-            <button
-              key={frameName}
-              type="button"
-              className="flex min-w-44 items-center gap-3 rounded-lg border border-border bg-surface-2 px-3 py-2 text-left hover:border-primary/35"
-            >
-              <span className="flex size-9 items-center justify-center rounded-md border border-primary/30 bg-primary/10 text-primary-bright">
-                {index + 1}
-              </span>
-              <span className="min-w-0">
-                <span className="block truncate text-xs font-medium text-foreground">{frameName}</span>
-                <span className="block truncate text-[11px] text-faint-foreground">
-                  {t('prototype.mapFramesCopy')}
-                </span>
-              </span>
-            </button>
-          ))}
-          </div>
-        </div>
-      </div>
-    )
-  }
-
-  if (mode === 'component') {
-    return (
-      <div className="border-t border-border bg-surface px-4 py-3">
-        <div className="flex items-center justify-between gap-3">
-          <div className="min-w-0">
-            <div className="text-xs font-semibold text-foreground">{t('prototype.componentStories')}</div>
-            <div className="mt-1 text-[11px] text-faint-foreground">{t('prototype.componentStoriesCopy')}</div>
-          </div>
-          <div className="flex max-w-full gap-1.5 overflow-x-auto scrollbar-thin">
-            {page.componentStories.map((story) => (
-              <button
-                key={story}
-                type="button"
-                className={cn(
-                  'shrink-0 rounded-md border px-2.5 py-1.5 text-[11px] font-medium',
-                  selectedLayer?.name.includes(story.split(' ')[0])
-                    ? 'border-primary/45 bg-primary/10 text-primary-bright'
-                    : 'border-border bg-surface-2 text-muted-foreground hover:text-foreground',
-                )}
-              >
-                {story}
-              </button>
-            ))}
-          </div>
-        </div>
-      </div>
-    )
-  }
-
-  if (mode === 'handoff') {
-    return (
-      <div className="border-t border-border bg-surface px-4 py-3">
-        <div className="flex items-center justify-between gap-3 max-lg:flex-col max-lg:items-stretch">
-          <div>
-            <div className="text-xs font-semibold text-foreground">{t('prototype.deliveryPackage')}</div>
-            <div className="mt-1 text-[11px] text-faint-foreground">
-              {t('prototype.deliveryPackageCopy', { page: page.name })}
-            </div>
-          </div>
-          <div className="flex gap-1.5">
-            {EXPORT_TARGETS.map((target) => {
-              const Icon = target.icon
-              return (
-                <button
-                  key={target.id}
-                  type="button"
-                  className="inline-flex items-center justify-center gap-1.5 rounded-lg border border-border bg-surface-2 px-3 py-2 text-xs font-medium text-muted-foreground hover:border-primary/40 hover:text-foreground"
-                >
-                  <Icon className="size-3.5 text-primary-bright" />
-                  {t(target.labelKey)}
-                </button>
-              )
-            })}
-            <button
-              type="button"
-              onClick={onSaveSnapshot}
-              className="inline-flex items-center justify-center gap-1.5 rounded-lg border border-border bg-surface-2 px-3 py-2 text-xs font-medium text-muted-foreground hover:border-primary/40 hover:text-foreground"
-            >
-              <Save className="size-3.5 text-primary-bright" />
-              v{snapshotCount + 1}
-            </button>
-          </div>
-        </div>
-      </div>
-    )
-  }
-
-  return (
-    <div className="border-t border-border bg-surface px-4 py-3">
-      <div className="flex items-center justify-between gap-4 max-xl:flex-col max-xl:items-stretch">
-        <div className="min-w-0">
-          <div className="flex items-center gap-2">
-            <Database className="size-3.5 text-primary-bright" />
-            <span className="text-xs font-semibold text-foreground">{t('prototype.fixtureStrip')}</span>
-          </div>
-          <div className="mt-1 text-[11px] text-faint-foreground">
-            {activeFixture.method} {activeFixture.endpoint} · {activeFixture.status} · {activeFixture.latency}ms
-          </div>
-        </div>
-        <div className="flex max-w-full items-center gap-1.5 overflow-x-auto scrollbar-thin">
-          {MOCK_FIXTURES.map((fixture) => (
-            <button
-              key={fixture.id}
-              type="button"
-              onClick={() => onSelectFixture(fixture)}
-              className={cn(
-                'inline-flex shrink-0 items-center gap-1.5 rounded-md border px-2.5 py-1.5 text-[11px] font-medium',
-                activeFixture.id === fixture.id
-                  ? 'border-primary/45 bg-primary/10 text-primary-bright'
-                  : 'border-border bg-surface-2 text-muted-foreground hover:text-foreground',
-              )}
-            >
-              <Play className="size-3" />
-              {t(STATE_LABEL_KEY[fixture.state])}
-              <span className="font-mono text-[10px] text-faint-foreground">{fixture.fixture}</span>
-            </button>
-          ))}
-        </div>
-      </div>
-    </div>
-  )
-}
-
-function DataPanel({
-  activeFixture,
-  fixtures,
-  onSelectFixture,
-}: {
-  activeFixture: MockFixture
-  fixtures: MockFixture[]
-  onSelectFixture: (fixture: MockFixture) => void
-}) {
-  const { t } = useI18n()
-
-  return (
-    <div className="space-y-5">
-      <section>
-        <SectionLabel>{t('prototype.fixtureLibrary')}</SectionLabel>
-        <div className="mt-2 space-y-1.5">
-          {fixtures.map((fixture) => (
-            <button
-              key={fixture.id}
-              type="button"
-              onClick={() => onSelectFixture(fixture)}
-              className={cn(
-                'w-full rounded-lg border p-2.5 text-left transition-colors',
-                activeFixture.id === fixture.id
-                  ? 'border-primary/45 bg-primary/10'
-                  : 'border-border bg-surface-2 hover:border-white/20',
-              )}
-            >
-              <div className="flex items-center gap-2">
-                <Database className="size-3.5 text-primary-bright" />
-                <span className="min-w-0 flex-1 truncate font-mono text-xs text-foreground">
-                  {fixture.method} {fixture.endpoint}
-                </span>
-                <span className="rounded bg-white/5 px-1.5 py-0.5 text-[10px] text-faint-foreground">
-                  {fixture.status}
-                </span>
-              </div>
-              <div className="mt-1 flex items-center gap-2 text-[11px] text-faint-foreground">
-                <span className="truncate">{fixture.fixture}</span>
-                <span className="ml-auto">{t(STATE_LABEL_KEY[fixture.state])}</span>
-              </div>
-            </button>
-          ))}
-        </div>
-      </section>
-
-      <section>
-        <SectionLabel>{t('prototype.activeFixture')}</SectionLabel>
-        <div className="mt-2 grid grid-cols-2 gap-2">
-          <InfoTile label={t('prototype.method')} value={activeFixture.method} />
-          <InfoTile label={t('prototype.statusCode')} value={String(activeFixture.status)} />
-          <InfoTile label={t('prototype.latency')} value={`${activeFixture.latency}ms`} />
-          <InfoTile label={t('prototype.schema')} value={activeFixture.schema} />
-        </div>
-        <div className="mt-2 rounded-lg border border-border bg-surface-2 p-3">
-          <div className="mb-2 flex items-center gap-1.5 text-xs font-semibold text-foreground">
-            <Braces className="size-3.5 text-primary-bright" />
-            {activeFixture.fixture}
-          </div>
-          <pre className="max-h-32 overflow-auto whitespace-pre-wrap rounded-md bg-black/20 p-2 font-mono text-[10px] leading-relaxed text-muted-foreground scrollbar-thin">
-            {activeFixture.sample}
-          </pre>
-        </div>
-      </section>
-
-      <section className="grid grid-cols-2 gap-1.5">
-        <button
-          type="button"
-          className="inline-flex items-center justify-center gap-1.5 rounded-lg bg-primary px-3 py-2 text-xs font-medium text-white hover:bg-primary/90"
-        >
-          <Play className="size-3.5" />
-          {t('prototype.runFixture')}
-        </button>
-        <button
-          type="button"
-          className="inline-flex items-center justify-center gap-1.5 rounded-lg border border-border bg-surface-2 px-3 py-2 text-xs font-medium text-muted-foreground hover:border-primary/40 hover:text-foreground"
-        >
-          <Save className="size-3.5 text-primary-bright" />
-          {t('prototype.saveFixture')}
-        </button>
-      </section>
-    </div>
-  )
-}
-
-function HandoffPanel({
-  page,
-  mode,
-  snapshotCount,
-  onOpenDoc,
-  onGenerate,
-  onCreateFrontendDoc,
-  onSaveSnapshot,
-}: {
-  page: PrototypePage
-  mode: PrototypeMode
-  snapshotCount: number
-  onOpenDoc: () => void
-  onGenerate: () => void
-  onCreateFrontendDoc: () => void
-  onSaveSnapshot: () => void
-}) {
-  const { t } = useI18n()
-  const labels = useLocalizedLabels()
-
-  return (
-    <div className="space-y-5">
-      <section>
-        <SectionLabel>{t('prototype.deliveryReadiness')}</SectionLabel>
-        <div className="mt-2 grid grid-cols-2 gap-2">
-          <InfoTile label={t('common.type')} value={labels.docType(page.docType)} />
-          <InfoTile label={t('prototype.versionHistory')} value={`v${snapshotCount}`} />
-          <InfoTile label={t('prototype.viewport')} value={`${page.viewport.width}x${page.viewport.height}`} />
-          <InfoTile label={t('prototype.mode')} value={t(MODE_LABEL_KEY[mode])} />
-        </div>
-      </section>
-
-      <section>
-        <SectionLabel>{t('prototype.sourceDocuments')}</SectionLabel>
-        <div className="mt-2 space-y-1.5">
-          {page.sourceDocs.map((doc) => (
-            <div key={doc} className="flex items-center gap-2 rounded-lg border border-border bg-surface-2 px-2.5 py-2 text-xs">
-              <Link2 className="size-3.5 text-primary-bright" />
-              <span className="min-w-0 flex-1 truncate text-muted-foreground">{doc}</span>
-            </div>
-          ))}
-        </div>
-      </section>
-
-      <section>
-        <SectionLabel>{t('prototype.acceptanceChecks')}</SectionLabel>
-        <div className="mt-2 space-y-1.5">
-          {ACCEPTANCE_CHECKS.map((item) => (
-            <div
-              key={item.id}
-              className="flex items-center gap-2 rounded-lg border border-border bg-surface-2 px-2.5 py-2 text-xs text-muted-foreground"
-            >
-              <CheckCircle2 className={cn('size-3.5', item.passed ? 'text-success' : 'text-warning')} />
-              <span className="min-w-0 flex-1">{t(item.labelKey)}</span>
-            </div>
-          ))}
-        </div>
-      </section>
-
-      <section>
-        <SectionLabel>{t('prototype.exportBundle')}</SectionLabel>
-        <div className="mt-2 grid grid-cols-1 gap-1.5">
-          {EXPORT_TARGETS.map((target) => {
-            const Icon = target.icon
-            return (
-              <button
-                key={target.id}
-                type="button"
-                className="inline-flex items-center gap-2 rounded-lg border border-border bg-surface-2 px-2.5 py-2 text-xs text-muted-foreground hover:border-primary/40 hover:text-foreground"
-              >
-                <Icon className="size-3.5 text-primary-bright" />
-                <span className="min-w-0 flex-1 truncate text-left">{t(target.labelKey)}</span>
-                <Download className="size-3 text-faint-foreground" />
-              </button>
-            )
-          })}
-        </div>
-      </section>
-
-      <section className="space-y-2">
-        <button
-          type="button"
-          onClick={onOpenDoc}
-          className="inline-flex w-full items-center gap-2 rounded-lg border border-border bg-surface-2 px-2.5 py-2 text-xs text-muted-foreground hover:border-white/20"
-        >
-          <Link2 className="size-3.5 text-primary-bright" />
-          <span className="flex-1 truncate text-left">{labels.docType(page.docType)}</span>
-          <ArrowUpRight className="size-3 text-faint-foreground" />
-        </button>
-        <button
-          type="button"
-          onClick={onGenerate}
-          className="inline-flex w-full items-center justify-center gap-1.5 rounded-lg bg-primary px-3 py-2 text-xs font-medium text-white hover:bg-primary/90"
-        >
-          <Sparkles className="size-3.5" />
-          {t('prototype.generateImplementation')}
-        </button>
-        <button
-          type="button"
-          onClick={onCreateFrontendDoc}
-          className="inline-flex w-full items-center justify-center gap-1.5 rounded-lg border border-border bg-surface-2 px-3 py-2 text-xs font-medium text-muted-foreground hover:border-primary/40 hover:text-foreground"
-        >
-          <Sparkles className="size-3.5 text-primary-bright" />
-          {t('prototype.createFrontendDoc')}
-        </button>
-        <button
-          type="button"
-          onClick={onSaveSnapshot}
-          className="inline-flex w-full items-center justify-center gap-1.5 rounded-lg border border-border bg-surface-2 px-3 py-2 text-xs font-medium text-muted-foreground hover:border-primary/40 hover:text-foreground"
-        >
-          <History className="size-3.5 text-primary-bright" />
-          {t('prototype.saveSnapshot')}
-        </button>
-      </section>
-    </div>
-  )
-}
-
-function PropertiesPanel({
-  layer,
-  page,
-  mode,
-  snapshotCount,
-  disabled,
-  onChange,
-  onToggleVisible,
-  onToggleLocked,
-  onDuplicate,
-  onDelete,
-  onReset,
-  onNudge,
-}: {
-  layer: PrototypeLayer
-  page: PrototypePage
-  mode: PrototypeMode
-  snapshotCount: number
-  disabled: boolean
-  onChange: (updates: Partial<PrototypeLayer>) => void
-  onToggleVisible: () => void
-  onToggleLocked: () => void
-  onDuplicate: () => void
-  onDelete: () => void
-  onReset: () => void
-  onNudge: (dx: number, dy: number) => void
-}) {
-  const { t } = useI18n()
-
-  return (
-    <div className="space-y-5">
-      <section>
-        <SectionLabel>{t('prototype.pageSettings')}</SectionLabel>
-        <div className="mt-2 grid grid-cols-2 gap-2">
-          <InfoTile label={t('prototype.route')} value={page.name} />
-          <InfoTile label={t('prototype.mode')} value={t(MODE_LABEL_KEY[mode])} />
-          <InfoTile label={t('prototype.apiContract')} value={page.apiContract} />
-          <InfoTile label={t('prototype.versionHistory')} value={`v${snapshotCount}`} />
-        </div>
-      </section>
-
-      <section>
-        <SectionLabel>{t('prototype.activeLayer')}</SectionLabel>
-        <div className="mt-2 flex items-center gap-2 rounded-lg border border-border bg-surface-2 p-2">
-          <Layers className="size-4 text-primary-bright" />
-          <input
-            value={layer.name}
-            disabled={disabled}
-            onChange={(event) => onChange({ name: event.target.value })}
-            className="min-w-0 flex-1 bg-transparent text-xs font-semibold text-foreground outline-none disabled:text-faint-foreground"
-            aria-label={t('prototype.activeLayer')}
-          />
-        </div>
-        <div className="mt-2 grid grid-cols-4 gap-1.5">
-          <IconAction icon={layer.visible ? Eye : EyeOff} label={layer.visible ? t('prototype.visible') : t('prototype.hidden')} onClick={onToggleVisible} />
-          <IconAction icon={layer.locked ? Lock : Unlock} label={layer.locked ? t('prototype.locked') : t('prototype.unlocked')} onClick={onToggleLocked} />
-          <IconAction icon={Copy} label={t('prototype.duplicateLayer')} onClick={onDuplicate} />
-          <IconAction icon={RotateCcw} label={t('prototype.resetLayer')} onClick={onReset} disabled={disabled} />
-        </div>
-      </section>
-
-      <section>
-        <SectionLabel>{t('prototype.layout')}</SectionLabel>
-        <div className="mt-2 grid grid-cols-2 gap-2">
-          <NumberField label="X" value={layer.x} disabled={disabled} onChange={(value) => onChange({ x: value })} />
-          <NumberField label="Y" value={layer.y} disabled={disabled} onChange={(value) => onChange({ y: value })} />
-          <NumberField label="W" value={layer.w} disabled={disabled} min={12} onChange={(value) => onChange({ w: value })} />
-          <NumberField label="H" value={layer.h} disabled={disabled} min={12} onChange={(value) => onChange({ h: value })} />
-        </div>
-        <div className="mt-3 grid grid-cols-[1fr_34px_1fr] items-center gap-1.5">
-          <span />
-          <IconAction icon={ArrowUp} label={t('prototype.nudgeUp')} onClick={() => onNudge(0, -8)} disabled={disabled} />
-          <span />
-          <IconAction icon={ArrowLeft} label={t('prototype.nudgeLeft')} onClick={() => onNudge(-8, 0)} disabled={disabled} />
-          <IconAction icon={Move} label={t('prototype.nudge')} onClick={() => onNudge(0, 0)} disabled={disabled} />
-          <IconAction icon={ArrowRight} label={t('prototype.nudgeRight')} onClick={() => onNudge(8, 0)} disabled={disabled} />
-          <span />
-          <IconAction icon={ArrowDown} label={t('prototype.nudgeDown')} onClick={() => onNudge(0, 8)} disabled={disabled} />
-          <span />
-        </div>
-      </section>
-
-      <section>
-        <SectionLabel>{t('prototype.appearance')}</SectionLabel>
-        <div className="mt-2 space-y-3">
-          <RangeField label={t('prototype.radius')} value={layer.radius} min={0} max={64} disabled={disabled} onChange={(value) => onChange({ radius: value })} />
-          <RangeField label={t('prototype.opacity')} value={layer.opacity} min={12} max={100} disabled={disabled} onChange={(value) => onChange({ opacity: value })} suffix="%" />
-          <RangeField label={t('prototype.rotation')} value={layer.rotation} min={-30} max={30} disabled={disabled} onChange={(value) => onChange({ rotation: value })} suffix="deg" />
-          <RangeField label={t('prototype.textSize')} value={layer.textSize ?? 14} min={10} max={32} disabled={disabled || layer.kind !== 'text'} onChange={(value) => onChange({ textSize: value })} suffix="px" />
-        </div>
-        <div className="mt-3">
-          <div className="mb-2 text-[11px] font-medium text-muted-foreground">{t('prototype.fill')}</div>
-          <div className="grid grid-cols-8 gap-1.5">
-            {COLOR_SWATCHES.map((color) => (
-              <button
-                key={color}
-                type="button"
-                disabled={disabled}
-                onClick={() => onChange({ fill: color })}
-                className={cn(
-                  'size-6 rounded-md border border-border disabled:opacity-40',
-                  layer.fill === color && 'ring-2 ring-primary ring-offset-1 ring-offset-surface',
-                )}
-                style={{ backgroundColor: color }}
-                aria-label={`${t('prototype.fill')} ${color}`}
-              />
-            ))}
-          </div>
-        </div>
-      </section>
-
-      <section>
-        <SectionLabel>{t('prototype.imageAdjustments')}</SectionLabel>
-        {layer.kind === 'image' ? (
-          <div className="mt-2 space-y-3">
-            <RangeField label={t('prototype.cropX')} value={layer.cropX ?? 50} min={0} max={100} disabled={disabled} onChange={(value) => onChange({ cropX: value })} suffix="%" />
-            <RangeField label={t('prototype.cropY')} value={layer.cropY ?? 50} min={0} max={100} disabled={disabled} onChange={(value) => onChange({ cropY: value })} suffix="%" />
-            <RangeField label={t('prototype.imageScale')} value={layer.imageScale ?? 118} min={80} max={180} disabled={disabled} onChange={(value) => onChange({ imageScale: value })} suffix="%" />
-            <RangeField label={t('prototype.brightness')} value={layer.brightness ?? 100} min={50} max={150} disabled={disabled} onChange={(value) => onChange({ brightness: value })} suffix="%" />
-            <RangeField label={t('prototype.contrast')} value={layer.contrast ?? 100} min={50} max={160} disabled={disabled} onChange={(value) => onChange({ contrast: value })} suffix="%" />
-            <RangeField label={t('prototype.saturation')} value={layer.saturation ?? 100} min={0} max={180} disabled={disabled} onChange={(value) => onChange({ saturation: value })} suffix="%" />
-            <RangeField label={t('prototype.blur')} value={layer.blur ?? 0} min={0} max={8} disabled={disabled} onChange={(value) => onChange({ blur: value })} suffix="px" />
-          </div>
-        ) : (
-          <div className="mt-2 rounded-lg border border-dashed border-border bg-surface-2 p-3 text-[11px] leading-relaxed text-faint-foreground">
-            {t('prototype.selectImageLayer')}
-          </div>
-        )}
-      </section>
-
-      <button
-        type="button"
-        onClick={onDelete}
-        disabled={disabled}
-        className="inline-flex w-full items-center justify-center gap-1.5 rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs font-medium text-destructive hover:bg-destructive/10 disabled:cursor-not-allowed disabled:opacity-45"
-      >
-        {t('prototype.deleteLayer')}
-      </button>
-    </div>
-  )
-}
-
-function EmptyInspector() {
-  const { t } = useI18n()
-
-  return (
-    <div className="rounded-lg border border-dashed border-border bg-surface-2 p-4 text-center">
-      <MousePointer2 className="mx-auto size-5 text-faint-foreground" />
-      <div className="mt-2 text-xs font-semibold text-foreground">{t('prototype.noLayerSelected')}</div>
-      <p className="mt-1 text-[11px] leading-relaxed text-faint-foreground">
-        {t('prototype.selectLayerCopy')}
-      </p>
-    </div>
-  )
-}
-
-function InfoTile({ label, value }: { label: string; value: string }) {
-  return (
-    <div className="rounded-lg border border-border bg-surface-2 p-2">
-      <div className="text-[10px] uppercase tracking-wide text-faint-foreground">{label}</div>
-      <div className="mt-1 truncate text-xs font-medium text-foreground">{value}</div>
-    </div>
-  )
-}
-
-function SectionLabel({ children }: { children: React.ReactNode }) {
-  return (
-    <div className="text-[11px] font-semibold uppercase tracking-wider text-faint-foreground">
-      {children}
-    </div>
-  )
-}
-
-function NumberField({
-  label,
-  value,
-  min = -999,
-  max = 999,
-  disabled,
-  onChange,
-}: {
-  label: string
-  value: number
-  min?: number
-  max?: number
-  disabled?: boolean
-  onChange: (value: number) => void
-}) {
-  return (
-    <label className="block rounded-lg border border-border bg-surface-2 px-2 py-1.5">
-      <span className="text-[10px] font-medium text-faint-foreground">{label}</span>
-      <input
-        type="number"
-        value={value}
-        min={min}
-        max={max}
-        disabled={disabled}
-        onChange={(event) => onChange(clamp(parsedNumber(event.target.value, value), min, max))}
-        className="mt-0.5 w-full bg-transparent text-xs font-medium text-foreground outline-none disabled:text-faint-foreground"
-      />
-    </label>
-  )
-}
-
-function RangeField({
-  label,
-  value,
-  min,
-  max,
-  suffix,
-  disabled,
-  onChange,
-}: {
-  label: string
-  value: number
-  min: number
-  max: number
-  suffix?: string
-  disabled?: boolean
-  onChange: (value: number) => void
-}) {
-  return (
-    <label className="block">
-      <span className="mb-1 flex items-center justify-between gap-2 text-[11px] font-medium text-muted-foreground">
-        <span>{label}</span>
-        <span className="font-mono text-faint-foreground">
-          {value}
-          {suffix}
-        </span>
-      </span>
-      <input
-        type="range"
-        value={value}
-        min={min}
-        max={max}
-        disabled={disabled}
-        onChange={(event) => onChange(parsedNumber(event.target.value, value))}
-        className="h-1.5 w-full accent-primary disabled:opacity-45"
-      />
-    </label>
-  )
-}
-
-function IconAction({
-  icon: Icon,
-  label,
-  onClick,
-  disabled,
-}: {
-  icon: typeof Frame
-  label: string
-  onClick: () => void
-  disabled?: boolean
-}) {
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      disabled={disabled}
-      className="inline-flex h-8 items-center justify-center rounded-md border border-border bg-surface-2 text-faint-foreground hover:border-primary/35 hover:text-foreground disabled:cursor-not-allowed disabled:opacity-45"
-      aria-label={label}
-      title={label}
-    >
-      <Icon className="size-3.5" />
-    </button>
-  )
-}
+function cloneContent(content: PrototypeContentDto): PrototypeContentDto { return typeof structuredClone === 'function' ? structuredClone(content) : JSON.parse(JSON.stringify(content)) as PrototypeContentDto }
+function cloneLayer(layer: PrototypeLayerDto, id: string): PrototypeLayerDto { return { ...layer, id, childIds: [], layout: { ...layer.layout }, style: { ...layer.style }, properties: { ...layer.properties }, requirementIds: [...layer.requirementIds], acceptanceCriterionIds: [...layer.acceptanceCriterionIds], fieldMetadata: { ...layer.fieldMetadata } } }
+function layerTree(layers: Readonly<Record<string, PrototypeLayerDto>>, rootId?: string) { if (!rootId || !layers[rootId]) return Object.values(layers); const result: PrototypeLayerDto[] = []; const visited = new Set<string>(); const visit = (id: string) => { if (visited.has(id) || !layers[id]) return; visited.add(id); result.push(layers[id]); layers[id].childIds.forEach(visit) }; visit(rootId); Object.keys(layers).forEach(visit); return result }
+function descendantIds(layers: Readonly<Record<string, PrototypeLayerDto>>, id: string) { const result: string[] = []; const visit = (current: string) => { for (const child of layers[current]?.childIds ?? []) { result.push(child); visit(child) } }; visit(id); return result }
+function fieldMetadataFor(updates: object, userId: string): PrototypeLayerDto['fieldMetadata'] { const now = new Date().toISOString(); const operationId = stableId('edit'); return Object.fromEntries(Object.keys(updates).map((field) => [field, { source: 'human' as const, changedBy: userId || 'anonymous', changedAt: now, operationId, aiPolicy: 'suggestOnly' as const }])) }
+function numberValue(value: JsonValue | undefined, fallback: number) { return typeof value === 'number' && Number.isFinite(value) ? value : fallback }
+function stringValue(value: JsonValue | undefined, fallback: string) { return typeof value === 'string' ? value : fallback }
+function booleanValue(value: JsonValue | undefined) { return value === true }
+function normalizeColor(value: string) { return /^#[0-9a-f]{6}$/i.test(value) ? value : '#1e1e21' }
+function shortRef(ref: { artifactId: string; revisionId: string }) { return `${ref.artifactId.slice(0, 8)}:${ref.revisionId.slice(0, 8)}` }
+function stableId(prefix: string) { const id = typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function' ? crypto.randomUUID() : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`; return `${prefix}-${id}` }
+function message(cause: unknown) { return cause instanceof Error ? cause.message : 'Prototype service request failed.' }

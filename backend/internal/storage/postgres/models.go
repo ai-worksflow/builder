@@ -1,0 +1,557 @@
+package postgres
+
+import (
+	"encoding/json"
+	"net/netip"
+	"time"
+
+	"github.com/google/uuid"
+)
+
+// Models deliberately keep relationships as identifiers. Cross-aggregate loading is
+// explicit in repositories so a GORM preload cannot accidentally cross a project
+// authorization boundary.
+
+type UserModel struct {
+	ID           uuid.UUID `gorm:"type:uuid;primaryKey"`
+	Email        string    `gorm:"not null"`
+	DisplayName  string    `gorm:"not null"`
+	PasswordHash string    `gorm:"not null"`
+	AvatarURL    *string
+	DisabledAt   *time.Time
+	CreatedAt    time.Time
+	UpdatedAt    time.Time
+}
+
+func (UserModel) TableName() string { return "users" }
+
+type AuthSessionModel struct {
+	ID         uuid.UUID `gorm:"type:uuid;primaryKey"`
+	UserID     uuid.UUID `gorm:"type:uuid;not null;index"`
+	TokenHash  []byte    `gorm:"not null;uniqueIndex"`
+	ExpiresAt  time.Time `gorm:"not null;index"`
+	RevokedAt  *time.Time
+	LastSeenAt time.Time
+	UserAgent  *string
+	IPAddress  *netip.Addr `gorm:"type:inet"`
+	CreatedAt  time.Time
+}
+
+func (AuthSessionModel) TableName() string { return "auth_sessions" }
+
+type ProjectModel struct {
+	ID          uuid.UUID `gorm:"type:uuid;primaryKey"`
+	Slug        *string
+	Name        string    `gorm:"not null"`
+	Description string    `gorm:"not null"`
+	Lifecycle   string    `gorm:"not null"`
+	Version     uint64    `gorm:"not null"`
+	CreatedBy   uuid.UUID `gorm:"type:uuid;not null"`
+	CreatedAt   time.Time
+	UpdatedAt   time.Time
+	ArchivedAt  *time.Time
+}
+
+func (ProjectModel) TableName() string { return "projects" }
+
+type ProjectMemberModel struct {
+	ProjectID uuid.UUID  `gorm:"type:uuid;primaryKey"`
+	UserID    uuid.UUID  `gorm:"type:uuid;primaryKey"`
+	Role      string     `gorm:"not null"`
+	InvitedBy *uuid.UUID `gorm:"type:uuid"`
+	JoinedAt  time.Time
+	UpdatedAt time.Time
+}
+
+func (ProjectMemberModel) TableName() string { return "project_members" }
+
+type ProjectInvitationModel struct {
+	ID         uuid.UUID  `gorm:"type:uuid;primaryKey"`
+	ProjectID  uuid.UUID  `gorm:"type:uuid;not null;index"`
+	Email      string     `gorm:"not null"`
+	Role       string     `gorm:"not null"`
+	TokenHash  []byte     `gorm:"not null;uniqueIndex"`
+	Status     string     `gorm:"not null"`
+	InvitedBy  uuid.UUID  `gorm:"type:uuid;not null"`
+	AcceptedBy *uuid.UUID `gorm:"type:uuid"`
+	ExpiresAt  time.Time  `gorm:"not null"`
+	CreatedAt  time.Time
+	AcceptedAt *time.Time
+	RevokedAt  *time.Time
+}
+
+func (ProjectInvitationModel) TableName() string { return "project_invitations" }
+
+type ArtifactModel struct {
+	ID                       uuid.UUID  `gorm:"type:uuid;primaryKey"`
+	ProjectID                uuid.UUID  `gorm:"type:uuid;not null;index"`
+	Kind                     string     `gorm:"not null"`
+	ArtifactKey              string     `gorm:"not null"`
+	Title                    string     `gorm:"not null"`
+	Lifecycle                string     `gorm:"not null"`
+	Version                  uint64     `gorm:"not null"`
+	LatestDraftID            *uuid.UUID `gorm:"type:uuid"`
+	LatestRevisionID         *uuid.UUID `gorm:"type:uuid"`
+	LatestApprovedRevisionID *uuid.UUID `gorm:"type:uuid"`
+	CreatedBy                uuid.UUID  `gorm:"type:uuid;not null"`
+	CreatedAt                time.Time
+	UpdatedAt                time.Time
+	ArchivedAt               *time.Time
+}
+
+func (ArtifactModel) TableName() string { return "artifacts" }
+
+type ArtifactDraftModel struct {
+	ID             uuid.UUID  `gorm:"type:uuid;primaryKey"`
+	ArtifactID     uuid.UUID  `gorm:"type:uuid;not null;index"`
+	BaseRevisionID *uuid.UUID `gorm:"type:uuid"`
+	Sequence       uint64     `gorm:"not null"`
+	ETag           string     `gorm:"not null"`
+	SchemaVersion  int        `gorm:"not null"`
+	ContentStore   string     `gorm:"not null"`
+	ContentRef     string     `gorm:"not null"`
+	ContentHash    string     `gorm:"not null"`
+	ByteSize       int64      `gorm:"not null"`
+	Status         string     `gorm:"not null"`
+	CreatedBy      uuid.UUID  `gorm:"type:uuid;not null"`
+	UpdatedBy      uuid.UUID  `gorm:"type:uuid;not null"`
+	CreatedAt      time.Time
+	UpdatedAt      time.Time
+}
+
+func (ArtifactDraftModel) TableName() string { return "artifact_drafts" }
+
+type ArtifactDraftSourceModel struct {
+	DraftID           uuid.UUID `gorm:"type:uuid;primaryKey"`
+	SourceArtifactID  uuid.UUID `gorm:"type:uuid;not null;index"`
+	SourceRevisionID  uuid.UUID `gorm:"type:uuid;primaryKey"`
+	SourceContentHash string    `gorm:"not null"`
+	SourceAnchorID    *string
+	Purpose           string    `gorm:"primaryKey"`
+	Required          bool      `gorm:"not null"`
+	AddedBy           uuid.UUID `gorm:"type:uuid;not null"`
+	AddedAt           time.Time
+}
+
+func (ArtifactDraftSourceModel) TableName() string { return "artifact_draft_sources" }
+
+type ArtifactRevisionModel struct {
+	ID                       uuid.UUID  `gorm:"type:uuid;primaryKey"`
+	ArtifactID               uuid.UUID  `gorm:"type:uuid;not null;index"`
+	RevisionNumber           uint64     `gorm:"not null"`
+	ParentRevisionID         *uuid.UUID `gorm:"type:uuid"`
+	SchemaVersion            int        `gorm:"not null"`
+	ContentStore             string     `gorm:"not null"`
+	ContentRef               string     `gorm:"not null"`
+	ContentHash              string     `gorm:"not null"`
+	ByteSize                 int64      `gorm:"not null"`
+	WorkflowStatus           string     `gorm:"not null"`
+	ChangeSource             string     `gorm:"not null"`
+	ChangeSummary            string     `gorm:"not null"`
+	SourceManifestID         *uuid.UUID `gorm:"type:uuid"`
+	ProposalID               *uuid.UUID `gorm:"type:uuid"`
+	ImplementationProposalID *uuid.UUID `gorm:"type:uuid"`
+	CreatedBy                uuid.UUID  `gorm:"type:uuid;not null"`
+	CreatedAt                time.Time
+	ApprovedAt               *time.Time
+	SupersededAt             *time.Time
+}
+
+func (ArtifactRevisionModel) TableName() string { return "artifact_revisions" }
+
+type ArtifactResponsibilityModel struct {
+	ArtifactID     uuid.UUID `gorm:"type:uuid;primaryKey"`
+	UserID         uuid.UUID `gorm:"type:uuid;primaryKey"`
+	Responsibility string    `gorm:"primaryKey"`
+	Reason         string    `gorm:"not null"`
+	AssignedBy     uuid.UUID `gorm:"type:uuid;not null"`
+	AssignedAt     time.Time
+}
+
+func (ArtifactResponsibilityModel) TableName() string { return "artifact_responsibilities" }
+
+type ArtifactDependencyModel struct {
+	ID                uuid.UUID  `gorm:"type:uuid;primaryKey"`
+	ProjectID         uuid.UUID  `gorm:"type:uuid;not null;index"`
+	SourceArtifactID  uuid.UUID  `gorm:"type:uuid;not null"`
+	SourceRevisionID  uuid.UUID  `gorm:"type:uuid;not null"`
+	SourceContentHash string     `gorm:"not null"`
+	TargetArtifactID  uuid.UUID  `gorm:"type:uuid;not null"`
+	TargetRevisionID  *uuid.UUID `gorm:"type:uuid"`
+	Relation          string     `gorm:"not null"`
+	Required          bool       `gorm:"not null"`
+	CreatedBy         uuid.UUID  `gorm:"type:uuid;not null"`
+	CreatedAt         time.Time
+}
+
+func (ArtifactDependencyModel) TableName() string { return "artifact_dependencies" }
+
+type TraceLinkModel struct {
+	ID               uuid.UUID `gorm:"type:uuid;primaryKey"`
+	ProjectID        uuid.UUID `gorm:"type:uuid;not null;index"`
+	SourceArtifactID uuid.UUID `gorm:"type:uuid;not null"`
+	SourceRevisionID uuid.UUID `gorm:"type:uuid;not null"`
+	SourceAnchorID   *string
+	TargetArtifactID uuid.UUID  `gorm:"type:uuid;not null"`
+	TargetRevisionID *uuid.UUID `gorm:"type:uuid"`
+	TargetAnchorID   *string
+	Relation         string          `gorm:"not null"`
+	Metadata         json.RawMessage `gorm:"type:jsonb;not null"`
+	CreatedBy        uuid.UUID       `gorm:"type:uuid;not null"`
+	CreatedAt        time.Time
+}
+
+func (TraceLinkModel) TableName() string { return "trace_links" }
+
+type ArtifactHealthModel struct {
+	ArtifactID     uuid.UUID       `gorm:"type:uuid;primaryKey"`
+	SyncStatus     string          `gorm:"not null"`
+	DeliveryStatus string          `gorm:"not null"`
+	FindingCount   int             `gorm:"not null"`
+	BlockingCount  int             `gorm:"not null"`
+	Report         json.RawMessage `gorm:"type:jsonb;not null"`
+	ComputedAt     time.Time
+}
+
+func (ArtifactHealthModel) TableName() string { return "artifact_health" }
+
+type ReviewRequestModel struct {
+	ID          uuid.UUID       `gorm:"type:uuid;primaryKey"`
+	ProjectID   uuid.UUID       `gorm:"type:uuid;not null;index"`
+	ArtifactID  uuid.UUID       `gorm:"type:uuid;not null"`
+	RevisionID  uuid.UUID       `gorm:"type:uuid;not null"`
+	ContentHash string          `gorm:"not null"`
+	Status      string          `gorm:"not null"`
+	Policy      json.RawMessage `gorm:"type:jsonb;not null"`
+	RequestedBy uuid.UUID       `gorm:"type:uuid;not null"`
+	RequestedAt time.Time
+	ClosedAt    *time.Time
+}
+
+func (ReviewRequestModel) TableName() string { return "review_requests" }
+
+type ReviewDecisionModel struct {
+	ID              uuid.UUID `gorm:"type:uuid;primaryKey"`
+	ReviewRequestID uuid.UUID `gorm:"type:uuid;not null;index"`
+	ReviewerID      uuid.UUID `gorm:"type:uuid;not null"`
+	Decision        string    `gorm:"not null"`
+	Summary         string    `gorm:"not null"`
+	CreatedAt       time.Time
+}
+
+func (ReviewDecisionModel) TableName() string { return "review_decisions" }
+
+type CommentThreadModel struct {
+	ID         uuid.UUID       `gorm:"type:uuid;primaryKey"`
+	ProjectID  uuid.UUID       `gorm:"type:uuid;not null;index"`
+	ArtifactID uuid.UUID       `gorm:"type:uuid;not null;index"`
+	RevisionID *uuid.UUID      `gorm:"type:uuid"`
+	Anchor     json.RawMessage `gorm:"type:jsonb;not null"`
+	Severity   string          `gorm:"not null"`
+	AssignedTo *uuid.UUID      `gorm:"type:uuid"`
+	CreatedBy  uuid.UUID       `gorm:"type:uuid;not null"`
+	CreatedAt  time.Time
+	ResolvedBy *uuid.UUID `gorm:"type:uuid"`
+	ResolvedAt *time.Time
+	OutdatedAt *time.Time
+}
+
+func (CommentThreadModel) TableName() string { return "comment_threads" }
+
+type CommentMessageModel struct {
+	ID              uuid.UUID       `gorm:"type:uuid;primaryKey"`
+	ThreadID        uuid.UUID       `gorm:"type:uuid;not null;index"`
+	ParentMessageID *uuid.UUID      `gorm:"type:uuid"`
+	Body            string          `gorm:"not null"`
+	Mentions        json.RawMessage `gorm:"type:jsonb;not null"`
+	CreatedBy       uuid.UUID       `gorm:"type:uuid;not null"`
+	CreatedAt       time.Time
+	EditedAt        *time.Time
+	DeletedAt       *time.Time
+}
+
+func (CommentMessageModel) TableName() string { return "comment_messages" }
+
+type InputManifestModel struct {
+	ID            uuid.UUID `gorm:"type:uuid;primaryKey"`
+	ProjectID     uuid.UUID `gorm:"type:uuid;not null;index"`
+	Kind          string    `gorm:"not null"`
+	SchemaVersion int       `gorm:"not null"`
+	ContentStore  string    `gorm:"not null"`
+	ContentRef    string    `gorm:"not null"`
+	ContentHash   string    `gorm:"not null"`
+	ManifestHash  string    `gorm:"not null"`
+	CreatedBy     uuid.UUID `gorm:"type:uuid;not null"`
+	CreatedAt     time.Time
+}
+
+func (InputManifestModel) TableName() string { return "input_manifests" }
+
+type OutputProposalModel struct {
+	ID              uuid.UUID  `gorm:"type:uuid;primaryKey"`
+	ProjectID       uuid.UUID  `gorm:"type:uuid;not null;index"`
+	ArtifactID      *uuid.UUID `gorm:"type:uuid"`
+	Kind            string     `gorm:"not null"`
+	InputManifestID uuid.UUID  `gorm:"type:uuid;not null"`
+	BaseRevisionID  *uuid.UUID `gorm:"type:uuid"`
+	BaseDraftID     *uuid.UUID `gorm:"type:uuid"`
+	BaseContentHash *string
+	Status          string    `gorm:"not null"`
+	Version         uint64    `gorm:"not null"`
+	ContentStore    string    `gorm:"not null"`
+	ContentRef      string    `gorm:"not null"`
+	ContentHash     string    `gorm:"not null"`
+	PayloadHash     string    `gorm:"not null"`
+	OperationCount  int       `gorm:"not null"`
+	AcceptedCount   int       `gorm:"not null"`
+	RejectedCount   int       `gorm:"not null"`
+	CreatedBy       uuid.UUID `gorm:"type:uuid;not null"`
+	CreatedAt       time.Time
+	AppliedBy       *uuid.UUID `gorm:"type:uuid"`
+	AppliedAt       *time.Time
+}
+
+func (OutputProposalModel) TableName() string { return "output_proposals" }
+
+type ProposalOperationDecisionModel struct {
+	ProposalID  uuid.UUID `gorm:"type:uuid;primaryKey"`
+	OperationID string    `gorm:"primaryKey"`
+	Decision    string    `gorm:"not null"`
+	Reason      string    `gorm:"not null"`
+	DecidedBy   uuid.UUID `gorm:"type:uuid;not null"`
+	DecidedAt   time.Time
+}
+
+func (ProposalOperationDecisionModel) TableName() string { return "proposal_operation_decisions" }
+
+type DeliverySliceModel struct {
+	ID                  uuid.UUID  `gorm:"type:uuid;primaryKey"`
+	ProjectID           uuid.UUID  `gorm:"type:uuid;not null;index"`
+	SliceKey            string     `gorm:"not null"`
+	Title               string     `gorm:"not null"`
+	BlueprintRevisionID uuid.UUID  `gorm:"type:uuid;not null"`
+	PageSpecRevisionID  *uuid.UUID `gorm:"type:uuid"`
+	PrototypeRevisionID *uuid.UUID `gorm:"type:uuid"`
+	SyncStatus          string     `gorm:"not null"`
+	WorkflowStatus      string     `gorm:"not null"`
+	OwnerID             *uuid.UUID `gorm:"type:uuid"`
+	BlockerReason       string     `gorm:"not null"`
+	UpdatedAt           time.Time
+}
+
+func (DeliverySliceModel) TableName() string { return "delivery_slices" }
+
+type ImpactReportModel struct {
+	ID               uuid.UUID       `gorm:"type:uuid;primaryKey"`
+	ProjectID        uuid.UUID       `gorm:"type:uuid;not null;index"`
+	SourceArtifactID uuid.UUID       `gorm:"type:uuid;not null"`
+	FromRevisionID   uuid.UUID       `gorm:"type:uuid;not null"`
+	ToRevisionID     uuid.UUID       `gorm:"type:uuid;not null"`
+	Status           string          `gorm:"not null"`
+	Report           json.RawMessage `gorm:"type:jsonb;not null"`
+	CreatedBy        uuid.UUID       `gorm:"type:uuid;not null"`
+	CreatedAt        time.Time
+	ResolvedAt       *time.Time
+}
+
+func (ImpactReportModel) TableName() string { return "impact_reports" }
+
+type WorkflowDefinitionModel struct {
+	ID          uuid.UUID  `gorm:"type:uuid;primaryKey"`
+	ProjectID   *uuid.UUID `gorm:"type:uuid;index"`
+	WorkflowKey string     `gorm:"not null"`
+	Title       string     `gorm:"not null"`
+	Description string     `gorm:"not null"`
+	Lifecycle   string     `gorm:"not null"`
+	CreatedBy   uuid.UUID  `gorm:"type:uuid;not null"`
+	CreatedAt   time.Time
+	UpdatedAt   time.Time
+}
+
+func (WorkflowDefinitionModel) TableName() string { return "workflow_definitions" }
+
+type WorkflowDefinitionVersionModel struct {
+	ID               uuid.UUID       `gorm:"type:uuid;primaryKey"`
+	DefinitionID     uuid.UUID       `gorm:"type:uuid;not null;index"`
+	Version          int             `gorm:"not null"`
+	SchemaVersion    int             `gorm:"not null"`
+	Content          json.RawMessage `gorm:"type:jsonb;not null"`
+	ContentHash      string          `gorm:"not null"`
+	ValidationReport json.RawMessage `gorm:"type:jsonb;not null"`
+	Published        bool            `gorm:"not null"`
+	CreatedBy        uuid.UUID       `gorm:"type:uuid;not null"`
+	CreatedAt        time.Time
+}
+
+func (WorkflowDefinitionVersionModel) TableName() string { return "workflow_definition_versions" }
+
+type WorkflowRunModel struct {
+	ID                  uuid.UUID       `gorm:"type:uuid;primaryKey"`
+	ProjectID           uuid.UUID       `gorm:"type:uuid;not null;index"`
+	DefinitionVersionID uuid.UUID       `gorm:"type:uuid;not null"`
+	Status              string          `gorm:"not null"`
+	InputManifestID     *uuid.UUID      `gorm:"type:uuid"`
+	Scope               json.RawMessage `gorm:"type:jsonb;not null"`
+	Context             json.RawMessage `gorm:"type:jsonb;not null"`
+	EventCursor         uint64          `gorm:"not null"`
+	StartedBy           uuid.UUID       `gorm:"type:uuid;not null"`
+	StartedAt           *time.Time
+	CompletedAt         *time.Time
+	CancelledAt         *time.Time
+	Failure             json.RawMessage `gorm:"type:jsonb"`
+	CreatedAt           time.Time
+	UpdatedAt           time.Time
+}
+
+func (WorkflowRunModel) TableName() string { return "workflow_runs" }
+
+type WorkflowNodeRunModel struct {
+	ID               uuid.UUID  `gorm:"type:uuid;primaryKey"`
+	RunID            uuid.UUID  `gorm:"type:uuid;not null;index"`
+	NodeKey          string     `gorm:"not null"`
+	NodeType         string     `gorm:"not null"`
+	Status           string     `gorm:"not null"`
+	Attempt          int        `gorm:"not null"`
+	InputManifestID  *uuid.UUID `gorm:"type:uuid"`
+	OutputProposalID *uuid.UUID `gorm:"type:uuid"`
+	OutputRevisionID *uuid.UUID `gorm:"type:uuid"`
+	LeaseOwner       *string
+	LeaseExpiresAt   *time.Time
+	AvailableAt      time.Time
+	StartedAt        *time.Time
+	CompletedAt      *time.Time
+	Failure          json.RawMessage `gorm:"type:jsonb"`
+	CreatedAt        time.Time
+	UpdatedAt        time.Time
+}
+
+func (WorkflowNodeRunModel) TableName() string { return "workflow_node_runs" }
+
+type WorkflowRunEventModel struct {
+	ID        uuid.UUID `gorm:"type:uuid;primaryKey"`
+	RunID     uuid.UUID `gorm:"type:uuid;not null;index"`
+	Sequence  uint64    `gorm:"not null"`
+	EventType string    `gorm:"not null"`
+	NodeKey   *string
+	Payload   json.RawMessage `gorm:"type:jsonb;not null"`
+	ActorID   *uuid.UUID      `gorm:"type:uuid"`
+	CreatedAt time.Time
+}
+
+func (WorkflowRunEventModel) TableName() string { return "workflow_run_events" }
+
+type ApplicationBuildManifestModel struct {
+	ID                 uuid.UUID  `gorm:"type:uuid;primaryKey"`
+	ProjectID          uuid.UUID  `gorm:"type:uuid;not null;index"`
+	WorkflowRunID      *uuid.UUID `gorm:"type:uuid"`
+	SchemaVersion      int        `gorm:"not null"`
+	ContentStore       string     `gorm:"not null"`
+	ContentRef         string     `gorm:"not null"`
+	ContentHash        string     `gorm:"not null"`
+	ManifestHash       string     `gorm:"not null"`
+	Status             string     `gorm:"not null"`
+	CreatedBy          uuid.UUID  `gorm:"type:uuid;not null"`
+	CreatedAt          time.Time
+	InvalidatedAt      *time.Time
+	InvalidationReason *string
+}
+
+func (ApplicationBuildManifestModel) TableName() string { return "application_build_manifests" }
+
+type ImplementationProposalModel struct {
+	ID                      uuid.UUID  `gorm:"type:uuid;primaryKey"`
+	ProjectID               uuid.UUID  `gorm:"type:uuid;not null;index"`
+	BuildManifestID         uuid.UUID  `gorm:"type:uuid;not null"`
+	BaseWorkspaceRevisionID *uuid.UUID `gorm:"type:uuid"`
+	Status                  string     `gorm:"not null"`
+	Version                 uint64     `gorm:"not null"`
+	ContentStore            string     `gorm:"not null"`
+	ContentRef              string     `gorm:"not null"`
+	ContentHash             string     `gorm:"not null"`
+	PayloadHash             string     `gorm:"not null"`
+	OperationCount          int        `gorm:"not null"`
+	AcceptedCount           int        `gorm:"not null"`
+	RejectedCount           int        `gorm:"not null"`
+	CreatedBy               uuid.UUID  `gorm:"type:uuid;not null"`
+	CreatedAt               time.Time
+	AppliedBy               *uuid.UUID `gorm:"type:uuid"`
+	AppliedAt               *time.Time
+}
+
+func (ImplementationProposalModel) TableName() string { return "implementation_proposals" }
+
+type ImplementationOperationDecisionModel struct {
+	ProposalID  uuid.UUID `gorm:"type:uuid;primaryKey"`
+	OperationID string    `gorm:"primaryKey"`
+	Decision    string    `gorm:"not null"`
+	Reason      string    `gorm:"not null"`
+	DecidedBy   uuid.UUID `gorm:"type:uuid;not null"`
+	DecidedAt   time.Time
+}
+
+func (ImplementationOperationDecisionModel) TableName() string {
+	return "implementation_operation_decisions"
+}
+
+type NotificationModel struct {
+	ID           uuid.UUID `gorm:"type:uuid;primaryKey"`
+	UserID       uuid.UUID `gorm:"type:uuid;not null;index"`
+	ProjectID    uuid.UUID `gorm:"type:uuid;not null"`
+	Kind         string    `gorm:"not null"`
+	Title        string    `gorm:"not null"`
+	Body         string    `gorm:"not null"`
+	ResourceType string    `gorm:"not null"`
+	ResourceID   string    `gorm:"not null"`
+	CreatedAt    time.Time
+	ReadAt       *time.Time
+}
+
+func (NotificationModel) TableName() string { return "notifications" }
+
+type IdempotencyRecordModel struct {
+	Scope           string `gorm:"primaryKey"`
+	IdempotencyKey  string `gorm:"primaryKey"`
+	RequestHash     string `gorm:"not null"`
+	ResponseStatus  *int
+	ResponseHeaders json.RawMessage `gorm:"type:jsonb"`
+	ResponseBody    []byte
+	ResourceType    *string
+	ResourceID      *string
+	LockedUntil     *time.Time
+	ExpiresAt       time.Time `gorm:"not null;index"`
+	CreatedAt       time.Time
+	CompletedAt     *time.Time
+}
+
+func (IdempotencyRecordModel) TableName() string { return "idempotency_records" }
+
+type AuditEventModel struct {
+	ID         uuid.UUID  `gorm:"type:uuid;primaryKey"`
+	ProjectID  *uuid.UUID `gorm:"type:uuid;index"`
+	ActorID    *uuid.UUID `gorm:"type:uuid"`
+	RequestID  *string
+	Action     string          `gorm:"not null"`
+	TargetType string          `gorm:"not null"`
+	TargetID   string          `gorm:"not null"`
+	Metadata   json.RawMessage `gorm:"type:jsonb;not null"`
+	CreatedAt  time.Time
+}
+
+func (AuditEventModel) TableName() string { return "audit_events" }
+
+type OutboxEventModel struct {
+	ID            uuid.UUID       `gorm:"type:uuid;primaryKey"`
+	AggregateType string          `gorm:"not null"`
+	AggregateID   string          `gorm:"not null"`
+	EventType     string          `gorm:"not null"`
+	Subject       string          `gorm:"not null"`
+	Payload       json.RawMessage `gorm:"type:jsonb;not null"`
+	Headers       json.RawMessage `gorm:"type:jsonb;not null"`
+	Attempts      int             `gorm:"not null"`
+	AvailableAt   time.Time
+	PublishedAt   *time.Time
+	LastError     *string
+	CreatedAt     time.Time
+}
+
+func (OutboxEventModel) TableName() string { return "outbox_events" }
