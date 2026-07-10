@@ -25,10 +25,21 @@ func (MinimumLoopProjectInitializer) InitializeProject(
 		return err
 	}
 	definitionID := uuid.NewSHA1(projectID, []byte("worksflow:minimum-loop:definition")).String()
-	versionID := uuid.NewSHA1(projectID, []byte("worksflow:minimum-loop:version:1")).String()
+	versionID, err := minimumLoopVersionID(projectID.String(), MinimumLoopCurrentVersion)
+	if err != nil {
+		return err
+	}
 	_, err = SeedMinimumLoop(ctx, store, MinimumLoopSeed{
 		DefinitionID: definitionID, VersionID: versionID, ProjectID: projectID.String(),
 		InstallerUserID: actorID.String(), Published: true,
+	}, createdAt.UTC())
+	if err != nil {
+		return err
+	}
+	selectionDefinitionID, selectionVersionID := BlueprintSelectionFlowIDs(projectID)
+	_, err = SeedBlueprintSelectionFlow(ctx, store, BlueprintSelectionFlowSeed{
+		DefinitionID: selectionDefinitionID, VersionID: selectionVersionID,
+		ProjectID: projectID.String(), InstallerUserID: actorID.String(), Published: true,
 	}, createdAt.UTC())
 	return err
 }

@@ -27,8 +27,15 @@ export function selectReleaseBuildManifestId(
 ) {
   for (let index = queue.length - 1; index >= 0; index -= 1) {
     const item = queue[index]
-    if (proposalIsApplied(item.proposal) && item.proposal?.buildManifestId === item.bundleId) {
-      return item.bundleId
+    if (
+      item.bundle
+      && proposalIsApplied(item.proposal)
+      && item.proposal?.buildManifestId === item.bundle.id
+    ) {
+      // Publish may accept any selector in the producer's root lineage, but the
+      // exact applied leaf is unambiguous and cannot accidentally select a
+      // previous page root from another lineage.
+      return item.bundle.id
     }
   }
   if (

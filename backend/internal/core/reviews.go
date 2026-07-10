@@ -116,6 +116,9 @@ func (s *ReviewService) Submit(ctx context.Context, projectID, artifactID, actor
 		if err := transaction.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id = ?", artifactUUID).Take(&artifact).Error; err != nil {
 			return err
 		}
+		if err := ensureGenericArtifactMutationAllowed(artifact.Kind); err != nil {
+			return err
+		}
 		var revision storage.ArtifactRevisionModel
 		if err := transaction.Clauses(clause.Locking{Strength: "UPDATE"}).
 			Where("id = ? AND artifact_id = ?", revisionUUID, artifactUUID).Take(&revision).Error; err != nil {
@@ -253,6 +256,13 @@ func (s *ReviewService) DecideIfMatch(ctx context.Context, reviewID, actorID, ex
 		if len(policy.ReviewerIDs) > 0 && !containsString(policy.ReviewerIDs, actorID) {
 			return ErrForbidden
 		}
+		var artifact storage.ArtifactModel
+		if err := transaction.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id = ?", request.ArtifactID).Take(&artifact).Error; err != nil {
+			return err
+		}
+		if err := ensureGenericArtifactMutationAllowed(artifact.Kind); err != nil {
+			return err
+		}
 		var revision storage.ArtifactRevisionModel
 		if err := transaction.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id = ?", request.RevisionID).Take(&revision).Error; err != nil {
 			return err
@@ -268,10 +278,6 @@ func (s *ReviewService) DecideIfMatch(ctx context.Context, reviewID, actorID, ex
 			return enqueue(transaction, "review", reviewID, "review.stale", "worksflow.review.stale", map[string]any{
 				"projectId": request.ProjectID.String(), "reviewId": reviewID,
 			})
-		}
-		var artifact storage.ArtifactModel
-		if err := transaction.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id = ?", request.ArtifactID).Take(&artifact).Error; err != nil {
-			return err
 		}
 		if artifact.LatestRevisionID == nil || *artifact.LatestRevisionID != revision.ID {
 			return ErrConflict

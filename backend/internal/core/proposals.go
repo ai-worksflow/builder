@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -22,12 +23,22 @@ type ManifestSourceInput struct {
 }
 
 type CreateManifestInput struct {
-	JobType             string                `json:"jobType"`
-	DeliverySliceID     string                `json:"deliverySliceId,omitempty"`
-	BaseRevision        *VersionRef           `json:"baseRevision,omitempty"`
-	Sources             []ManifestSourceInput `json:"sources"`
-	Constraints         json.RawMessage       `json:"constraints"`
-	OutputSchemaVersion string                `json:"outputSchemaVersion"`
+	JobType               string                   `json:"jobType"`
+	DeliverySliceID       string                   `json:"deliverySliceId,omitempty"`
+	BaseRevision          *VersionRef              `json:"baseRevision,omitempty"`
+	Sources               []ManifestSourceInput    `json:"sources"`
+	Constraints           json.RawMessage          `json:"constraints"`
+	OutputSchemaVersion   string                   `json:"outputSchemaVersion"`
+	BlueprintSelection    *BlueprintSelectionInput `json:"blueprintSelection,omitempty"`
+	ExpectedBlueprintETag string                   `json:"-"`
+}
+
+const DocumentSyncBackJobType = "document.sync_back"
+
+type CreateDocumentSyncBackManifestInput struct {
+	BaseRevision      VersionRef
+	WorkspaceRevision VersionRef
+	Constraints       json.RawMessage
 }
 
 type CreateProposalInput struct {
@@ -36,6 +47,8 @@ type CreateProposalInput struct {
 	Operations  []domain.ProposalOperation `json:"operations"`
 	Assumptions []string                   `json:"assumptions,omitempty"`
 	Questions   []string                   `json:"questions,omitempty"`
+	AIProvider  string                     `json:"-"`
+	AIModel     string                     `json:"-"`
 }
 
 type DecideProposalInput struct {
@@ -65,7 +78,186 @@ func NewProposalService(database *gorm.DB, contents content.Store, access *Acces
 	return &ProposalService{database: database, contents: contents, access: access, trace: trace, now: time.Now}, nil
 }
 
+func (s *ProposalService) ValidateArtifactProposalTarget(
+	ctx context.Context,
+	projectID string,
+	artifactID string,
+	actorID string,
+) error {
+	artifactUUID, artifactProjectID, err := (&ArtifactService{database: s.database, access: s.access}).
+		authorizeArtifact(ctx, artifactID, actorID, ActionEdit)
+	if err != nil {
+		return err
+	}
+	if artifactProjectID.String() != projectID {
+		return ErrConflict
+	}
+	var artifact storage.ArtifactModel
+	if err := s.database.WithContext(ctx).Select("id", "kind").Where("id = ?", artifactUUID).Take(&artifact).Error; err != nil {
+		return err
+	}
+	return ensureGenericArtifactMutationAllowed(artifact.Kind)
+}
+
+func (s *ProposalService) ValidateArtifactProposalBase(
+	ctx context.Context,
+	projectID string,
+	actorID string,
+	base VersionRef,
+) error {
+	if err := s.ValidateArtifactProposalTarget(ctx, projectID, base.ArtifactID, actorID); err != nil {
+		return err
+	}
+	artifactID, err := uuid.Parse(base.ArtifactID)
+	if err != nil {
+		return fmt.Errorf("%w: base artifact id", ErrInvalidInput)
+	}
+	revisionID, err := uuid.Parse(base.RevisionID)
+	if err != nil {
+		return fmt.Errorf("%w: base revision id", ErrInvalidInput)
+	}
+	var artifact storage.ArtifactModel
+	if err := s.database.WithContext(ctx).Where("id = ?", artifactID).Take(&artifact).Error; err != nil {
+		return err
+	}
+	if artifact.LatestRevisionID == nil || *artifact.LatestRevisionID != revisionID {
+		return ErrProposalStale
+	}
+	var revision storage.ArtifactRevisionModel
+	if err := s.database.WithContext(ctx).Where(
+		"id = ? AND artifact_id = ? AND content_hash = ?", revisionID, artifactID, base.ContentHash,
+	).Take(&revision).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return ErrProposalStale
+		}
+		return err
+	}
+	if artifact.LatestDraftID == nil {
+		return nil
+	}
+	var draft storage.ArtifactDraftModel
+	if err := s.database.WithContext(ctx).Where("id = ? AND artifact_id = ?", *artifact.LatestDraftID, artifactID).
+		Take(&draft).Error; err != nil {
+		return err
+	}
+	return ensureExactCleanProposalDraft(s.database.WithContext(ctx), draft, revision)
+}
+
+func ensureExactCleanProposalDraft(
+	database *gorm.DB,
+	draft storage.ArtifactDraftModel,
+	base storage.ArtifactRevisionModel,
+) error {
+	if draft.ArtifactID != base.ArtifactID || draft.BaseRevisionID == nil || *draft.BaseRevisionID != base.ID ||
+		draft.Status != "draft" || draft.SchemaVersion != base.SchemaVersion || draft.ContentHash != base.ContentHash {
+		return ErrProposalStale
+	}
+	var draftSources []storage.ArtifactDraftSourceModel
+	if err := database.Where("draft_id = ?", draft.ID).Find(&draftSources).Error; err != nil {
+		return err
+	}
+	var revisionSources []storage.ArtifactRevisionSourceModel
+	if err := database.Where("revision_id = ?", base.ID).Find(&revisionSources).Error; err != nil {
+		return err
+	}
+	if len(draftSources) != len(revisionSources) {
+		return ErrProposalStale
+	}
+	sort.Slice(draftSources, func(i, j int) bool {
+		return proposalDraftSourceKey(draftSources[i]) < proposalDraftSourceKey(draftSources[j])
+	})
+	sort.Slice(revisionSources, func(i, j int) bool {
+		return proposalRevisionSourceKey(revisionSources[i]) < proposalRevisionSourceKey(revisionSources[j])
+	})
+	for index := range draftSources {
+		draftSource, revisionSource := draftSources[index], revisionSources[index]
+		if draftSource.SourceArtifactID != revisionSource.SourceArtifactID ||
+			draftSource.SourceRevisionID != revisionSource.SourceRevisionID ||
+			draftSource.SourceContentHash != revisionSource.SourceContentHash ||
+			!stringPointerEqual(draftSource.SourceAnchorID, revisionSource.SourceAnchorID) ||
+			draftSource.Purpose != revisionSource.Purpose || draftSource.Required != revisionSource.Required {
+			return ErrProposalStale
+		}
+	}
+	return nil
+}
+
+func proposalDraftSourceKey(source storage.ArtifactDraftSourceModel) string {
+	return source.SourceArtifactID.String() + "\x00" + source.SourceRevisionID.String() + "\x00" + source.Purpose
+}
+
+func proposalRevisionSourceKey(source storage.ArtifactRevisionSourceModel) string {
+	return source.SourceArtifactID.String() + "\x00" + source.SourceRevisionID.String() + "\x00" + source.Purpose
+}
+
 func (s *ProposalService) CreateManifest(ctx context.Context, projectID, actorID string, input CreateManifestInput) (domain.InputManifest, error) {
+	return s.createManifest(ctx, projectID, actorID, uuid.New(), input)
+}
+
+// CreateManifestWithID retains the normal manifest authorization and
+// validation path while allowing a durable internal command to pre-allocate a
+// stable identity for crash recovery.
+func (s *ProposalService) CreateManifestWithID(
+	ctx context.Context,
+	projectID, actorID, manifestID string,
+	input CreateManifestInput,
+) (domain.InputManifest, error) {
+	stableID, err := uuid.Parse(strings.TrimSpace(manifestID))
+	if err != nil || stableID == uuid.Nil {
+		return domain.InputManifest{}, fmt.Errorf("%w: manifest id", ErrInvalidInput)
+	}
+	return s.createManifest(ctx, projectID, actorID, stableID, input)
+}
+
+// CreateDocumentSyncBackManifest is the narrow trusted path by which an
+// approved system-managed Workspace revision may be frozen as proposal input.
+// It does not relax the generic proposal target guard: the base remains an
+// editable document revision, while the Workspace is read-only evidence.
+func (s *ProposalService) CreateDocumentSyncBackManifest(
+	ctx context.Context,
+	projectID, actorID string,
+	input CreateDocumentSyncBackManifestInput,
+) (domain.InputManifest, error) {
+	projectUUID, err := uuid.Parse(strings.TrimSpace(projectID))
+	if err != nil {
+		return domain.InputManifest{}, fmt.Errorf("%w: project id", ErrInvalidInput)
+	}
+	workspaceArtifactID, err := uuid.Parse(strings.TrimSpace(input.WorkspaceRevision.ArtifactID))
+	if err != nil {
+		return domain.InputManifest{}, fmt.Errorf("%w: workspace artifact id", ErrInvalidInput)
+	}
+	workspaceRevisionID, err := uuid.Parse(strings.TrimSpace(input.WorkspaceRevision.RevisionID))
+	if err != nil || !strings.HasPrefix(input.WorkspaceRevision.ContentHash, "sha256:") || input.WorkspaceRevision.AnchorID != nil {
+		return domain.InputManifest{}, fmt.Errorf("%w: workspace revision", ErrInvalidInput)
+	}
+	var count int64
+	if err := s.database.WithContext(ctx).Table("artifact_revisions AS revision").
+		Joins("JOIN artifacts AS artifact ON artifact.id = revision.artifact_id").
+		Where(
+			"artifact.id = ? AND artifact.project_id = ? AND artifact.kind = 'workspace' AND artifact.lifecycle = 'active' AND revision.id = ? AND revision.content_hash = ? AND revision.workflow_status = 'approved'",
+			workspaceArtifactID, projectUUID, workspaceRevisionID, input.WorkspaceRevision.ContentHash,
+		).Count(&count).Error; err != nil {
+		return domain.InputManifest{}, err
+	}
+	if count != 1 {
+		return domain.InputManifest{}, ErrNotFound
+	}
+	return s.CreateManifest(ctx, projectID, actorID, CreateManifestInput{
+		JobType:      DocumentSyncBackJobType,
+		BaseRevision: &input.BaseRevision,
+		Sources: []ManifestSourceInput{{
+			Ref: input.WorkspaceRevision, Purpose: "implementation_workspace",
+		}},
+		Constraints: input.Constraints, OutputSchemaVersion: "document.patch.v1",
+	})
+}
+
+func (s *ProposalService) createManifest(
+	ctx context.Context,
+	projectID, actorID string,
+	manifestID uuid.UUID,
+	input CreateManifestInput,
+) (domain.InputManifest, error) {
 	if _, err := s.access.Authorize(ctx, projectID, actorID, ActionEdit); err != nil {
 		return domain.InputManifest{}, err
 	}
@@ -75,8 +267,20 @@ func (s *ProposalService) CreateManifest(ctx context.Context, projectID, actorID
 	}
 	input.JobType = strings.TrimSpace(input.JobType)
 	input.OutputSchemaVersion = strings.TrimSpace(input.OutputSchemaVersion)
+	if input.BlueprintSelection != nil || input.JobType == BlueprintSelectionJobType {
+		if input.BlueprintSelection == nil {
+			return domain.InputManifest{}, fmt.Errorf("%w: blueprint selection", ErrInvalidInput)
+		}
+		input, err = s.compileBlueprintSelection(ctx, projectUUID, input)
+		if err != nil {
+			return domain.InputManifest{}, err
+		}
+	}
 	if input.JobType == "" || input.OutputSchemaVersion == "" || len(input.OutputSchemaVersion) > 64 {
 		return domain.InputManifest{}, fmt.Errorf("%w: manifest job type or output schema", ErrInvalidInput)
+	}
+	if err := s.validateParentBlueprintSelection(ctx, projectUUID, actorID, input); err != nil {
+		return domain.InputManifest{}, err
 	}
 	manifestSources := make([]domain.ManifestSource, 0, len(input.Sources))
 	for _, source := range input.Sources {
@@ -107,12 +311,14 @@ func (s *ProposalService) CreateManifest(ctx context.Context, projectID, actorID
 		if _, _, err := s.trace.validateRef(ctx, projectUUID, *input.BaseRevision); err != nil {
 			return domain.InputManifest{}, err
 		}
+		if err := s.ValidateArtifactProposalBase(ctx, projectID, actorID, *input.BaseRevision); err != nil {
+			return domain.InputManifest{}, err
+		}
 		baseRevision = &domain.ArtifactRef{
 			ArtifactID: input.BaseRevision.ArtifactID, RevisionID: input.BaseRevision.RevisionID,
 			ContentHash: input.BaseRevision.ContentHash, AnchorID: dereferenceString(input.BaseRevision.AnchorID),
 		}
 	}
-	manifestID := uuid.New()
 	manifest, err := domain.NewInputManifest(
 		manifestID.String(), projectID, input.JobType, input.DeliverySliceID,
 		baseRevision, manifestSources, input.Constraints, input.OutputSchemaVersion,
@@ -141,13 +347,45 @@ func (s *ProposalService) CreateManifest(ctx context.Context, projectID, actorID
 		ManifestHash: manifest.Hash, CreatedBy: actorUUID, CreatedAt: manifest.CreatedAt,
 	}
 	err = s.database.WithContext(ctx).Transaction(func(transaction *gorm.DB) error {
+		if input.JobType == BlueprintSelectionJobType && input.BlueprintSelection != nil {
+			blueprintID, parseErr := uuid.Parse(input.BlueprintSelection.BlueprintRevision.ArtifactID)
+			if parseErr != nil {
+				return fmt.Errorf("%w: Blueprint artifact id", ErrInvalidInput)
+			}
+			var lockedBlueprint storage.ArtifactModel
+			if queryErr := transaction.Clauses(clause.Locking{Strength: "UPDATE"}).
+				Where("id = ? AND project_id = ? AND kind = 'blueprint' AND lifecycle = 'active'", blueprintID, projectUUID).
+				Take(&lockedBlueprint).Error; queryErr != nil {
+				return queryErr
+			}
+			if artifactETag(lockedBlueprint.ID, lockedBlueprint.Version) != strings.TrimSpace(input.ExpectedBlueprintETag) {
+				return ErrConflict
+			}
+		}
 		if err := transaction.Create(&model).Error; err != nil {
 			return err
 		}
-		if err := insertAudit(transaction, projectUUID, actorUUID, "manifest.created", "input_manifest", manifestID.String(), map[string]any{"jobType": input.JobType}); err != nil {
+		action := "manifest.created"
+		topic := "worksflow.manifest.created"
+		metadata := map[string]any{"jobType": input.JobType}
+		if input.JobType == BlueprintSelectionJobType {
+			action = "blueprint.selection.compiled"
+			topic = "worksflow.blueprint.selection.compiled"
+			var constraints struct {
+				BlueprintSelection struct {
+					SelectionID string   `json:"selectionId"`
+					NodeIDs     []string `json:"nodeIds"`
+				} `json:"blueprintSelection"`
+			}
+			if json.Unmarshal(input.Constraints, &constraints) == nil {
+				metadata["selectionId"] = constraints.BlueprintSelection.SelectionID
+				metadata["nodeCount"] = len(constraints.BlueprintSelection.NodeIDs)
+			}
+		}
+		if err := insertAudit(transaction, projectUUID, actorUUID, action, "input_manifest", manifestID.String(), metadata); err != nil {
 			return err
 		}
-		return enqueue(transaction, "input_manifest", manifestID.String(), "manifest.created", "worksflow.manifest.created", map[string]any{
+		return enqueue(transaction, "input_manifest", manifestID.String(), action, topic, map[string]any{
 			"projectId": projectID, "manifestId": manifestID.String(), "jobType": input.JobType,
 		})
 	})
@@ -170,6 +408,32 @@ func manifestSourceIsExactBase(base *VersionRef, source VersionRef) bool {
 }
 
 func (s *ProposalService) CreateProposal(ctx context.Context, projectID, actorID string, input CreateProposalInput) (domain.OutputProposal, error) {
+	return s.createProposal(ctx, projectID, actorID, uuid.New(), input)
+}
+
+// CreateProposalWithID retains the normal proposal authorization, immutable
+// manifest binding, exact-base validation, audit, and outbox path while letting
+// a durable internal command pre-allocate the proposal identity. Callers must
+// still recover an already-created proposal through GetProposal and verify its
+// full contract; duplicate IDs are not silently treated as success here.
+func (s *ProposalService) CreateProposalWithID(
+	ctx context.Context,
+	projectID, actorID, proposalID string,
+	input CreateProposalInput,
+) (domain.OutputProposal, error) {
+	stableID, err := uuid.Parse(strings.TrimSpace(proposalID))
+	if err != nil || stableID == uuid.Nil {
+		return domain.OutputProposal{}, fmt.Errorf("%w: proposal id", ErrInvalidInput)
+	}
+	return s.createProposal(ctx, projectID, actorID, stableID, input)
+}
+
+func (s *ProposalService) createProposal(
+	ctx context.Context,
+	projectID, actorID string,
+	proposalID uuid.UUID,
+	input CreateProposalInput,
+) (domain.OutputProposal, error) {
 	if _, err := s.access.Authorize(ctx, projectID, actorID, ActionEdit); err != nil {
 		return domain.OutputProposal{}, err
 	}
@@ -184,10 +448,17 @@ func (s *ProposalService) CreateProposal(ctx context.Context, projectID, actorID
 	if manifest.ProjectID != projectID || manifest.BaseRevision == nil || manifest.BaseRevision.ArtifactID != input.ArtifactID {
 		return domain.OutputProposal{}, ErrConflict
 	}
-	if _, _, err := (&ArtifactService{database: s.database, access: s.access}).authorizeArtifact(ctx, input.ArtifactID, actorID, ActionEdit); err != nil {
+	base := VersionRef{
+		ArtifactID: manifest.BaseRevision.ArtifactID, RevisionID: manifest.BaseRevision.RevisionID,
+		ContentHash: manifest.BaseRevision.ContentHash,
+	}
+	if manifest.BaseRevision.AnchorID != "" {
+		anchor := manifest.BaseRevision.AnchorID
+		base.AnchorID = &anchor
+	}
+	if err := s.ValidateArtifactProposalBase(ctx, projectID, actorID, base); err != nil {
 		return domain.OutputProposal{}, err
 	}
-	proposalID := uuid.New()
 	proposal, err := domain.NewOutputProposal(
 		proposalID.String(), projectID, input.ArtifactID, manifest.Ref(), *manifest.BaseRevision,
 		input.Operations, input.Assumptions, input.Questions, actorID, s.now().UTC(),
@@ -218,6 +489,7 @@ func (s *ProposalService) CreateProposal(ctx context.Context, projectID, actorID
 		BaseContentHash: &baseHash, Status: string(proposal.Status), Version: proposal.Version,
 		ContentStore: "mongo", ContentRef: contentRef.ID, ContentHash: contentRef.ContentHash,
 		PayloadHash: proposal.PayloadHash, OperationCount: len(proposal.Operations),
+		AIProvider: trimmedStringPointer(input.AIProvider), AIModel: trimmedStringPointer(input.AIModel),
 		CreatedBy: actorUUID, CreatedAt: proposal.CreatedAt,
 	}
 	err = s.database.WithContext(ctx).Transaction(func(transaction *gorm.DB) error {
@@ -296,6 +568,16 @@ func (s *ProposalService) Decide(ctx context.Context, proposalID, actorID string
 		return domain.OutputProposal{}, err
 	}
 	if _, err := s.access.Authorize(ctx, model.ProjectID.String(), actorID, ActionEdit); err != nil {
+		return domain.OutputProposal{}, err
+	}
+	if model.ArtifactID == nil {
+		return domain.OutputProposal{}, ErrConflict
+	}
+	var artifact storage.ArtifactModel
+	if err := s.database.WithContext(ctx).Select("id", "kind").Where("id = ?", *model.ArtifactID).Take(&artifact).Error; err != nil {
+		return domain.OutputProposal{}, err
+	}
+	if err := ensureGenericArtifactMutationAllowed(artifact.Kind); err != nil {
 		return domain.OutputProposal{}, err
 	}
 	if input.Version == 0 {
@@ -408,6 +690,9 @@ func (s *ProposalService) Apply(ctx context.Context, proposalID, actorID string,
 	if err := s.database.WithContext(ctx).Where("id = ?", *proposalModel.ArtifactID).Take(&artifact).Error; err != nil {
 		return ArtifactDraft{}, err
 	}
+	if err := ensureGenericArtifactMutationAllowed(artifact.Kind); err != nil {
+		return ArtifactDraft{}, err
+	}
 	if artifact.LatestRevisionID == nil || *artifact.LatestRevisionID != base.ID {
 		return ArtifactDraft{}, ErrProposalStale
 	}
@@ -416,8 +701,8 @@ func (s *ProposalService) Apply(ctx context.Context, proposalID, actorID string,
 		if err := s.database.WithContext(ctx).Where("id = ?", *artifact.LatestDraftID).Take(&draft).Error; err != nil {
 			return ArtifactDraft{}, err
 		}
-		if draft.BaseRevisionID != nil && *draft.BaseRevisionID != base.ID || draft.ContentHash != base.ContentHash {
-			return ArtifactDraft{}, ErrProposalStale
+		if err := ensureExactCleanProposalDraft(s.database.WithContext(ctx), draft, base); err != nil {
+			return ArtifactDraft{}, err
 		}
 		existingDraft = &draft
 		draftID = draft.ID
@@ -473,6 +758,10 @@ func (s *ProposalService) Apply(ctx context.Context, proposalID, actorID string,
 		if lockedArtifact.LatestRevisionID == nil || *lockedArtifact.LatestRevisionID != base.ID {
 			return ErrProposalStale
 		}
+		if (existingDraft == nil && lockedArtifact.LatestDraftID != nil) ||
+			(existingDraft != nil && (lockedArtifact.LatestDraftID == nil || *lockedArtifact.LatestDraftID != existingDraft.ID)) {
+			return ErrProposalStale
+		}
 		if existingDraft == nil {
 			draftModel = storage.ArtifactDraftModel{
 				ID: draftID, ArtifactID: artifact.ID, BaseRevisionID: &base.ID, Sequence: 1,
@@ -489,8 +778,8 @@ func (s *ProposalService) Apply(ctx context.Context, proposalID, actorID string,
 			if err := transaction.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id = ?", existingDraft.ID).Take(&locked).Error; err != nil {
 				return err
 			}
-			if locked.ContentHash != base.ContentHash || locked.Status != "draft" {
-				return ErrProposalStale
+			if err := ensureExactCleanProposalDraft(transaction, locked, base); err != nil {
+				return err
 			}
 			nextSequence := locked.Sequence + 1
 			nextETag := draftETag(locked.ID, nextSequence, draftContentRef.ContentHash)
@@ -643,4 +932,12 @@ func dereferenceString(value *string) string {
 		return ""
 	}
 	return *value
+}
+
+func trimmedStringPointer(value string) *string {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return nil
+	}
+	return &trimmed
 }

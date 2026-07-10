@@ -37,9 +37,13 @@ type PortDefinition struct {
 }
 
 type ArtifactInputNodeConfig struct {
-	AllowedTypes     []ArtifactType `json:"allowedTypes"`
-	RequireApproved  bool           `json:"requireApproved"`
-	MinimumArtifacts int            `json:"minimumArtifacts"`
+	AllowedTypes []ArtifactType `json:"allowedTypes"`
+	// AllowedKinds is the exact persisted artifact-kind allowlist. Historical
+	// definitions may omit it, but every newly authored governed definition is
+	// required to pin it through its workflow input contract.
+	AllowedKinds     []string `json:"allowedKinds,omitempty"`
+	RequireApproved  bool     `json:"requireApproved"`
+	MinimumArtifacts int      `json:"minimumArtifacts"`
 }
 
 type AITransformNodeConfig struct {
@@ -52,8 +56,47 @@ type AITransformNodeConfig struct {
 
 type HumanEditNodeConfig struct {
 	ArtifactType ArtifactType `json:"artifactType"`
-	RequiredRole string       `json:"requiredRole"`
-	Instructions string       `json:"instructions,omitempty"`
+	// ArtifactKind narrows the broad UI/category ArtifactType to the exact
+	// persisted artifact kind accepted by this node. It is optional so v1
+	// definitions remain replayable, but new governed workflows should always
+	// set it (for example project_brief, page_spec, or prototype).
+	ArtifactKind string `json:"artifactKind,omitempty"`
+	RequiredRole string `json:"requiredRole"`
+	Instructions string `json:"instructions,omitempty"`
+}
+
+func validWorkflowArtifactKind(kind string) bool {
+	switch kind {
+	case "project_brief", "product_requirements", "decision_record", "glossary_policy",
+		"reference_source", "change_request", "requirement_baseline", "blueprint",
+		"page_spec", "prototype", "prototype_flow", "fixture_bundle", "design_system",
+		"token_set", "component_registry", "api_contract", "data_contract",
+		"permission_contract", "workspace", "test_report", "quality_report":
+		return true
+	default:
+		return false
+	}
+}
+
+// WorkflowArtifactTypeForKind maps an exact persisted kind to the broad
+// category used by the visual graph. Keeping this mapping in the domain makes
+// it possible to prove that broad UI filters do not widen a workflow contract.
+func WorkflowArtifactTypeForKind(kind string) (ArtifactType, bool) {
+	switch strings.TrimSpace(kind) {
+	case "project_brief", "product_requirements", "decision_record", "glossary_policy",
+		"reference_source", "change_request", "requirement_baseline":
+		return ArtifactDocument, true
+	case "blueprint", "page_spec", "api_contract", "data_contract", "permission_contract":
+		return ArtifactBlueprint, true
+	case "prototype", "prototype_flow", "fixture_bundle", "design_system", "token_set", "component_registry":
+		return ArtifactPrototype, true
+	case "workspace":
+		return ArtifactImplementation, true
+	case "test_report", "quality_report":
+		return ArtifactTest, true
+	default:
+		return "", false
+	}
 }
 
 type ReviewGateNodeConfig struct {
@@ -208,6 +251,18 @@ func (n NodeDefinition) Validate() error {
 					issues = append(issues, ValidationIssue{Path: "node.artifactInput.allowedTypes", Message: "contains an invalid artifact type"})
 				}
 			}
+			seenKinds := map[string]struct{}{}
+			for _, artifactKind := range n.ArtifactInput.AllowedKinds {
+				artifactKind = strings.TrimSpace(artifactKind)
+				if !validWorkflowArtifactKind(artifactKind) {
+					issues = append(issues, ValidationIssue{Path: "node.artifactInput.allowedKinds", Message: "contains an invalid exact artifact kind"})
+					continue
+				}
+				if _, duplicate := seenKinds[artifactKind]; duplicate {
+					issues = append(issues, ValidationIssue{Path: "node.artifactInput.allowedKinds", Message: "must not contain duplicates"})
+				}
+				seenKinds[artifactKind] = struct{}{}
+			}
 		}
 	case NodeAITransform:
 		if n.AITransform == nil || strings.TrimSpace(n.AITransform.JobType) == "" || strings.TrimSpace(n.AITransform.OutputSchemaVersion) == "" || n.AITransform.MaxAttempts < 1 || n.AITransform.Timeout <= 0 {
@@ -216,6 +271,8 @@ func (n NodeDefinition) Validate() error {
 	case NodeHumanEdit:
 		if n.HumanEdit == nil || !n.HumanEdit.ArtifactType.Valid() || strings.TrimSpace(n.HumanEdit.RequiredRole) == "" {
 			issues = append(issues, ValidationIssue{Path: "node.humanEdit", Message: "matching config with artifactType and requiredRole is required"})
+		} else if kind := strings.TrimSpace(n.HumanEdit.ArtifactKind); kind != "" && !validWorkflowArtifactKind(kind) {
+			issues = append(issues, ValidationIssue{Path: "node.humanEdit.artifactKind", Message: "must be a supported exact artifact kind"})
 		}
 	case NodeReviewGate:
 		if n.ReviewGate == nil || strings.TrimSpace(n.ReviewGate.RequiredRole) == "" || n.ReviewGate.MinimumApprovals < 1 {
@@ -228,7 +285,7 @@ func (n NodeDefinition) Validate() error {
 			issues = append(issues, ValidationIssue{Path: "node.condition.branches", Message: err.Error()})
 		}
 	case NodeFanOut:
-		if n.FanOut == nil || !strings.HasPrefix(n.FanOut.ItemsPath, "/") || !strings.HasPrefix(n.FanOut.SliceKeyPath, "/") || strings.TrimSpace(n.FanOut.MergeNodeID) == "" || n.FanOut.MaxParallel < 1 || (n.FanOut.ItemKind != "" && n.FanOut.ItemKind != "generic" && n.FanOut.ItemKind != "delivery_slice") {
+		if n.FanOut == nil || !strings.HasPrefix(n.FanOut.ItemsPath, "/") || !strings.HasPrefix(n.FanOut.SliceKeyPath, "/") || strings.TrimSpace(n.FanOut.MergeNodeID) == "" || n.FanOut.MaxParallel < 1 || (n.FanOut.ItemKind != "" && n.FanOut.ItemKind != "generic" && n.FanOut.ItemKind != "delivery_slice" && n.FanOut.ItemKind != "blueprint_page" && n.FanOut.ItemKind != "blueprint_selection_page") {
 			issues = append(issues, ValidationIssue{Path: "node.fanOut", Message: "matching config with JSON pointers, mergeNodeId and positive maxParallel is required"})
 		}
 	case NodeMerge:
@@ -353,15 +410,104 @@ type WorkflowEdge struct {
 }
 
 type WorkflowDefinition struct {
-	ID            string           `json:"id"`
-	Version       int              `json:"version"`
-	Name          string           `json:"name"`
-	SchemaVersion string           `json:"schemaVersion"`
-	Nodes         []NodeDefinition `json:"nodes"`
-	Edges         []WorkflowEdge   `json:"edges"`
-	Hash          string           `json:"hash"`
-	CreatedBy     string           `json:"createdBy"`
-	CreatedAt     time.Time        `json:"createdAt"`
+	ID             string                  `json:"id"`
+	Version        int                     `json:"version"`
+	Name           string                  `json:"name"`
+	SchemaVersion  string                  `json:"schemaVersion"`
+	Nodes          []NodeDefinition        `json:"nodes"`
+	Edges          []WorkflowEdge          `json:"edges"`
+	InputContract  *WorkflowInputContract  `json:"inputContract,omitempty"`
+	OutputContract *WorkflowOutputContract `json:"outputContract,omitempty"`
+	Hash           string                  `json:"hash"`
+	CreatedBy      string                  `json:"createdBy"`
+	CreatedAt      time.Time               `json:"createdAt"`
+}
+
+const (
+	WorkflowInputProjectBrief       = "project_brief"
+	WorkflowInputBlueprintSelection = "blueprint_selection"
+	WorkflowOutputApplication       = "application"
+
+	WorkflowOutcomeApplication = "application"
+	WorkflowOutcomeDeployment  = "deployment"
+)
+
+// WorkflowInputContract is the immutable, workflow-level declaration used to
+// select a DAG before a run exists. It deliberately names both semantic
+// capability and exact manifest/artifact constraints.
+type WorkflowInputContract struct {
+	Capability              string            `json:"capability"`
+	ManifestJobTypes        []string          `json:"manifestJobTypes"`
+	ArtifactKinds           []string          `json:"artifactKinds"`
+	RequiredSourcePurposes  []string          `json:"requiredSourcePurposes"`
+	ManifestSchemaContracts map[string]string `json:"manifestSchemaContracts"`
+}
+
+// WorkflowOutputContract describes what a successful terminal path actually
+// produces. TerminalOutcome is semantic while TerminalNodeType is executable.
+type WorkflowOutputContract struct {
+	Capability            string           `json:"capability"`
+	ProducedArtifactKinds []string         `json:"producedArtifactKinds"`
+	TerminalOutcome       string           `json:"terminalOutcome"`
+	TerminalNodeType      WorkflowNodeType `json:"terminalNodeType"`
+}
+
+func (c WorkflowInputContract) Validate() error {
+	issues := make([]ValidationIssue, 0)
+	if strings.TrimSpace(c.Capability) == "" {
+		issues = append(issues, ValidationIssue{Path: "inputContract.capability", Message: "is required"})
+	}
+	issues = append(issues, validateContractStrings("inputContract.manifestJobTypes", c.ManifestJobTypes, nil)...)
+	issues = append(issues, validateContractStrings("inputContract.requiredSourcePurposes", c.RequiredSourcePurposes, nil)...)
+	issues = append(issues, validateContractStrings("inputContract.artifactKinds", c.ArtifactKinds, validWorkflowArtifactKind)...)
+	if len(c.ManifestSchemaContracts) != len(c.ManifestJobTypes) {
+		issues = append(issues, ValidationIssue{Path: "inputContract.manifestSchemaContracts", Message: "must map every allowed manifest job type exactly once"})
+	}
+	allowedJobs := map[string]struct{}{}
+	for _, jobType := range c.ManifestJobTypes {
+		allowedJobs[jobType] = struct{}{}
+	}
+	for jobType, schema := range c.ManifestSchemaContracts {
+		if _, allowed := allowedJobs[strings.TrimSpace(jobType)]; !allowed || strings.TrimSpace(schema) == "" {
+			issues = append(issues, ValidationIssue{Path: "inputContract.manifestSchemaContracts", Message: "contains an invalid job type or schema contract"})
+		}
+	}
+	return validationError(issues)
+}
+
+func (c WorkflowOutputContract) Validate() error {
+	issues := make([]ValidationIssue, 0)
+	if strings.TrimSpace(c.Capability) == "" {
+		issues = append(issues, ValidationIssue{Path: "outputContract.capability", Message: "is required"})
+	}
+	issues = append(issues, validateContractStrings("outputContract.producedArtifactKinds", c.ProducedArtifactKinds, validWorkflowArtifactKind)...)
+	if c.TerminalOutcome != WorkflowOutcomeApplication && c.TerminalOutcome != WorkflowOutcomeDeployment {
+		issues = append(issues, ValidationIssue{Path: "outputContract.terminalOutcome", Message: "must be application or deployment"})
+	}
+	if strings.TrimSpace(string(c.TerminalNodeType)) == "" {
+		issues = append(issues, ValidationIssue{Path: "outputContract.terminalNodeType", Message: "is required"})
+	}
+	return validationError(issues)
+}
+
+func validateContractStrings(path string, values []string, valid func(string) bool) []ValidationIssue {
+	issues := make([]ValidationIssue, 0)
+	if len(values) == 0 {
+		return append(issues, ValidationIssue{Path: path, Message: "must contain at least one value"})
+	}
+	seen := map[string]struct{}{}
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" || (valid != nil && !valid(value)) {
+			issues = append(issues, ValidationIssue{Path: path, Message: "contains an invalid value"})
+			continue
+		}
+		if _, duplicate := seen[value]; duplicate {
+			issues = append(issues, ValidationIssue{Path: path, Message: "must not contain duplicates"})
+		}
+		seen[value] = struct{}{}
+	}
+	return issues
 }
 
 type WorkflowDefinitionRef struct {
@@ -714,9 +860,44 @@ func cloneNodeOutputReference(source NodeOutputReference) NodeOutputReference {
 }
 
 func NewWorkflowDefinition(id string, version int, name, schemaVersion string, nodes []NodeDefinition, edges []WorkflowEdge, createdBy string, now time.Time) (WorkflowDefinition, error) {
+	return newWorkflowDefinition(id, version, name, schemaVersion, nodes, edges, nil, nil, createdBy, now)
+}
+
+// NewWorkflowDefinitionWithContracts creates a governed immutable workflow
+// version. New authoring and built-in provisioners use this constructor while
+// the legacy constructor remains available to replay pre-contract versions.
+func NewWorkflowDefinitionWithContracts(
+	id string,
+	version int,
+	name, schemaVersion string,
+	nodes []NodeDefinition,
+	edges []WorkflowEdge,
+	input WorkflowInputContract,
+	output WorkflowOutputContract,
+	createdBy string,
+	now time.Time,
+) (WorkflowDefinition, error) {
+	normalizedInput := normalizeWorkflowInputContract(input)
+	normalizedOutput := normalizeWorkflowOutputContract(output)
+	return newWorkflowDefinition(id, version, name, schemaVersion, nodes, edges, &normalizedInput, &normalizedOutput, createdBy, now)
+}
+
+func newWorkflowDefinition(
+	id string,
+	version int,
+	name, schemaVersion string,
+	nodes []NodeDefinition,
+	edges []WorkflowEdge,
+	input *WorkflowInputContract,
+	output *WorkflowOutputContract,
+	createdBy string,
+	now time.Time,
+) (WorkflowDefinition, error) {
 	definition := WorkflowDefinition{
 		ID: strings.TrimSpace(id), Version: version, Name: strings.TrimSpace(name), SchemaVersion: strings.TrimSpace(schemaVersion),
-		Nodes: cloneNodeDefinitions(nodes), Edges: cloneWorkflowEdges(edges), CreatedBy: strings.TrimSpace(createdBy), CreatedAt: now.UTC(),
+		Nodes: cloneNodeDefinitions(nodes), Edges: cloneWorkflowEdges(edges),
+		InputContract: cloneWorkflowInputContract(input), OutputContract: cloneWorkflowOutputContract(output),
+		CreatedBy: strings.TrimSpace(createdBy), CreatedAt: now.UTC(),
 	}
 	if err := definition.validate(false); err != nil {
 		return WorkflowDefinition{}, err
@@ -727,6 +908,36 @@ func NewWorkflowDefinition(id string, version int, name, schemaVersion string, n
 	}
 	definition.Hash = hash
 	return definition, nil
+}
+
+func normalizeWorkflowInputContract(contract WorkflowInputContract) WorkflowInputContract {
+	contract.Capability = strings.TrimSpace(contract.Capability)
+	contract.ManifestJobTypes = normalizedStringSet(contract.ManifestJobTypes)
+	contract.ArtifactKinds = normalizedStringSet(contract.ArtifactKinds)
+	contract.RequiredSourcePurposes = normalizedStringSet(contract.RequiredSourcePurposes)
+	contracts := make(map[string]string, len(contract.ManifestSchemaContracts))
+	for jobType, schema := range contract.ManifestSchemaContracts {
+		contracts[strings.TrimSpace(jobType)] = strings.TrimSpace(schema)
+	}
+	contract.ManifestSchemaContracts = contracts
+	return contract
+}
+
+func normalizeWorkflowOutputContract(contract WorkflowOutputContract) WorkflowOutputContract {
+	contract.Capability = strings.TrimSpace(contract.Capability)
+	contract.ProducedArtifactKinds = normalizedStringSet(contract.ProducedArtifactKinds)
+	contract.TerminalOutcome = strings.TrimSpace(contract.TerminalOutcome)
+	contract.TerminalNodeType = WorkflowNodeType(strings.TrimSpace(string(contract.TerminalNodeType)))
+	return contract
+}
+
+func normalizedStringSet(values []string) []string {
+	normalized := make([]string, len(values))
+	for index, value := range values {
+		normalized[index] = strings.TrimSpace(value)
+	}
+	sort.Strings(normalized)
+	return normalized
 }
 
 func (d WorkflowDefinition) Ref() WorkflowDefinitionRef {
@@ -857,6 +1068,17 @@ func (d WorkflowDefinition) validate(requireHash bool) error {
 	if len(d.Nodes) == 0 {
 		issues = append(issues, ValidationIssue{Path: "workflow.nodes", Message: "at least one node is required"})
 	}
+	if (d.InputContract == nil) != (d.OutputContract == nil) {
+		issues = append(issues, ValidationIssue{Path: "workflow.contracts", Message: "inputContract and outputContract must be declared together"})
+	}
+	if d.InputContract != nil && d.OutputContract != nil {
+		if err := d.InputContract.Validate(); err != nil {
+			issues = append(issues, ValidationIssue{Path: "workflow.inputContract", Message: err.Error()})
+		}
+		if err := d.OutputContract.Validate(); err != nil {
+			issues = append(issues, ValidationIssue{Path: "workflow.outputContract", Message: err.Error()})
+		}
+	}
 	nodes := make(map[string]NodeDefinition, len(d.Nodes))
 	for index, node := range d.Nodes {
 		if err := node.Validate(); err != nil {
@@ -945,6 +1167,15 @@ func (d WorkflowDefinition) validate(requireHash bool) error {
 		}
 		issues = append(issues, validateConditionEdges(nodes, d.Edges)...)
 		issues = append(issues, validateFanOutMergePairs(nodes, adjacency, d.Edges)...)
+		if len(entries) == 1 && d.InputContract != nil {
+			entry := nodes[entries[0]]
+			if entry.Type != NodeArtifactInput || entry.ArtifactInput == nil {
+				issues = append(issues, ValidationIssue{Path: "workflow.inputContract", Message: "requires artifact_input as the single entry node"})
+			}
+		}
+		if len(terminals) == 1 && d.OutputContract != nil && nodes[terminals[0]].Type != d.OutputContract.TerminalNodeType {
+			issues = append(issues, ValidationIssue{Path: "workflow.outputContract.terminalNodeType", Message: "does not match the executable terminal node"})
+		}
 	}
 	return validationError(issues)
 }
@@ -1081,16 +1312,33 @@ func fanOutRegionIDs(fanOutID, mergeID string, adjacency map[string][]string) ma
 }
 
 func (d WorkflowDefinition) calculateHash() (string, error) {
+	// Definitions created before workflow-level contracts existed retain their
+	// original hash payload and remain replayable byte-for-byte.
+	if d.InputContract == nil && d.OutputContract == nil {
+		payload := struct {
+			ID            string           `json:"id"`
+			Version       int              `json:"version"`
+			Name          string           `json:"name"`
+			SchemaVersion string           `json:"schemaVersion"`
+			Nodes         []NodeDefinition `json:"nodes"`
+			Edges         []WorkflowEdge   `json:"edges"`
+			CreatedBy     string           `json:"createdBy"`
+			CreatedAt     time.Time        `json:"createdAt"`
+		}{d.ID, d.Version, d.Name, d.SchemaVersion, d.Nodes, d.Edges, d.CreatedBy, d.CreatedAt}
+		return CanonicalHash(payload)
+	}
 	payload := struct {
-		ID            string           `json:"id"`
-		Version       int              `json:"version"`
-		Name          string           `json:"name"`
-		SchemaVersion string           `json:"schemaVersion"`
-		Nodes         []NodeDefinition `json:"nodes"`
-		Edges         []WorkflowEdge   `json:"edges"`
-		CreatedBy     string           `json:"createdBy"`
-		CreatedAt     time.Time        `json:"createdAt"`
-	}{d.ID, d.Version, d.Name, d.SchemaVersion, d.Nodes, d.Edges, d.CreatedBy, d.CreatedAt}
+		ID             string                  `json:"id"`
+		Version        int                     `json:"version"`
+		Name           string                  `json:"name"`
+		SchemaVersion  string                  `json:"schemaVersion"`
+		Nodes          []NodeDefinition        `json:"nodes"`
+		Edges          []WorkflowEdge          `json:"edges"`
+		InputContract  *WorkflowInputContract  `json:"inputContract"`
+		OutputContract *WorkflowOutputContract `json:"outputContract"`
+		CreatedBy      string                  `json:"createdBy"`
+		CreatedAt      time.Time               `json:"createdAt"`
+	}{d.ID, d.Version, d.Name, d.SchemaVersion, d.Nodes, d.Edges, d.InputContract, d.OutputContract, d.CreatedBy, d.CreatedAt}
 	return CanonicalHash(payload)
 }
 
@@ -1104,6 +1352,7 @@ func cloneNodeDefinitions(nodes []NodeDefinition) []NodeDefinition {
 		if node.ArtifactInput != nil {
 			copy := *node.ArtifactInput
 			copy.AllowedTypes = append([]ArtifactType(nil), node.ArtifactInput.AllowedTypes...)
+			copy.AllowedKinds = append([]string(nil), node.ArtifactInput.AllowedKinds...)
 			node.ArtifactInput = &copy
 		}
 		if node.AITransform != nil {
@@ -1170,6 +1419,30 @@ func cloneNodeDefinitions(nodes []NodeDefinition) []NodeDefinition {
 		clones[index] = node
 	}
 	return clones
+}
+
+func cloneWorkflowInputContract(contract *WorkflowInputContract) *WorkflowInputContract {
+	if contract == nil {
+		return nil
+	}
+	clone := *contract
+	clone.ManifestJobTypes = append([]string(nil), contract.ManifestJobTypes...)
+	clone.ArtifactKinds = append([]string(nil), contract.ArtifactKinds...)
+	clone.RequiredSourcePurposes = append([]string(nil), contract.RequiredSourcePurposes...)
+	clone.ManifestSchemaContracts = make(map[string]string, len(contract.ManifestSchemaContracts))
+	for jobType, schema := range contract.ManifestSchemaContracts {
+		clone.ManifestSchemaContracts[jobType] = schema
+	}
+	return &clone
+}
+
+func cloneWorkflowOutputContract(contract *WorkflowOutputContract) *WorkflowOutputContract {
+	if contract == nil {
+		return nil
+	}
+	clone := *contract
+	clone.ProducedArtifactKinds = append([]string(nil), contract.ProducedArtifactKinds...)
+	return &clone
 }
 
 func clonePorts(source map[string]PortDefinition) map[string]PortDefinition {

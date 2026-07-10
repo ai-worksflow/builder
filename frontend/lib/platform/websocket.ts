@@ -96,6 +96,29 @@ interface DomainEvent<TType extends string, TPayload> {
   readonly payload: TPayload
 }
 
+export type ProjectProjectionEventType =
+  | 'artifact.created'
+  | 'artifact.draft_updated'
+  | 'artifact.revision_created'
+  | 'artifact.member_bindings_replaced'
+  | 'dependency.created'
+  | 'trace.created'
+  | 'manifest.created'
+  | 'proposal.created'
+  | 'proposal.operation_decided'
+  | 'proposal.applied'
+  | 'workbench.bundle_created'
+  | 'implementation.proposal_created'
+  | 'implementation.operation_decided'
+  | 'implementation.applied'
+  | 'deployment.requested'
+  | 'deployment.completed'
+  | 'deployment.failed'
+  | 'deployment.runtime_activation_failed'
+  | 'document.downstream_generated'
+  | 'document.downstream_generation_failed'
+  | 'document.sync_back_proposed'
+
 export type PlatformDomainEvent =
   | DomainEvent<'project.updated', ProjectDto>
   | DomainEvent<'member.updated', ProjectMemberDto>
@@ -115,6 +138,7 @@ export type PlatformDomainEvent =
   | DomainEvent<'run.event', RunEventDto>
   | DomainEvent<'trace.updated', TraceLinkDto>
   | DomainEvent<'presence.updated', PresenceDto>
+  | DomainEvent<ProjectProjectionEventType, Record<string, JsonValue>>
 
 export type WsServerMessageDto =
   | {
@@ -276,6 +300,27 @@ const DOMAIN_EVENT_TYPES = new Set<PlatformDomainEvent['type']>([
   'run.event',
   'trace.updated',
   'presence.updated',
+  'artifact.created',
+  'artifact.draft_updated',
+  'artifact.revision_created',
+  'artifact.member_bindings_replaced',
+  'dependency.created',
+  'trace.created',
+  'manifest.created',
+  'proposal.created',
+  'proposal.operation_decided',
+  'proposal.applied',
+  'workbench.bundle_created',
+  'implementation.proposal_created',
+  'implementation.operation_decided',
+  'implementation.applied',
+  'deployment.requested',
+  'deployment.completed',
+  'deployment.failed',
+  'deployment.runtime_activation_failed',
+  'document.downstream_generated',
+  'document.downstream_generation_failed',
+  'document.sync_back_proposed',
 ])
 
 export function isPlatformDomainEvent(value: unknown): value is PlatformDomainEvent {

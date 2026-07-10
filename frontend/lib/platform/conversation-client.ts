@@ -10,6 +10,7 @@ import type {
   GenerateWorkflowIntentProposalDto,
   GeneratedWorkflowIntentProposalDto,
   WorkflowIntentProposalDto,
+  WorkbenchExecutionResultDto,
 } from './conversation-contract'
 import { HttpClient } from './http'
 
@@ -188,14 +189,25 @@ export class PlatformConversationClient {
     projectId: string,
     conversationId: string,
     command: Pick<ConversationCommandDto, 'id' | 'etag' | 'kind'>,
-    input: { readonly workbenchResult?: { readonly runId: string; readonly bundleId: string } } = {},
+    input: { readonly workbenchResult?: WorkbenchExecutionResultDto } = {},
     options?: ClientMutationOptions,
   ) {
     if (command.kind === 'start_workflow' && input.workbenchResult) {
       throw new Error('start_workflow does not accept a client Workbench result.')
     }
     if (command.kind === 'workbench_instruction' && !input.workbenchResult) {
-      throw new Error('workbench_instruction requires an exact run and bundle result.')
+      throw new Error('workbench_instruction requires an exact run, active bundle, and implementation proposal result.')
+    }
+    if (
+      command.kind === 'workbench_instruction'
+      && input.workbenchResult
+      && (
+        !input.workbenchResult.runId.trim()
+        || !input.workbenchResult.bundleId.trim()
+        || !input.workbenchResult.implementationProposalId.trim()
+      )
+    ) {
+      throw new Error('workbench_instruction result identities must be non-empty.')
     }
     return this.http.post<ConversationCommandDto, typeof input>(
       `${this.base(projectId)}/${segment(conversationId)}/commands/${segment(command.id)}/execute`,

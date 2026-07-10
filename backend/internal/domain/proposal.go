@@ -56,7 +56,8 @@ func NewInputManifest(id, projectID, jobType, deliverySliceID string, base *Arti
 		copyRef := *base
 		manifest.BaseRevision = &copyRef
 	}
-	manifest.Sources = append([]ManifestSource(nil), sources...)
+	// Keep the wire shape an array even for a valid base-only transform.
+	manifest.Sources = append([]ManifestSource{}, sources...)
 	if len(constraints) == 0 {
 		constraints = json.RawMessage(`{}`)
 	}
@@ -96,8 +97,8 @@ func (m InputManifest) validate(requireHash bool) error {
 	if m.ID == "" || m.ProjectID == "" || m.JobType == "" || m.OutputSchemaVersion == "" || m.CreatedBy == "" {
 		return invalid("manifest", "id, projectId, jobType, outputSchemaVersion and createdBy are required")
 	}
-	if len(m.Sources) == 0 {
-		return &DomainError{Kind: ErrManifestUnpinned, Field: "manifest.sources", Message: "at least one pinned source is required"}
+	if len(m.Sources) == 0 && m.BaseRevision == nil {
+		return &DomainError{Kind: ErrManifestUnpinned, Field: "manifest", Message: "a pinned base revision or source is required"}
 	}
 	if m.BaseRevision != nil {
 		if err := m.BaseRevision.Validate(); err != nil {

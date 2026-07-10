@@ -3,6 +3,7 @@ package domain
 import (
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 )
 
@@ -43,6 +44,20 @@ func TestManifestRequiresPinnedSourcesAndDetectsMutation(t *testing.T) {
 	manifest.JobType = "mutated"
 	if err := manifest.Validate(); !errors.Is(err, ErrConflict) {
 		t.Fatalf("expected manifest hash conflict, got %v", err)
+	}
+	baseOnly, err := NewInputManifest(
+		"base-only", "project", "refine_project_brief", "", &base, nil,
+		json.RawMessage(`{"reviewedIntent":true}`), "project-brief-proposal/v1", "user", testNow,
+	)
+	if err != nil {
+		t.Fatalf("exact base-only transform manifest was rejected: %v", err)
+	}
+	if baseOnly.BaseRevision == nil || !baseOnly.BaseRevision.Equal(base) || len(baseOnly.Sources) != 0 {
+		t.Fatalf("base-only manifest lost its immutable target: %+v", baseOnly)
+	}
+	encoded, err := json.Marshal(baseOnly)
+	if err != nil || !strings.Contains(string(encoded), `"sources":[]`) {
+		t.Fatalf("base-only manifest sources must retain an array wire shape: %s err=%v", encoded, err)
 	}
 }
 

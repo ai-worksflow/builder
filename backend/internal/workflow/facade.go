@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 
@@ -24,20 +25,29 @@ type Facade struct {
 }
 
 type CreateDefinitionInput struct {
-	Key           string                  `json:"key"`
-	Title         string                  `json:"title"`
-	Description   string                  `json:"description,omitempty"`
-	Name          string                  `json:"name,omitempty"`
-	SchemaVersion string                  `json:"schemaVersion,omitempty"`
-	Nodes         []domain.NodeDefinition `json:"nodes"`
-	Edges         []domain.WorkflowEdge   `json:"edges"`
+	Key            string                        `json:"key"`
+	Title          string                        `json:"title"`
+	Description    string                        `json:"description,omitempty"`
+	Name           string                        `json:"name,omitempty"`
+	SchemaVersion  string                        `json:"schemaVersion,omitempty"`
+	Nodes          []domain.NodeDefinition       `json:"nodes"`
+	Edges          []domain.WorkflowEdge         `json:"edges"`
+	InputContract  domain.WorkflowInputContract  `json:"inputContract"`
+	OutputContract domain.WorkflowOutputContract `json:"outputContract"`
 }
 
 type CreateDefinitionVersionInput struct {
-	Name          string                  `json:"name,omitempty"`
-	SchemaVersion string                  `json:"schemaVersion,omitempty"`
-	Nodes         []domain.NodeDefinition `json:"nodes"`
-	Edges         []domain.WorkflowEdge   `json:"edges"`
+	Name           string                        `json:"name,omitempty"`
+	SchemaVersion  string                        `json:"schemaVersion,omitempty"`
+	Nodes          []domain.NodeDefinition       `json:"nodes"`
+	Edges          []domain.WorkflowEdge         `json:"edges"`
+	InputContract  domain.WorkflowInputContract  `json:"inputContract"`
+	OutputContract domain.WorkflowOutputContract `json:"outputContract"`
+}
+
+type DefinitionDiscoveryRequest struct {
+	InputManifest           domain.ManifestRef `json:"inputManifest"`
+	DesiredOutputCapability string             `json:"desiredOutputCapability"`
 }
 
 var workflowKeyPattern = regexp.MustCompile(`^[a-z][a-z0-9-]{2,63}$`)
@@ -61,6 +71,98 @@ func (f Facade) ListDefinitions(ctx context.Context, projectID, actorID string) 
 		return nil, err
 	}
 	return f.Store.ListDefinitions(ctx, projectID)
+}
+
+func (f Facade) WorkflowCapabilities(ctx context.Context, projectID, actorID string) (WorkflowCapabilities, error) {
+	if err := f.authorize(ctx, projectID, actorID, core.ActionView); err != nil {
+		return WorkflowCapabilities{}, err
+	}
+	return f.Engine.Capabilities, nil
+}
+
+// DiscoverCompatibleDefinitionVersions is the authoritative control-plane
+// discovery seam used by conversation intent generation. It loads the pinned
+// manifest and trusted artifact metadata itself; client candidate lists are
+// neither accepted nor consulted.
+func (f Facade) DiscoverCompatibleDefinitionVersions(
+	ctx context.Context,
+	projectID, actorID string,
+	request DefinitionDiscoveryRequest,
+) ([]DefinitionRecord, error) {
+	if err := f.authorize(ctx, projectID, actorID, core.ActionView); err != nil {
+		return nil, err
+	}
+	if err := request.InputManifest.Validate(); err != nil || strings.TrimSpace(request.DesiredOutputCapability) == "" {
+		return nil, core.ErrInvalidInput
+	}
+	manifest, err := f.Store.GetManifest(ctx, request.InputManifest.ID)
+	if err != nil {
+		return nil, err
+	}
+	if manifest.Ref() != request.InputManifest || manifest.ProjectID != projectID {
+		return nil, domain.ErrManifestUnpinned
+	}
+	if f.Engine.StartArtifactKinds == nil {
+		return nil, fmt.Errorf("workflow start artifact-kind resolver is required")
+	}
+	artifactKinds, err := f.Engine.StartArtifactKinds.ResolveStartArtifactKinds(ctx, manifest)
+	if err != nil {
+		return nil, err
+	}
+	descriptor := DescribeStartManifest(manifest, artifactKinds)
+	definitions, err := f.Store.ListDefinitions(ctx, projectID)
+	if err != nil {
+		return nil, err
+	}
+	compatible := make([]DefinitionRecord, 0)
+	for _, latest := range definitions {
+		versions, err := f.Store.ListDefinitionVersions(ctx, latest.Definition.ID)
+		if err != nil {
+			return nil, err
+		}
+		var highest *DefinitionRecord
+		for _, version := range versions {
+			if !version.Published || (version.ProjectID != "" && version.ProjectID != projectID) {
+				continue
+			}
+			if err := version.Definition.Validate(); err != nil {
+				return nil, err
+			}
+			// Discovery is for new runs, not historical replay. Pre-contract
+			// versions remain loadable by already pinned runs but are never offered
+			// as candidates, and removed execution capabilities fail closed.
+			if version.Definition.InputContract == nil || f.Engine.Capabilities.ValidateDefinition(version.Definition) != nil {
+				continue
+			}
+			if CompatibleStart(version.Definition, descriptor, request.DesiredOutputCapability) == nil {
+				if highest == nil || version.Definition.Version > highest.Definition.Version {
+					candidate := version
+					highest = &candidate
+				}
+			}
+		}
+		if highest != nil {
+			compatible = append(compatible, *highest)
+		}
+	}
+	sort.Slice(compatible, func(i, j int) bool {
+		if compatible[i].Definition.ID == compatible[j].Definition.ID {
+			return compatible[i].Definition.Version > compatible[j].Definition.Version
+		}
+		return compatible[i].Definition.ID < compatible[j].Definition.ID
+	})
+	return compatible, nil
+}
+
+func (f Facade) CompatibleDefinitionVersions(
+	ctx context.Context,
+	projectID, actorID string,
+	manifestRef domain.ManifestRef,
+	desiredOutputCapability string,
+) ([]DefinitionRecord, error) {
+	return f.DiscoverCompatibleDefinitionVersions(ctx, projectID, actorID, DefinitionDiscoveryRequest{
+		InputManifest: manifestRef, DesiredOutputCapability: desiredOutputCapability,
+	})
 }
 func (f Facade) ListDefinitionVersions(ctx context.Context, projectID, definitionID, actorID string) ([]DefinitionRecord, error) {
 	if err := f.authorize(ctx, projectID, actorID, core.ActionView); err != nil {
@@ -96,11 +198,14 @@ func (f Facade) CreateDefinition(ctx context.Context, projectID, actorID string,
 	if input.SchemaVersion == "" {
 		input.SchemaVersion = "2"
 	}
-	definition, err := domain.NewWorkflowDefinition(uuid.NewString(), 1, input.Name, input.SchemaVersion, input.Nodes, input.Edges, actorID, time.Now().UTC())
+	definition, err := domain.NewWorkflowDefinitionWithContracts(
+		uuid.NewString(), 1, input.Name, input.SchemaVersion, input.Nodes, input.Edges,
+		input.InputContract, input.OutputContract, actorID, time.Now().UTC(),
+	)
 	if err != nil {
 		return DefinitionRecord{}, err
 	}
-	if err := validateAuthoredDefinition(definition); err != nil {
+	if err := validateAuthoredDefinition(definition, f.Engine.Capabilities); err != nil {
 		return DefinitionRecord{}, err
 	}
 	record := DefinitionRecord{
@@ -133,14 +238,20 @@ func (f Facade) CreateDefinitionVersion(ctx context.Context, projectID, definiti
 	if input.SchemaVersion == "" {
 		input.SchemaVersion = latest.Definition.SchemaVersion
 	}
-	definition, err := domain.NewWorkflowDefinition(
+	if input.InputContract.Capability == "" && latest.Definition.InputContract != nil {
+		input.InputContract = *latest.Definition.InputContract
+	}
+	if input.OutputContract.Capability == "" && latest.Definition.OutputContract != nil {
+		input.OutputContract = *latest.Definition.OutputContract
+	}
+	definition, err := domain.NewWorkflowDefinitionWithContracts(
 		latest.Definition.ID, latest.Definition.Version+1, input.Name, input.SchemaVersion,
-		input.Nodes, input.Edges, actorID, time.Now().UTC(),
+		input.Nodes, input.Edges, input.InputContract, input.OutputContract, actorID, time.Now().UTC(),
 	)
 	if err != nil {
 		return DefinitionRecord{}, err
 	}
-	if err := validateAuthoredDefinition(definition); err != nil {
+	if err := validateAuthoredDefinition(definition, f.Engine.Capabilities); err != nil {
 		return DefinitionRecord{}, err
 	}
 	record := DefinitionRecord{
@@ -164,13 +275,13 @@ func (f Facade) PublishDefinitionVersion(ctx context.Context, projectID, definit
 	if record.ProjectID != projectID || record.Definition.ID != definitionID {
 		return DefinitionRecord{}, core.ErrNotFound
 	}
-	if err := validateAuthoredDefinition(record.Definition); err != nil {
+	if err := validateAuthoredDefinition(record.Definition, f.Engine.Capabilities); err != nil {
 		return DefinitionRecord{}, err
 	}
 	return f.Store.PublishDefinitionVersion(ctx, projectID, definitionID, versionID, actorID)
 }
 
-func validateAuthoredDefinition(definition domain.WorkflowDefinition) error {
+func validateAuthoredDefinition(definition domain.WorkflowDefinition, registries ...WorkflowCapabilities) error {
 	if err := definition.Validate(); err != nil {
 		return err
 	}
@@ -182,6 +293,10 @@ func validateAuthoredDefinition(definition domain.WorkflowDefinition) error {
 		case domain.NodeArtifactInput, domain.NodeAITransform, domain.NodeHumanEdit, domain.NodeReviewGate,
 			domain.NodeCondition, domain.NodeFanOut, domain.NodeMerge, domain.NodeQualityGate,
 			domain.NodeManifestCompiler, domain.NodeWorkbenchBuild, domain.NodePublish:
+		case domain.NodeTransform:
+			if node.Transform == nil || node.Transform.Transform != "selection_passthrough" {
+				return &domain.DomainError{Kind: domain.ErrValidation, Field: "workflow.nodes." + node.ID, Message: "only selection_passthrough transforms are supported"}
+			}
 		default:
 			return &domain.DomainError{Kind: domain.ErrValidation, Field: "workflow.nodes." + node.ID, Message: "legacy node type cannot be used in a new workflow version"}
 		}
@@ -204,7 +319,11 @@ func validateAuthoredDefinition(definition domain.WorkflowDefinition) error {
 			}
 		}
 	}
-	return nil
+	capabilities := PlatformWorkflowCapabilities(true, true)
+	if len(registries) > 0 {
+		capabilities = registries[0]
+	}
+	return capabilities.ValidateDefinition(definition)
 }
 
 func workflowNodeRoles(node domain.NodeDefinition) []string {
@@ -271,49 +390,9 @@ func (f Facade) Start(ctx context.Context, projectID, actorID string, request St
 }
 
 func (f Facade) ensureMinimumLoop(ctx context.Context, projectID, actorID string) ([]DefinitionRecord, error) {
-	records, err := f.Store.ListDefinitions(ctx, projectID)
-	if err != nil {
-		return nil, err
-	}
-	for _, record := range records {
-		if record.Key == MinimumLoopKey {
-			return records, nil
-		}
-	}
-	role, err := f.Access.Authorize(ctx, projectID, actorID, core.ActionAdmin)
-	if err != nil {
-		if errors.Is(err, core.ErrForbidden) {
-			return records, nil
-		}
-		return nil, err
-	}
-	if role != core.RoleOwner {
-		// Viewing workflows should not fail merely because a non-owner reached a
-		// newly-created project before its owner installed built-ins.
-		return records, nil
-	}
-	projectUUID, err := uuid.Parse(projectID)
-	if err != nil {
-		return nil, core.ErrInvalidInput
-	}
-	definitionID := uuid.NewSHA1(projectUUID, []byte("worksflow:minimum-loop:definition")).String()
-	versionID := uuid.NewSHA1(projectUUID, []byte("worksflow:minimum-loop:version:1")).String()
-	_, seedErr := SeedMinimumLoop(ctx, f.Store, MinimumLoopSeed{
-		DefinitionID: definitionID, VersionID: versionID, ProjectID: projectID,
-		InstallerUserID: actorID, Published: true,
-	}, time.Now().UTC())
-	if seedErr != nil {
-		// A concurrent owner may have installed the same deterministic version.
-		reloaded, reloadErr := f.Store.ListDefinitions(ctx, projectID)
-		if reloadErr == nil {
-			for _, record := range reloaded {
-				if record.Key == MinimumLoopKey {
-					return reloaded, nil
-				}
-			}
-		}
-		return nil, seedErr
-	}
+	_ = actorID
+	// Project creation and the explicit startup provisioner own built-in
+	// installation/upgrades. Read/list and default-start selection never write.
 	return f.Store.ListDefinitions(ctx, projectID)
 }
 func (f Facade) GetRun(ctx context.Context, projectID, runID, actorID string) (*RunRecord, error) {

@@ -102,6 +102,22 @@ type WorkbenchInstruction struct {
 	ExpectedBundleID string   `json:"expectedBundleId,omitempty"`
 }
 
+// ReviewedConversationIntent is the immutable, server-identified intent that
+// is copied into workflow run scope after a human accepts the proposal. Its
+// IDs are minted by the proposal transaction and cannot be supplied by the
+// client or model.
+type ReviewedConversationIntent struct {
+	ConversationID       string                       `json:"conversationId"`
+	TriggerMessageID     string                       `json:"triggerMessageId"`
+	ProposalID           string                       `json:"proposalId"`
+	AssistantMessageID   string                       `json:"assistantMessageId"`
+	Kind                 IntentKind                   `json:"kind"`
+	DefinitionVersionID  string                       `json:"definitionVersionId"`
+	WorkbenchInstruction WorkbenchInstruction         `json:"workbenchInstruction"`
+	ManifestIntent       ManifestIntent               `json:"manifestIntent"`
+	SourceRefs           []platformdomain.ArtifactRef `json:"sourceRefs"`
+}
+
 type AIProvenance struct {
 	Provider   string `json:"provider"`
 	Model      string `json:"model"`
@@ -220,8 +236,9 @@ type DecideProposalInput struct {
 }
 
 type WorkbenchExecutionResult struct {
-	RunID    string `json:"runId"`
-	BundleID string `json:"bundleId"`
+	RunID                    string `json:"runId"`
+	BundleID                 string `json:"bundleId"`
+	ImplementationProposalID string `json:"implementationProposalId"`
 }
 
 type ExecuteCommandInput struct {
@@ -425,14 +442,12 @@ func normalizeProposalInput(input CreateIntentProposalInput) (CreateIntentPropos
 			}
 		}
 	}
-	if input.Kind == IntentWorkbenchInstruction && input.WorkbenchInstruction.ExpectedRunID == "" {
-		return input, fmt.Errorf("%w: workbench instruction requires expectedRunId", core.ErrInvalidInput)
+	if input.Kind == IntentWorkbenchInstruction && (input.WorkbenchInstruction.ExpectedRunID == "" || input.WorkbenchInstruction.ExpectedBundleID == "") {
+		return input, fmt.Errorf("%w: workbench instruction requires expectedRunId and expectedBundleId", core.ErrInvalidInput)
 	}
-	scope["conversationIntent"] = map[string]any{"workbenchInstruction": input.WorkbenchInstruction}
-	canonicalScope, err = platformdomain.CanonicalJSON(scope)
-	if err != nil || len(canonicalScope) > 65536 {
-		return input, fmt.Errorf("%w: workflow scope", core.ErrInvalidInput)
-	}
+	// The reviewed conversationIntent envelope is added only after the store
+	// mints the proposal and assistant-message IDs. Keeping it absent here makes
+	// it impossible for a client or model to preselect those server identities.
 	input.Scope = canonicalScope
 	return input, nil
 }

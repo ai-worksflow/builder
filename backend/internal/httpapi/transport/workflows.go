@@ -34,6 +34,10 @@ type WorkflowAPI interface {
 	Waive(context.Context, string, string, string, string, string) error
 }
 
+type workflowCapabilityAPI interface {
+	WorkflowCapabilities(context.Context, string, string) (runtime.WorkflowCapabilities, error)
+}
+
 type WorkflowDependencies struct {
 	Facade           WorkflowAPI
 	MaxJSONBodyBytes int64
@@ -60,6 +64,7 @@ func RegisterWorkflowRoutes(routes gin.IRoutes, handler *WorkflowHandler, mutati
 		return errors.New("workflow routes and handler are required")
 	}
 	routes.GET("/projects/:projectId/workflow-definitions", handler.listDefinitions)
+	routes.GET("/projects/:projectId/workflow-capabilities", handler.capabilities)
 	routes.POST("/projects/:projectId/workflow-definitions", workflowHandlers(mutationMiddleware, handler.createDefinition)...)
 	routes.GET("/projects/:projectId/workflow-definitions/:definitionId/versions", handler.listVersions)
 	routes.POST("/projects/:projectId/workflow-definitions/:definitionId/versions", workflowHandlers(mutationMiddleware, handler.createVersion)...)
@@ -76,6 +81,24 @@ func RegisterWorkflowRoutes(routes gin.IRoutes, handler *WorkflowHandler, mutati
 	routes.POST("/projects/:projectId/workflow-runs/:runId/retry", workflowHandlers(mutationMiddleware, handler.retry)...)
 	routes.POST("/projects/:projectId/workflow-runs/:runId/waive", workflowHandlers(mutationMiddleware, handler.waive)...)
 	return nil
+}
+
+func (h *WorkflowHandler) capabilities(c *gin.Context) {
+	actor, ok := workflowActor(c)
+	if !ok {
+		return
+	}
+	provider, ok := h.facade.(workflowCapabilityAPI)
+	if !ok {
+		problem.Write(c, problem.New(http.StatusNotImplemented, "workflow_capabilities_unavailable", "Workflow capabilities unavailable", "This workflow service does not expose an authoring capability registry."))
+		return
+	}
+	capabilities, err := provider.WorkflowCapabilities(c.Request.Context(), c.Param("projectId"), actor)
+	if err != nil {
+		writeWorkflowError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, capabilities)
 }
 
 func workflowHandlers(middleware []gin.HandlerFunc, handler gin.HandlerFunc) []gin.HandlerFunc {

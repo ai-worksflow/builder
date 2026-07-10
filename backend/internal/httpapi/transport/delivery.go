@@ -8,6 +8,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/worksflow/builder/backend/internal/ai"
 	"github.com/worksflow/builder/backend/internal/core"
+	"github.com/worksflow/builder/backend/internal/domain"
 	"github.com/worksflow/builder/backend/internal/httpapi/problem"
 )
 
@@ -22,19 +23,29 @@ type generateImplementationInput struct {
 	Instruction string `json:"instruction,omitempty"`
 }
 
+type createWorkbenchBundleRequest struct {
+	PrototypeRevision core.VersionRef `json:"prototypeRevision"`
+	AllowStale        bool            `json:"allowStale,omitempty"`
+	OverrideReason    string          `json:"overrideReason,omitempty"`
+}
+
 func (s *Server) CreateWorkbenchBundle(context *gin.Context) {
 	if s.services.Workbench == nil {
 		serviceUnavailable(context, "workbench")
 		return
 	}
-	var input core.CreateWorkbenchBundleInput
-	if err := DecodeJSON(context, &input, s.config.HTTP.MaxJSONBodyBytes); err != nil {
+	var request createWorkbenchBundleRequest
+	if err := DecodeJSON(context, &request, s.config.HTTP.MaxJSONBodyBytes); err != nil {
 		WriteJSONError(context, err)
 		return
 	}
 	actor, ok := actorID(context)
 	if !ok {
 		return
+	}
+	input := core.CreateWorkbenchBundleInput{
+		PrototypeRevision: request.PrototypeRevision,
+		AllowStale:        request.AllowStale, OverrideReason: request.OverrideReason,
 	}
 	bundle, err := s.services.Workbench.CreateBundle(context.Request.Context(), context.Param("projectId"), actor, input)
 	if err != nil {
@@ -59,6 +70,62 @@ func (s *Server) GetWorkbenchBundle(context *gin.Context) {
 		return
 	}
 	writeWorkbenchBundle(context, http.StatusOK, bundle)
+}
+
+func (s *Server) GetWorkbenchLineageState(context *gin.Context) {
+	if s.services.Workbench == nil {
+		serviceUnavailable(context, "workbench")
+		return
+	}
+	actor, ok := actorID(context)
+	if !ok {
+		return
+	}
+	bundleID := context.Param("bundleId")
+	state, err := s.services.Workbench.GetLineageState(context.Request.Context(), bundleID, actor)
+	if err != nil {
+		s.businessError(context, err)
+		return
+	}
+	etag := workbenchLineageStateETag(state)
+	context.Header("ETag", etag)
+	if strings.TrimSpace(context.GetHeader("If-None-Match")) == etag {
+		context.Status(http.StatusNotModified)
+		return
+	}
+	context.JSON(http.StatusOK, state)
+}
+
+func workbenchLineageStateETag(state core.WorkbenchLineageState) string {
+	identity, err := domain.CanonicalHash(state)
+	if err != nil {
+		identity = state.ActiveBundle.ManifestHash
+	}
+	return entityHashETag("build-manifest-lineage-state", state.RootBundleID, identity)
+}
+
+func (s *Server) RebaseWorkbenchBundle(context *gin.Context) {
+	if s.services.Workbench == nil {
+		serviceUnavailable(context, "workbench")
+		return
+	}
+	var input core.RebaseWorkbenchBundleInput
+	if err := DecodeJSON(context, &input, s.config.HTTP.MaxJSONBodyBytes); err != nil {
+		WriteJSONError(context, err)
+		return
+	}
+	actor, ok := actorID(context)
+	if !ok {
+		return
+	}
+	bundle, err := s.services.Workbench.Rebase(context.Request.Context(), context.Param("bundleId"), actor, input)
+	if err != nil {
+		s.businessError(context, err)
+		return
+	}
+	context.Header("ETag", entityHashETag("workbench-bundle", bundle.ID, bundle.ManifestHash))
+	context.Header("Location", "/v1/build-manifests/"+bundle.ID)
+	context.JSON(http.StatusCreated, bundle)
 }
 
 func writeWorkbenchBundle(context *gin.Context, status int, bundle core.WorkbenchBundle) {

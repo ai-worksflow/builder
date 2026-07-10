@@ -185,6 +185,53 @@ type ArtifactResponsibilityModel struct {
 
 func (ArtifactResponsibilityModel) TableName() string { return "artifact_responsibilities" }
 
+type ArtifactCollaborationStateModel struct {
+	ArtifactID uuid.UUID `gorm:"type:uuid;primaryKey"`
+	ProjectID  uuid.UUID `gorm:"type:uuid;not null;index"`
+	Version    uint64    `gorm:"not null"`
+	UpdatedBy  uuid.UUID `gorm:"type:uuid;not null"`
+	UpdatedAt  time.Time
+}
+
+func (ArtifactCollaborationStateModel) TableName() string { return "artifact_collaboration_states" }
+
+type ArtifactMemberBindingModel struct {
+	ArtifactID uuid.UUID `gorm:"type:uuid;primaryKey"`
+	ProjectID  uuid.UUID `gorm:"type:uuid;not null;index"`
+	UserID     uuid.UUID `gorm:"type:uuid;primaryKey"`
+	Role       string    `gorm:"primaryKey"`
+	Reason     string    `gorm:"not null"`
+	AssignedBy uuid.UUID `gorm:"type:uuid;not null"`
+	AssignedAt time.Time
+}
+
+func (ArtifactMemberBindingModel) TableName() string { return "artifact_member_bindings" }
+
+type DocumentGenerationCommandModel struct {
+	ID                 uuid.UUID       `gorm:"type:uuid;primaryKey"`
+	ProjectID          uuid.UUID       `gorm:"type:uuid;not null;index"`
+	ActorID            uuid.UUID       `gorm:"type:uuid;not null"`
+	CommandKey         string          `gorm:"not null"`
+	RequestHash        string          `gorm:"not null"`
+	SourceBindingsETag string          `gorm:"column:source_bindings_etag;not null"`
+	ResolvedOwnerIDs   json.RawMessage `gorm:"type:jsonb;not null"`
+	Status             string          `gorm:"not null"`
+	TargetArtifactID   *uuid.UUID      `gorm:"type:uuid"`
+	BaseRevisionID     *uuid.UUID      `gorm:"type:uuid"`
+	InputManifestID    *uuid.UUID      `gorm:"type:uuid"`
+	OutputProposalID   *uuid.UUID      `gorm:"type:uuid"`
+	Provider           string          `gorm:"not null"`
+	Model              string          `gorm:"not null"`
+	AttemptCount       int             `gorm:"not null"`
+	LastFailure        *string
+	LastFailedAt       *time.Time
+	LockedUntil        *time.Time
+	CreatedAt          time.Time
+	UpdatedAt          time.Time
+}
+
+func (DocumentGenerationCommandModel) TableName() string { return "document_generation_commands" }
+
 type ArtifactDependencyModel struct {
 	ID                uuid.UUID  `gorm:"type:uuid;primaryKey"`
 	ProjectID         uuid.UUID  `gorm:"type:uuid;not null;index"`
@@ -320,6 +367,8 @@ type OutputProposalModel struct {
 	OperationCount  int       `gorm:"not null"`
 	AcceptedCount   int       `gorm:"not null"`
 	RejectedCount   int       `gorm:"not null"`
+	AIProvider      *string   `gorm:"column:ai_provider"`
+	AIModel         *string   `gorm:"column:ai_model"`
 	CreatedBy       uuid.UUID `gorm:"type:uuid;not null"`
 	CreatedAt       time.Time
 	AppliedBy       *uuid.UUID `gorm:"type:uuid"`
@@ -497,12 +546,12 @@ type WorkflowIntentProposalModel struct {
 	ManifestIntent               json.RawMessage `gorm:"type:jsonb;not null"`
 	WorkbenchInstruction         json.RawMessage `gorm:"type:jsonb;not null"`
 	Origin                       string          `gorm:"not null"`
-	AIProvider                   *string
-	AIModel                      *string
-	AIResponseID                 *string
-	DecisionReason               string     `gorm:"not null"`
-	ProposedBy                   uuid.UUID  `gorm:"type:uuid;not null"`
-	DecidedBy                    *uuid.UUID `gorm:"type:uuid"`
+	AIProvider                   *string         `gorm:"column:ai_provider"`
+	AIModel                      *string         `gorm:"column:ai_model"`
+	AIResponseID                 *string         `gorm:"column:ai_response_id"`
+	DecisionReason               string          `gorm:"not null"`
+	ProposedBy                   uuid.UUID       `gorm:"type:uuid;not null"`
+	DecidedBy                    *uuid.UUID      `gorm:"type:uuid"`
 	CreatedAt                    time.Time
 	DecidedAt                    *time.Time
 }
@@ -536,19 +585,24 @@ type ConversationCommandModel struct {
 func (ConversationCommandModel) TableName() string { return "conversation_commands" }
 
 type ApplicationBuildManifestModel struct {
-	ID                 uuid.UUID  `gorm:"type:uuid;primaryKey"`
-	ProjectID          uuid.UUID  `gorm:"type:uuid;not null;index"`
-	WorkflowRunID      *uuid.UUID `gorm:"type:uuid"`
-	SchemaVersion      int        `gorm:"not null"`
-	ContentStore       string     `gorm:"not null"`
-	ContentRef         string     `gorm:"not null"`
-	ContentHash        string     `gorm:"not null"`
-	ManifestHash       string     `gorm:"not null"`
-	Status             string     `gorm:"not null"`
-	CreatedBy          uuid.UUID  `gorm:"type:uuid;not null"`
-	CreatedAt          time.Time
-	InvalidatedAt      *time.Time
-	InvalidationReason *string
+	ID                  uuid.UUID  `gorm:"type:uuid;primaryKey"`
+	ProjectID           uuid.UUID  `gorm:"type:uuid;not null;index"`
+	WorkflowRunID       *uuid.UUID `gorm:"type:uuid"`
+	RootManifestID      uuid.UUID  `gorm:"type:uuid;not null"`
+	DerivedFromID       *uuid.UUID `gorm:"type:uuid"`
+	WorkspaceRevisionID *uuid.UUID `gorm:"type:uuid"`
+	RootOrdinal         *int
+	ManifestGroupKey    *string
+	SchemaVersion       int       `gorm:"not null"`
+	ContentStore        string    `gorm:"not null"`
+	ContentRef          string    `gorm:"not null"`
+	ContentHash         string    `gorm:"not null"`
+	ManifestHash        string    `gorm:"not null"`
+	Status              string    `gorm:"not null"`
+	CreatedBy           uuid.UUID `gorm:"type:uuid;not null"`
+	CreatedAt           time.Time
+	InvalidatedAt       *time.Time
+	InvalidationReason  *string
 }
 
 func (ApplicationBuildManifestModel) TableName() string { return "application_build_manifests" }

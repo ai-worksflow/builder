@@ -48,14 +48,15 @@ func (s *publishAccessStub) Authorize(_ context.Context, _, _ string, action cor
 }
 
 type publishLoaderStub struct {
-	workspace       WorkspaceSnapshot
-	bundle          core.WorkbenchBundle
-	err             error
-	manifest        string
-	lineageErr      error
-	lineageCalled   bool
-	lineageRevision core.VersionRef
-	lineageManifest string
+	workspace        WorkspaceSnapshot
+	bundle           core.WorkbenchBundle
+	err              error
+	manifest         string
+	lineageErr       error
+	lineageCalled    bool
+	lineageRevision  core.VersionRef
+	lineageManifest  string
+	resolvedManifest string
 }
 
 func (s *publishLoaderStub) LoadFrozenWorkspace(_ context.Context, _, _ string, reference core.VersionRef, _ core.Action) (WorkspaceSnapshot, error) {
@@ -74,11 +75,41 @@ func (s *publishLoaderStub) LoadBuildManifest(_ context.Context, _, _, manifestI
 	return s.bundle, s.err
 }
 
-func (s *publishLoaderStub) ValidateWorkspaceManifestLineage(_ context.Context, _, _ string, revision core.VersionRef, manifestID string, _ core.Action) error {
+func (s *publishLoaderStub) ResolveWorkspaceManifestLineage(_ context.Context, _, _ string, revision core.VersionRef, manifestID string, _ core.Action) (string, error) {
 	s.lineageCalled = true
 	s.lineageRevision = revision
 	s.lineageManifest = manifestID
-	return s.lineageErr
+	if s.lineageErr != nil {
+		return "", s.lineageErr
+	}
+	if s.resolvedManifest != "" {
+		return s.resolvedManifest, nil
+	}
+	return manifestID, nil
+}
+
+func TestPublishSourceStoresResolvedDerivedProducerManifest(t *testing.T) {
+	t.Parallel()
+
+	projectID := uuid.NewString()
+	rootID := uuid.NewString()
+	derivedID := uuid.NewString()
+	reference := publishExactRef()
+	loader := &publishLoaderStub{
+		workspace:        WorkspaceSnapshot{ProjectID: projectID, Revision: reference},
+		bundle:           core.WorkbenchBundle{ID: rootID, ProjectID: projectID},
+		resolvedManifest: derivedID,
+	}
+	service := &PublishService{loader: loader}
+	source, err := service.resolvePublishSource(
+		context.Background(), projectID, uuid.NewString(), core.ActionView, reference, rootID,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if source.buildManifestID == nil || source.buildManifestID.String() != derivedID || loader.lineageManifest != rootID {
+		t.Fatalf("publish source did not replace root selector with exact derived producer: source=%+v loader=%+v", source, loader)
+	}
 }
 
 type publishQualityStub struct {

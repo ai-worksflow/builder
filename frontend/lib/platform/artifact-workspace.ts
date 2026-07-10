@@ -6,6 +6,7 @@ import type {
   BlueprintContentDto,
   DocumentContentDto,
   ImpactReportDto,
+  JsonObject,
   PageSpecContentDto,
   ProposalDto,
   PrototypeContentDto,
@@ -143,6 +144,7 @@ export interface CreateArtifactProposalInput {
   readonly targetRevision: VersionRefDto
   readonly instruction: string
   readonly inputVersions?: readonly VersionRefDto[]
+  readonly constraints?: JsonObject
   readonly outputSchemaVersion: string
   readonly model?: string
 }
@@ -563,7 +565,7 @@ export class ArtifactWorkspaceGateway {
         ref: wireVersionRef(ref),
         purpose: upstreamSources.length > 0 ? 'approved_upstream' : index === 0 ? 'proposal_base' : 'approved_upstream',
       })),
-      constraints: { instruction: input.instruction.trim() },
+      constraints: { instruction: input.instruction.trim(), ...(input.constraints ?? {}) },
       outputSchemaVersion: input.outputSchemaVersion,
     }, { idempotencyKey: true })
     const generated = await this.client.manifests.generateArtifactProposal(
@@ -596,6 +598,23 @@ export class ArtifactWorkspaceGateway {
     }
     return this.client.proposals.apply(proposalId, { version: current.version }, {
       ifMatch: proposalEtag(current),
+      idempotencyKey: true,
+    })
+  }
+
+  decideProposalOperation(
+    proposal: Pick<ProposalDto, 'id' | 'version'>,
+    operationId: string,
+    decision: 'accepted' | 'rejected',
+    reason?: string,
+  ) {
+    return this.client.proposals.decide(proposal.id, {
+      operationId,
+      decision,
+      ...(reason ? { reason } : {}),
+      version: proposal.version,
+    }, {
+      ifMatch: proposalEtag(proposal),
       idempotencyKey: true,
     })
   }

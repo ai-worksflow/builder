@@ -17,6 +17,38 @@ func (a fixedWorkflowAccess) Authorize(context.Context, string, string, core.Act
 	return a.role, nil
 }
 
+type fixedStartArtifactKinds []string
+
+func (k fixedStartArtifactKinds) ResolveStartArtifactKinds(context.Context, domain.InputManifest) ([]string, error) {
+	return append([]string(nil), k...), nil
+}
+
+func authoredWorkflowFixture() ([]domain.NodeDefinition, []domain.WorkflowEdge) {
+	schema := json.RawMessage(`{"type":"object","additionalProperties":true}`)
+	nodes := []domain.NodeDefinition{
+		{
+			ID: "source", Name: "Project brief input", Type: domain.NodeArtifactInput,
+			InputSchema: schema, OutputSchema: schema,
+			ArtifactInput: &domain.ArtifactInputNodeConfig{AllowedTypes: []domain.ArtifactType{domain.ArtifactDocument}, AllowedKinds: []string{"project_brief"}, MinimumArtifacts: 1},
+		},
+		{
+			ID: "workbench", Name: "Build in Workbench", Type: domain.NodeWorkbenchBuild,
+			InputSchema: schema, OutputSchema: schema,
+			WorkbenchBuild: &domain.WorkbenchBuildNodeConfig{BuildManifestSchemaVersion: 1, MaxAttempts: 1, Timeout: time.Minute},
+		},
+		{
+			ID: "publish", Name: "Publish", Type: domain.NodePublish,
+			InputSchema: schema, OutputSchema: schema,
+			Publish: &domain.PublishNodeConfig{Environment: "production", RequiredRole: "admin"},
+		},
+	}
+	edges := []domain.WorkflowEdge{
+		{ID: "source-workbench", From: "source", To: "workbench"},
+		{ID: "workbench-publish", From: "workbench", To: "publish"},
+	}
+	return nodes, edges
+}
+
 func TestWorkflowDefinitionAuthoringVersionsAndPublishesImmutableGraphs(t *testing.T) {
 	t.Parallel()
 	store := NewMemoryStore(nil)
@@ -24,16 +56,15 @@ func TestWorkflowDefinitionAuthoringVersionsAndPublishesImmutableGraphs(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
+	engine.StartArtifactKinds = startArtifactKindResolverFunc(func(context.Context, domain.InputManifest) ([]string, error) {
+		return []string{"project_brief"}, nil
+	})
 	facade := Facade{Engine: engine, Store: store, Access: fixedWorkflowAccess{role: core.RoleOwner}}
 	projectID, ownerID := uuid.NewString(), uuid.NewString()
-	schema := json.RawMessage(`{"type":"object","additionalProperties":true}`)
-	nodes := []domain.NodeDefinition{{
-		ID: "input", Name: "Input", Type: domain.NodeArtifactInput,
-		InputSchema: schema, OutputSchema: schema,
-		ArtifactInput: &domain.ArtifactInputNodeConfig{AllowedTypes: []domain.ArtifactType{domain.ArtifactDocument}, MinimumArtifacts: 1},
-	}}
+	nodes, edges := authoredWorkflowFixture()
 	created, err := facade.CreateDefinition(context.Background(), projectID, ownerID, CreateDefinitionInput{
-		Key: "custom-delivery", Title: "Custom delivery", Nodes: nodes,
+		Key: "custom-delivery", Title: "Custom delivery", Nodes: nodes, Edges: edges,
+		InputContract: ProjectBriefInputContract(), OutputContract: ApplicationOutputContract(),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -49,7 +80,8 @@ func TestWorkflowDefinitionAuthoringVersionsAndPublishesImmutableGraphs(t *testi
 		t.Fatalf("publish mutated immutable graph: %+v", published)
 	}
 	second, err := facade.CreateDefinitionVersion(context.Background(), projectID, created.Definition.ID, ownerID, CreateDefinitionVersionInput{
-		Name: "Custom delivery v2", Nodes: nodes,
+		Name: "Custom delivery v2", Nodes: nodes, Edges: edges,
+		InputContract: ProjectBriefInputContract(), OutputContract: ApplicationOutputContract(),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -67,6 +99,9 @@ func TestWorkflowDefinitionAuthoringRejectsUnknownRoles(t *testing.T) {
 	t.Parallel()
 	store := NewMemoryStore(nil)
 	engine, _ := NewEngine(store)
+	engine.StartArtifactKinds = startArtifactKindResolverFunc(func(context.Context, domain.InputManifest) ([]string, error) {
+		return []string{"project_brief"}, nil
+	})
 	facade := Facade{Engine: engine, Store: store, Access: fixedWorkflowAccess{role: core.RoleOwner}}
 	schema := json.RawMessage(`{"type":"object","additionalProperties":true}`)
 	_, err := facade.CreateDefinition(context.Background(), uuid.NewString(), uuid.NewString(), CreateDefinitionInput{
@@ -82,13 +117,17 @@ func TestWorkflowDefinitionAuthoringRejectsUnknownRoles(t *testing.T) {
 	}
 }
 
-func TestListingIsSideEffectFreeAndLegacyStartInstallsMinimumLoopOnce(t *testing.T) {
+func TestListingAndDefaultStartAreSideEffectFreeUntilExplicitProvisioning(t *testing.T) {
 	t.Parallel()
 	store := NewMemoryStore(nil)
 	engine, err := NewEngine(store)
 	if err != nil {
 		t.Fatal(err)
 	}
+	engine.StartArtifactKinds = fixedStartArtifactKinds{"project_brief"}
+	engine.StartArtifactKinds = startArtifactKindResolverFunc(func(context.Context, domain.InputManifest) ([]string, error) {
+		return []string{"project_brief"}, nil
+	})
 	facade := Facade{Engine: engine, Store: store, Access: fixedWorkflowAccess{role: core.RoleOwner}}
 	projectID, ownerID := uuid.NewString(), uuid.NewString()
 	first, err := facade.ListDefinitions(context.Background(), projectID, ownerID)
@@ -106,12 +145,26 @@ func TestListingIsSideEffectFreeAndLegacyStartInstallsMinimumLoopOnce(t *testing
 	if err := store.SaveManifest(context.Background(), manifest); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := facade.Start(context.Background(), projectID, ownerID, StartRequest{InputManifest: manifest.Ref()}); err != nil {
+	if _, err := facade.Start(context.Background(), projectID, ownerID, StartRequest{InputManifest: manifest.Ref()}); err == nil {
+		t.Fatal("default start implicitly installed the minimum loop")
+	}
+	definitionID := uuid.NewSHA1(uuid.MustParse(projectID), []byte("worksflow:minimum-loop:definition")).String()
+	versionID, err := minimumLoopVersionID(projectID, MinimumLoopCurrentVersion)
+	if err != nil {
 		t.Fatal(err)
+	}
+	if _, err := SeedMinimumLoop(context.Background(), store, MinimumLoopSeed{
+		DefinitionID: definitionID, VersionID: versionID, ProjectID: projectID,
+		InstallerUserID: ownerID, Published: true,
+	}, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := facade.Start(context.Background(), projectID, ownerID, StartRequest{InputManifest: manifest.Ref()}); err != nil {
+		t.Fatalf("explicitly provisioned minimum loop did not start: %v", err)
 	}
 	installed, err := facade.ListDefinitions(context.Background(), projectID, ownerID)
 	if err != nil || len(installed) != 1 || installed[0].Key != MinimumLoopKey || !installed[0].Published {
-		t.Fatalf("legacy start did not install the template once: %+v, error=%v", installed, err)
+		t.Fatalf("explicit provisioner did not install the template once: %+v, error=%v", installed, err)
 	}
 }
 
@@ -119,6 +172,9 @@ func TestListRunsUsesStableOpaqueCursorAndProjectScope(t *testing.T) {
 	t.Parallel()
 	store := NewMemoryStore(nil)
 	engine, _ := NewEngine(store)
+	engine.StartArtifactKinds = startArtifactKindResolverFunc(func(context.Context, domain.InputManifest) ([]string, error) {
+		return []string{"project_brief"}, nil
+	})
 	facade := Facade{Engine: engine, Store: store, Access: fixedWorkflowAccess{role: core.RoleOwner}}
 	projectID, actorID := uuid.NewString(), uuid.NewString()
 	base := time.Date(2026, 7, 10, 10, 0, 0, 0, time.UTC)
@@ -149,6 +205,10 @@ func TestDefinitionListKeepsLatestDraftVisibleWhileDefaultStartUsesPublishedVers
 	t.Parallel()
 	store := NewMemoryStore(nil)
 	engine, _ := NewEngine(store)
+	engine.StartArtifactKinds = fixedStartArtifactKinds{"project_brief"}
+	engine.StartArtifactKinds = startArtifactKindResolverFunc(func(context.Context, domain.InputManifest) ([]string, error) {
+		return []string{"project_brief"}, nil
+	})
 	facade := Facade{Engine: engine, Store: store, Access: fixedWorkflowAccess{role: core.RoleOwner}}
 	projectID, actorID := uuid.NewString(), uuid.NewString()
 	if _, err := SeedMinimumLoop(context.Background(), store, MinimumLoopSeed{

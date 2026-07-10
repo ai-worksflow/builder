@@ -14,6 +14,7 @@ import (
 	"github.com/worksflow/builder/backend/internal/ai"
 	"github.com/worksflow/builder/backend/internal/core"
 	platformdomain "github.com/worksflow/builder/backend/internal/domain"
+	storage "github.com/worksflow/builder/backend/internal/storage/postgres"
 	runtime "github.com/worksflow/builder/backend/internal/workflow"
 )
 
@@ -42,9 +43,11 @@ func (conversationProviderStub) Generate(context.Context, ai.Request) (ai.Result
 type generatedConversationProviderStub struct {
 	result  ai.Result
 	request ai.Request
+	calls   int
 }
 
 func (s *generatedConversationProviderStub) Generate(_ context.Context, request ai.Request) (ai.Result, error) {
+	s.calls++
 	s.request = request
 	return s.result, nil
 }
@@ -81,12 +84,15 @@ func (s *conversationRuntimeStub) GetRun(context.Context, string, string, string
 }
 
 type conversationStoreStub struct {
-	mu               sync.Mutex
-	appendCalls      int
-	proposalAccepted bool
-	command          ConversationCommand
-	claimToken       *uuid.UUID
-	proposal         WorkflowIntentProposal
+	mu                   sync.Mutex
+	appendCalls          int
+	proposalAccepted     bool
+	command              ConversationCommand
+	claimToken           *uuid.UUID
+	proposal             WorkflowIntentProposal
+	generationContext    intentGenerationContext
+	claimCalls           int
+	atomicWorkbenchCalls int
 }
 
 func (s *conversationStoreStub) CreateConversation(context.Context, uuid.UUID, uuid.UUID, string) (Conversation, error) {
@@ -110,7 +116,7 @@ func (s *conversationStoreStub) AppendUserMessage(_ context.Context, _, _, _ uui
 func (s *conversationStoreStub) ListMessages(context.Context, uuid.UUID, uuid.UUID, ListOptions) (MessagePage, error) {
 	return MessagePage{}, nil
 }
-func (s *conversationStoreStub) CreateIntentProposal(_ context.Context, _, conversationID, actorID uuid.UUID, input CreateIntentProposalInput, provenance ProposalProvenance) (WorkflowIntentProposal, Message, error) {
+func (s *conversationStoreStub) CreateIntentProposal(_ context.Context, _, conversationID, actorID uuid.UUID, input CreateIntentProposalInput, provenance ProposalProvenance, _ string) (WorkflowIntentProposal, Message, error) {
 	proposalID, messageID := uuid.NewString(), uuid.NewString()
 	proposal := WorkflowIntentProposal{
 		ID: proposalID, ConversationID: conversationID.String(), TriggerMessageID: input.TriggerMessageID,
@@ -124,8 +130,22 @@ func (s *conversationStoreStub) CreateIntentProposal(_ context.Context, _, conve
 	s.mu.Unlock()
 	return proposal, Message{ID: messageID, ConversationID: conversationID.String(), Role: MessageAssistant, ProposalID: &proposalID}, nil
 }
-func (s *conversationStoreStub) IntentGenerationContext(context.Context, uuid.UUID, uuid.UUID, uuid.UUID, []uuid.UUID, []platformdomain.ArtifactRef, ManifestIntent) (intentGenerationContext, error) {
-	return intentGenerationContext{}, nil
+func (s *conversationStoreStub) IntentGenerationContext(_ context.Context, _, _, _ uuid.UUID, candidateIDs []uuid.UUID, _ []platformdomain.ArtifactRef, _ ManifestIntent, _ string) (intentGenerationContext, error) {
+	result := s.generationContext
+	result.Definitions = append([]intentDefinitionContext(nil), result.Definitions...)
+	seen := make(map[string]struct{}, len(result.Definitions))
+	for _, definition := range result.Definitions {
+		seen[definition.VersionID] = struct{}{}
+	}
+	for _, candidateID := range candidateIDs {
+		if _, exists := seen[candidateID.String()]; exists {
+			continue
+		}
+		result.Definitions = append(result.Definitions, intentDefinitionContext{
+			VersionID: candidateID.String(), Content: json.RawMessage(`{"nodes":[],"edges":[]}`),
+		})
+	}
+	return result, nil
 }
 func (s *conversationStoreStub) GetProposal(context.Context, uuid.UUID, uuid.UUID, uuid.UUID) (WorkflowIntentProposal, error) {
 	s.mu.Lock()
@@ -167,6 +187,7 @@ func (s *conversationStoreStub) ListCommands(context.Context, uuid.UUID, uuid.UU
 func (s *conversationStoreStub) ClaimCommand(_ context.Context, _, _, _ uuid.UUID, actorID uuid.UUID, expectedETag string, _ time.Duration) (commandClaim, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.claimCalls++
 	if !s.proposalAccepted || s.command.Status != CommandPending || s.command.ETag != expectedETag || s.claimToken != nil {
 		return commandClaim{}, core.ErrConflict
 	}
@@ -177,6 +198,28 @@ func (s *conversationStoreStub) ClaimCommand(_ context.Context, _, _, _ uuid.UUI
 	actor := actorID.String()
 	s.command.ExecutionActorID = &actor
 	return commandClaim{Command: cloneCommand(s.command), Token: token}, nil
+}
+func (s *conversationStoreStub) CompleteWorkbenchCommand(_ context.Context, _, _, _ uuid.UUID, actorID uuid.UUID, expectedETag string, _ time.Duration, result WorkbenchExecutionResult) (ConversationCommand, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.atomicWorkbenchCalls++
+	if !s.proposalAccepted || s.command.Kind != IntentWorkbenchInstruction || s.command.Status != CommandPending || s.command.ETag != expectedETag {
+		return ConversationCommand{}, core.ErrConflict
+	}
+	encoded, err := platformdomain.CanonicalJSON(result)
+	if err != nil {
+		return ConversationCommand{}, err
+	}
+	now := time.Now().UTC()
+	s.command.Status = CommandExecuted
+	s.command.Version += 2
+	s.command.ETag = CommandETag(s.command.ID, s.command.Version)
+	s.command.Result = encoded
+	actor := actorID.String()
+	s.command.ExecutionActorID = &actor
+	s.command.ExecutedBy = &actor
+	s.command.ExecutedAt = &now
+	return cloneCommand(s.command), nil
 }
 func (s *conversationStoreStub) CompleteCommand(_ context.Context, claim commandClaim, actorID uuid.UUID, status CommandStatus, result json.RawMessage, failure *CommandFailure) (ConversationCommand, error) {
 	s.mu.Lock()
@@ -292,6 +335,158 @@ func TestServerAIGenerationPersistsReviewableProvenanceWithoutExecution(t *testi
 	if len(provider.request.OutputSchema) == 0 || provider.request.OutputSchemaName != "workflow_intent_proposal" {
 		t.Fatalf("AI generation was not schema constrained: %+v", provider.request)
 	}
+	if bytes.Contains(provider.request.OutputSchema, []byte(string(IntentWorkbenchInstruction))) {
+		t.Fatalf("schema offered workbench_instruction without an authoritative target: %s", provider.request.OutputSchema)
+	}
+}
+
+func TestServerAIGenerationRejectsBlueprintSelectionStartCandidateForConversationManifest(t *testing.T) {
+	projectID, conversationID, actorID := uuid.NewString(), uuid.NewString(), uuid.NewString()
+	input, manifest := proposalInputWithManifest(t, projectID, actorID)
+	selectionContent := json.RawMessage(`{"nodes":[{"id":"pages","type":"fan_out","fanOut":{"itemKind":"blueprint_selection_page"}}],"edges":[]}`)
+	store := &conversationStoreStub{generationContext: intentGenerationContext{Definitions: []intentDefinitionContext{{
+		VersionID: input.SuggestedDefinitionVersionID, Content: selectionContent,
+	}}}}
+	provider := &generatedConversationProviderStub{}
+	service, err := newService(store, &conversationAccessStub{}, &conversationRuntimeStub{}, conversationManifestStub{manifest: manifest}, provider)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = service.GenerateIntentProposal(context.Background(), projectID, conversationID, actorID, GenerateIntentProposalInput{
+		TriggerMessageID: input.TriggerMessageID, CandidateDefinitionVersionIDs: []string{input.SuggestedDefinitionVersionID},
+		SourceRefs: input.SourceRefs, ManifestIntent: input.ManifestIntent,
+	})
+	if !errors.Is(err, core.ErrInvalidInput) {
+		t.Fatalf("incompatible selection start candidate error = %v", err)
+	}
+	if provider.calls != 0 {
+		t.Fatalf("incompatible start candidate reached AI provider %d times", provider.calls)
+	}
+}
+
+func TestServerAIGenerationUsesOnlySuppliedAuthoritativeWorkbenchTarget(t *testing.T) {
+	projectID, conversationID, actorID := uuid.NewString(), uuid.NewString(), uuid.NewString()
+	input, manifest := proposalInputWithManifest(t, projectID, actorID)
+	target := intentWorkbenchTargetContext{
+		DefinitionVersionID: uuid.NewString(), RunID: uuid.NewString(),
+		RootBundleID: uuid.NewString(), ActiveBundleID: uuid.NewString(),
+		ManifestGroup: uuid.NewString(), Ordinal: 2,
+	}
+	output, err := platformdomain.CanonicalJSON(map[string]any{
+		"assistantContent": "Continue the existing reviewed application run.",
+		"kind":             IntentWorkbenchInstruction, "suggestedDefinitionVersionId": target.DefinitionVersionID,
+		"scope": map[string]any{"slice": "all"},
+		"workbenchInstruction": map[string]any{
+			"objective": "Continue the exact active bundle", "constraints": []string{"Keep exact traces"},
+			"expectedRunId": target.RunID, "expectedBundleId": target.RootBundleID,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := &conversationStoreStub{generationContext: intentGenerationContext{
+		Definitions: []intentDefinitionContext{{
+			VersionID: target.DefinitionVersionID,
+			Content:   json.RawMessage(`{"nodes":[{"id":"pages","type":"fan_out","fanOut":{"itemKind":"blueprint_selection_page"}}],"edges":[]}`),
+		}},
+		WorkbenchTargets: []intentWorkbenchTargetContext{target},
+	}}
+	provider := &generatedConversationProviderStub{result: ai.Result{Provider: "test", Model: "test", Output: output}}
+	service, err := newService(store, &conversationAccessStub{}, &conversationRuntimeStub{}, conversationManifestStub{manifest: manifest}, provider)
+	if err != nil {
+		t.Fatal(err)
+	}
+	generated, err := service.GenerateIntentProposal(context.Background(), projectID, conversationID, actorID, GenerateIntentProposalInput{
+		TriggerMessageID: input.TriggerMessageID, CandidateDefinitionVersionIDs: []string{input.SuggestedDefinitionVersionID},
+		SourceRefs: input.SourceRefs, ManifestIntent: input.ManifestIntent,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if generated.Proposal.Kind != IntentWorkbenchInstruction || generated.Proposal.SuggestedDefinitionVersionID != target.DefinitionVersionID ||
+		generated.Proposal.WorkbenchInstruction.ExpectedRunID != target.RunID || generated.Proposal.WorkbenchInstruction.ExpectedBundleID != target.RootBundleID {
+		t.Fatalf("AI proposal lost the supplied target: %+v", generated.Proposal)
+	}
+	for _, exactID := range []string{target.DefinitionVersionID, target.RunID, target.RootBundleID, target.ActiveBundleID} {
+		if !bytes.Contains(provider.request.Input, []byte(exactID)) || !bytes.Contains(provider.request.OutputSchema, []byte(exactID)) && exactID != target.ActiveBundleID {
+			t.Fatalf("provider request omitted authoritative target identity %s", exactID)
+		}
+	}
+	var prompt struct {
+		StartCandidateDefinitionVersionIDs []string `json:"startCandidateDefinitionVersionIds"`
+	}
+	if err := json.Unmarshal(provider.request.Input, &prompt); err != nil {
+		t.Fatal(err)
+	}
+	if len(prompt.StartCandidateDefinitionVersionIDs) != 1 || prompt.StartCandidateDefinitionVersionIDs[0] != input.SuggestedDefinitionVersionID {
+		t.Fatalf("active selection target leaked into start candidates: %+v", prompt.StartCandidateDefinitionVersionIDs)
+	}
+
+	commandID := uuid.NewString()
+	store.command = ConversationCommand{
+		ID: commandID, ProjectID: projectID, ConversationID: conversationID, ProposalID: generated.Proposal.ID,
+		Kind: IntentWorkbenchInstruction, Status: CommandPending, Version: 1, ETag: CommandETag(commandID, 1),
+		Payload: CommandPayload{
+			DefinitionVersionID: target.DefinitionVersionID, Scope: generated.Proposal.Scope,
+			SourceRefs: generated.Proposal.SourceRefs, ManifestIntent: generated.Proposal.ManifestIntent,
+			Workbench: generated.Proposal.WorkbenchInstruction,
+		},
+		AcceptedBy: actorID,
+	}
+	accepted, command, err := service.DecideProposal(
+		context.Background(), projectID, conversationID, generated.Proposal.ID, actorID, generated.Proposal.ETag,
+		DecideProposalInput{Decision: DecisionAccept},
+	)
+	if err != nil || command == nil || accepted.Status != ProposalAccepted || command.Kind != IntentWorkbenchInstruction {
+		t.Fatalf("accept active selection Workbench target: proposal=%+v command=%+v err=%v", accepted, command, err)
+	}
+	executed, err := service.ExecuteCommand(
+		context.Background(), projectID, conversationID, command.ID, actorID, command.ETag,
+		ExecuteCommandInput{WorkbenchResult: &WorkbenchExecutionResult{
+			RunID: target.RunID, BundleID: target.ActiveBundleID, ImplementationProposalID: uuid.NewString(),
+		}},
+	)
+	if err != nil || executed.Status != CommandExecuted || store.atomicWorkbenchCalls != 1 {
+		t.Fatalf("execute active selection Workbench target: command=%+v atomic=%d err=%v", executed, store.atomicWorkbenchCalls, err)
+	}
+	if starts := service.workflow.(*conversationRuntimeStub).starts.Load(); starts != 0 {
+		t.Fatalf("Workbench continuation incorrectly started a new workflow %d times", starts)
+	}
+
+	selectionStartOutput, _ := platformdomain.CanonicalJSON(map[string]any{
+		"assistantContent": "Start the selection definition incorrectly.",
+		"kind":             IntentStartWorkflow, "suggestedDefinitionVersionId": target.DefinitionVersionID,
+		"scope": map[string]any{},
+		"workbenchInstruction": map[string]any{
+			"objective": "Start selection", "constraints": []string{},
+		},
+	})
+	provider.result.Output = selectionStartOutput
+	if _, err := service.GenerateIntentProposal(context.Background(), projectID, conversationID, actorID, GenerateIntentProposalInput{
+		TriggerMessageID: input.TriggerMessageID, CandidateDefinitionVersionIDs: []string{input.SuggestedDefinitionVersionID},
+		SourceRefs: input.SourceRefs, ManifestIntent: input.ManifestIntent,
+	}); !errors.Is(err, ai.ErrInvalidOutput) {
+		t.Fatalf("selection target was accepted as a start candidate: %v", err)
+	}
+
+	hallucinated := target
+	hallucinated.RunID = uuid.NewString()
+	hallucinatedOutput, _ := platformdomain.CanonicalJSON(map[string]any{
+		"assistantContent": "Continue an invented run.",
+		"kind":             IntentWorkbenchInstruction, "suggestedDefinitionVersionId": target.DefinitionVersionID,
+		"scope": map[string]any{},
+		"workbenchInstruction": map[string]any{
+			"objective": "Continue", "constraints": []string{},
+			"expectedRunId": hallucinated.RunID, "expectedBundleId": target.RootBundleID,
+		},
+	})
+	provider.result.Output = hallucinatedOutput
+	if _, err := service.GenerateIntentProposal(context.Background(), projectID, conversationID, actorID, GenerateIntentProposalInput{
+		TriggerMessageID: input.TriggerMessageID, CandidateDefinitionVersionIDs: []string{input.SuggestedDefinitionVersionID},
+		SourceRefs: input.SourceRefs, ManifestIntent: input.ManifestIntent,
+	}); !errors.Is(err, ai.ErrInvalidOutput) {
+		t.Fatalf("hallucinated workbench target error = %v", err)
+	}
 }
 
 func TestCommandCannotExecuteWithoutAcceptedProposal(t *testing.T) {
@@ -356,8 +551,9 @@ func TestConcurrentCommandExecutionStartsExactlyOneDeterministicRun(t *testing.T
 func TestWorkbenchInstructionCompletesOnlyThroughExactResultProtocol(t *testing.T) {
 	command := conversationCommandFixture()
 	command.Kind = IntentWorkbenchInstruction
-	runID, bundleID := uuid.NewString(), uuid.NewString()
+	runID, bundleID, implementationProposalID := uuid.NewString(), uuid.NewString(), uuid.NewString()
 	command.Payload.Workbench.ExpectedRunID = runID
+	command.Payload.Workbench.ExpectedBundleID = bundleID
 	store := &conversationStoreStub{command: command, proposalAccepted: true}
 	runtimeStub := &conversationRuntimeStub{}
 	service, err := newService(store, &conversationAccessStub{}, runtimeStub, conversationManifestStub{}, conversationProviderStub{})
@@ -365,13 +561,19 @@ func TestWorkbenchInstructionCompletesOnlyThroughExactResultProtocol(t *testing.
 		t.Fatal(err)
 	}
 	result, err := service.ExecuteCommand(context.Background(), command.ProjectID, command.ConversationID, command.ID, uuid.NewString(), command.ETag, ExecuteCommandInput{
-		WorkbenchResult: &WorkbenchExecutionResult{RunID: runID, BundleID: bundleID},
+		WorkbenchResult: &WorkbenchExecutionResult{RunID: runID, BundleID: bundleID, ImplementationProposalID: implementationProposalID},
 	})
-	if err != nil || result.Status != CommandExecuted || !bytes.Contains(result.Result, []byte(runID)) || !bytes.Contains(result.Result, []byte(bundleID)) {
+	if err != nil || result.Status != CommandExecuted || !bytes.Contains(result.Result, []byte(runID)) ||
+		!bytes.Contains(result.Result, []byte(bundleID)) || !bytes.Contains(result.Result, []byte(implementationProposalID)) {
 		t.Fatalf("workbench result was not linked: result=%+v err=%v", result, err)
 	}
 	if runtimeStub.starts.Load() != 0 {
 		t.Fatal("workbench callback incorrectly started a new workflow")
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if store.atomicWorkbenchCalls != 1 || store.claimCalls != 0 {
+		t.Fatalf("workbench completion was not atomic: atomic=%d ordinaryClaims=%d", store.atomicWorkbenchCalls, store.claimCalls)
 	}
 }
 
@@ -396,9 +598,60 @@ func TestNormalizeProposalRequiresExactImmutableInputs(t *testing.T) {
 		t.Fatal("non-object workflow scope was accepted")
 	}
 	invalid = valid
+	invalid.Scope = json.RawMessage(`{"conversationIntent":{"proposalId":"client-selected"}}`)
+	if _, err := normalizeProposalInput(invalid); err == nil {
+		t.Fatal("client-supplied conversationIntent identities were accepted")
+	}
+	invalid = valid
 	invalid.Kind = IntentWorkbenchInstruction
 	if _, err := normalizeProposalInput(invalid); err == nil {
 		t.Fatal("workbench instruction without an exact existing run was accepted")
+	}
+}
+
+func TestReviewedConversationIntentScopeUsesOnlyServerMintedExactIdentities(t *testing.T) {
+	input := proposalInputFixture()
+	normalized, err := normalizeProposalInput(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conversationID, triggerID := uuid.New(), uuid.MustParse(input.TriggerMessageID)
+	proposalID, assistantID := uuid.New(), uuid.New()
+	scope, err := reviewedConversationIntentScope(normalized.Scope, conversationID, triggerID, proposalID, assistantID, normalized)
+	if err != nil {
+		t.Fatal(err)
+	}
+	canonical, err := platformdomain.CanonicalJSON(json.RawMessage(scope))
+	if err != nil || !bytes.Equal(scope, canonical) {
+		t.Fatalf("reviewed scope is not canonical: %s err=%v", scope, err)
+	}
+	var envelope struct {
+		Slice              string                     `json:"slice"`
+		ConversationIntent ReviewedConversationIntent `json:"conversationIntent"`
+	}
+	if err := json.Unmarshal(scope, &envelope); err != nil {
+		t.Fatal(err)
+	}
+	intent := envelope.ConversationIntent
+	if envelope.Slice != "all" || intent.ConversationID != conversationID.String() || intent.TriggerMessageID != triggerID.String() ||
+		intent.ProposalID != proposalID.String() || intent.AssistantMessageID != assistantID.String() || intent.Kind != input.Kind ||
+		intent.DefinitionVersionID != input.SuggestedDefinitionVersionID || intent.ManifestIntent.InputManifest != input.ManifestIntent.InputManifest ||
+		len(intent.SourceRefs) != 1 || !intent.SourceRefs[0].Equal(input.SourceRefs[0]) || intent.WorkbenchInstruction.Objective != input.WorkbenchInstruction.Objective {
+		t.Fatalf("reviewed scope lost exact server/source identities: %+v", intent)
+	}
+
+	sources, _ := platformdomain.CanonicalJSON(input.SourceRefs)
+	manifest, _ := platformdomain.CanonicalJSON(input.ManifestIntent)
+	instruction, _ := platformdomain.CanonicalJSON(input.WorkbenchInstruction)
+	payload, err := commandPayloadFromProposal(storage.WorkflowIntentProposalModel{
+		SuggestedDefinitionVersionID: uuid.MustParse(input.SuggestedDefinitionVersionID),
+		Scope:                        scope, SourceRefs: sources, ManifestIntent: manifest, WorkbenchInstruction: instruction,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(payload.Scope, scope) {
+		t.Fatalf("accepted command did not retain the exact reviewed canonical scope: proposal=%s command=%s", scope, payload.Scope)
 	}
 }
 
@@ -427,7 +680,7 @@ func proposalInputWithManifest(t *testing.T, projectID, actorID string) (CreateI
 	t.Helper()
 	input := proposalInputFixture()
 	manifest, err := platformdomain.NewInputManifest(
-		input.ManifestIntent.InputManifest.ID, projectID, "conversation_intent", "", nil,
+		input.ManifestIntent.InputManifest.ID, projectID, "conversation.workflow_intent", "", nil,
 		[]platformdomain.ManifestSource{{Ref: input.SourceRefs[0], Purpose: "requirements to application"}},
 		json.RawMessage(`{}`), "1", actorID, time.Now().UTC(),
 	)

@@ -440,6 +440,14 @@ func (s *QualityService) persistReport(ctx context.Context, report *QualityRepor
 		ChangeSummary: "Evaluate frozen workspace revision " + report.WorkspaceRevision.RevisionID,
 		CreatedBy:     actorID, CreatedAt: *report.CompletedAt, ApprovedAt: report.CompletedAt,
 	}
+	var buildArtifactID *uuid.UUID
+	if report.BuildArtifact != nil {
+		parsed, err := uuid.Parse(report.BuildArtifact.ID)
+		if err != nil {
+			return conflict("quality build artifact id is invalid")
+		}
+		buildArtifactID = &parsed
+	}
 	draftID := uuid.New()
 	draft := storage.ArtifactDraftModel{
 		ID: draftID, ArtifactID: reportArtifactID, BaseRevisionID: &reportRevisionID,
@@ -458,8 +466,7 @@ func (s *QualityService) persistReport(ctx context.Context, report *QualityRepor
 		StartedAt: report.StartedAt, CompletedAt: report.CompletedAt, CreatedAt: report.StartedAt,
 	}
 	if report.BuildArtifact != nil {
-		buildArtifactID, _ := uuid.Parse(report.BuildArtifact.ID)
-		run.BuildArtifactID = &buildArtifactID
+		run.BuildArtifactID = buildArtifactID
 		run.BuildContentRef = &report.BuildArtifact.ContentRef
 		run.BuildContentHash = &report.BuildArtifact.ContentHash
 		run.BuildHash = &report.BuildArtifact.BuildHash
@@ -498,6 +505,21 @@ func (s *QualityService) persistReport(ctx context.Context, report *QualityRepor
 		if err := transaction.Create(&draft).Error; err != nil {
 			return err
 		}
+		if _, err := core.PersistSystemRevisionLineage(
+			transaction,
+			projectID,
+			reportArtifactID,
+			reportRevisionID,
+			draftID,
+			actorID,
+			*report.CompletedAt,
+			[]core.SystemRevisionSource{{
+				Ref: report.WorkspaceRevision, Purpose: "quality_workspace",
+				Required: true, Relation: "verified_by",
+			}},
+		); err != nil {
+			return err
+		}
 		if err := transaction.Model(&storage.ArtifactModel{}).Where("id = ?", reportArtifactID).Updates(map[string]any{
 			"latest_draft_id": draftID, "latest_revision_id": reportRevisionID, "latest_approved_revision_id": reportRevisionID,
 		}).Error; err != nil {
@@ -510,16 +532,6 @@ func (s *QualityService) persistReport(ctx context.Context, report *QualityRepor
 			if err := transaction.Create(&diagnosticModels).Error; err != nil {
 				return err
 			}
-		}
-		targetRevisionID := reportRevisionID
-		if err := transaction.Create(&storage.ArtifactDependencyModel{
-			ID: uuid.New(), ProjectID: projectID,
-			SourceArtifactID: workspaceArtifactID, SourceRevisionID: workspaceRevisionID,
-			SourceContentHash: report.WorkspaceRevision.ContentHash,
-			TargetArtifactID:  reportArtifactID, TargetRevisionID: &targetRevisionID,
-			Relation: "verified_by", Required: true, CreatedBy: actorID, CreatedAt: *report.CompletedAt,
-		}).Error; err != nil {
-			return err
 		}
 		deliveryStatus := "complete"
 		blockingCount := 0

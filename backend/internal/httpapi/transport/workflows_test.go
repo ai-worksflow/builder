@@ -28,6 +28,7 @@ type fakeWorkflowAPI struct {
 	actorID      string
 	projectID    string
 	start        runtime.StartRequest
+	startErr     error
 	approveErr   error
 	executeNode  string
 	executeActor string
@@ -54,6 +55,9 @@ func (f *fakeWorkflowAPI) Start(_ context.Context, projectID, actorID string, re
 	f.projectID = projectID
 	f.actorID = actorID
 	f.start = request
+	if f.startErr != nil {
+		return nil, f.startErr
+	}
 	if f.run == nil {
 		f.run = &runtime.RunRecord{ID: uuid.NewString(), ProjectID: projectID, DefinitionVersionID: request.DefinitionVersionID, Status: runtime.RunRunning, EventCursor: 1, Nodes: map[string]*runtime.NodeRecord{}}
 	}
@@ -91,7 +95,6 @@ func (f *fakeWorkflowAPI) Waive(context.Context, string, string, string, string,
 
 func workflowRouterForTest(t *testing.T, api WorkflowAPI, userID string) *gin.Engine {
 	t.Helper()
-	gin.SetMode(gin.TestMode)
 	router := gin.New()
 	security := config.SecurityConfig{Session: config.SessionSecurityConfig{CookieName: "session"}}
 	group := router.Group("/v1", worksmiddleware.RequireAuthentication(workflowAuthenticator{userID: userID}, security))
@@ -132,6 +135,24 @@ func TestWorkflowStartHandlerUsesAuthenticatedActorAndStrictPins(t *testing.T) {
 	bad := workflowRequest(router, http.MethodPost, "/v1/projects/"+projectID+"/workflow-runs", `{"definitionVersionId":"x","inputManifest":{"id":"x","hash":"x"},"unknown":true}`)
 	if bad.Code != http.StatusBadRequest {
 		t.Fatalf("unknown field status=%d", bad.Code)
+	}
+}
+
+func TestWorkflowDirectStartRejectsManifestDefinitionContractMismatch(t *testing.T) {
+	projectID, userID := uuid.NewString(), uuid.NewString()
+	api := &fakeWorkflowAPI{startErr: &domain.DomainError{
+		Kind: domain.ErrInvalidArgument, Field: "inputManifest.jobType",
+		Message: "the input manifest job type is incompatible with the selected workflow definition",
+	}}
+	router := workflowRouterForTest(t, api, userID)
+	hash, _ := domain.CanonicalHash(map[string]any{"manifest": true})
+	body := `{"definitionVersionId":"` + uuid.NewString() + `","inputManifest":{"id":"` + uuid.NewString() + `","hash":"` + hash + `"}}`
+	response := workflowRequest(router, http.MethodPost, "/v1/projects/"+projectID+"/workflow-runs", body)
+	if response.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("mismatched direct start status=%d body=%s", response.Code, response.Body.String())
+	}
+	if api.start.InputManifest.ID == "" {
+		t.Fatal("direct start request did not reach the authoritative facade boundary")
 	}
 }
 

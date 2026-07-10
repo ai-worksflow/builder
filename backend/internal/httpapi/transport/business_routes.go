@@ -69,6 +69,11 @@ func (s *Server) RegisterBusinessRoutes(group *gin.RouterGroup, persistence ...g
 	group.GET("/projects/:projectId/trace", s.ListTraceLinks)
 	command(http.MethodPost, "/projects/:projectId/trace", s.CreateTraceLink)
 	group.GET("/projects/:projectId/trace-matrix", s.GetTraceMatrix)
+	group.GET("/projects/:projectId/document-graph", s.GetDocumentGraph)
+	group.GET("/artifacts/:artifactId/member-bindings", s.GetDocumentMemberBindings)
+	conditionalCommand(http.MethodPut, "/artifacts/:artifactId/member-bindings", s.ReplaceDocumentMemberBindings)
+	command(http.MethodPost, "/projects/:projectId/documents/generate-downstream", s.GenerateDownstreamDocument)
+	command(http.MethodPost, "/projects/:projectId/documents/sync-back", s.CreateDocumentSyncBackProposal)
 	group.GET("/artifacts/:artifactId/dependencies", s.ListArtifactDependencies)
 	command(http.MethodPost, "/artifacts/:artifactId/dependencies", s.CreateArtifactDependency)
 	command(http.MethodPost, "/projects/:projectId/dependencies", s.CreateProjectDependency)
@@ -99,6 +104,7 @@ func (s *Server) RegisterBusinessRoutes(group *gin.RouterGroup, persistence ...g
 
 	command(http.MethodPost, "/projects/:projectId/input-manifests", s.CreateInputManifest)
 	command(http.MethodPost, "/projects/:projectId/manifests", s.CreateInputManifest)
+	conditionalCommand(http.MethodPost, "/projects/:projectId/blueprint-selections/compile", s.CompileBlueprintSelection)
 	group.GET("/input-manifests/:manifestId", s.GetInputManifest)
 	group.GET("/manifests/:manifestId", s.GetInputManifest)
 
@@ -117,6 +123,8 @@ func (s *Server) RegisterBusinessRoutes(group *gin.RouterGroup, persistence ...g
 	command(http.MethodPost, "/projects/:projectId/build-manifests", s.CreateWorkbenchBundle)
 	group.GET("/workbench-bundles/:bundleId", s.GetWorkbenchBundle)
 	group.GET("/build-manifests/:bundleId", s.GetWorkbenchBundle)
+	group.GET("/build-manifests/:bundleId/lineage-state", s.GetWorkbenchLineageState)
+	command(http.MethodPost, "/build-manifests/:bundleId/rebase", s.RebaseWorkbenchBundle)
 
 	command(http.MethodPost, "/projects/:projectId/implementation-proposals", s.CreateImplementationProposal)
 	group.GET("/implementation-proposals/:implementationProposalId", s.GetImplementationProposal)

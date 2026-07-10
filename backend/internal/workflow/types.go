@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -365,6 +366,7 @@ type Store interface {
 	ListDefinitions(context.Context, string) ([]DefinitionRecord, error)
 	ListDefinitionVersions(context.Context, string) ([]DefinitionRecord, error)
 	PublishDefinitionVersion(context.Context, string, string, string, string) (DefinitionRecord, error)
+	UnpublishDefinitionVersion(context.Context, string, string, string, string) (DefinitionRecord, error)
 
 	SaveManifest(context.Context, domain.InputManifest) error
 	GetManifest(context.Context, string) (domain.InputManifest, error)
@@ -401,6 +403,7 @@ type Execution struct {
 	Run        RunRecord
 	Node       NodeRecord
 	Definition domain.NodeDefinition
+	Workflow   domain.WorkflowDefinition
 	Lease      Lease
 	Inputs     domain.NodeInputEnvelope
 }
@@ -487,15 +490,16 @@ type WorkerResult struct {
 }
 
 type BuildManifest struct {
-	SchemaVersion int                  `json:"schemaVersion"`
-	ProjectID     string               `json:"projectId"`
-	RunID         string               `json:"runId"`
-	SliceIDs      []string             `json:"sliceIds"`
-	BundleIDs     []string             `json:"bundleIds,omitempty"`
-	Sources       []domain.ArtifactRef `json:"sources"`
-	Constraints   json.RawMessage      `json:"constraints"`
-	CreatedAt     time.Time            `json:"createdAt"`
-	Hash          string               `json:"hash"`
+	SchemaVersion    int                  `json:"schemaVersion"`
+	ProjectID        string               `json:"projectId"`
+	RunID            string               `json:"runId"`
+	ManifestGroupKey string               `json:"manifestGroupKey,omitempty"`
+	SliceIDs         []string             `json:"sliceIds"`
+	BundleIDs        []string             `json:"bundleIds,omitempty"`
+	Sources          []domain.ArtifactRef `json:"sources"`
+	Constraints      json.RawMessage      `json:"constraints"`
+	CreatedAt        time.Time            `json:"createdAt"`
+	Hash             string               `json:"hash"`
 }
 
 func buildManifestFromExecution(execution Execution) (BuildManifest, error) {
@@ -522,7 +526,7 @@ func buildManifestFromExecution(execution Execution) (BuildManifest, error) {
 // the current node and their exact predecessor input snapshots. It deliberately
 // does not inspect Run.Context.Values or unrelated nodes, so parallel workflow
 // branches cannot leak a different build manifest into quality or publish.
-func buildManifestFromInputLineage(execution Execution) (BuildManifest, error) {
+func buildManifestsFromInputLineage(execution Execution) ([]BuildManifest, error) {
 	manifests := make(map[string]BuildManifest)
 	visitedNodes := make(map[string]bool)
 	var visit func(domain.NodeInputEnvelope) error
@@ -569,19 +573,36 @@ func buildManifestFromInputLineage(execution Execution) (BuildManifest, error) {
 		return nil
 	}
 	if err := visit(execution.Inputs); err != nil {
+		return nil, err
+	}
+	if len(manifests) == 0 {
+		return nil, fmt.Errorf("incoming build manifest is unavailable")
+	}
+	hashes := make([]string, 0, len(manifests))
+	for hash := range manifests {
+		hashes = append(hashes, hash)
+	}
+	sort.Strings(hashes)
+	result := make([]BuildManifest, 0, len(hashes))
+	for _, hash := range hashes {
+		result = append(result, manifests[hash])
+	}
+	return result, nil
+}
+
+func buildManifestFromInputLineage(execution Execution) (BuildManifest, error) {
+	manifests, err := buildManifestsFromInputLineage(execution)
+	if err != nil {
 		return BuildManifest{}, err
 	}
 	if len(manifests) != 1 {
 		return BuildManifest{}, fmt.Errorf("quality requires exactly one incoming frozen application build manifest, got %d", len(manifests))
 	}
-	for _, manifest := range manifests {
-		return manifest, nil
-	}
-	return BuildManifest{}, fmt.Errorf("incoming build manifest is unavailable")
+	return manifests[0], nil
 }
 
 func (m *BuildManifest) Freeze() error {
-	if err := m.validateFields(); err != nil {
+	if err := m.validateFields(true); err != nil {
 		return err
 	}
 	if len(m.Constraints) == 0 {
@@ -601,7 +622,7 @@ func (m *BuildManifest) Freeze() error {
 }
 
 func (m BuildManifest) Validate() error {
-	if err := m.validateFields(); err != nil {
+	if err := m.validateFields(false); err != nil {
 		return err
 	}
 	copyManifest := m
@@ -617,9 +638,17 @@ func (m BuildManifest) Validate() error {
 	return nil
 }
 
-func (m BuildManifest) validateFields() error {
+func (m BuildManifest) validateFields(requireManifestGroup bool) error {
 	if m.SchemaVersion < 1 || strings.TrimSpace(m.ProjectID) == "" || strings.TrimSpace(m.RunID) == "" {
 		return fmt.Errorf("build manifest schemaVersion, projectId and runId are required")
+	}
+	manifestGroupKey := strings.TrimSpace(m.ManifestGroupKey)
+	if manifestGroupKey == "" {
+		if requireManifestGroup {
+			return fmt.Errorf("build manifest manifestGroupKey is required")
+		}
+	} else if parsed, err := uuid.Parse(manifestGroupKey); err != nil || parsed.String() != manifestGroupKey {
+		return fmt.Errorf("build manifest manifestGroupKey must be a canonical workflow node run UUID")
 	}
 	if len(m.SliceIDs) == 0 || len(m.BundleIDs) == 0 || len(m.SliceIDs) != len(m.BundleIDs) {
 		return fmt.Errorf("build manifest requires one bundle per delivery slice")
@@ -657,6 +686,37 @@ type ManifestFreezer interface {
 
 type ArtifactInputValidator interface {
 	Validate(context.Context, Execution, domain.InputManifest) (json.RawMessage, error)
+}
+
+// StartArtifactKindResolver resolves persisted artifact metadata before a run
+// is written. It shares the entry resolver's semantic source filtering (for
+// example Blueprint-selection roots) and never trusts client JSON.
+type StartArtifactKindResolver interface {
+	ResolveStartArtifactKinds(context.Context, domain.InputManifest) ([]string, error)
+}
+
+// HumanEditValidation is the server-resolved identity of a submitted human
+// edit. ArtifactKind comes from the persisted artifact row, never from node
+// output JSON or the broad workflow ArtifactType category.
+type HumanEditValidation struct {
+	ArtifactRefs []domain.ArtifactRef
+	Primary      domain.ArtifactRef
+	ArtifactKind string
+}
+
+type HumanEditOutputValidator interface {
+	ValidateHumanEdit(context.Context, Execution, json.RawMessage, string) (HumanEditValidation, error)
+}
+
+type HumanEditOutputValidatorFunc func(context.Context, Execution, json.RawMessage, string) (HumanEditValidation, error)
+
+func (f HumanEditOutputValidatorFunc) ValidateHumanEdit(
+	ctx context.Context,
+	execution Execution,
+	output json.RawMessage,
+	actorID string,
+) (HumanEditValidation, error) {
+	return f(ctx, execution, output, actorID)
 }
 
 type WorkbenchCompletionValidator interface {

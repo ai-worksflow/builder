@@ -150,66 +150,72 @@ func (l *RevisionLoader) LoadBuildManifest(ctx context.Context, projectID, actor
 	return bundle, nil
 }
 
-// ValidateWorkspaceManifestLineage proves the immutable server-side producer
-// relation. The client-provided pair is accepted only when the exact workspace
-// revision was created by an applied proposal for the selected build manifest.
-func (l *RevisionLoader) ValidateWorkspaceManifestLineage(
+// ResolveWorkspaceManifestLineage proves the immutable server-side producer
+// relation. The caller supplies any selector in the expected root lineage; the
+// returned ID is the exact consumed leaf manifest whose applied proposal
+// created the pinned workspace revision.
+func (l *RevisionLoader) ResolveWorkspaceManifestLineage(
 	ctx context.Context,
 	projectID, actorID string,
 	reference core.VersionRef,
-	manifestID string,
+	selectorManifestID string,
 	action core.Action,
-) error {
+) (string, error) {
 	if err := ValidateVersionRef(reference); err != nil {
-		return err
+		return "", err
 	}
 	if reference.AnchorID != nil {
-		return Invalid("workspaceRevision.anchorId", "publish provenance requires the whole workspace revision")
+		return "", Invalid("workspaceRevision.anchorId", "publish provenance requires the whole workspace revision")
 	}
 	if _, err := l.access.Authorize(ctx, projectID, actorID, action); err != nil {
-		return err
+		return "", err
 	}
 	projectUUID, err := uuid.Parse(projectID)
 	if err != nil {
-		return Invalid("projectId", "projectId must be a UUID")
+		return "", Invalid("projectId", "projectId must be a UUID")
 	}
 	artifactUUID, err := uuid.Parse(reference.ArtifactID)
 	if err != nil {
-		return Invalid("workspaceRevision.artifactId", "artifactId must be a UUID")
+		return "", Invalid("workspaceRevision.artifactId", "artifactId must be a UUID")
 	}
 	revisionUUID, err := uuid.Parse(reference.RevisionID)
 	if err != nil {
-		return Invalid("workspaceRevision.revisionId", "revisionId must be a UUID")
+		return "", Invalid("workspaceRevision.revisionId", "revisionId must be a UUID")
 	}
-	manifestUUID, err := uuid.Parse(strings.TrimSpace(manifestID))
+	selectorUUID, err := uuid.Parse(strings.TrimSpace(selectorManifestID))
 	if err != nil {
-		return Invalid("buildManifestId", "buildManifestId must be a UUID")
+		return "", Invalid("buildManifestId", "buildManifestId must be a UUID")
 	}
 	var lineage struct {
 		RevisionID uuid.UUID `gorm:"column:revision_id"`
+		ManifestID uuid.UUID `gorm:"column:manifest_id"`
 	}
 	query := l.database.WithContext(ctx).
 		Table("artifact_revisions AS workspace_revision").
-		Select("workspace_revision.id AS revision_id").
+		Select("workspace_revision.id AS revision_id, manifest.id AS manifest_id").
 		Joins("JOIN artifacts AS workspace_artifact ON workspace_artifact.id = workspace_revision.artifact_id").
 		Joins("JOIN implementation_proposals AS proposal ON proposal.id = workspace_revision.implementation_proposal_id").
 		Joins("JOIN application_build_manifests AS manifest ON manifest.id = proposal.build_manifest_id").
+		Joins("JOIN application_build_manifests AS selector ON selector.id = ?", selectorUUID).
 		Where("workspace_revision.id = ? AND workspace_revision.artifact_id = ? AND workspace_revision.content_hash = ?", revisionUUID, artifactUUID, reference.ContentHash).
 		Where("workspace_revision.workflow_status = 'approved'").
 		Where("workspace_artifact.project_id = ? AND workspace_artifact.kind = 'workspace'", projectUUID).
-		Where("proposal.project_id = ? AND proposal.build_manifest_id = ?", projectUUID, manifestUUID).
+		Where("proposal.project_id = ? AND proposal.build_manifest_id = manifest.id", projectUUID).
 		Where("proposal.status IN ? AND proposal.applied_at IS NOT NULL", []string{"applied", "partially_applied"}).
-		Where("manifest.id = ? AND manifest.project_id = ? AND manifest.status = 'consumed' AND manifest.invalidated_at IS NULL", manifestUUID, projectUUID)
+		Where("manifest.project_id = ? AND manifest.status = 'consumed' AND manifest.invalidated_at IS NULL", projectUUID).
+		Where("selector.project_id = ? AND selector.root_manifest_id = manifest.root_manifest_id", projectUUID).
+		Where("selector.workflow_run_id IS NOT DISTINCT FROM manifest.workflow_run_id").
+		Where("NOT EXISTS (SELECT 1 FROM application_build_manifests AS child WHERE child.derived_from_id = manifest.id)")
 	if err := query.Take(&lineage).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return conflict("workspaceRevision was not produced by the selected buildManifestId")
+			return "", conflict("workspaceRevision was not produced by the selected buildManifest lineage")
 		}
-		return wrapInternal("validate workspace build manifest lineage", err)
+		return "", wrapInternal("resolve workspace build manifest lineage", err)
 	}
-	if lineage.RevisionID != revisionUUID {
-		return conflict("workspaceRevision build manifest lineage is inconsistent")
+	if lineage.RevisionID != revisionUUID || lineage.ManifestID == uuid.Nil {
+		return "", conflict("workspaceRevision build manifest lineage is inconsistent")
 	}
-	return nil
+	return lineage.ManifestID.String(), nil
 }
 
 func decodeWorkspace(payload json.RawMessage) ([]WorkspaceFile, string, error) {

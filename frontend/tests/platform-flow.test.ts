@@ -5,9 +5,16 @@ import {
   resolveCandidateSelection,
   revisionCandidates,
   starterWorkflowDefinition as starterDefinition,
+  workflowRoleSatisfies,
 } from '../lib/platform/workflow-ui-contract'
+import {
+  highestPublishedWorkflowVersionIds,
+  projectBriefIntentCandidateVersionIds,
+  projectBriefEntryAction,
+} from '../lib/platform/workflow-entry'
 import { PlatformClient } from '../lib/platform/client'
 import type { FetchLike } from '../lib/platform/http'
+import type { WorkflowDefinitionRecordDto, WorkflowNodeDefinitionDto } from '../lib/platform/flow-contract'
 
 type TestCase = {
   readonly name: string
@@ -55,6 +62,13 @@ test('workflow definitions and immutable versions use the Go workflow routes', a
     title: 'Custom flow',
     name: 'Custom flow',
     schemaVersion: 'workflow/v2',
+    inputContract: {
+      capability: 'project_brief', manifestJobTypes: ['workflow_start'], artifactKinds: ['project_brief'],
+      requiredSourcePurposes: ['project_brief'], manifestSchemaContracts: { workflow_start: 'workflow-input/v1' },
+    },
+    outputContract: {
+      capability: 'application', producedArtifactKinds: ['workspace'], terminalOutcome: 'deployment', terminalNodeType: 'publish',
+    },
     nodes: [],
     edges: [],
   })
@@ -119,6 +133,101 @@ test('starting a run preserves the exact manifest id and hash', async () => {
   })
   assert.ok(calls[0].headers.get('idempotency-key'))
   assert.ok(calls[1].headers.get('idempotency-key'))
+})
+
+test('Blueprint selection compile is conditional, idempotent, and pins exact anchors server-side', async () => {
+  const calls: Array<{ path: string; headers: Headers; body: unknown }> = []
+  const client = flowClient((path, init) => {
+    calls.push({
+      path,
+      headers: new Headers(init?.headers),
+      body: typeof init?.body === 'string' ? JSON.parse(init.body) as unknown : undefined,
+    })
+    return json({
+      id: 'selection-1', projectId: 'project-1', jobType: 'blueprint.selection',
+      deliverySliceId: 'selection-hash', sources: [], constraints: {},
+      outputSchemaVersion: 'blueprint-selection/v1', createdBy: 'user-1',
+      createdAt: new Date(0).toISOString(), hash: 'a'.repeat(64),
+    }, 201)
+  })
+
+  await client.compileBlueprintSelection('project-1', {
+    blueprintRevision: {
+      artifactId: 'blueprint-1', revisionId: 'revision-7', revisionNumber: 7,
+      contentHash: 'b'.repeat(64),
+    },
+    nodeIds: ['page-orders', 'api-orders'],
+  }, '"artifact:blueprint-1:9"')
+
+  assert.equal(calls[0].path, '/v1/projects/project-1/blueprint-selections/compile')
+  assert.equal(calls[0].headers.get('if-match'), '"artifact:blueprint-1:9"')
+  assert.ok(calls[0].headers.get('idempotency-key'))
+  assert.deepEqual(calls[0].body, {
+    blueprintRevision: {
+      artifactId: 'blueprint-1', revisionId: 'revision-7', contentHash: 'b'.repeat(64),
+    },
+    nodeIds: ['page-orders', 'api-orders'],
+  })
+})
+
+test('Project Brief entry checkpoints newer drafts and fails closed for approved inputs', () => {
+  const approvedRevision = { id: 'brief-r1', contentHash: 'approved-hash' }
+  const latestRevision = { id: 'brief-r1', contentHash: 'approved-hash' }
+  const newerDraft = { contentHash: 'newer-draft-hash' }
+  assert.equal(projectBriefEntryAction({
+    requireApproved: false,
+    approvedRevision,
+    latestRevision,
+    draft: newerDraft,
+  }), 'checkpoint_draft')
+  assert.equal(projectBriefEntryAction({
+    requireApproved: true,
+    approvedRevision,
+    latestRevision,
+    draft: newerDraft,
+  }), 'blocked_unapproved_changes')
+  assert.equal(projectBriefEntryAction({
+    requireApproved: true,
+    approvedRevision,
+    latestRevision: { id: 'brief-r2', contentHash: 'unapproved-hash' },
+  }), 'blocked_unapproved_changes')
+  assert.equal(projectBriefEntryAction({
+    requireApproved: false,
+    approvedRevision,
+    latestRevision,
+    draft: { contentHash: approvedRevision.contentHash },
+  }), 'use_existing_revision')
+})
+
+test('conversation candidates include only the highest published version per definition', () => {
+  assert.deepEqual(highestPublishedWorkflowVersionIds([
+    { id: 'minimum', versionId: 'minimum-v1', version: 1, published: true },
+    { id: 'minimum', versionId: 'minimum-v2', version: 2, published: true },
+    { id: 'custom', versionId: 'custom-v1', version: 1, published: true },
+    { id: 'custom', versionId: 'custom-v2-draft', version: 2, published: false },
+  ]), ['minimum-v2', 'custom-v1'])
+})
+
+test('Project Brief intent candidates exclude Blueprint-selection-only workflows', () => {
+  const ordinary = workflowRecord({
+    id: 'ordinary', versionId: 'ordinary-v1', key: 'minimum-product-loop',
+    nodes: [{ id: 'input', name: 'Brief', type: 'artifact_input', artifactInput: { allowedTypes: ['document'], requireApproved: true, minimumArtifacts: 1 } }],
+  })
+  const selection = workflowRecord({
+    id: 'selection', versionId: 'selection-v1', key: 'blueprint-selection-app',
+    nodes: [
+      { id: 'input', name: 'Selection', type: 'artifact_input', artifactInput: { allowedTypes: ['blueprint'], requireApproved: true, minimumArtifacts: 1 } },
+      { id: 'pages', name: 'Pages', type: 'fan_out', fanOut: { itemsPath: '/blueprintPages', sliceKeyPath: '/key', mergeNodeId: 'merge', maxParallel: 4, itemKind: 'blueprint_selection_page' } },
+    ],
+  })
+  assert.deepEqual(projectBriefIntentCandidateVersionIds([selection, ordinary]), ['ordinary-v1'])
+})
+
+test('review role ranking does not treat admin as owner', () => {
+  assert.equal(workflowRoleSatisfies('owner', 'owner'), true)
+  assert.equal(workflowRoleSatisfies('admin', 'owner'), false)
+  assert.equal(workflowRoleSatisfies('admin', 'editor'), true)
+  assert.equal(workflowRoleSatisfies('editor', 'admin'), false)
 })
 
 test('human resume, privileged execution, and review commands target a project-scoped run', async () => {
@@ -218,13 +327,63 @@ test('build generation is pinned to a build manifest and has no browser fallback
   })
 })
 
+test('Workbench lineage hydration and exact workspace rebase use root-scoped routes', async () => {
+  const calls: Array<{ path: string; method: string; body: unknown }> = []
+  const client = flowClient((path, init) => {
+    calls.push({
+      path,
+      method: init?.method ?? 'GET',
+      body: typeof init?.body === 'string' ? JSON.parse(init.body) as unknown : undefined,
+    })
+    if (path.endsWith('/lineage-state')) {
+      return json({ rootBundleId: 'bundle-2', activeBundle: { id: 'bundle-2' }, lineage: [] })
+    }
+    return json({
+      id: 'bundle-2-w1',
+      rootBuildManifestId: 'bundle-2',
+      derivedFromBuildManifestId: 'bundle-2',
+      currentWorkspaceRevision: {
+        artifactId: 'workspace-1', revisionId: 'workspace-r1', contentHash: 'b'.repeat(64),
+      },
+    }, 201)
+  })
+
+  await client.getWorkbenchBundleLineageState('bundle-2')
+  await client.rebaseWorkbenchBundle('bundle-2', {
+    artifactId: 'workspace-1',
+    revisionId: 'workspace-r1',
+    revisionNumber: 1,
+    contentHash: 'b'.repeat(64),
+  })
+
+  assert.deepEqual(calls, [
+    {
+      path: '/v1/build-manifests/bundle-2/lineage-state',
+      method: 'GET',
+      body: undefined,
+    },
+    {
+      path: '/v1/build-manifests/bundle-2/rebase',
+      method: 'POST',
+      body: {
+        workspaceRevision: {
+          artifactId: 'workspace-1',
+          revisionId: 'workspace-r1',
+          contentHash: 'b'.repeat(64),
+        },
+      },
+    },
+  ])
+})
+
 test('new workflow definitions start as the complete executable product delivery loop', () => {
   const definition = starterDefinition()
-  assert.equal(definition.schemaVersion, '1')
-  assert.equal(definition.nodes.length, 18)
-  assert.equal(definition.edges.length, 17)
+  assert.equal(definition.schemaVersion, '2')
+  assert.equal(definition.nodes.length, 22)
+  assert.equal(definition.edges.length, 21)
   assert.deepEqual(definition.nodes.map((node) => node.type), [
     'artifact_input',
+    'ai_transform',
     'human_edit',
     'review_gate',
     'ai_transform',
@@ -237,14 +396,24 @@ test('new workflow definitions start as the complete executable product delivery
     'ai_transform',
     'human_edit',
     'review_gate',
+    'ai_transform',
+    'human_edit',
+    'review_gate',
     'merge',
     'manifest_compiler',
     'workbench_build',
     'quality_gate',
     'publish',
   ])
-  assert.deepEqual(definition.edges.at(0), { id: 'edge-01', from: 'source', to: 'project-brief-edit' })
-  assert.deepEqual(definition.edges.at(-1), { id: 'edge-17', from: 'quality', to: 'publish' })
+  assert.deepEqual(definition.edges.at(0), { id: 'edge-01', from: 'source', to: 'project-brief-ai' })
+  assert.deepEqual(definition.edges.at(-1), { id: 'edge-21', from: 'quality', to: 'publish' })
+  assert.deepEqual(definition.nodes.find((node) => node.id === 'pages')?.fanOut, {
+    itemsPath: '/blueprintPages', sliceKeyPath: '/key', mergeNodeId: 'pages-merged',
+    maxParallel: 4, itemKind: 'blueprint_page',
+  })
+  assert.equal(definition.nodes.find((node) => node.id === 'project-brief-ai')?.aiTransform?.jobType, 'refine_project_brief')
+  assert.equal(definition.nodes.find((node) => node.id === 'page-spec-ai')?.aiTransform?.jobType, 'generate_page_spec')
+  assert.equal(definition.nodes.find((node) => node.id === 'page-spec-edit')?.humanEdit?.artifactKind, 'page_spec')
   assert.equal(definition.nodes.find((node) => node.id === 'compile-manifest')?.manifestCompiler?.hook, 'application-build-manifest/v1')
   assert.ok(definition.nodes.every((node) => node.inputSchema?.type === 'object' && node.outputSchema?.type === 'object'))
   assert.ok(definition.edges.every((edge) => edge.fromPort === undefined && edge.toPort === undefined))
@@ -352,6 +521,71 @@ test('slice Human Edit candidates cannot cross into another delivery-slice propo
     artifactSnapshot({ prototypes: [prototypeA, prototypeB], proposals }) as never,
   )
   assert.deepEqual(resolution.candidates.map((candidate) => candidate.artifactId), ['prototype-a'])
+})
+
+test('Human Edit never offers a Proposal base revision as the edited result', () => {
+  const target = versionedResource('requirements-a', 'requirements-base-r1', 'Requirements A', { kind: 'requirement' })
+  Object.assign(target.artifact, { kind: 'product_requirements' })
+  const linkedProposal = proposal('proposal-a', 'payload-a', target.artifact.id, target.latestRevision)
+  delete (target.latestRevision as typeof target.latestRevision & { proposalId?: string }).proposalId
+  const node = {
+    id: 'requirements-node', runId: 'run-1', key: 'requirements-edit',
+    definitionNodeId: 'requirements-edit', type: 'human_edit', status: 'waiting_input', attempt: 1,
+  }
+  const definitionNode = {
+    id: 'requirements-edit', name: 'Edit requirements', type: 'human_edit',
+    humanEdit: { artifactType: 'document', artifactKind: 'product_requirements', requiredRole: 'editor' },
+  }
+  const run = workflowRun(node, [
+    lineageBinding([], { id: linkedProposal.id, payloadHash: linkedProposal.payloadHash }),
+  ])
+  const beforeRevision = revisionCandidates(
+    definitionNode as never,
+    node as never,
+    run as never,
+    artifactSnapshot({ documents: [target], proposals: [linkedProposal] }) as never,
+  )
+  assert.equal(beforeRevision.candidates.length, 0)
+  assert.match(beforeRevision.error ?? '', /Apply the linked Proposal.*create an immutable revision/i)
+
+  Object.assign(target.latestRevision, { proposalId: linkedProposal.id, changeSource: 'ai_proposal' })
+  const afterRevision = revisionCandidates(
+    definitionNode as never,
+    node as never,
+    run as never,
+    artifactSnapshot({ documents: [target], proposals: [linkedProposal] }) as never,
+  )
+  assert.deepEqual(afterRevision.candidates.map((candidate) => candidate.ref.revisionId), ['requirements-base-r1'])
+})
+
+test('PageSpec branch Human Edit selects the exact applied PageSpec revision', () => {
+  const pageSpec = versionedResource('page-a', 'page-a-r2', 'Page A specification', {
+    blueprintPageNodeId: 'page-node-a',
+    title: 'Page A',
+  })
+  Object.assign(pageSpec.artifact, { kind: 'page_spec' })
+  const linkedProposal = proposal('page-spec-proposal-a', 'page-spec-payload-a', pageSpec.artifact.id, pageSpec.latestRevision)
+  const node = {
+    id: 'page-spec-node-a', runId: 'run-1', key: 'page-spec-edit:slice-a',
+    definitionNodeId: 'page-spec-edit', sliceId: 'slice-a', type: 'human_edit',
+    status: 'waiting_input', attempt: 1,
+  }
+  const definitionNode = {
+    id: 'page-spec-edit', name: 'Edit PageSpec', type: 'human_edit',
+    humanEdit: { artifactType: 'blueprint', artifactKind: 'page_spec', requiredRole: 'editor' },
+  }
+  const run = workflowRun(node, [lineageBinding(
+    [],
+    { id: linkedProposal.id, payloadHash: linkedProposal.payloadHash },
+    [deliverySliceRef('slice-a', pageSpec.artifact.id, 'prototype-a')],
+  )])
+  const resolution = revisionCandidates(
+    definitionNode as never,
+    node as never,
+    run as never,
+    artifactSnapshot({ pageSpecs: [pageSpec], proposals: [linkedProposal] }) as never,
+  )
+  assert.deepEqual(resolution.candidates.map((candidate) => candidate.ref), [revisionRefFixture(pageSpec.latestRevision)])
 })
 
 test('Blueprint delivery slices include only PageSpecs pinned to the selected Blueprint revision', () => {
@@ -471,14 +705,20 @@ function revisionRefFixture(revision: { id: string; artifactId: string; revision
 }
 
 function proposal(id: string, payloadHash: string, artifactId: string, revision: { id: string; artifactId: string; revisionNumber: number; contentHash: string }) {
+  Object.assign(revision, { proposalId: id })
+  const baseRevision = {
+    ...revisionRefFixture(revision),
+    revisionId: `${revision.id}-base`,
+    contentHash: `sha256:${revision.id}-base`,
+  }
   return {
     id,
     projectId: 'project-1',
     artifactId,
     manifest: { id: `${id}-manifest`, hash: `${id}-manifest-hash` },
-    baseRevision: revisionRefFixture(revision),
+    baseRevision,
     payloadHash,
-    status: 'open',
+    status: 'applied',
     version: 1,
     operations: [],
     assumptions: [],
@@ -549,6 +789,22 @@ function artifactSnapshot(overrides: Record<string, unknown> = {}) {
     proposals: [],
     traces: [],
     ...overrides,
+  }
+}
+
+function workflowRecord(input: {
+  readonly id: string
+  readonly versionId: string
+  readonly key: string
+  readonly nodes: readonly WorkflowNodeDefinitionDto[]
+}): WorkflowDefinitionRecordDto {
+  return {
+    id: input.id, versionId: input.versionId, projectId: 'project-1', key: input.key,
+    title: input.key, published: true, version: 1, contentHash: 'sha256:definition',
+    definition: {
+      id: input.id, version: 1, name: input.key, schemaVersion: '1', nodes: input.nodes,
+      edges: [], hash: 'sha256:definition', createdBy: 'user-1', createdAt: new Date(0).toISOString(),
+    },
   }
 }
 

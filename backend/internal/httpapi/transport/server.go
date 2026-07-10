@@ -5,6 +5,7 @@ import (
 	"log/slog"
 
 	"github.com/worksflow/builder/backend/internal/auth"
+	documentcollaboration "github.com/worksflow/builder/backend/internal/collaboration"
 	"github.com/worksflow/builder/backend/internal/config"
 	"github.com/worksflow/builder/backend/internal/core"
 	"github.com/worksflow/builder/backend/internal/domain"
@@ -109,6 +110,8 @@ type ProposalService interface {
 type WorkbenchService interface {
 	CreateBundle(context.Context, string, string, core.CreateWorkbenchBundleInput) (core.WorkbenchBundle, error)
 	GetBundle(context.Context, string, string) (core.WorkbenchBundle, error)
+	GetLineageState(context.Context, string, string) (core.WorkbenchLineageState, error)
+	Rebase(context.Context, string, string, core.RebaseWorkbenchBundleInput) (core.WorkbenchBundle, error)
 }
 
 type ImplementationService interface {
@@ -131,6 +134,14 @@ type GenerationService interface {
 	GenerateImplementation(context.Context, string, string, string, string) (generation.ImplementationGenerationResult, error)
 }
 
+type DocumentCollaborationService interface {
+	GetMemberBindings(context.Context, string, string) (documentcollaboration.DocumentMemberBindingSet, error)
+	ReplaceMemberBindings(context.Context, string, string, string, []documentcollaboration.DocumentMemberBindingInput) (documentcollaboration.DocumentMemberBindingSet, error)
+	GetDocumentGraph(context.Context, string, string) (documentcollaboration.DocumentGraph, error)
+	GenerateDownstreamDocument(context.Context, string, string, documentcollaboration.GenerateDownstreamDocumentInput) (documentcollaboration.DownstreamDocumentGeneration, error)
+	CreateSyncBackProposal(context.Context, string, string, documentcollaboration.CreateSyncBackProposalInput) (documentcollaboration.SyncBackProposal, error)
+}
+
 type Services struct {
 	Auth           AuthService
 	Projects       ProjectService
@@ -147,6 +158,7 @@ type Services struct {
 	Implementation ImplementationService
 	Activity       ActivityService
 	Generation     GenerationService
+	Collaboration  DocumentCollaborationService
 }
 
 type Server struct {

@@ -1,4 +1,5 @@
 import type {
+  ArtifactKind,
   ArtifactRevisionDto,
   IsoDateTime,
   JsonObject,
@@ -20,6 +21,7 @@ export type WorkflowNodeType =
   | 'manifest_compiler'
   | 'workbench_build'
   | 'publish'
+  | 'transform'
 
 export type WorkflowArtifactType =
   | 'document'
@@ -35,8 +37,24 @@ export interface WorkflowPortDto {
 
 export interface WorkflowArtifactInputConfigDto {
   readonly allowedTypes: readonly WorkflowArtifactType[]
+  readonly allowedKinds?: readonly ArtifactKind[]
   readonly requireApproved: boolean
   readonly minimumArtifacts: number
+}
+
+export interface WorkflowInputContractDto {
+  readonly capability: 'project_brief' | 'blueprint_selection' | string
+  readonly manifestJobTypes: readonly string[]
+  readonly artifactKinds: readonly ArtifactKind[]
+  readonly requiredSourcePurposes: readonly string[]
+  readonly manifestSchemaContracts: Readonly<Record<string, string>>
+}
+
+export interface WorkflowOutputContractDto {
+  readonly capability: 'application' | string
+  readonly producedArtifactKinds: readonly ArtifactKind[]
+  readonly terminalOutcome: 'application' | 'deployment'
+  readonly terminalNodeType: WorkflowNodeType
 }
 
 export interface WorkflowAITransformConfigDto {
@@ -50,6 +68,7 @@ export interface WorkflowAITransformConfigDto {
 
 export interface WorkflowHumanEditConfigDto {
   readonly artifactType: WorkflowArtifactType
+  readonly artifactKind?: ArtifactKind
   readonly requiredRole: string
   readonly instructions?: string
 }
@@ -74,7 +93,7 @@ export interface WorkflowFanOutConfigDto {
   readonly sliceKeyPath: string
   readonly mergeNodeId: string
   readonly maxParallel: number
-  readonly itemKind?: 'generic' | 'delivery_slice'
+  readonly itemKind?: 'generic' | 'delivery_slice' | 'blueprint_page' | 'blueprint_selection_page'
 }
 
 export interface WorkflowMergeConfigDto {
@@ -128,6 +147,7 @@ export interface WorkflowNodeDefinitionDto {
   readonly manifestCompiler?: WorkflowManifestCompilerConfigDto
   readonly workbenchBuild?: WorkflowWorkbenchBuildConfigDto
   readonly publish?: WorkflowPublishConfigDto
+  readonly transform?: { readonly transform: string }
 }
 
 export interface WorkflowEdgeDto {
@@ -146,6 +166,10 @@ export interface WorkflowDefinitionDto {
   readonly schemaVersion: string
   readonly nodes: readonly WorkflowNodeDefinitionDto[]
   readonly edges: readonly WorkflowEdgeDto[]
+  /** Absent only on immutable historical versions created before contracts. */
+  readonly inputContract?: WorkflowInputContractDto
+  /** Absent only on immutable historical versions created before contracts. */
+  readonly outputContract?: WorkflowOutputContractDto
   readonly hash: string
   readonly createdBy: string
   readonly createdAt: IsoDateTime
@@ -172,6 +196,8 @@ export interface CreateWorkflowDefinitionInputDto {
   readonly schemaVersion?: string
   readonly nodes: readonly WorkflowNodeDefinitionDto[]
   readonly edges: readonly WorkflowEdgeDto[]
+  readonly inputContract: WorkflowInputContractDto
+  readonly outputContract: WorkflowOutputContractDto
 }
 
 export interface CreateWorkflowDefinitionVersionInputDto {
@@ -179,6 +205,34 @@ export interface CreateWorkflowDefinitionVersionInputDto {
   readonly schemaVersion?: string
   readonly nodes: readonly WorkflowNodeDefinitionDto[]
   readonly edges: readonly WorkflowEdgeDto[]
+  readonly inputContract: WorkflowInputContractDto
+  readonly outputContract: WorkflowOutputContractDto
+}
+
+export interface WorkflowAITransformCapabilityDto {
+  readonly jobType: string
+  readonly outputSchemaVersion: string
+  readonly modelPolicies: readonly string[]
+}
+
+export interface WorkflowManifestCompilerCapabilityDto {
+  readonly manifestKind: string
+  readonly schemaVersion: number
+  readonly hook: string
+}
+
+export interface WorkflowCapabilitiesDto {
+  readonly version: number
+  readonly nodeTypes: readonly WorkflowNodeType[]
+  readonly inputContracts: readonly WorkflowInputContractDto[]
+  readonly outputContracts: readonly WorkflowOutputContractDto[]
+  readonly aiTransforms: readonly WorkflowAITransformCapabilityDto[]
+  readonly manifestCompilers: readonly WorkflowManifestCompilerCapabilityDto[]
+  readonly transforms: readonly string[]
+  readonly fanOutItemKinds: readonly ('generic' | 'delivery_slice' | 'blueprint_page' | 'blueprint_selection_page')[]
+  readonly qualityGates: readonly string[]
+  readonly publishEnvironments: readonly string[]
+  readonly workbenchSchemaVersions: readonly number[]
 }
 
 export interface ExactArtifactRefDto {
@@ -220,6 +274,39 @@ export interface CreateInputManifestDto {
   readonly sources: readonly ManifestSourceDto[]
   readonly constraints: JsonObject
   readonly outputSchemaVersion: string
+}
+
+export interface BlueprintSelectionCompileInputDto {
+  readonly blueprintRevision: ExactArtifactRefDto
+  readonly nodeIds: readonly string[]
+}
+
+export interface BlueprintSelectionPageBindingDto {
+  readonly nodeId: string
+  readonly pageSpec?: ExactArtifactRefDto
+  readonly prototype?: ExactArtifactRefDto
+}
+
+export interface BlueprintSelectionScopeDto {
+  readonly schemaVersion: 1
+  readonly selectionId: string
+  readonly blueprint: ExactArtifactRefDto
+  readonly nodeIds: readonly string[]
+  readonly nodes: readonly {
+    readonly id: string
+    readonly key: string
+    readonly kind: string
+    readonly title: string
+    readonly requirementIds?: readonly string[]
+  }[]
+  readonly edges: readonly {
+    readonly id: string
+    readonly sourceNodeId: string
+    readonly targetNodeId: string
+    readonly kind: string
+    readonly required: boolean
+  }[]
+  readonly pageBindings: readonly BlueprintSelectionPageBindingDto[]
 }
 
 export type WorkflowRunStatus =
@@ -286,6 +373,7 @@ export interface WorkflowRunContextDto {
     readonly waived?: boolean
     readonly waiverReason?: string
     readonly selectedBranch?: string
+    readonly input?: JsonValue
     readonly output?: JsonValue
     readonly executionActor?: WorkflowActorProvenanceDto
     readonly reviewDecisionActor?: WorkflowActorProvenanceDto
@@ -367,6 +455,10 @@ export interface AssetRefDto {
 
 export interface WorkbenchBundleDto {
   readonly id: string
+  /** Stable manifest-order identity shared by every exact-workspace derivative. */
+  readonly rootBuildManifestId?: string
+  /** Immediate immutable manifest from which this exact-workspace bundle was derived. */
+  readonly derivedFromBuildManifestId?: string
   readonly projectId: string
   readonly workflowRunId?: string
   readonly deliverySliceId?: string
@@ -395,9 +487,29 @@ export interface WorkbenchBundleDto {
   readonly contentHash: string
 }
 
+export interface WorkbenchBundleLineageStateDto {
+  readonly rootBundleId: string
+  readonly activeBundle: WorkbenchBundleDto
+  readonly currentProposal?: ImplementationProposalDto
+  /** Project-wide latest applied workspace, shared by every root lineage state. */
+  readonly currentWorkspaceRevision?: ExactArtifactRefDto
+  readonly lineage: readonly {
+    readonly bundleId: string
+    readonly derivedFromBuildManifestId?: string
+    readonly workspaceRevision?: ExactArtifactRefDto
+    readonly status: string
+    readonly createdAt: IsoDateTime
+    readonly latestProposal?: {
+      readonly id: string
+      readonly status: ImplementationProposalDto['status']
+      readonly version: number
+      readonly createdAt: IsoDateTime
+    }
+  }[]
+}
+
 export interface CreateWorkbenchBundleInputDto {
   readonly prototypeRevision: ExactArtifactRefDto
-  readonly workflowRunId?: string
   readonly deliverySliceId?: string
   readonly allowStale?: boolean
   readonly overrideReason?: string

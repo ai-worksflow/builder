@@ -2,6 +2,7 @@ package workflow
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"regexp"
@@ -27,13 +28,16 @@ type PlatformDependencies struct {
 	}
 	Workbench           CoreWorkbenchAPI
 	ArtifactInputs      ArtifactInputValidator
+	HumanEditOutput     HumanEditOutputValidator
 	TargetArtifacts     TargetArtifactInitializer
 	RequirementBaseline RequirementBaselineCompiler
 	WorkbenchCompletion WorkbenchCompletionValidator
 	ReviewGate          ReviewGateVerifier
 	Access              PublishAuthorizer
 	FanOut              FanOutResolver
+	BlueprintPages      FanOutResolver
 	Quality             QualityEvaluator
+	QualityManifest     QualityManifestResolver
 	Publisher           Publisher
 	DefaultModel        string
 	BuildInstruction    string
@@ -44,7 +48,7 @@ type PlatformDependencies struct {
 // NewPlatformEngine exposes a single bootstrap seam without coupling app.go or
 // the HTTP router to concrete runner implementations.
 func NewPlatformEngine(dependencies PlatformDependencies) (*Engine, error) {
-	if dependencies.Store == nil || dependencies.CoreProposals == nil || dependencies.Generation == nil || dependencies.Workbench == nil || dependencies.ArtifactInputs == nil || dependencies.TargetArtifacts == nil || dependencies.WorkbenchCompletion == nil || dependencies.ReviewGate == nil || dependencies.Access == nil || dependencies.DefaultModel == "" {
+	if dependencies.Store == nil || dependencies.CoreProposals == nil || dependencies.Generation == nil || dependencies.Workbench == nil || dependencies.ArtifactInputs == nil || dependencies.HumanEditOutput == nil || dependencies.TargetArtifacts == nil || dependencies.WorkbenchCompletion == nil || dependencies.ReviewGate == nil || dependencies.Access == nil || dependencies.BlueprintPages == nil || dependencies.DefaultModel == "" {
 		return nil, fmt.Errorf("workflow store, artifact input/target, proposal, generation, workbench and access dependencies are required")
 	}
 	engine, err := NewEngine(dependencies.Store)
@@ -62,27 +66,89 @@ func NewPlatformEngine(dependencies PlatformDependencies) (*Engine, error) {
 		RequirementBaseline: dependencies.RequirementBaseline,
 	}
 	engine.ArtifactInputs = dependencies.ArtifactInputs
+	if resolver, ok := dependencies.ArtifactInputs.(StartArtifactKindResolver); ok {
+		engine.StartArtifactKinds = resolver
+	} else {
+		return nil, fmt.Errorf("platform artifact input validator must resolve exact start artifact kinds")
+	}
+	engine.HumanEditOutput = dependencies.HumanEditOutput
 	engine.WorkbenchCompletion = dependencies.WorkbenchCompletion
 	engine.ReviewGate = dependencies.ReviewGate
 	engine.ProposalDispatcher = GenerationProposalDispatcher{Generation: dependencies.Generation, DefaultModel: dependencies.DefaultModel}
-	engine.BuildManifestHook = CoreWorkbenchManifestHook{Workbench: dependencies.Workbench, Proposals: dependencies.CoreProposals, Now: engine.now}
+	manifestHook := CoreWorkbenchManifestHook{Workbench: dependencies.Workbench, Proposals: dependencies.CoreProposals, Now: engine.now}
+	engine.BuildManifestHook = manifestHook
+	engine.ManifestCompilers = NewBuildManifestRegistry()
+	if err := engine.ManifestCompilers.Register(ManifestCompilerCapability{
+		ManifestKind: "application_build", SchemaVersion: 1, Hook: "application-build-manifest/v1",
+	}, manifestHook); err != nil {
+		return nil, err
+	}
 	engine.ConditionEvaluator = DeclarativeConditionEvaluator{}
 	registry := NewMapRegistry()
-	_ = registry.Register(domain.NodeFanOut, FanOutRunner{Resolver: DefinitionFanOutResolver{DeliverySlices: dependencies.FanOut}})
-	_ = registry.Register(domain.NodeWorkbenchBuild, GenerationWorkbenchRunner{Generation: dependencies.Generation, DefaultModel: dependencies.DefaultModel, Instruction: dependencies.BuildInstruction})
+	_ = registry.Register(domain.NodeFanOut, FanOutRunner{Resolver: DefinitionFanOutResolver{
+		DeliverySlices: dependencies.FanOut,
+		BlueprintPages: dependencies.BlueprintPages,
+	}})
+	_ = registry.Register(domain.NodeTransform, RunnerFunc(func(_ context.Context, execution Execution) (WorkerResult, error) {
+		if execution.Definition.Transform == nil || execution.Definition.Transform.Transform != "selection_passthrough" {
+			return WorkerResult{}, fmt.Errorf("unsupported platform transform")
+		}
+		value, _, ok := execution.Inputs.FirstValue("default")
+		if !ok {
+			value = json.RawMessage(`{}`)
+		}
+		return WorkerResult{Disposition: ResultComplete, Output: append(json.RawMessage(nil), value...)}, nil
+	}))
+	_ = registry.Register(domain.NodeWorkbenchBuild, GenerationWorkbenchRunner{Generation: dependencies.Generation, Workbench: dependencies.Workbench, DefaultModel: dependencies.DefaultModel, Instruction: dependencies.BuildInstruction})
 	if dependencies.Quality != nil {
-		_ = registry.Register(domain.NodeQualityGate, QualityGateRunner{Evaluator: dependencies.Quality, Access: dependencies.Access})
+		if dependencies.QualityManifest == nil {
+			return nil, fmt.Errorf("workflow quality manifest resolver is required")
+		}
+		_ = registry.Register(domain.NodeQualityGate, QualityGateRunner{
+			Evaluator: dependencies.Quality, ManifestResolver: dependencies.QualityManifest, Access: dependencies.Access,
+		})
 	}
 	if dependencies.Publisher != nil {
 		_ = registry.Register(domain.NodePublish, PublishRunner{Publisher: dependencies.Publisher, Access: dependencies.Access})
 	}
 	engine.Runners = registry
+	engine.Capabilities = PlatformWorkflowCapabilities(dependencies.Quality != nil, dependencies.Publisher != nil)
 	return engine, nil
 }
 
 // CoreArtifactInputValidator enforces the declarative input gate against the
 // exact artifact revisions referenced by the run manifest.
 type CoreArtifactInputValidator struct{ Database *gorm.DB }
+
+func (v CoreArtifactInputValidator) ResolveStartArtifactKinds(ctx context.Context, manifest domain.InputManifest) ([]string, error) {
+	if v.Database == nil {
+		return nil, fmt.Errorf("artifact input database is required")
+	}
+	kinds := map[string]struct{}{}
+	for _, ref := range artifactInputRefs(manifest) {
+		var row struct {
+			Kind      string `gorm:"column:artifact_kind"`
+			ProjectID string `gorm:"column:artifact_project_id"`
+		}
+		if err := v.Database.WithContext(ctx).Table("artifact_revisions").
+			Select("artifacts.kind AS artifact_kind, artifacts.project_id::text AS artifact_project_id").
+			Joins("JOIN artifacts ON artifacts.id = artifact_revisions.artifact_id").
+			Where("artifact_revisions.id = ? AND artifact_revisions.artifact_id = ? AND artifact_revisions.content_hash = ?", ref.RevisionID, ref.ArtifactID, ref.ContentHash).
+			Take(&row).Error; err != nil {
+			return nil, err
+		}
+		if row.ProjectID != manifest.ProjectID {
+			return nil, fmt.Errorf("artifact input revision is outside the manifest project")
+		}
+		kinds[strings.TrimSpace(row.Kind)] = struct{}{}
+	}
+	resolved := make([]string, 0, len(kinds))
+	for kind := range kinds {
+		resolved = append(resolved, kind)
+	}
+	sort.Strings(resolved)
+	return resolved, nil
+}
 
 func (v CoreArtifactInputValidator) Validate(ctx context.Context, execution Execution, manifest domain.InputManifest) (json.RawMessage, error) {
 	if v.Database == nil || execution.Definition.ArtifactInput == nil {
@@ -134,9 +200,123 @@ func artifactInputRefs(manifest domain.InputManifest) []domain.ArtifactRef {
 		appendRef(*manifest.BaseRevision)
 	}
 	for _, source := range manifest.Sources {
+		if manifest.JobType == core.BlueprintSelectionJobType &&
+			source.Purpose != "blueprint_selection_root" && source.Purpose != "blueprint_selection_node" {
+			continue
+		}
 		appendRef(source.Ref)
 	}
 	return refs
+}
+
+type workflowBlueprintSelectionPageBinding struct {
+	NodeID    string              `json:"nodeId"`
+	PageSpec  *domain.ArtifactRef `json:"pageSpec,omitempty"`
+	Prototype *domain.ArtifactRef `json:"prototype,omitempty"`
+}
+
+type workflowBlueprintSelectionScope struct {
+	SchemaVersion int                                     `json:"schemaVersion"`
+	SelectionID   string                                  `json:"selectionId"`
+	Blueprint     domain.ArtifactRef                      `json:"blueprint"`
+	NodeIDs       []string                                `json:"nodeIds"`
+	PageBindings  []workflowBlueprintSelectionPageBinding `json:"pageBindings"`
+}
+
+func blueprintSelectionScope(manifest domain.InputManifest) (workflowBlueprintSelectionScope, bool, error) {
+	if manifest.JobType != core.BlueprintSelectionJobType {
+		return workflowBlueprintSelectionScope{}, false, nil
+	}
+	if err := manifest.Validate(); err != nil {
+		return workflowBlueprintSelectionScope{}, true, err
+	}
+	if manifest.OutputSchemaVersion != "blueprint-selection/v1" {
+		return workflowBlueprintSelectionScope{}, true, fmt.Errorf("Blueprint selection manifest schema is unsupported")
+	}
+	var constraints struct {
+		BlueprintSelection workflowBlueprintSelectionScope `json:"blueprintSelection"`
+	}
+	if err := json.Unmarshal(manifest.Constraints, &constraints); err != nil {
+		return workflowBlueprintSelectionScope{}, true, fmt.Errorf("decode Blueprint selection scope: %w", err)
+	}
+	scope := constraints.BlueprintSelection
+	if scope.SchemaVersion != 1 || strings.TrimSpace(scope.SelectionID) == "" ||
+		manifest.DeliverySliceID != scope.SelectionID || scope.Blueprint.Validate() != nil ||
+		scope.Blueprint.AnchorID != "" || len(scope.NodeIDs) == 0 {
+		return workflowBlueprintSelectionScope{}, true, fmt.Errorf("Blueprint selection scope identity is invalid")
+	}
+	rootCount := 0
+	nodeSources := map[string]bool{}
+	otherSources := map[string]bool{}
+	for _, source := range manifest.Sources {
+		key := exactWorkflowArtifactRefKey(source.Ref)
+		otherSources[key] = true
+		switch source.Purpose {
+		case "blueprint_selection_root":
+			if !source.Ref.Equal(scope.Blueprint) {
+				return workflowBlueprintSelectionScope{}, true, fmt.Errorf("Blueprint selection root source drifted")
+			}
+			rootCount++
+		case "blueprint_selection_node":
+			if source.Ref.ArtifactID != scope.Blueprint.ArtifactID ||
+				source.Ref.RevisionID != scope.Blueprint.RevisionID ||
+				source.Ref.ContentHash != scope.Blueprint.ContentHash || source.Ref.AnchorID == "" {
+				return workflowBlueprintSelectionScope{}, true, fmt.Errorf("Blueprint selection node source drifted")
+			}
+			nodeSources[source.Ref.AnchorID] = true
+		}
+	}
+	if rootCount != 1 || len(nodeSources) != len(scope.NodeIDs) {
+		return workflowBlueprintSelectionScope{}, true, fmt.Errorf("Blueprint selection sources do not match its node scope")
+	}
+	seenNodes := map[string]bool{}
+	for _, nodeID := range scope.NodeIDs {
+		if strings.TrimSpace(nodeID) == "" || seenNodes[nodeID] || !nodeSources[nodeID] {
+			return workflowBlueprintSelectionScope{}, true, fmt.Errorf("Blueprint selection node anchors are incomplete")
+		}
+		seenNodes[nodeID] = true
+	}
+	seenBindings := map[string]bool{}
+	for _, binding := range scope.PageBindings {
+		if !seenNodes[binding.NodeID] || seenBindings[binding.NodeID] {
+			return workflowBlueprintSelectionScope{}, true, fmt.Errorf("Blueprint selection page binding is outside the node scope")
+		}
+		seenBindings[binding.NodeID] = true
+		for _, ref := range []*domain.ArtifactRef{binding.PageSpec, binding.Prototype} {
+			if ref != nil && (ref.Validate() != nil || ref.AnchorID != "" || !otherSources[exactWorkflowArtifactRefKey(*ref)]) {
+				return workflowBlueprintSelectionScope{}, true, fmt.Errorf("Blueprint selection page binding is not frozen in manifest sources")
+			}
+		}
+		if binding.Prototype != nil && binding.PageSpec == nil {
+			return workflowBlueprintSelectionScope{}, true, fmt.Errorf("Blueprint selection Prototype has no PageSpec binding")
+		}
+	}
+	return scope, true, nil
+}
+
+func exactWorkflowArtifactRefKey(ref domain.ArtifactRef) string {
+	return ref.ArtifactID + "\x00" + ref.RevisionID + "\x00" + ref.ContentHash + "\x00" + ref.AnchorID
+}
+
+func loadRunBlueprintSelection(
+	ctx context.Context,
+	proposals CoreProposalAPI,
+	execution Execution,
+) (workflowBlueprintSelectionScope, bool, error) {
+	if execution.Run.InputManifest == nil {
+		return workflowBlueprintSelectionScope{}, false, nil
+	}
+	if proposals == nil {
+		return workflowBlueprintSelectionScope{}, false, nil
+	}
+	manifest, err := proposals.GetManifest(ctx, execution.Run.InputManifest.ID, execution.Run.StartedBy)
+	if err != nil {
+		return workflowBlueprintSelectionScope{}, false, err
+	}
+	if manifest.Ref() != *execution.Run.InputManifest || manifest.ProjectID != execution.Run.ProjectID {
+		return workflowBlueprintSelectionScope{}, false, fmt.Errorf("workflow run input manifest drifted")
+	}
+	return blueprintSelectionScope(manifest)
 }
 
 func validateArtifactInputRevision(
@@ -148,6 +328,18 @@ func validateArtifactInputRevision(
 	}
 	if config.RequireApproved && workflowStatus != "approved" {
 		return "", fmt.Errorf("artifact input revision is not approved")
+	}
+	if len(config.AllowedKinds) > 0 {
+		allowed := false
+		for _, candidate := range config.AllowedKinds {
+			if strings.TrimSpace(candidate) == kind {
+				allowed = true
+				break
+			}
+		}
+		if !allowed {
+			return "", fmt.Errorf("artifact kind %s is not allowed by the exact input contract", kind)
+		}
 	}
 	artifactType := workflowArtifactType(kind)
 	if len(config.AllowedTypes) > 0 {
@@ -176,6 +368,254 @@ func artifactInputOutput(
 			"manifestId": manifest.ID, "manifestHash": manifest.Hash, "artifacts": accepted,
 		},
 	})
+}
+
+type HumanEditArtifactAPI interface {
+	Get(context.Context, string, string, bool) (core.VersionedArtifact, error)
+	GetRevision(context.Context, string, string) (core.ArtifactRevision, error)
+}
+
+type HumanEditProposalAPI interface {
+	GetManifest(context.Context, string, string) (domain.InputManifest, error)
+	GetProposal(context.Context, string, string) (domain.OutputProposal, error)
+}
+
+// CoreHumanEditOutputValidator resolves every client-supplied revision against
+// the authoritative artifact/proposal stores. The engine consumes only this
+// result when updating slice lineage; broad ArtifactType values never decide
+// whether a ref is a PageSpec or Prototype.
+type CoreHumanEditOutputValidator struct {
+	Artifacts HumanEditArtifactAPI
+	Proposals HumanEditProposalAPI
+}
+
+func (v CoreHumanEditOutputValidator) ValidateHumanEdit(
+	ctx context.Context,
+	execution Execution,
+	output json.RawMessage,
+	actorID string,
+) (HumanEditValidation, error) {
+	if v.Artifacts == nil || execution.Definition.HumanEdit == nil {
+		return HumanEditValidation{}, fmt.Errorf("human edit artifact service and node config are required")
+	}
+	refs, primary, err := humanEditOutputRefs(output)
+	if err != nil {
+		return HumanEditValidation{}, err
+	}
+	expectedKind := strings.TrimSpace(execution.Definition.HumanEdit.ArtifactKind)
+	if expectedKind != "" && len(refs) != 1 {
+		return HumanEditValidation{}, humanEditValidationError("artifactRevisions", "exact-kind human edit nodes must submit exactly one artifact revision")
+	}
+	resolvedKind := ""
+	revisions := make(map[string]core.ArtifactRevision, len(refs))
+	for index, ref := range refs {
+		if ref.AnchorID != "" {
+			return HumanEditValidation{}, humanEditValidationError(
+				fmt.Sprintf("artifactRevisions[%d].anchorId", index),
+				"human edit output must pin a whole artifact revision",
+			)
+		}
+		artifact, err := v.Artifacts.Get(ctx, ref.ArtifactID, actorID, false)
+		if err != nil {
+			return HumanEditValidation{}, humanEditValidationError(fmt.Sprintf("artifactRevisions[%d].artifactId", index), "artifact is unavailable to this actor")
+		}
+		if artifact.Artifact.ID != ref.ArtifactID || artifact.Artifact.ProjectID != execution.Run.ProjectID {
+			return HumanEditValidation{}, humanEditValidationError(fmt.Sprintf("artifactRevisions[%d].artifactId", index), "artifact belongs to another project")
+		}
+		kind := artifact.Artifact.Kind
+		if expectedKind != "" {
+			if kind != expectedKind {
+				return HumanEditValidation{}, humanEditValidationError(fmt.Sprintf("artifactRevisions[%d]", index), fmt.Sprintf("artifact kind %q does not match required kind %q", kind, expectedKind))
+			}
+		} else if workflowArtifactType(kind) != execution.Definition.HumanEdit.ArtifactType {
+			return HumanEditValidation{}, humanEditValidationError(fmt.Sprintf("artifactRevisions[%d]", index), fmt.Sprintf("artifact kind %q does not match required artifact type", kind))
+		}
+		if resolvedKind == "" {
+			resolvedKind = kind
+		} else if resolvedKind != kind {
+			return HumanEditValidation{}, humanEditValidationError("artifactRevisions", "human edit output cannot mix exact artifact kinds")
+		}
+		revision, err := v.Artifacts.GetRevision(ctx, ref.RevisionID, actorID)
+		if err != nil {
+			return HumanEditValidation{}, humanEditValidationError(fmt.Sprintf("artifactRevisions[%d].revisionId", index), "artifact revision is unavailable to this actor")
+		}
+		if revision.ID != ref.RevisionID || revision.ArtifactID != ref.ArtifactID || revision.ContentHash != ref.ContentHash {
+			return HumanEditValidation{}, humanEditValidationError(fmt.Sprintf("artifactRevisions[%d]", index), "artifact revision id, artifact id, and content hash must match exactly")
+		}
+		revisions[ref.RevisionID] = revision
+	}
+	primaryRevision, exists := revisions[primary.RevisionID]
+	if !exists || primaryRevision.ArtifactID != primary.ArtifactID {
+		return HumanEditValidation{}, humanEditValidationError("artifactRevision", "primary artifact revision was not validated")
+	}
+	if resolvedKind == "project_brief" {
+		if err := v.validateProjectBriefEntry(ctx, execution, primary, actorID); err != nil {
+			return HumanEditValidation{}, err
+		}
+	}
+	if err := v.validateProposalLineage(ctx, execution, primaryRevision, primary, actorID); err != nil {
+		return HumanEditValidation{}, err
+	}
+	return HumanEditValidation{ArtifactRefs: refs, Primary: primary, ArtifactKind: resolvedKind}, nil
+}
+
+func humanEditOutputRefs(output json.RawMessage) ([]domain.ArtifactRef, domain.ArtifactRef, error) {
+	var envelope struct {
+		ArtifactRevision *domain.ArtifactRef `json:"artifactRevision"`
+	}
+	if err := json.Unmarshal(output, &envelope); err != nil {
+		return nil, domain.ArtifactRef{}, err
+	}
+	refs, err := artifactRefsFromNodeOutput(output)
+	if err != nil {
+		return nil, domain.ArtifactRef{}, err
+	}
+	if len(refs) == 0 {
+		return nil, domain.ArtifactRef{}, humanEditValidationError("artifactRevision", "human edit output must pin at least one artifact revision")
+	}
+	if envelope.ArtifactRevision != nil {
+		if err := envelope.ArtifactRevision.Validate(); err != nil {
+			return nil, domain.ArtifactRef{}, err
+		}
+		return refs, *envelope.ArtifactRevision, nil
+	}
+	if len(refs) != 1 {
+		return nil, domain.ArtifactRef{}, humanEditValidationError("artifactRevision", "a primary artifact revision is required when multiple revisions are submitted")
+	}
+	return refs, refs[0], nil
+}
+
+func (v CoreHumanEditOutputValidator) validateProjectBriefEntry(
+	ctx context.Context,
+	execution Execution,
+	primary domain.ArtifactRef,
+	actorID string,
+) error {
+	if v.Proposals == nil || execution.Run.InputManifest == nil {
+		return humanEditValidationError("artifactRevision.artifactId", "Project Brief edit requires the immutable workflow entry manifest")
+	}
+	manifest, err := v.Proposals.GetManifest(ctx, execution.Run.InputManifest.ID, actorID)
+	if err != nil || manifest.Ref() != *execution.Run.InputManifest || manifest.ProjectID != execution.Run.ProjectID {
+		return humanEditValidationError("inputManifest", "workflow entry manifest does not match the run")
+	}
+	var entry *domain.ArtifactRef
+	if manifest.BaseRevision != nil {
+		value := *manifest.BaseRevision
+		entry = &value
+	} else {
+		for _, source := range manifest.Sources {
+			if source.Purpose != "project_brief" {
+				continue
+			}
+			if entry != nil && entry.ArtifactID != source.Ref.ArtifactID {
+				return humanEditValidationError("inputManifest.sources", "workflow entry has ambiguous Project Brief artifacts")
+			}
+			value := source.Ref
+			entry = &value
+		}
+	}
+	if entry == nil || primary.ArtifactID != entry.ArtifactID {
+		return humanEditValidationError("artifactRevision.artifactId", "Project Brief edit must retain the workflow entry artifact id")
+	}
+	return nil
+}
+
+type humanEditProposalPin struct {
+	proposal domain.ProposalRef
+	manifest domain.ManifestRef
+}
+
+func (v CoreHumanEditOutputValidator) validateProposalLineage(
+	ctx context.Context,
+	execution Execution,
+	revision core.ArtifactRevision,
+	primary domain.ArtifactRef,
+	actorID string,
+) error {
+	pins := make(map[string]humanEditProposalPin)
+	for _, binding := range execution.Inputs.Bindings() {
+		if binding.Source.OutputProposal == nil {
+			continue
+		}
+		if binding.Source.InputManifest == nil {
+			return humanEditValidationError("input.outputProposal", "proposal input is missing its immutable manifest ref")
+		}
+		pin := humanEditProposalPin{proposal: *binding.Source.OutputProposal, manifest: *binding.Source.InputManifest}
+		key := pin.proposal.ID + "\x00" + pin.proposal.PayloadHash
+		if existing, duplicate := pins[key]; duplicate && existing.manifest != pin.manifest {
+			return humanEditValidationError("input.outputProposal", "proposal is bound to conflicting manifests")
+		}
+		pins[key] = pin
+	}
+	if len(pins) == 0 {
+		return nil
+	}
+	if len(pins) != 1 || v.Proposals == nil {
+		return humanEditValidationError("input.outputProposal", "human edit requires exactly one resolvable proposal input")
+	}
+	var pin humanEditProposalPin
+	for _, candidate := range pins {
+		pin = candidate
+	}
+	proposal, err := v.Proposals.GetProposal(ctx, pin.proposal.ID, actorID)
+	if err != nil || proposal.ValidatePayloadHash() != nil || proposal.PayloadHash != pin.proposal.PayloadHash {
+		return humanEditValidationError("input.outputProposal", "proposal id and payload hash do not match the stored proposal")
+	}
+	if proposal.ProjectID != execution.Run.ProjectID || proposal.ArtifactID != primary.ArtifactID || proposal.BaseRevision.ArtifactID != primary.ArtifactID {
+		return humanEditValidationError("artifactRevision.artifactId", "submitted revision does not target the pinned proposal artifact")
+	}
+	if proposal.Manifest != pin.manifest {
+		return humanEditValidationError("input.outputProposal.manifest", "proposal manifest does not match the frozen input binding")
+	}
+	manifest, err := v.Proposals.GetManifest(ctx, pin.manifest.ID, actorID)
+	if err != nil || manifest.Ref() != pin.manifest || manifest.ProjectID != execution.Run.ProjectID || manifest.BaseRevision == nil || !manifest.BaseRevision.Equal(proposal.BaseRevision) {
+		return humanEditValidationError("input.outputProposal.manifest", "proposal base revision is not pinned by the exact input manifest")
+	}
+	return v.requireRevisionDescendant(ctx, revision, proposal.BaseRevision, proposal.ID, actorID)
+}
+
+func (v CoreHumanEditOutputValidator) requireRevisionDescendant(
+	ctx context.Context,
+	revision core.ArtifactRevision,
+	base domain.ArtifactRef,
+	proposalID string,
+	actorID string,
+) error {
+	if base.AnchorID != "" || revision.ID == base.RevisionID {
+		return humanEditValidationError("artifactRevision.revisionId", "submitted revision must be a descendant of the proposal base revision")
+	}
+	seen := map[string]struct{}{revision.ID: {}}
+	current := revision
+	containsProposalRevision := current.ProposalID != nil && *current.ProposalID == proposalID
+	for depth := 0; depth < 10000 && current.ParentRevisionID != nil; depth++ {
+		parentID := *current.ParentRevisionID
+		if _, cycle := seen[parentID]; cycle {
+			return humanEditValidationError("artifactRevision.revisionId", "artifact revision ancestry contains a cycle")
+		}
+		seen[parentID] = struct{}{}
+		parent, err := v.Artifacts.GetRevision(ctx, parentID, actorID)
+		if err != nil || parent.ArtifactID != revision.ArtifactID {
+			return humanEditValidationError("artifactRevision.revisionId", "artifact revision ancestry is unavailable or crosses artifacts")
+		}
+		if parent.ID == base.RevisionID {
+			if parent.ContentHash != base.ContentHash || parent.ArtifactID != base.ArtifactID {
+				return humanEditValidationError("artifactRevision.revisionId", "proposal base revision hash does not match ancestry")
+			}
+			if !containsProposalRevision {
+				return humanEditValidationError("artifactRevision.proposalId", "revision ancestry does not contain the bound output proposal")
+			}
+			return nil
+		}
+		if parent.ProposalID != nil && *parent.ProposalID == proposalID {
+			containsProposalRevision = true
+		}
+		current = parent
+	}
+	return humanEditValidationError("artifactRevision.revisionId", "submitted revision is not descended from the proposal base revision")
+}
+
+func humanEditValidationError(field, message string) error {
+	return &domain.DomainError{Kind: domain.ErrValidation, Field: field, Message: message}
 }
 
 // CoreReviewGateVerifier requires every exact upstream artifact revision to
@@ -282,20 +722,65 @@ func (v CoreWorkbenchCompletionValidator) ValidateCompletion(ctx context.Context
 	if err != nil {
 		return "", err
 	}
-	allowedBundles := map[string]bool{}
-	for _, bundleID := range buildManifest.BundleIDs {
-		allowedBundles[bundleID] = true
+	workflowRunID, err := uuid.Parse(execution.Run.ID)
+	if err != nil {
+		return "", fmt.Errorf("workflow run id is invalid")
 	}
-	if len(envelope.ImplementationProposalIDs) != len(allowedBundles) {
+	manifestGroupKey := strings.TrimSpace(buildManifest.ManifestGroupKey)
+	if manifestGroupKey == "" {
+		// Migration 000012 deterministically assigns pre-group workflow roots to
+		// this compatibility group. Their already-frozen BuildManifest hash cannot
+		// be rewritten, so completion accepts only the corresponding DB marker.
+		manifestGroupKey = "legacy"
+	} else if parsed, err := uuid.Parse(manifestGroupKey); err != nil || parsed.String() != manifestGroupKey {
+		return "", fmt.Errorf("frozen build manifest group is invalid")
+	}
+	allowedRoots := map[uuid.UUID]bool{}
+	allowedRootOrder := make([]uuid.UUID, 0, len(buildManifest.BundleIDs))
+	for rootOrdinal, bundleID := range buildManifest.BundleIDs {
+		parsedBundleID, err := uuid.Parse(bundleID)
+		if err != nil {
+			return "", fmt.Errorf("frozen build manifest bundle id is invalid")
+		}
+		var manifest storage.ApplicationBuildManifestModel
+		if err := v.Database.WithContext(ctx).
+			Where("id = ? AND project_id = ?", parsedBundleID, execution.Run.ProjectID).
+			Take(&manifest).Error; err != nil {
+			return "", err
+		}
+		if manifest.WorkflowRunID == nil || *manifest.WorkflowRunID != workflowRunID {
+			return "", fmt.Errorf("frozen build manifest does not belong to the workflow run")
+		}
+		if manifest.ManifestGroupKey == nil || *manifest.ManifestGroupKey != manifestGroupKey {
+			return "", fmt.Errorf("frozen build manifest does not belong to the manifest compiler group")
+		}
+		if manifest.RootOrdinal == nil || *manifest.RootOrdinal != rootOrdinal {
+			return "", fmt.Errorf("frozen build manifest root ordinal does not match bundle order")
+		}
+		rootID := manifest.RootManifestID
+		if rootID == uuid.Nil {
+			rootID = manifest.ID
+		}
+		if allowedRoots[rootID] {
+			return "", fmt.Errorf("frozen build manifest contains duplicate root lineage %s", rootID)
+		}
+		if err := validateBuildManifestRootLineage(ctx, v.Database, manifest, rootID, manifest.ProjectID, workflowRunID); err != nil {
+			return "", err
+		}
+		allowedRoots[rootID] = true
+		allowedRootOrder = append(allowedRootOrder, rootID)
+	}
+	if len(envelope.ImplementationProposalIDs) != len(allowedRoots) {
 		return "", fmt.Errorf("workbench completion requires exactly one applied implementation proposal for every frozen bundle")
 	}
-	seen, coveredBundles := map[string]bool{}, map[string]bool{}
-	for _, proposalID := range envelope.ImplementationProposalIDs {
+	seen, coveredRoots := map[string]bool{}, map[uuid.UUID]bool{}
+	for proposalIndex, proposalID := range envelope.ImplementationProposalIDs {
 		parsedProposalID, err := uuid.Parse(proposalID)
 		if err != nil {
 			return "", fmt.Errorf("implementation proposal id is invalid")
 		}
 		proposalID = parsedProposalID.String()
+		envelope.ImplementationProposalIDs[proposalIndex] = proposalID
 		if seen[proposalID] {
 			return "", fmt.Errorf("duplicate implementation proposal %s", proposalID)
 		}
@@ -304,22 +789,60 @@ func (v CoreWorkbenchCompletionValidator) ValidateCompletion(ctx context.Context
 		if err := v.Database.WithContext(ctx).Where("id = ? AND project_id = ?", proposalID, execution.Run.ProjectID).Take(&proposal).Error; err != nil {
 			return "", err
 		}
-		bundleID := proposal.BuildManifestID.String()
-		if !allowedBundles[bundleID] || coveredBundles[bundleID] || proposal.AppliedAt == nil || (proposal.Status != "applied" && proposal.Status != "partially_applied") {
+		var proposalManifest storage.ApplicationBuildManifestModel
+		if err := v.Database.WithContext(ctx).
+			Where("id = ? AND project_id = ?", proposal.BuildManifestID, execution.Run.ProjectID).
+			Take(&proposalManifest).Error; err != nil {
+			return "", err
+		}
+		if proposalManifest.WorkflowRunID == nil || *proposalManifest.WorkflowRunID != workflowRunID {
+			return "", fmt.Errorf("implementation proposal %s belongs to another workflow run", proposalID)
+		}
+		if proposalManifest.ManifestGroupKey == nil || *proposalManifest.ManifestGroupKey != manifestGroupKey {
+			return "", fmt.Errorf("implementation proposal %s belongs to another manifest compiler group", proposalID)
+		}
+		if proposalManifest.RootOrdinal == nil || *proposalManifest.RootOrdinal != proposalIndex {
+			return "", fmt.Errorf("implementation proposal %s has the wrong frozen root ordinal", proposalID)
+		}
+		rootID := proposalManifest.RootManifestID
+		if rootID == uuid.Nil {
+			rootID = proposalManifest.ID
+		}
+		if rootID != allowedRootOrder[proposalIndex] || !allowedRoots[rootID] || coveredRoots[rootID] || proposal.AppliedAt == nil || (proposal.Status != "applied" && proposal.Status != "partially_applied") {
 			return "", fmt.Errorf("implementation proposal %s is not an applied output of the frozen build manifest", proposalID)
 		}
-		coveredBundles[bundleID] = true
+		if err := validateBuildManifestRootLineage(ctx, v.Database, proposalManifest, rootID, proposal.ProjectID, workflowRunID); err != nil {
+			return "", fmt.Errorf("implementation proposal %s has invalid build manifest lineage: %w", proposalID, err)
+		}
+		coveredRoots[rootID] = true
+	}
+	for rootID := range allowedRoots {
+		var appliedProposalRows []struct {
+			ID uuid.UUID
+		}
+		if err := v.Database.WithContext(ctx).Table("implementation_proposals AS proposals").
+			Select("proposals.id").
+			Joins("JOIN application_build_manifests AS manifests ON manifests.id = proposals.build_manifest_id").
+			Where(
+				"proposals.project_id = ? AND manifests.root_manifest_id = ? AND manifests.workflow_run_id = ? AND proposals.status IN ? AND proposals.applied_at IS NOT NULL",
+				execution.Run.ProjectID, rootID, workflowRunID, []string{"applied", "partially_applied"},
+			).Scan(&appliedProposalRows).Error; err != nil {
+			return "", err
+		}
+		if len(appliedProposalRows) != 1 || !seen[appliedProposalRows[0].ID.String()] {
+			return "", fmt.Errorf("build manifest root %s must have exactly one selected applied proposal", rootID)
+		}
 	}
 	var workspace storage.ArtifactRevisionModel
 	err = v.Database.WithContext(ctx).Table("artifact_revisions").
 		Select("artifact_revisions.*").
 		Joins("JOIN artifacts ON artifacts.id = artifact_revisions.artifact_id").
-		Where("artifact_revisions.id = ? AND artifact_revisions.artifact_id = ? AND artifact_revisions.content_hash = ? AND artifact_revisions.workflow_status = 'approved' AND artifacts.project_id = ? AND artifacts.kind = 'workspace'", envelope.WorkspaceRevision.RevisionID, envelope.WorkspaceRevision.ArtifactID, envelope.WorkspaceRevision.ContentHash, execution.Run.ProjectID).
+		Where("artifact_revisions.id = ? AND artifact_revisions.artifact_id = ? AND artifact_revisions.content_hash = ? AND artifact_revisions.workflow_status = 'approved' AND artifacts.project_id = ? AND artifacts.kind = 'workspace' AND artifacts.latest_approved_revision_id = artifact_revisions.id", envelope.WorkspaceRevision.RevisionID, envelope.WorkspaceRevision.ArtifactID, envelope.WorkspaceRevision.ContentHash, execution.Run.ProjectID).
 		Take(&workspace).Error
 	if err != nil {
 		return "", err
 	}
-	lineageProposals := map[string]bool{}
+	selectedDescendantOrder := make([]string, 0, len(seen))
 	visitedRevisions := map[uuid.UUID]bool{}
 	current := workspace
 	for current.ID != uuid.Nil {
@@ -328,7 +851,10 @@ func (v CoreWorkbenchCompletionValidator) ValidateCompletion(ctx context.Context
 		}
 		visitedRevisions[current.ID] = true
 		if current.ImplementationProposalID != nil {
-			lineageProposals[current.ImplementationProposalID.String()] = true
+			proposalID := current.ImplementationProposalID.String()
+			if seen[proposalID] {
+				selectedDescendantOrder = append(selectedDescendantOrder, proposalID)
+			}
 		}
 		if current.ParentRevisionID == nil {
 			break
@@ -344,12 +870,82 @@ func (v CoreWorkbenchCompletionValidator) ValidateCompletion(ctx context.Context
 		}
 		current = parent
 	}
-	for proposalID := range seen {
-		if !lineageProposals[proposalID] {
-			return "", fmt.Errorf("workspace revision is not descended from implementation proposal %s", proposalID)
-		}
+	if err := validateSelectedProposalOrder(envelope.ImplementationProposalIDs, selectedDescendantOrder); err != nil {
+		return "", err
 	}
 	return workspace.ID.String(), nil
+}
+
+func validateSelectedProposalOrder(expectedAncestorOrder, actualDescendantOrder []string) error {
+	if len(actualDescendantOrder) != len(expectedAncestorOrder) {
+		return fmt.Errorf("workspace revision lineage does not contain every selected implementation proposal")
+	}
+	for index, proposalID := range expectedAncestorOrder {
+		actual := actualDescendantOrder[len(actualDescendantOrder)-1-index]
+		if actual != proposalID {
+			return fmt.Errorf(
+				"workspace implementation order does not match frozen bundle order at position %d", index,
+			)
+		}
+	}
+	return nil
+}
+
+func validateBuildManifestRootLineage(
+	ctx context.Context,
+	database *gorm.DB,
+	manifest storage.ApplicationBuildManifestModel,
+	rootID uuid.UUID,
+	projectID uuid.UUID,
+	workflowRunID uuid.UUID,
+) error {
+	visited := map[uuid.UUID]bool{}
+	current := manifest
+	expectedManifestGroup := manifest.ManifestGroupKey
+	if expectedManifestGroup == nil || strings.TrimSpace(*expectedManifestGroup) == "" {
+		return fmt.Errorf("build manifest lineage has no manifest compiler group")
+	}
+	for {
+		if current.ID == uuid.Nil || current.ProjectID != projectID || current.WorkflowRunID == nil ||
+			*current.WorkflowRunID != workflowRunID || !optionalWorkflowStringEqual(current.ManifestGroupKey, expectedManifestGroup) ||
+			visited[current.ID] {
+			return fmt.Errorf("build manifest lineage is invalid or cyclic")
+		}
+		visited[current.ID] = true
+		currentRootID := current.RootManifestID
+		if currentRootID == uuid.Nil {
+			currentRootID = current.ID
+		}
+		if currentRootID != rootID {
+			return fmt.Errorf("build manifest changed root lineage")
+		}
+		if current.ID == rootID {
+			if current.DerivedFromID != nil {
+				return fmt.Errorf("root build manifest has a parent")
+			}
+			return nil
+		}
+		if current.DerivedFromID == nil || len(visited) > 10_000 {
+			return fmt.Errorf("derived build manifest does not reach its root")
+		}
+		var parent storage.ApplicationBuildManifestModel
+		if err := database.WithContext(ctx).
+			Where(
+				"id = ? AND project_id = ? AND root_manifest_id = ? AND workflow_run_id = ?",
+				*current.DerivedFromID, projectID, rootID, workflowRunID,
+			).
+			Take(&parent).Error; err != nil {
+			return err
+		}
+		current = parent
+	}
+}
+
+func optionalWorkflowStringEqual(left, right *string) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	return *left == *right
 }
 
 // CoreContentStoreAdapter lets workflow persistence share the finalized Mongo
@@ -426,6 +1022,7 @@ func (i CoreTargetArtifactInitializer) EnsureTarget(
 	if err != nil {
 		return nil, err
 	}
+	key = input.ArtifactKey
 	artifacts, err := i.Artifacts.List(ctx, execution.Run.ProjectID, execution.Run.StartedBy, kind, "")
 	if err != nil {
 		return nil, err
@@ -448,7 +1045,7 @@ func (i CoreTargetArtifactInitializer) EnsureTarget(
 	if err != nil {
 		return nil, err
 	}
-	if err := validateExistingTargetLineage(kind, versioned, input); err != nil {
+	if err := validateTargetIdentity(kind, versioned, input); err != nil {
 		return nil, err
 	}
 	if versioned.LatestRevision == nil {
@@ -463,7 +1060,53 @@ func (i CoreTargetArtifactInitializer) EnsureTarget(
 		}
 		return &core.VersionRef{ArtifactID: selected.ID, RevisionID: revision.ID, ContentHash: revision.ContentHash}, nil
 	}
+	if err := validateCleanReusableDraft(kind, versioned.Draft, versioned.LatestRevision); err != nil {
+		return nil, err
+	}
 	return &core.VersionRef{ArtifactID: selected.ID, RevisionID: versioned.LatestRevision.ID, ContentHash: versioned.LatestRevision.ContentHash}, nil
+}
+
+func validateCleanReusableDraft(
+	kind string,
+	draft *core.ArtifactDraft,
+	latest *core.ArtifactRevision,
+) error {
+	if draft == nil {
+		return nil
+	}
+	if latest == nil || draft.BaseRevisionID == nil || *draft.BaseRevisionID != latest.ID {
+		return fmt.Errorf("existing %s target has uncheckpointed draft base lineage", kind)
+	}
+	if draft.Status != "draft" {
+		return fmt.Errorf("existing %s target has uncheckpointed draft status %q", kind, draft.Status)
+	}
+	if draft.SchemaVersion != latest.SchemaVersion {
+		return fmt.Errorf("existing %s target has uncheckpointed draft schema", kind)
+	}
+	if draft.ContentHash != latest.ContentHash {
+		return fmt.Errorf("existing %s target has uncheckpointed draft content", kind)
+	}
+	if len(draft.SourceVersions) != len(latest.SourceVersions) {
+		return fmt.Errorf("existing %s target has uncheckpointed draft source lineage", kind)
+	}
+	for index := range draft.SourceVersions {
+		left, right := draft.SourceVersions[index], latest.SourceVersions[index]
+		if left.Purpose != right.Purpose || left.Required != right.Required ||
+			!sameExactCoreVersionRef(left.VersionRef, right.VersionRef) {
+			return fmt.Errorf("existing %s target has uncheckpointed draft source lineage at index %d", kind, index)
+		}
+	}
+	return nil
+}
+
+func sameExactCoreVersionRef(left, right core.VersionRef) bool {
+	if left.ArtifactID != right.ArtifactID || left.RevisionID != right.RevisionID || left.ContentHash != right.ContentHash {
+		return false
+	}
+	if left.AnchorID == nil || right.AnchorID == nil {
+		return left.AnchorID == nil && right.AnchorID == nil
+	}
+	return *left.AnchorID == *right.AnchorID
 }
 
 func (i CoreTargetArtifactInitializer) targetArtifactInput(
@@ -503,6 +1146,7 @@ func (i CoreTargetArtifactInitializer) targetArtifactInput(
 		if err != nil {
 			return core.CreateArtifactInput{}, err
 		}
+		input.ArtifactKey += "-" + stableArtifactIdentitySuffix(source.Ref.ArtifactID) + "-" + stableArtifactIdentitySuffix(pageNodeID)
 		input.SourceVersions = []core.ArtifactSourceInput{{
 			Ref: source.Ref, Purpose: "blueprint", Required: true,
 		}}
@@ -518,11 +1162,17 @@ func (i CoreTargetArtifactInitializer) targetArtifactInput(
 		if err != nil {
 			return core.CreateArtifactInput{}, err
 		}
+		input.ArtifactKey += "-" + stableArtifactIdentitySuffix(source.Ref.ArtifactID)
 		input.SourceVersions = []core.ArtifactSourceInput{{
 			Ref: source.Ref, Purpose: "page_spec", Required: true,
 		}}
 	}
 	return input, nil
+}
+
+func stableArtifactIdentitySuffix(artifactID string) string {
+	hash := sha256.Sum256([]byte(strings.TrimSpace(artifactID)))
+	return strings.ToUpper(fmt.Sprintf("%x", hash[:5]))
 }
 
 func (i CoreTargetArtifactInitializer) uniqueSourceByKind(
@@ -553,7 +1203,7 @@ func (i CoreTargetArtifactInitializer) uniqueSourceByKind(
 	return matches[0], nil
 }
 
-func validateExistingTargetLineage(
+func validateTargetIdentity(
 	kind string,
 	artifact core.VersionedArtifact,
 	desired core.CreateArtifactInput,
@@ -561,47 +1211,116 @@ func validateExistingTargetLineage(
 	if kind != "blueprint" && kind != "page_spec" && kind != "prototype" {
 		return nil
 	}
-	var content json.RawMessage
-	var sources []core.ArtifactSource
-	if artifact.Draft != nil {
-		content = artifact.Draft.Content
-		sources = artifact.Draft.SourceVersions
-	} else if artifact.LatestRevision != nil {
-		content = artifact.LatestRevision.Content
-		sources = artifact.LatestRevision.SourceVersions
-	} else {
-		return fmt.Errorf("existing %s target has no exact draft or revision lineage", kind)
+	if artifact.Artifact.ID == "" || artifact.Artifact.Kind != kind || artifact.Artifact.ArtifactKey != desired.ArtifactKey {
+		return fmt.Errorf("existing %s target does not match its stable artifact identity", kind)
 	}
+	if artifact.LatestRevision == nil {
+		if artifact.Draft == nil {
+			return fmt.Errorf("existing %s target has no exact draft or revision lineage", kind)
+		}
+		return validateInitialTargetLineage(kind, artifact.Draft.Content, artifact.Draft.SourceVersions, desired)
+	}
+	if artifact.Artifact.LatestRevisionID == nil || *artifact.Artifact.LatestRevisionID != artifact.LatestRevision.ID ||
+		artifact.LatestRevision.ArtifactID != artifact.Artifact.ID || artifact.LatestRevision.ContentHash == "" {
+		return fmt.Errorf("existing %s target latest revision identity is invalid", kind)
+	}
+	return validateReusableTargetLineage(kind, artifact.LatestRevision.Content, artifact.LatestRevision.SourceVersions, desired)
+}
+
+func validateInitialTargetLineage(
+	kind string,
+	content json.RawMessage,
+	sources []core.ArtifactSource,
+	desired core.CreateArtifactInput,
+) error {
 	if len(sources) != len(desired.SourceVersions) {
-		return fmt.Errorf("existing %s target lineage differs from the immutable workflow input", kind)
+		return fmt.Errorf("initial %s target lineage differs from the immutable workflow input", kind)
 	}
 	for index, expected := range desired.SourceVersions {
 		actual := sources[index]
 		if actual.Purpose != expected.Purpose || actual.Required != expected.Required ||
 			!sameCoreVersionRef(actual.VersionRef, expected.Ref) {
-			return fmt.Errorf("existing %s target source %d differs from the immutable workflow input", kind, index)
+			return fmt.Errorf("initial %s target source %d differs from the immutable workflow input", kind, index)
 		}
+	}
+	if !sameTargetLogicalContent(kind, content, sources, desired, true) {
+		return fmt.Errorf("initial %s target content differs from the immutable workflow input", kind)
+	}
+	return nil
+}
+
+func validateReusableTargetLineage(
+	kind string,
+	content json.RawMessage,
+	sources []core.ArtifactSource,
+	desired core.CreateArtifactInput,
+) error {
+	if !sameTargetLogicalContent(kind, content, sources, desired, false) {
+		return fmt.Errorf("existing %s target belongs to another logical source artifact or page", kind)
+	}
+	return nil
+}
+
+func sameTargetLogicalContent(
+	kind string,
+	content json.RawMessage,
+	sources []core.ArtifactSource,
+	desired core.CreateArtifactInput,
+	exact bool,
+) bool {
+	if kind == "blueprint" {
+		return json.Valid(content)
+	}
+	if len(sources) != 1 || len(desired.SourceVersions) != 1 {
+		return false
+	}
+	actualSource, desiredSource := sources[0], desired.SourceVersions[0]
+	if actualSource.Purpose != desiredSource.Purpose || actualSource.Required != desiredSource.Required ||
+		actualSource.ArtifactID != desiredSource.Ref.ArtifactID {
+		return false
+	}
+	if exact && !sameCoreVersionRef(actualSource.VersionRef, desiredSource.Ref) {
+		return false
 	}
 	switch kind {
 	case "page_spec":
+		actualAnchor, desiredAnchor := coreVersionAnchor(actualSource.VersionRef), coreVersionAnchor(desiredSource.Ref)
+		if actualAnchor == "" || actualAnchor != desiredAnchor {
+			return false
+		}
 		var actual, expected struct {
 			BlueprintPageNodeID string `json:"blueprintPageNodeId"`
 		}
-		if json.Unmarshal(content, &actual) != nil || json.Unmarshal(desired.Content, &expected) != nil ||
-			strings.TrimSpace(actual.BlueprintPageNodeID) != strings.TrimSpace(expected.BlueprintPageNodeID) {
-			return fmt.Errorf("existing PageSpec target content differs from its exact Blueprint Page anchor")
-		}
+		return json.Unmarshal(content, &actual) == nil && json.Unmarshal(desired.Content, &expected) == nil &&
+			strings.TrimSpace(actual.BlueprintPageNodeID) == strings.TrimSpace(expected.BlueprintPageNodeID) &&
+			strings.TrimSpace(actual.BlueprintPageNodeID) == actualAnchor
 	case "prototype":
+		if coreVersionAnchor(actualSource.VersionRef) != "" || coreVersionAnchor(desiredSource.Ref) != "" {
+			return false
+		}
 		var actual, expected struct {
 			PageSpecRevision core.VersionRef `json:"pageSpecRevision"`
 			Exploratory      bool            `json:"exploratory"`
 		}
-		if json.Unmarshal(content, &actual) != nil || json.Unmarshal(desired.Content, &expected) != nil ||
-			actual.Exploratory != expected.Exploratory || !sameCoreVersionRef(actual.PageSpecRevision, expected.PageSpecRevision) {
-			return fmt.Errorf("existing Prototype target content differs from its exact PageSpec revision")
+		if json.Unmarshal(content, &actual) != nil || json.Unmarshal(desired.Content, &expected) != nil {
+			return false
 		}
+		if exact {
+			return actual.Exploratory == expected.Exploratory &&
+				sameCoreVersionRef(actual.PageSpecRevision, expected.PageSpecRevision)
+		}
+		return actual.PageSpecRevision.ArtifactID == expected.PageSpecRevision.ArtifactID &&
+			actual.PageSpecRevision.ArtifactID == desiredSource.Ref.ArtifactID
+	default:
+		return false
 	}
-	return nil
+}
+
+func coreVersionAnchor(reference core.VersionRef) string {
+	if reference.AnchorID == nil {
+		return ""
+	}
+	return strings.TrimSpace(*reference.AnchorID)
 }
 
 func sameCoreVersionRef(left, right core.VersionRef) bool {
@@ -880,6 +1599,7 @@ func (d GenerationProposalDispatcher) Dispatch(ctx context.Context, execution Ex
 
 type CoreWorkbenchAPI interface {
 	CreateBundle(context.Context, string, string, core.CreateWorkbenchBundleInput) (core.WorkbenchBundle, error)
+	GetLineageState(context.Context, string, string) (core.WorkbenchLineageState, error)
 }
 
 type CoreWorkbenchManifestHook struct {
@@ -894,6 +1614,10 @@ func (h CoreWorkbenchManifestHook) Compile(ctx context.Context, execution Execut
 	}
 	if execution.Definition.ManifestCompiler == nil {
 		return BuildManifest{}, fmt.Errorf("manifest compiler node config is required")
+	}
+	config := execution.Definition.ManifestCompiler
+	if config.ManifestKind != "application_build" || config.SchemaVersion != 1 || config.Hook != "application-build-manifest/v1" {
+		return BuildManifest{}, fmt.Errorf("unsupported manifest compiler %s/%d/%s", config.ManifestKind, config.SchemaVersion, config.Hook)
 	}
 	sliceRefs := execution.Inputs.SliceRefs()
 	slices := make([]SliceContext, 0, len(sliceRefs))
@@ -920,10 +1644,23 @@ func (h CoreWorkbenchManifestHook) Compile(ctx context.Context, execution Execut
 	if len(slices) == 0 {
 		return BuildManifest{}, fmt.Errorf("build manifest requires delivery slices")
 	}
+	selection, selected, err := loadRunBlueprintSelection(ctx, h.Proposals, execution)
+	if err != nil {
+		return BuildManifest{}, err
+	}
+	if selected {
+		if err := validateBlueprintSelectionSlices(selection, slices); err != nil {
+			return BuildManifest{}, err
+		}
+	}
 	bundleIDs := make([]string, 0, len(slices))
 	sliceIDs := make([]string, 0, len(slices))
 	sources := make([]domain.ArtifactRef, 0)
-	for _, slice := range slices {
+	manifestGroupKey := execution.Node.ID
+	if _, err := uuid.Parse(manifestGroupKey); err != nil {
+		return BuildManifest{}, fmt.Errorf("manifest compiler node run id is invalid")
+	}
+	for rootOrdinal, slice := range slices {
 		if slice.Prototype == nil {
 			return BuildManifest{}, fmt.Errorf("slice %s has no exact prototype revision", slice.Key)
 		}
@@ -931,7 +1668,11 @@ func (h CoreWorkbenchManifestHook) Compile(ctx context.Context, execution Execut
 			return BuildManifest{}, err
 		}
 		runID, sliceID := execution.Run.ID, slice.ID
-		bundle, err := h.Workbench.CreateBundle(ctx, execution.Run.ProjectID, execution.Run.StartedBy, core.CreateWorkbenchBundleInput{PrototypeRevision: toCoreVersionRef(*slice.Prototype), WorkflowRunID: &runID, DeliverySliceID: &sliceID})
+		ordinal := rootOrdinal
+		bundle, err := h.Workbench.CreateBundle(ctx, execution.Run.ProjectID, execution.Run.StartedBy, core.CreateWorkbenchBundleInput{
+			PrototypeRevision: toCoreVersionRef(*slice.Prototype), WorkflowRunID: &runID,
+			ManifestGroupKey: &manifestGroupKey, RootOrdinal: &ordinal, DeliverySliceID: &sliceID,
+		})
 		if err != nil {
 			return BuildManifest{}, err
 		}
@@ -955,7 +1696,37 @@ func (h CoreWorkbenchManifestHook) Compile(ctx context.Context, execution Execut
 		now = h.Now().UTC()
 	}
 	constraints, _ := domain.CanonicalJSON(map[string]any{"definition": execution.Run.Definition, "scope": json.RawMessage(execution.Run.Scope)})
-	return BuildManifest{SchemaVersion: execution.Definition.ManifestCompiler.SchemaVersion, ProjectID: execution.Run.ProjectID, RunID: execution.Run.ID, SliceIDs: sliceIDs, BundleIDs: bundleIDs, Sources: sources, Constraints: constraints, CreatedAt: now}, nil
+	return BuildManifest{SchemaVersion: execution.Definition.ManifestCompiler.SchemaVersion, ProjectID: execution.Run.ProjectID, RunID: execution.Run.ID, ManifestGroupKey: manifestGroupKey, SliceIDs: sliceIDs, BundleIDs: bundleIDs, Sources: sources, Constraints: constraints, CreatedAt: now}, nil
+}
+
+func validateBlueprintSelectionSlices(selection workflowBlueprintSelectionScope, slices []SliceContext) error {
+	bindings := make(map[string]workflowBlueprintSelectionPageBinding, len(selection.PageBindings))
+	for _, binding := range selection.PageBindings {
+		if binding.PageSpec == nil || binding.Prototype == nil {
+			return fmt.Errorf("selected Blueprint page %s is missing an approved PageSpec or Prototype", binding.NodeID)
+		}
+		bindings[binding.NodeID] = binding
+	}
+	if len(bindings) == 0 || len(slices) != len(bindings) {
+		return fmt.Errorf("build slices do not exactly match the frozen Blueprint selection")
+	}
+	seen := map[string]bool{}
+	for _, slice := range slices {
+		nodeID := slice.Blueprint.AnchorID
+		binding, exists := bindings[nodeID]
+		if !exists || seen[nodeID] {
+			return fmt.Errorf("build slice %s is outside the frozen Blueprint selection", slice.Key)
+		}
+		seen[nodeID] = true
+		if slice.Blueprint.ArtifactID != selection.Blueprint.ArtifactID ||
+			slice.Blueprint.RevisionID != selection.Blueprint.RevisionID ||
+			slice.Blueprint.ContentHash != selection.Blueprint.ContentHash ||
+			slice.PageSpec == nil || !slice.PageSpec.Equal(*binding.PageSpec) ||
+			slice.Prototype == nil || !slice.Prototype.Equal(*binding.Prototype) {
+			return fmt.Errorf("build slice %s lineage differs from its frozen Blueprint selection binding", slice.Key)
+		}
+	}
+	return nil
 }
 
 type ImplementationGenerator interface {
@@ -964,13 +1735,14 @@ type ImplementationGenerator interface {
 
 type GenerationWorkbenchRunner struct {
 	Generation   ImplementationGenerator
+	Workbench    CoreWorkbenchAPI
 	DefaultModel string
 	Instruction  string
 }
 
 func (r GenerationWorkbenchRunner) Run(ctx context.Context, execution Execution) (WorkerResult, error) {
-	if r.Generation == nil {
-		return WorkerResult{}, fmt.Errorf("generation service is required")
+	if r.Generation == nil || r.Workbench == nil {
+		return WorkerResult{}, fmt.Errorf("generation and workbench lineage services are required")
 	}
 	manifest, err := buildManifestFromExecution(execution)
 	if err != nil {
@@ -984,17 +1756,69 @@ func (r GenerationWorkbenchRunner) Run(ctx context.Context, execution Execution)
 	if err != nil {
 		return WorkerResult{}, err
 	}
-	for _, bundleID := range manifest.BundleIDs {
-		generated, err := r.Generation.GenerateImplementation(ctx, bundleID, execution.Run.StartedBy, r.DefaultModel, instruction)
+	for rootIndex, rootBundleID := range manifest.BundleIDs {
+		state, err := r.Workbench.GetLineageState(ctx, rootBundleID, execution.Run.StartedBy)
 		if err != nil {
 			return WorkerResult{}, err
 		}
-		if generated.Proposal.Status == "applied" {
+		if state.RootBundleID != rootBundleID || state.ActiveBundle.ID == "" ||
+			(state.ActiveBundle.RootBuildManifestID != "" && state.ActiveBundle.RootBuildManifestID != rootBundleID) {
+			return WorkerResult{}, fmt.Errorf("workbench lineage state does not match frozen root %s", rootBundleID)
+		}
+		if state.CurrentProposal != nil &&
+			(state.CurrentProposal.Status == "applied" || state.CurrentProposal.Status == "partially_applied") {
+			results = append(results, workbenchProposalResult(rootBundleID, state.ActiveBundle.ID, *state.CurrentProposal))
+			continue
+		}
+		if !sameOptionalWorkflowVersionRef(state.ActiveBundle.CurrentWorkspaceRevision, state.CurrentWorkspaceRevision) {
+			return workbenchWaitInputResult(results, manifest.BundleIDs[rootIndex:]), nil
+		}
+		if state.CurrentProposal != nil {
+			results = append(results, workbenchProposalResult(rootBundleID, state.ActiveBundle.ID, *state.CurrentProposal))
+			return workbenchWaitInputResult(results, manifest.BundleIDs[rootIndex+1:]), nil
+		}
+		generated, err := r.Generation.GenerateImplementation(
+			ctx, state.ActiveBundle.ID, execution.Run.StartedBy, r.DefaultModel, instruction,
+		)
+		if err != nil {
+			return WorkerResult{}, err
+		}
+		if generated.Proposal.Status == "applied" || generated.Proposal.Status == "partially_applied" {
 			return WorkerResult{}, fmt.Errorf("generation returned an already-applied proposal")
 		}
-		results = append(results, map[string]any{"bundleId": bundleID, "proposalId": generated.Proposal.ID, "payloadHash": generated.Proposal.PayloadHash})
+		results = append(results, workbenchProposalResult(rootBundleID, state.ActiveBundle.ID, generated.Proposal))
+		return workbenchWaitInputResult(results, manifest.BundleIDs[rootIndex+1:]), nil
 	}
-	return WorkerResult{Disposition: ResultWaitInput, Output: mustJSON(map[string]any{"implementationProposals": results})}, nil
+	return workbenchWaitInputResult(results, nil), nil
+}
+
+func workbenchProposalResult(rootBundleID, activeBundleID string, proposal core.ImplementationProposal) map[string]any {
+	return map[string]any{
+		"bundleId": rootBundleID, "activeBundleId": activeBundleID,
+		"proposalId": proposal.ID, "payloadHash": proposal.PayloadHash, "status": proposal.Status,
+	}
+}
+
+func workbenchWaitInputResult(results []map[string]any, pending []string) WorkerResult {
+	return WorkerResult{Disposition: ResultWaitInput, Output: mustJSON(map[string]any{
+		"implementationProposals": results,
+		"pendingBundleIds":        append([]string(nil), pending...),
+	})}
+}
+
+func sameOptionalWorkflowVersionRef(left, right *core.VersionRef) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	leftAnchor, rightAnchor := "", ""
+	if left.AnchorID != nil {
+		leftAnchor = *left.AnchorID
+	}
+	if right.AnchorID != nil {
+		rightAnchor = *right.AnchorID
+	}
+	return left.ArtifactID == right.ArtifactID && left.RevisionID == right.RevisionID &&
+		left.ContentHash == right.ContentHash && leftAnchor == rightAnchor
 }
 
 func workbenchInstruction(scope json.RawMessage, fallback string) (string, error) {
@@ -1040,6 +1864,7 @@ func (f FanOutResolverFunc) Resolve(ctx context.Context, e Execution) ([]FanOutI
 
 type DefinitionFanOutResolver struct {
 	DeliverySlices FanOutResolver
+	BlueprintPages FanOutResolver
 }
 
 func (r DefinitionFanOutResolver) Resolve(ctx context.Context, execution Execution) ([]FanOutItem, error) {
@@ -1050,7 +1875,215 @@ func (r DefinitionFanOutResolver) Resolve(ctx context.Context, execution Executi
 	if config.ItemKind == "delivery_slice" && r.DeliverySlices != nil {
 		return r.DeliverySlices.Resolve(ctx, execution)
 	}
+	if config.ItemKind == "blueprint_page" || config.ItemKind == "blueprint_selection_page" {
+		if r.BlueprintPages == nil {
+			return nil, fmt.Errorf("blueprint_page fan-out resolver is required")
+		}
+		return r.BlueprintPages.Resolve(ctx, execution)
+	}
 	return InputEnvelopeFanOutResolver{}.Resolve(ctx, execution)
+}
+
+// CoreBlueprintPageFanOutResolver derives branches only from the immutable
+// Blueprint ref carried by the incoming edge binding. It never trusts a client
+// supplied page array or mutable run-context value.
+type CoreBlueprintPageFanOutResolver struct {
+	Artifacts HumanEditArtifactAPI
+	Proposals CoreProposalAPI
+}
+
+func (r CoreBlueprintPageFanOutResolver) Resolve(
+	ctx context.Context,
+	execution Execution,
+) ([]FanOutItem, error) {
+	if r.Artifacts == nil {
+		return nil, fmt.Errorf("Blueprint artifact service is required")
+	}
+	selection, selected, err := loadRunBlueprintSelection(ctx, r.Proposals, execution)
+	if err != nil {
+		return nil, err
+	}
+	if execution.Definition.FanOut != nil && execution.Definition.FanOut.ItemKind == "blueprint_selection_page" && !selected {
+		return nil, fmt.Errorf("blueprint_selection_page fan-out requires a frozen Blueprint selection manifest")
+	}
+	refs := make([]domain.ArtifactRef, 0, 1)
+	seen := map[string]struct{}{}
+	for _, binding := range execution.Inputs.Bindings() {
+		if binding.Source.RunID != execution.Run.ID {
+			return nil, fmt.Errorf("blueprint_page fan-out input belongs to another workflow run")
+		}
+		for _, ref := range binding.Source.ArtifactRevisions {
+			if ref.AnchorID != "" {
+				continue
+			}
+			artifact, err := r.Artifacts.Get(ctx, ref.ArtifactID, execution.Run.StartedBy, false)
+			if err != nil {
+				return nil, fmt.Errorf("resolve fan-out source artifact %s: %w", ref.ArtifactID, err)
+			}
+			if artifact.Artifact.ProjectID != execution.Run.ProjectID {
+				return nil, fmt.Errorf("fan-out source artifact belongs to another project")
+			}
+			if artifact.Artifact.Kind != "blueprint" {
+				continue
+			}
+			if !selected {
+				if err := validateCurrentApprovedBlueprintRef(artifact, ref); err != nil {
+					return nil, err
+				}
+			} else if !ref.Equal(selection.Blueprint) {
+				return nil, fmt.Errorf("blueprint_page fan-out source differs from frozen selection Blueprint")
+			}
+			key := ref.ArtifactID + "\x00" + ref.RevisionID + "\x00" + ref.ContentHash
+			if _, duplicate := seen[key]; duplicate {
+				continue
+			}
+			seen[key] = struct{}{}
+			refs = append(refs, ref)
+		}
+	}
+	if len(refs) != 1 {
+		return nil, fmt.Errorf("blueprint_page fan-out requires exactly one current approved whole Blueprint revision, got %d", len(refs))
+	}
+	blueprint := refs[0]
+	revision, err := r.Artifacts.GetRevision(ctx, blueprint.RevisionID, execution.Run.StartedBy)
+	if err != nil {
+		return nil, fmt.Errorf("load Blueprint revision content: %w", err)
+	}
+	if revision.ID != blueprint.RevisionID || revision.ArtifactID != blueprint.ArtifactID || revision.ContentHash != blueprint.ContentHash || revision.WorkflowStatus != "approved" {
+		return nil, fmt.Errorf("Blueprint revision id, artifact, hash, and approved status must match exactly")
+	}
+	pages, err := semanticBlueprintPages(revision.Content)
+	if err != nil {
+		return nil, err
+	}
+	selectedNodes := map[string]bool{}
+	bindings := map[string]workflowBlueprintSelectionPageBinding{}
+	if selected {
+		for _, nodeID := range selection.NodeIDs {
+			selectedNodes[nodeID] = true
+		}
+		for _, binding := range selection.PageBindings {
+			bindings[binding.NodeID] = binding
+		}
+	}
+	items := make([]FanOutItem, 0, len(pages))
+	seenKeys := map[string]struct{}{}
+	for _, page := range pages {
+		if selected && !selectedNodes[page.ID] {
+			continue
+		}
+		if _, duplicate := seenKeys[page.Key]; duplicate {
+			return nil, fmt.Errorf("Blueprint Page keys must be unique")
+		}
+		seenKeys[page.Key] = struct{}{}
+		anchored := blueprint
+		anchored.AnchorID = page.ID
+		payload, err := domain.CanonicalJSON(map[string]any{
+			"key": page.Key, "title": page.Title, "pageNodeId": page.ID,
+			"route": page.Route, "userGoal": page.UserGoal,
+			"description": page.Description, "requirementIds": page.RequirementIDs,
+			"blueprint": anchored,
+		})
+		if err != nil {
+			return nil, err
+		}
+		item := FanOutItem{
+			Key: page.Key, Title: page.Title, Payload: payload, Blueprint: anchored,
+		}
+		if selected {
+			binding, exists := bindings[page.ID]
+			if !exists {
+				return nil, fmt.Errorf("selected Blueprint page %s has no frozen binding", page.ID)
+			}
+			item.PageSpec, item.Prototype = binding.PageSpec, binding.Prototype
+		}
+		items = append(items, item)
+	}
+	if selected && len(items) != len(bindings) {
+		return nil, fmt.Errorf("Blueprint selection page bindings do not match semantic Page anchors")
+	}
+	sort.Slice(items, func(left, right int) bool {
+		if items[left].Key == items[right].Key {
+			return items[left].Blueprint.AnchorID < items[right].Blueprint.AnchorID
+		}
+		return items[left].Key < items[right].Key
+	})
+	return items, nil
+}
+
+func validateCurrentApprovedBlueprintRef(artifact core.VersionedArtifact, ref domain.ArtifactRef) error {
+	if ref.AnchorID != "" || artifact.Artifact.LatestRevisionID == nil || artifact.Artifact.LatestApprovedRevisionID == nil ||
+		*artifact.Artifact.LatestRevisionID != ref.RevisionID || *artifact.Artifact.LatestApprovedRevisionID != ref.RevisionID ||
+		artifact.Artifact.SyncStatus != "current" {
+		return fmt.Errorf("blueprint_page fan-out source is not the current approved whole Blueprint revision")
+	}
+	return nil
+}
+
+type semanticBlueprintPage struct {
+	ID             string
+	Key            string
+	Title          string
+	Description    string
+	Route          string
+	UserGoal       string
+	RequirementIDs []string
+}
+
+func semanticBlueprintPages(content json.RawMessage) ([]semanticBlueprintPage, error) {
+	type node struct {
+		ID             string   `json:"id"`
+		Key            string   `json:"key"`
+		Kind           string   `json:"kind"`
+		Type           string   `json:"type"`
+		Title          string   `json:"title"`
+		Description    string   `json:"description"`
+		Route          string   `json:"route"`
+		UserGoal       string   `json:"userGoal"`
+		RequirementIDs []string `json:"requirementIds"`
+	}
+	var blueprint struct {
+		Nodes    []node `json:"nodes"`
+		Semantic *struct {
+			Nodes []node `json:"nodes"`
+		} `json:"semantic"`
+	}
+	if err := json.Unmarshal(content, &blueprint); err != nil {
+		return nil, fmt.Errorf("decode Blueprint semantic graph: %w", err)
+	}
+	nodes := blueprint.Nodes
+	if blueprint.Semantic != nil {
+		nodes = blueprint.Semantic.Nodes
+	}
+	pages := make([]semanticBlueprintPage, 0)
+	seenIDs := map[string]struct{}{}
+	for _, candidate := range nodes {
+		kind := strings.TrimSpace(candidate.Kind)
+		if kind == "" {
+			kind = strings.TrimSpace(candidate.Type)
+		}
+		if !strings.EqualFold(kind, "page") {
+			continue
+		}
+		page := semanticBlueprintPage{
+			ID: strings.TrimSpace(candidate.ID), Key: strings.TrimSpace(candidate.Key),
+			Title: strings.TrimSpace(candidate.Title), Description: strings.TrimSpace(candidate.Description),
+			Route: strings.TrimSpace(candidate.Route), UserGoal: strings.TrimSpace(candidate.UserGoal),
+			RequirementIDs: append([]string(nil), candidate.RequirementIDs...),
+		}
+		if page.ID == "" || page.Key == "" || page.Title == "" || !strings.HasPrefix(page.Route, "/") || page.UserGoal == "" {
+			return nil, fmt.Errorf("every semantic Blueprint Page requires id, key, title, absolute route, and userGoal")
+		}
+		if _, duplicate := seenIDs[page.ID]; duplicate {
+			return nil, fmt.Errorf("Blueprint Page ids must be unique")
+		}
+		seenIDs[page.ID] = struct{}{}
+		pages = append(pages, page)
+	}
+	if len(pages) == 0 {
+		return nil, fmt.Errorf("current approved Blueprint contains no semantic Page nodes")
+	}
+	return pages, nil
 }
 
 type InputEnvelopeFanOutResolver struct{}
@@ -1206,9 +2239,117 @@ func (f QualityEvaluatorFunc) Evaluate(ctx context.Context, e Execution) (Qualit
 	return f(ctx, e)
 }
 
+type QualityManifestResolver interface {
+	Resolve(context.Context, Execution, domain.ArtifactRef, []BuildManifest) (BuildManifest, error)
+}
+
+type QualityManifestResolverFunc func(context.Context, Execution, domain.ArtifactRef, []BuildManifest) (BuildManifest, error)
+
+func (f QualityManifestResolverFunc) Resolve(
+	ctx context.Context,
+	execution Execution,
+	workspace domain.ArtifactRef,
+	manifests []BuildManifest,
+) (BuildManifest, error) {
+	return f(ctx, execution, workspace, manifests)
+}
+
+// CoreQualityManifestResolver maps the exact final WorkspaceRevision back to
+// the implementation proposal and manifest leaf that produced it. This lets a
+// quality node consume several compiler/workbench ancestors while selecting
+// one unambiguous producer group for publish provenance.
+type CoreQualityManifestResolver struct{ Database *gorm.DB }
+
+func (r CoreQualityManifestResolver) Resolve(
+	ctx context.Context,
+	execution Execution,
+	workspace domain.ArtifactRef,
+	manifests []BuildManifest,
+) (BuildManifest, error) {
+	if r.Database == nil {
+		return BuildManifest{}, fmt.Errorf("quality manifest database is required")
+	}
+	if err := workspace.Validate(); err != nil || strings.TrimSpace(workspace.AnchorID) != "" {
+		return BuildManifest{}, fmt.Errorf("quality workspace revision is invalid")
+	}
+	if len(manifests) == 0 {
+		return BuildManifest{}, fmt.Errorf("quality has no incoming frozen application build manifest")
+	}
+	projectID, err := uuid.Parse(execution.Run.ProjectID)
+	if err != nil {
+		return BuildManifest{}, fmt.Errorf("quality workflow project id is invalid")
+	}
+	runID, err := uuid.Parse(execution.Run.ID)
+	if err != nil {
+		return BuildManifest{}, fmt.Errorf("quality workflow run id is invalid")
+	}
+	artifactID, err := uuid.Parse(workspace.ArtifactID)
+	if err != nil {
+		return BuildManifest{}, fmt.Errorf("quality workspace artifact id is invalid")
+	}
+	revisionID, err := uuid.Parse(workspace.RevisionID)
+	if err != nil {
+		return BuildManifest{}, fmt.Errorf("quality workspace revision id is invalid")
+	}
+
+	var revision storage.ArtifactRevisionModel
+	if err := r.Database.WithContext(ctx).Table("artifact_revisions AS revision").
+		Select("revision.*").
+		Joins("JOIN artifacts AS artifact ON artifact.id = revision.artifact_id").
+		Where(
+			"revision.id = ? AND revision.artifact_id = ? AND revision.content_hash = ? AND revision.workflow_status = ? AND revision.implementation_proposal_id IS NOT NULL AND artifact.project_id = ? AND artifact.kind = ? AND artifact.lifecycle = ? AND artifact.latest_approved_revision_id = revision.id",
+			revisionID, artifactID, workspace.ContentHash, "approved", projectID, "workspace", "active",
+		).Take(&revision).Error; err != nil {
+		return BuildManifest{}, fmt.Errorf("quality workspace is not the exact current implementation output: %w", err)
+	}
+
+	var proposal storage.ImplementationProposalModel
+	if err := r.Database.WithContext(ctx).Where(
+		"id = ? AND project_id = ? AND status IN ? AND applied_at IS NOT NULL AND applied_by IS NOT NULL",
+		*revision.ImplementationProposalID, projectID, []string{"applied", "partially_applied"},
+	).Take(&proposal).Error; err != nil {
+		return BuildManifest{}, fmt.Errorf("quality workspace producer proposal is not applied: %w", err)
+	}
+	var producer storage.ApplicationBuildManifestModel
+	if err := r.Database.WithContext(ctx).Where(
+		"id = ? AND project_id = ? AND workflow_run_id = ? AND status = ?",
+		proposal.BuildManifestID, projectID, runID, "consumed",
+	).Take(&producer).Error; err != nil {
+		return BuildManifest{}, fmt.Errorf("quality workspace producer manifest is unavailable: %w", err)
+	}
+	rootID := producer.RootManifestID
+	if rootID == uuid.Nil {
+		rootID = producer.ID
+	}
+	if producer.ManifestGroupKey == nil || strings.TrimSpace(*producer.ManifestGroupKey) == "" || producer.RootOrdinal == nil {
+		return BuildManifest{}, fmt.Errorf("quality workspace producer has no compiler coordinate")
+	}
+	if err := validateBuildManifestRootLineage(ctx, r.Database, producer, rootID, projectID, runID); err != nil {
+		return BuildManifest{}, fmt.Errorf("quality workspace producer lineage is invalid: %w", err)
+	}
+
+	matches := make([]BuildManifest, 0, 1)
+	for _, manifest := range manifests {
+		if err := manifest.Validate(); err != nil || manifest.ProjectID != execution.Run.ProjectID || manifest.RunID != execution.Run.ID || manifest.ManifestGroupKey != *producer.ManifestGroupKey {
+			continue
+		}
+		for ordinal, bundleID := range manifest.BundleIDs {
+			if bundleID == rootID.String() && ordinal == *producer.RootOrdinal && ordinal == len(manifest.BundleIDs)-1 {
+				matches = append(matches, manifest)
+				break
+			}
+		}
+	}
+	if len(matches) != 1 {
+		return BuildManifest{}, fmt.Errorf("quality workspace producer maps to %d incoming compiler manifests", len(matches))
+	}
+	return matches[0], nil
+}
+
 type QualityGateRunner struct {
-	Evaluator QualityEvaluator
-	Access    PublishAuthorizer
+	Evaluator        QualityEvaluator
+	ManifestResolver QualityManifestResolver
+	Access           PublishAuthorizer
 }
 
 func (r QualityGateRunner) Run(ctx context.Context, e Execution) (WorkerResult, error) {
@@ -1227,11 +2368,28 @@ func (r QualityGateRunner) Run(ctx context.Context, e Execution) (WorkerResult, 
 	if !workflowRoleSatisfies(currentRole, requiredRole) {
 		return WorkerResult{}, core.ErrForbidden
 	}
-	manifest, err := buildManifestFromInputLineage(e)
+	manifests, err := buildManifestsFromInputLineage(e)
 	if err != nil {
 		return WorkerResult{}, err
 	}
 	result, err := r.Evaluator.Evaluate(ctx, e)
+	if err != nil {
+		return WorkerResult{}, err
+	}
+	if result.WorkspaceRevision == nil {
+		return WorkerResult{}, fmt.Errorf("quality evaluator did not return its exact WorkspaceRevision")
+	}
+	var manifest BuildManifest
+	if r.ManifestResolver != nil {
+		manifest, err = r.ManifestResolver.Resolve(ctx, e, *result.WorkspaceRevision, manifests)
+	} else if len(manifests) == 1 {
+		// Direct runner construction in small unit tests retains the historical
+		// single-manifest behavior. The platform bootstrap always injects the
+		// authoritative resolver above.
+		manifest = manifests[0]
+	} else {
+		err = fmt.Errorf("quality manifest resolver is required for %d compiler groups", len(manifests))
+	}
 	if err != nil {
 		return WorkerResult{}, err
 	}

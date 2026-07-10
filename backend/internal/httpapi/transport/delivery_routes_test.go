@@ -131,7 +131,6 @@ func (s *fakeStaticAssets) ServeAsset(response http.ResponseWriter, _ *http.Requ
 
 func deliveryRouterForTest(t *testing.T, api *fakeDeliveryAPI, userID string, static delivery.StaticAssetServer, mutation ...gin.HandlerFunc) *gin.Engine {
 	t.Helper()
-	gin.SetMode(gin.TestMode)
 	router := gin.New()
 	security := config.SecurityConfig{Session: config.SessionSecurityConfig{CookieName: "session"}}
 	protected := router.Group("/v1", worksmiddleware.RequireAuthentication(deliveryAuthenticator{userID: userID}, security))

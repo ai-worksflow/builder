@@ -39,12 +39,16 @@ type ImplementationGenerationResult struct {
 	Usage    *ai.Usage                   `json:"usage,omitempty"`
 }
 
+type implementationWorkbench interface {
+	GetBundleForGeneration(context.Context, string, string) (core.WorkbenchBundle, error)
+}
+
 type Service struct {
 	database       *gorm.DB
 	contents       content.Store
 	provider       ai.Provider
 	proposals      *core.ProposalService
-	workbench      *core.WorkbenchService
+	workbench      implementationWorkbench
 	implementation *core.ImplementationService
 }
 
@@ -73,6 +77,17 @@ func (s *Service) GenerateArtifactProposal(ctx context.Context, manifestID, acto
 	if manifest.BaseRevision == nil {
 		return ArtifactGenerationResult{}, fmt.Errorf("manifest %s has no proposal base revision", manifest.ID)
 	}
+	base := core.VersionRef{
+		ArtifactID: manifest.BaseRevision.ArtifactID, RevisionID: manifest.BaseRevision.RevisionID,
+		ContentHash: manifest.BaseRevision.ContentHash,
+	}
+	if manifest.BaseRevision.AnchorID != "" {
+		anchor := manifest.BaseRevision.AnchorID
+		base.AnchorID = &anchor
+	}
+	if err := s.proposals.ValidateArtifactProposalBase(ctx, manifest.ProjectID, actorID, base); err != nil {
+		return ArtifactGenerationResult{}, err
+	}
 	input, err := s.artifactInput(ctx, manifest)
 	if err != nil {
 		return ArtifactGenerationResult{}, err
@@ -96,6 +111,7 @@ func (s *Service) GenerateArtifactProposal(ctx context.Context, manifestID, acto
 	proposal, err := s.proposals.CreateProposal(ctx, manifest.ProjectID, actorID, core.CreateProposalInput{
 		ManifestID: manifest.ID, ArtifactID: manifest.BaseRevision.ArtifactID,
 		Operations: output.Operations, Assumptions: output.Assumptions, Questions: output.Questions,
+		AIProvider: result.Provider, AIModel: result.Model,
 	})
 	if err != nil {
 		return ArtifactGenerationResult{}, err
@@ -104,7 +120,7 @@ func (s *Service) GenerateArtifactProposal(ctx context.Context, manifestID, acto
 }
 
 func (s *Service) GenerateImplementation(ctx context.Context, bundleID, actorID, model, instruction string) (ImplementationGenerationResult, error) {
-	bundle, err := s.workbench.GetBundle(ctx, bundleID, actorID)
+	bundle, err := s.workbench.GetBundleForGeneration(ctx, bundleID, actorID)
 	if err != nil {
 		return ImplementationGenerationResult{}, err
 	}

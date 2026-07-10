@@ -107,12 +107,40 @@ func TestRevisionLineageDeduplicatesDependencyWithoutLosingAnchors(t *testing.T)
 	if !dependencies[0].Required {
 		t.Fatal("dependency must be required when any frozen purpose is required")
 	}
-	if len(links) != 2 {
-		t.Fatalf("distinct source anchors must remain traceable, got %d links", len(links))
+	if len(links) != 3 {
+		t.Fatalf("dependency must have whole-source coverage plus both exact anchors, got %d links", len(links))
 	}
-	if links[0].SourceAnchorID == nil || *links[0].SourceAnchorID != "page-orders" ||
-		links[1].SourceAnchorID == nil || *links[1].SourceAnchorID != "page-order-detail" {
-		t.Fatalf("unexpected exact trace anchors: %#v", links)
+	anchors := map[string]bool{}
+	wholeSourceCovered := false
+	for _, link := range links {
+		if link.SourceAnchorID == nil {
+			wholeSourceCovered = true
+			continue
+		}
+		anchors[*link.SourceAnchorID] = true
+	}
+	if !wholeSourceCovered || !anchors["page-orders"] || !anchors["page-order-detail"] {
+		t.Fatalf("unexpected whole-source and exact-anchor trace coverage: %#v", links)
+	}
+}
+
+func TestRevisionLineageDoesNotCreateSelfArtifactDependency(t *testing.T) {
+	t.Parallel()
+	artifactID := uuid.New()
+	anchor := "page-orders"
+	dependencies, links := revisionLineageModelsFromDraft(
+		uuid.New(), artifactID, uuid.New(), uuid.New(), time.Now().UTC(),
+		[]storage.ArtifactDraftSourceModel{{
+			SourceArtifactID: artifactID, SourceRevisionID: uuid.New(),
+			SourceContentHash: "sha256:prior", SourceAnchorID: &anchor,
+			Purpose: "editable_base", Required: true,
+		}},
+	)
+	if len(dependencies) != 0 {
+		t.Fatalf("same-artifact revision ancestry created an invalid artifact dependency: %+v", dependencies)
+	}
+	if len(links) != 1 || links[0].SourceAnchorID == nil || *links[0].SourceAnchorID != anchor {
+		t.Fatalf("skipping the self dependency lost exact anchor traceability: %+v", links)
 	}
 }
 

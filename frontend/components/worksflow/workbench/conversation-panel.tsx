@@ -25,6 +25,11 @@ import type {
 } from '@/lib/platform/conversation-contract'
 import { usePlatformFlow } from '@/lib/platform/flow-provider'
 import type { WorkflowRunDto } from '@/lib/platform/flow-contract'
+import { projectBriefIntentCandidateVersionIds } from '@/lib/platform/workflow-entry'
+import {
+  workbenchRootBundleId,
+  workflowWorkbenchQueueGroups,
+} from '@/lib/platform/flow-queue'
 import { cn } from '@/lib/utils'
 
 export function ConversationPanel({ onClose }: { onClose: () => void }) {
@@ -42,7 +47,14 @@ export function ConversationPanel({ onClose }: { onClose: () => void }) {
   const [model, setModel] = useState('gpt-5')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [checkpointNotice, setCheckpointNotice] = useState<string | null>(null)
   const selected = conversations.find((item) => item.id === conversationId)
+  const projectBrief = artifacts.documents.find((item) => item.artifact.kind === 'project_brief')
+  const briefRevision = projectBrief?.latestRevision ?? projectBrief?.approvedRevision
+  const briefNeedsCheckpoint = Boolean(
+    projectBrief?.draft
+    && (!briefRevision || projectBrief.draft.contentHash !== briefRevision.contentHash),
+  )
   const client = platformClient.conversation
 
   const loadConversation = useCallback(async (id: string) => {
@@ -156,31 +168,29 @@ export function ConversationPanel({ onClose }: { onClose: () => void }) {
 
   async function generateIntent(triggerMessageId: string) {
     if (!project || !conversationId || !can('edit')) return
-    const projectBrief = artifacts.documents.find((item) => item.artifact.kind === 'project_brief')
     if (!projectBrief) {
       setError('Create the Project Brief before asking AI to propose a workflow action.')
       return
     }
     setBusy(true)
     setError(null)
+    setCheckpointNotice(null)
     try {
-      const revision = projectBrief.approvedRevision
-      if (!revision) {
-        throw new Error('Approve an immutable Project Brief revision before generating an intent proposal.')
-      }
-      const draftIsNewer = Boolean(
+      let revision = projectBrief.latestRevision ?? projectBrief.approvedRevision
+      if (
         projectBrief.draft
-        && projectBrief.draft.contentHash !== revision.contentHash,
-      )
-      const latestIsNewer = Boolean(
-        projectBrief.latestRevision
-        && (
-          projectBrief.latestRevision.id !== revision.id
-          || projectBrief.latestRevision.contentHash !== revision.contentHash
-        ),
-      )
-      if (draftIsNewer || latestIsNewer) {
-        throw new Error('The Project Brief has unapproved changes. Finish its immutable revision, review, and approval before generating an intent proposal.')
+        && (!revision || projectBrief.draft.contentHash !== revision.contentHash)
+      ) {
+        revision = await artifacts.createDocumentRevision(
+          projectBrief.artifact.id,
+          projectBrief.draft.content,
+        )
+        setCheckpointNotice(
+          `Created immutable Project Brief checkpoint r${revision.revisionNumber}. The intent input is pinned to this exact revision and content hash.`,
+        )
+      }
+      if (!revision) {
+        throw new Error('Create an immutable Project Brief revision before generating an intent proposal.')
       }
       const sourceRef = {
         artifactId: revision.artifactId,
@@ -189,14 +199,21 @@ export function ConversationPanel({ onClose }: { onClose: () => void }) {
       }
       const manifest = await platformClient.flow.createManifest(project.id, {
         jobType: 'conversation.workflow_intent',
+        baseRevision: sourceRef,
         sources: [{ ref: sourceRef, purpose: 'project_brief' }],
-        constraints: { conversationId, triggerMessageId },
+        constraints: {
+          conversationId,
+          triggerMessageId,
+          projectBriefArtifactId: sourceRef.artifactId,
+          projectBriefRevisionId: sourceRef.revisionId,
+          projectBriefContentHash: sourceRef.contentHash,
+        },
         outputSchemaVersion: 'workflow-intent-input/v1',
       })
-      const candidateDefinitionVersionIds = Array.from(new Set([
-        ...flow.definitionVersions.filter((item) => item.published).map((item) => item.versionId),
-        ...flow.definitions.filter((item) => item.published).map((item) => item.versionId),
-      ]))
+      const candidateDefinitionVersionIds = projectBriefIntentCandidateVersionIds([
+        ...flow.definitionVersions,
+        ...flow.definitions,
+      ])
       if (candidateDefinitionVersionIds.length === 0) {
         throw new Error('Publish at least one workflow definition version before generating an intent proposal.')
       }
@@ -267,8 +284,21 @@ export function ConversationPanel({ onClose }: { onClose: () => void }) {
         if (!bundleId) {
           throw new Error('Load the frozen Workbench bundle linked to the expected workflow run before executing this instruction.')
         }
+        const workbenchGroups = workflowWorkbenchQueueGroups(targetRun)
+        const targetGroup = workbenchGroups.find((group) =>
+          group.references.some((reference) => reference.bundleId === bundleId),
+        )
+        if (workbenchGroups.length > 0 && !targetGroup) {
+          throw new Error('The expected frozen Workbench bundle is not owned by any Workbench node in this run.')
+        }
+        if (targetGroup) {
+          await flow.selectWorkbenchGroup(targetGroup.nodeKey)
+        }
         const targetBundle = await flow.loadBundle(bundleId)
-        if (!targetBundle || targetBundle.id !== bundleId) {
+        if (
+          !targetBundle
+          || (targetBundle.id !== bundleId && workbenchRootBundleId(targetBundle) !== bundleId)
+        ) {
           throw new Error('The expected frozen Workbench bundle is unavailable.')
         }
         if (targetBundle.workflowRunId !== runId) {
@@ -279,7 +309,11 @@ export function ConversationPanel({ onClose }: { onClose: () => void }) {
         const proposal = await flow.generateImplementation(instruction, model.trim() || undefined, bundleId)
         if (!proposal) throw new Error('Workbench did not return a reviewable implementation proposal.')
         await client.executeCommand(project.id, command.conversationId, command, {
-          workbenchResult: { runId, bundleId },
+          workbenchResult: {
+            runId,
+            bundleId: proposal.buildManifestId,
+            implementationProposalId: proposal.id,
+          },
         })
       }
       await loadConversation(command.conversationId)
@@ -335,6 +369,7 @@ export function ConversationPanel({ onClose }: { onClose: () => void }) {
       </header>
 
       {error && <div role="alert" className="flex items-start gap-2 border-b border-destructive/30 bg-destructive/10 px-3 py-2 text-[9px] leading-relaxed text-destructive"><CircleAlert className="mt-0.5 size-3 shrink-0" /><span className="min-w-0 flex-1">{error}</span><button type="button" onClick={() => setError(null)}><X className="size-3" /></button></div>}
+      {checkpointNotice && <div role="status" className="flex items-start gap-2 border-b border-success/30 bg-success/10 px-3 py-2 text-[9px] leading-relaxed text-success"><Check className="mt-0.5 size-3 shrink-0" /><span className="min-w-0 flex-1">{checkpointNotice}</span><button type="button" onClick={() => setCheckpointNotice(null)} aria-label="Dismiss checkpoint notice"><X className="size-3" /></button></div>}
 
       {!session.signedIn || !project ? (
         <PanelEmpty text="Sign in and select a server project before opening governed conversations." />
@@ -355,7 +390,7 @@ export function ConversationPanel({ onClose }: { onClose: () => void }) {
             {messages.map((item) => {
               const linkedProposal = item.proposalId ? proposalById.get(item.proposalId) : undefined
               const linkedCommand = linkedProposal ? commandByProposal.get(linkedProposal.id) : undefined
-              return <article key={item.id} className={cn('rounded-lg border p-2.5', item.role === 'user' ? 'ml-8 border-primary/25 bg-primary/8' : 'mr-4 border-border bg-background')}><div className="flex items-center gap-1.5 text-[8px] font-semibold uppercase tracking-wider text-faint-foreground">{item.role === 'user' ? <MessageSquare className="size-3" /> : <Bot className="size-3 text-primary-bright" />}{item.role}<span className="ml-auto font-mono">#{item.sequence}</span></div><p className="mt-2 whitespace-pre-wrap text-[10px] leading-relaxed text-muted-foreground">{item.content}</p>{item.role === 'user' && !proposals.some((proposal) => proposal.triggerMessageId === item.id) && <button type="button" onClick={() => void generateIntent(item.id)} disabled={busy || !can('edit')} className="mt-2 inline-flex h-7 items-center gap-1 rounded border border-primary/30 bg-primary/10 px-2 text-[8px] font-semibold text-primary-bright disabled:opacity-35"><Sparkles className="size-3" />Generate governed intent</button>}{linkedProposal && <IntentCard proposal={linkedProposal} command={linkedCommand} busy={busy} canEdit={can('edit')} onDecide={decideProposal} onExecute={executeCommand} onRejectCommand={rejectCommand} />}</article>
+              return <article key={item.id} className={cn('rounded-lg border p-2.5', item.role === 'user' ? 'ml-8 border-primary/25 bg-primary/8' : 'mr-4 border-border bg-background')}><div className="flex items-center gap-1.5 text-[8px] font-semibold uppercase tracking-wider text-faint-foreground">{item.role === 'user' ? <MessageSquare className="size-3" /> : <Bot className="size-3 text-primary-bright" />}{item.role}<span className="ml-auto font-mono">#{item.sequence}</span></div><p className="mt-2 whitespace-pre-wrap text-[10px] leading-relaxed text-muted-foreground">{item.content}</p>{item.role === 'user' && !proposals.some((proposal) => proposal.triggerMessageId === item.id) && <button type="button" onClick={() => void generateIntent(item.id)} disabled={busy || !can('edit')} className="mt-2 inline-flex h-7 items-center gap-1 rounded border border-primary/30 bg-primary/10 px-2 text-[8px] font-semibold text-primary-bright disabled:opacity-35"><Sparkles className="size-3" />{briefNeedsCheckpoint ? 'Checkpoint Brief & generate intent' : 'Generate governed intent'}</button>}{linkedProposal && <IntentCard proposal={linkedProposal} command={linkedCommand} busy={busy} canEdit={can('edit')} onDecide={decideProposal} onExecute={executeCommand} onRejectCommand={rejectCommand} />}</article>
             })}
             {commands.filter((command) => !proposals.some((proposal) => proposal.id === command.proposalId && messages.some((item) => item.proposalId === proposal.id))).map((command) => <CommandCard key={command.id} command={command} busy={busy} canEdit={can('edit')} onExecute={executeCommand} onReject={rejectCommand} />)}
           </div>
@@ -385,19 +420,24 @@ function stringField(value: unknown, key: string) {
   return typeof field === 'string' ? field : ''
 }
 
-function assertRunMatchesCommand(run: WorkflowRunDto | null, command: ConversationCommandDto) {
+function assertRunMatchesCommand(
+  run: WorkflowRunDto | null,
+  command: ConversationCommandDto,
+): asserts run is WorkflowRunDto {
   if (!run || run.id !== (command.kind === 'start_workflow' ? command.id : command.payload.workbench.expectedRunId)) {
     throw new Error('The expected workflow run could not be loaded exactly.')
   }
   if (run.definitionVersionId !== command.payload.definitionVersionId) {
     throw new Error('The workflow run does not use the definition version pinned by the accepted command.')
   }
-  const expectedManifest = command.payload.manifestIntent.inputManifest
-  if (
-    run.inputManifest?.id !== expectedManifest.id
-    || run.inputManifest?.hash !== expectedManifest.hash
-  ) {
-    throw new Error('The workflow run does not use the input manifest pinned by the accepted command.')
+  if (command.kind === 'start_workflow') {
+    const expectedManifest = command.payload.manifestIntent.inputManifest
+    if (
+      run.inputManifest?.id !== expectedManifest.id
+      || run.inputManifest?.hash !== expectedManifest.hash
+    ) {
+      throw new Error('The workflow run does not use the input manifest pinned by the accepted command.')
+    }
   }
 }
 

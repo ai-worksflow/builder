@@ -95,7 +95,11 @@ func (s *BaselineService) Compile(ctx context.Context, projectID, actorID string
 			if report := ValidateArtifactContent(artifact.Kind, stored.Payload); !report.Valid {
 				return ArtifactRevision{}, fmt.Errorf("%w: existing Requirement Baseline is invalid", ErrBlockingGate)
 			}
-			return revisionFromModel(revision, stored.Payload, nil), nil
+			sourceModels, err := (&ArtifactService{database: s.database}).loadRevisionSourceModels(ctx, []uuid.UUID{revision.ID})
+			if err != nil {
+				return ArtifactRevision{}, err
+			}
+			return revisionFromModel(revision, stored.Payload, revisionSourcesFromModels(sourceModels[revision.ID])), nil
 		}
 		if report := ValidateArtifactContent(artifact.Kind, stored.Payload); !report.Valid && (artifact.Kind == "project_brief" || artifact.Kind == "product_requirements") {
 			return ArtifactRevision{}, fmt.Errorf("%w: source validation failed", ErrBlockingGate)
@@ -126,6 +130,7 @@ func (s *BaselineService) Compile(ctx context.Context, projectID, actorID string
 	}()
 	now := s.now().UTC()
 	var revision storage.ArtifactRevisionModel
+	var frozenSources []ArtifactSource
 	reusedRevision := false
 	err = s.database.WithContext(ctx).Transaction(func(transaction *gorm.DB) error {
 		var artifact storage.ArtifactModel
@@ -142,6 +147,9 @@ func (s *BaselineService) Compile(ctx context.Context, projectID, actorID string
 			}
 		} else if err != nil {
 			return err
+		}
+		if artifact.Kind != "requirement_baseline" {
+			return fmt.Errorf("%w: REQUIREMENT-BASELINE key belongs to a non-baseline artifact", ErrConflict)
 		}
 		var existing storage.ArtifactRevisionModel
 		err = transaction.Where(
@@ -189,6 +197,19 @@ func (s *BaselineService) Compile(ctx context.Context, projectID, actorID string
 		if err := transaction.Create(&draft).Error; err != nil {
 			return err
 		}
+		lineageSources := make([]SystemRevisionSource, 0, len(baseline.SourceVersions))
+		for _, source := range baseline.SourceVersions {
+			lineageSources = append(lineageSources, SystemRevisionSource{
+				Ref: source, Purpose: "baseline_input", Required: true, Relation: "compiled_into",
+			})
+		}
+		frozenSources, err = PersistSystemRevisionLineage(
+			transaction, projectUUID, artifact.ID, revision.ID, draft.ID,
+			actorUUID, now, lineageSources,
+		)
+		if err != nil {
+			return err
+		}
 		if err := transaction.Model(&storage.ArtifactModel{}).Where("id = ?", artifact.ID).
 			Updates(map[string]any{
 				"latest_revision_id": revision.ID, "latest_approved_revision_id": revision.ID,
@@ -197,16 +218,6 @@ func (s *BaselineService) Compile(ctx context.Context, projectID, actorID string
 			return err
 		}
 		for _, source := range sourceModels {
-			targetRevisionID := revision.ID
-			dependency := storage.ArtifactDependencyModel{
-				ID: uuid.New(), ProjectID: projectUUID, SourceArtifactID: source.ArtifactID,
-				SourceRevisionID: source.ID, SourceContentHash: source.ContentHash,
-				TargetArtifactID: artifact.ID, TargetRevisionID: &targetRevisionID,
-				Relation: "compiled_into", Required: true, CreatedBy: actorUUID, CreatedAt: now,
-			}
-			if err := transaction.Create(&dependency).Error; err != nil {
-				return err
-			}
 			for _, anchor := range anchorsBySource[source.ID] {
 				anchorValue := anchor
 				link := storage.TraceLinkModel{
@@ -232,13 +243,17 @@ func (s *BaselineService) Compile(ctx context.Context, projectID, actorID string
 		return ArtifactRevision{}, err
 	}
 	if reusedRevision {
-		return revisionFromModel(revision, payload, nil), nil
+		sourceModels, err := (&ArtifactService{database: s.database}).loadRevisionSourceModels(ctx, []uuid.UUID{revision.ID})
+		if err != nil {
+			return ArtifactRevision{}, err
+		}
+		return revisionFromModel(revision, payload, revisionSourcesFromModels(sourceModels[revision.ID])), nil
 	}
 	abortPending = false
 	if err := s.contents.Finalize(ctx, contentRef.ID); err != nil {
 		return ArtifactRevision{}, fmt.Errorf("%w: %v", ErrContentNotReady, err)
 	}
-	return revisionFromModel(revision, payload, nil), nil
+	return revisionFromModel(revision, payload, frozenSources), nil
 }
 
 func finalizeRequirementBaselinePayload(baseline RequirementBaseline) (json.RawMessage, error) {

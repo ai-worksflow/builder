@@ -20,26 +20,37 @@ type realClock struct{}
 func (realClock) Now() time.Time { return time.Now().UTC() }
 
 type Engine struct {
-	Store               Store
-	Runners             RunnerRegistry
-	IDs                 IDGenerator
-	Clock               Clock
-	LeaseDuration       time.Duration
-	RetryBackoff        func(int) time.Duration
-	ManifestFreezer     ManifestFreezer
-	ArtifactInputs      ArtifactInputValidator
-	WorkbenchCompletion WorkbenchCompletionValidator
-	ReviewGate          ReviewGateVerifier
-	ProposalDispatcher  ProposalDispatcher
-	BuildManifestHook   BuildManifestHook
-	ConditionEvaluator  ConditionEvaluator
+	Store              Store
+	Runners            RunnerRegistry
+	IDs                IDGenerator
+	Clock              Clock
+	LeaseDuration      time.Duration
+	RetryBackoff       func(int) time.Duration
+	ManifestFreezer    ManifestFreezer
+	ArtifactInputs     ArtifactInputValidator
+	StartArtifactKinds StartArtifactKindResolver
+	HumanEditOutput    HumanEditOutputValidator
+	// HumanWorkflowContextKeys is the explicit server-side extension allowlist.
+	// Schema-declared keys are accepted without being repeated here; reserved
+	// control-plane keys remain denied even if a client schema declares them.
+	HumanWorkflowContextKeys map[string]struct{}
+	WorkbenchCompletion      WorkbenchCompletionValidator
+	ReviewGate               ReviewGateVerifier
+	ProposalDispatcher       ProposalDispatcher
+	BuildManifestHook        BuildManifestHook
+	ManifestCompilers        *BuildManifestRegistry
+	ConditionEvaluator       ConditionEvaluator
+	Capabilities             WorkflowCapabilities
 }
 
 func NewEngine(store Store) (*Engine, error) {
 	if store == nil {
 		return nil, fmt.Errorf("workflow store is required")
 	}
-	return &Engine{Store: store, IDs: UUIDGenerator{}, Clock: realClock{}, LeaseDuration: 2 * time.Minute, RetryBackoff: defaultRetryBackoff}, nil
+	return &Engine{
+		Store: store, IDs: UUIDGenerator{}, Clock: realClock{}, LeaseDuration: 2 * time.Minute,
+		RetryBackoff: defaultRetryBackoff, Capabilities: PlatformWorkflowCapabilities(true, true),
+	}, nil
 }
 
 type StartRequest struct {
@@ -65,6 +76,11 @@ func (e *Engine) Start(ctx context.Context, request StartRequest) (*RunRecord, e
 	if err := definitionRecord.Definition.Validate(); err != nil {
 		return nil, err
 	}
+	if definitionRecord.Definition.InputContract != nil {
+		if err := e.Capabilities.ValidateDefinition(definitionRecord.Definition); err != nil {
+			return nil, err
+		}
+	}
 	manifest, err := e.Store.GetManifest(ctx, request.InputManifest.ID)
 	if err != nil {
 		return nil, err
@@ -74,6 +90,22 @@ func (e *Engine) Start(ctx context.Context, request StartRequest) (*RunRecord, e
 	}
 	if manifest.Ref() != request.InputManifest || manifest.ProjectID != request.ProjectID {
 		return nil, domain.ErrManifestUnpinned
+	}
+	var artifactKinds []string
+	if definitionRecord.Definition.InputContract != nil {
+		if e.StartArtifactKinds == nil {
+			return nil, fmt.Errorf("workflow start artifact-kind resolver is required")
+		}
+		artifactKinds, err = e.StartArtifactKinds.ResolveStartArtifactKinds(ctx, manifest)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if err := CompatibleStart(definitionRecord.Definition, DescribeStartManifest(manifest, artifactKinds), ""); err != nil {
+		return nil, &domain.DomainError{
+			Kind: domain.ErrInvalidArgument, Field: "inputManifest",
+			Message: "the input manifest contract is incompatible with the selected workflow definition",
+		}
 	}
 	entry, err := definitionRecord.Definition.EntryNodeID()
 	if err != nil {
@@ -144,7 +176,7 @@ func (e *Engine) ExecuteLease(ctx context.Context, lease Lease) error {
 	if err != nil {
 		return e.handleFailure(ctx, run, definitionRecord.Definition, node, lease, err)
 	}
-	execution := Execution{Run: *run, Node: *node, Definition: definition, Lease: lease, Inputs: inputs}
+	execution := Execution{Run: *run, Node: *node, Definition: definition, Workflow: definitionRecord.Definition, Lease: lease, Inputs: inputs}
 	if _, _, required := nodeExecutionPolicy(definition); required && run.Context.Nodes[node.Key].ExecutionActor == nil {
 		return e.applyResult(ctx, run, definitionRecord.Definition, node, lease, execution, WorkerResult{Disposition: ResultWaitInput})
 	}
@@ -200,7 +232,19 @@ func (e *Engine) executeNode(ctx context.Context, execution Execution) (WorkerRe
 			return WorkerResult{Disposition: disposition, Manifest: &manifest, Proposal: proposal}, nil
 		}
 	case domain.NodeManifestCompiler:
-		if e.BuildManifestHook != nil {
+		if e.ManifestCompilers != nil {
+			manifest, err := e.ManifestCompilers.Compile(ctx, execution)
+			if err != nil {
+				return WorkerResult{}, err
+			}
+			if err := manifest.Freeze(); err != nil {
+				return WorkerResult{}, err
+			}
+			return WorkerResult{Disposition: ResultComplete, BuildManifest: &manifest}, nil
+		}
+		// Legacy definitions and isolated engine tests retain their injected hook;
+		// governed platform definitions always use the exact dispatcher above.
+		if execution.Workflow.InputContract == nil && e.BuildManifestHook != nil && execution.Definition.ManifestCompiler != nil {
 			manifest, err := e.BuildManifestHook.Compile(ctx, execution)
 			if err != nil {
 				return WorkerResult{}, err
@@ -551,28 +595,47 @@ func (e *Engine) SubmitHumanInput(ctx context.Context, runID, nodeKey string, ou
 		return err
 	}
 	var outputRevisionID string
+	var storedInputs domain.NodeInputEnvelope
+	var hasStoredInputs bool
+	if definitionNode.Type == domain.NodeWorkbenchBuild || definitionNode.Type == domain.NodeHumanEdit {
+		storedInputs, hasStoredInputs, err = decodeStoredInputs(run.Context.Nodes[node.Key].Input)
+		if err != nil {
+			return err
+		}
+	}
 	if definitionNode.Type == domain.NodeWorkbenchBuild {
 		if e.WorkbenchCompletion == nil {
 			return fmt.Errorf("workbench completion validator is required")
-		}
-		storedInputs, _, inputErr := decodeStoredInputs(run.Context.Nodes[node.Key].Input)
-		if inputErr != nil {
-			return inputErr
 		}
 		outputRevisionID, err = e.WorkbenchCompletion.ValidateCompletion(ctx, Execution{Run: *run, Node: *node, Definition: definitionNode, Inputs: storedInputs}, canonical)
 		if err != nil {
 			return err
 		}
 	}
-	var humanRefs []domain.ArtifactRef
+	var humanEdit HumanEditValidation
 	if definitionNode.Type == domain.NodeHumanEdit {
-		humanRefs, err = artifactRefsFromNodeOutput(canonical)
+		if e.HumanEditOutput == nil {
+			return fmt.Errorf("human edit output validator is required")
+		}
+		if !hasStoredInputs && len(record.Definition.Incoming(definitionNode.ID)) > 0 {
+			return &domain.DomainError{Kind: domain.ErrValidation, Field: "input", Message: "human edit input lineage is missing"}
+		}
+		humanEdit, err = e.HumanEditOutput.ValidateHumanEdit(
+			ctx,
+			Execution{Run: *run, Node: *node, Definition: definitionNode, Inputs: storedInputs},
+			canonical,
+			actorID,
+		)
 		if err != nil {
 			return err
 		}
-		if len(humanRefs) == 0 {
-			return &domain.DomainError{Kind: domain.ErrValidation, Field: "artifactRevisions", Message: "human edit output must pin at least one artifact revision"}
+		if len(humanEdit.ArtifactRefs) == 0 || humanEdit.Primary.Validate() != nil || strings.TrimSpace(humanEdit.ArtifactKind) == "" {
+			return &domain.DomainError{Kind: domain.ErrValidation, Field: "artifactRevision", Message: "human edit validator returned no exact artifact revision"}
 		}
+	}
+	workflowContext, err := e.validatedHumanWorkflowContext(definitionNode, canonical)
+	if err != nil {
+		return err
 	}
 	now := e.now()
 	builder := newMutationBuilder(e, run, now)
@@ -580,37 +643,13 @@ func (e *Engine) SubmitHumanInput(ctx context.Context, runID, nodeKey string, ou
 	metadata := run.Context.Nodes[node.Key]
 	metadata.Output = canonical
 	run.Context.Nodes[node.Key] = metadata
-	if metadata.SliceID != "" && definitionNode.HumanEdit != nil && len(humanRefs) > 0 {
-		slice, exists := run.Context.Slices[metadata.SliceID]
-		if !exists {
-			return &domain.DomainError{Kind: domain.ErrValidation, Field: "slice", Message: "human edit references an unknown delivery slice"}
+	if metadata.SliceID != "" && definitionNode.HumanEdit != nil && len(humanEdit.ArtifactRefs) > 0 {
+		if err := applyHumanEditSliceLineage(run, metadata.SliceID, humanEdit); err != nil {
+			return err
 		}
-		latest := humanRefs[len(humanRefs)-1]
-		switch definitionNode.HumanEdit.ArtifactType {
-		case domain.ArtifactPrototype:
-			slice.Prototype = &latest
-		case domain.ArtifactBlueprint:
-			slice.Blueprint = latest
-		}
-		run.Context.Slices[metadata.SliceID] = slice
 	}
-	var envelope struct {
-		WorkflowContext map[string]json.RawMessage `json:"workflowContext"`
-	}
-	if err := json.Unmarshal(canonical, &envelope); err == nil {
-		for key, value := range envelope.WorkflowContext {
-			if strings.TrimSpace(key) == "" || len(key) > 128 {
-				return domain.ErrInvalidArgument
-			}
-			if key == "buildManifest" || key == "workspaceRevision" || key == "executionActor" || key == "reviewDecisionActor" || strings.HasPrefix(key, "system.") {
-				return &domain.DomainError{Kind: domain.ErrValidation, Field: "workflowContext." + key, Message: "workflow context key is reserved for a trusted runner"}
-			}
-			normalized, err := domain.CanonicalJSON(value)
-			if err != nil {
-				return err
-			}
-			run.Context.Values[key] = normalized
-		}
+	for key, value := range workflowContext {
+		run.Context.Values[key] = value
 	}
 	node.Status = NodeCompleted
 	if outputRevisionID != "" {
@@ -623,6 +662,105 @@ func (e *Engine) SubmitHumanInput(ctx context.Context, runID, nodeKey string, ou
 	e.reconcile(run, record.Definition, builder)
 	e.refreshRunStatus(run, record.Definition, now)
 	return e.Store.Commit(ctx, builder.build())
+}
+
+func applyHumanEditSliceLineage(run *RunRecord, sliceID string, edit HumanEditValidation) error {
+	if run == nil {
+		return domain.ErrInvalidArgument
+	}
+	slice, exists := run.Context.Slices[sliceID]
+	if !exists {
+		return &domain.DomainError{Kind: domain.ErrValidation, Field: "slice", Message: "human edit references an unknown delivery slice"}
+	}
+	primary := edit.Primary
+	switch edit.ArtifactKind {
+	case "page_spec":
+		slice.PageSpec = &primary
+	case "prototype":
+		slice.Prototype = &primary
+	case "blueprint":
+		slice.Blueprint = primary
+	}
+	run.Context.Slices[sliceID] = slice
+	return nil
+}
+
+func (e *Engine) validatedHumanWorkflowContext(
+	definition domain.NodeDefinition,
+	output json.RawMessage,
+) (map[string]json.RawMessage, error) {
+	var envelope map[string]json.RawMessage
+	if err := json.Unmarshal(output, &envelope); err != nil {
+		return nil, nil
+	}
+	raw, exists := envelope["workflowContext"]
+	if !exists || len(raw) == 0 || string(raw) == "null" {
+		return nil, nil
+	}
+	var values map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &values); err != nil {
+		return nil, &domain.DomainError{Kind: domain.ErrValidation, Field: "workflowContext", Message: "must be an object"}
+	}
+	declared := declaredWorkflowContextKeys(definition)
+	normalized := make(map[string]json.RawMessage, len(values))
+	for key, value := range values {
+		if strings.TrimSpace(key) == "" || len(key) > 128 {
+			return nil, domain.ErrInvalidArgument
+		}
+		if reservedHumanWorkflowContextKey(key) {
+			return nil, &domain.DomainError{Kind: domain.ErrValidation, Field: "workflowContext." + key, Message: "workflow context key is reserved for a trusted runner"}
+		}
+		_, schemaDeclared := declared[key]
+		_, serverAllowed := e.HumanWorkflowContextKeys[key]
+		if !schemaDeclared && !serverAllowed {
+			return nil, &domain.DomainError{Kind: domain.ErrValidation, Field: "workflowContext." + key, Message: "workflow context key is not declared by the node schema or server allowlist"}
+		}
+		canonical, err := domain.CanonicalJSON(value)
+		if err != nil {
+			return nil, err
+		}
+		normalized[key] = canonical
+	}
+	return normalized, nil
+}
+
+func declaredWorkflowContextKeys(definition domain.NodeDefinition) map[string]struct{} {
+	result := map[string]struct{}{}
+	ports, err := definition.ResolvedOutputPorts()
+	if err != nil {
+		return result
+	}
+	for _, port := range ports {
+		var schema struct {
+			Properties map[string]json.RawMessage `json:"properties"`
+		}
+		if json.Unmarshal(port.Schema, &schema) != nil {
+			continue
+		}
+		workflowContext, exists := schema.Properties["workflowContext"]
+		if !exists {
+			continue
+		}
+		var contextSchema struct {
+			Properties map[string]json.RawMessage `json:"properties"`
+		}
+		if json.Unmarshal(workflowContext, &contextSchema) != nil {
+			continue
+		}
+		for key := range contextSchema.Properties {
+			result[key] = struct{}{}
+		}
+	}
+	return result
+}
+
+func reservedHumanWorkflowContextKey(key string) bool {
+	switch key {
+	case "buildManifest", "workspaceRevision", "executionActor", "reviewDecisionActor", "deliverySlices":
+		return true
+	default:
+		return strings.HasPrefix(key, "system.")
+	}
 }
 
 type ReviewResolution string
@@ -976,10 +1114,14 @@ func (e *Engine) instantiateFanOut(run *RunRecord, definition domain.WorkflowDef
 			return fmt.Errorf("fan-out item key and title are required")
 		}
 		deliverySlice := definitionNode.FanOut != nil && definitionNode.FanOut.ItemKind == "delivery_slice"
-		if deliverySlice || item.Blueprint.ArtifactID != "" || item.Blueprint.RevisionID != "" || item.Blueprint.ContentHash != "" {
+		blueprintPage := definitionNode.FanOut != nil && (definitionNode.FanOut.ItemKind == "blueprint_page" || definitionNode.FanOut.ItemKind == "blueprint_selection_page")
+		if deliverySlice || blueprintPage || item.Blueprint.ArtifactID != "" || item.Blueprint.RevisionID != "" || item.Blueprint.ContentHash != "" {
 			if err := item.Blueprint.Validate(); err != nil {
 				return fmt.Errorf("fan-out blueprint ref: %w", err)
 			}
+		}
+		if blueprintPage && strings.TrimSpace(item.Blueprint.AnchorID) == "" {
+			return fmt.Errorf("blueprint_page fan-out item requires an anchored Blueprint Page ref")
 		}
 		if deliverySlice && item.PageSpec == nil {
 			return fmt.Errorf("delivery fan-out item requires an exact PageSpec ref")

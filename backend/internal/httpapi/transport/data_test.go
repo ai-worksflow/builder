@@ -59,7 +59,6 @@ func (f *fakeDataAPI) ConnectSupabase(_ context.Context, projectID, actorID stri
 
 func dataRouterForTest(t *testing.T, api DataRuntimeAPI, userID string) *gin.Engine {
 	t.Helper()
-	gin.SetMode(gin.TestMode)
 	router := gin.New()
 	security := config.SecurityConfig{Session: config.SessionSecurityConfig{CookieName: "session"}}
 	group := router.Group("/v1", worksmiddleware.RequireAuthentication(dataAuthenticator{userID: userID}, security))
@@ -160,7 +159,6 @@ func TestDataSupabaseConnectionRequiresProjectHeaderAndNeverEchoesKey(t *testing
 }
 
 func TestRegisterDataRoutesAppliesMutationMiddlewareOnlyToWrites(t *testing.T) {
-	gin.SetMode(gin.TestMode)
 	projectID, userID, tableID := uuid.NewString(), uuid.NewString(), uuid.NewString()
 	api := &fakeDataAPI{}
 	router := gin.New()

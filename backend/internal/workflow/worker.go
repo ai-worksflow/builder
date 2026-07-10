@@ -3,11 +3,55 @@ package workflow
 import (
 	"context"
 	"fmt"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/worksflow/builder/backend/internal/domain"
 )
+
+type BuildManifestRegistry struct {
+	mu    sync.RWMutex
+	hooks map[string]BuildManifestHook
+}
+
+func NewBuildManifestRegistry() *BuildManifestRegistry {
+	return &BuildManifestRegistry{hooks: map[string]BuildManifestHook{}}
+}
+
+func manifestCompilerKey(manifestKind string, schemaVersion int, hook string) string {
+	return strings.TrimSpace(manifestKind) + "\x00" + strconv.Itoa(schemaVersion) + "\x00" + strings.TrimSpace(hook)
+}
+
+func (r *BuildManifestRegistry) Register(capability ManifestCompilerCapability, compiler BuildManifestHook) error {
+	if r == nil || compiler == nil || strings.TrimSpace(capability.ManifestKind) == "" || capability.SchemaVersion < 1 || strings.TrimSpace(capability.Hook) == "" {
+		return fmt.Errorf("valid manifest compiler capability and hook are required")
+	}
+	key := manifestCompilerKey(capability.ManifestKind, capability.SchemaVersion, capability.Hook)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, exists := r.hooks[key]; exists {
+		return fmt.Errorf("manifest compiler already registered")
+	}
+	r.hooks[key] = compiler
+	return nil
+}
+
+func (r *BuildManifestRegistry) Compile(ctx context.Context, execution Execution) (BuildManifest, error) {
+	if r == nil || execution.Definition.ManifestCompiler == nil {
+		return BuildManifest{}, fmt.Errorf("manifest compiler dispatcher and node config are required")
+	}
+	config := execution.Definition.ManifestCompiler
+	key := manifestCompilerKey(config.ManifestKind, config.SchemaVersion, config.Hook)
+	r.mu.RLock()
+	compiler, exists := r.hooks[key]
+	r.mu.RUnlock()
+	if !exists {
+		return BuildManifest{}, fmt.Errorf("%w for manifest compiler %s/%d/%s", ErrRunnerNotFound, config.ManifestKind, config.SchemaVersion, config.Hook)
+	}
+	return compiler.Compile(ctx, execution)
+}
 
 type MapRegistry struct {
 	mu      sync.RWMutex
@@ -71,10 +115,23 @@ func (r AIProposalRunner) Run(ctx context.Context, execution Execution) (WorkerR
 	return WorkerResult{Disposition: disposition, Manifest: &manifest, Proposal: proposal}, nil
 }
 
-type ManifestCompilerRunner struct{ Hook BuildManifestHook }
+type ManifestCompilerRunner struct {
+	Registry *BuildManifestRegistry
+	Hook     BuildManifestHook
+}
 
 func (r ManifestCompilerRunner) Run(ctx context.Context, execution Execution) (WorkerResult, error) {
-	if r.Hook == nil {
+	if r.Registry != nil {
+		manifest, err := r.Registry.Compile(ctx, execution)
+		if err != nil {
+			return WorkerResult{}, err
+		}
+		if err := manifest.Freeze(); err != nil {
+			return WorkerResult{}, err
+		}
+		return WorkerResult{Disposition: ResultComplete, BuildManifest: &manifest}, nil
+	}
+	if r.Hook == nil || execution.Workflow.InputContract != nil {
 		return WorkerResult{}, fmt.Errorf("build manifest hook is required")
 	}
 	manifest, err := r.Hook.Compile(ctx, execution)

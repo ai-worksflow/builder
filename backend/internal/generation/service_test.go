@@ -1,9 +1,67 @@
 package generation
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"testing"
+
+	"github.com/worksflow/builder/backend/internal/ai"
+	"github.com/worksflow/builder/backend/internal/core"
 )
+
+type blockedImplementationWorkbench struct{ calls int }
+
+func (w *blockedImplementationWorkbench) GetBundleForGeneration(context.Context, string, string) (core.WorkbenchBundle, error) {
+	w.calls++
+	return core.WorkbenchBundle{}, core.ErrBlockingGate
+}
+
+type staleImplementationWorkbench struct{ calls int }
+
+func (w *staleImplementationWorkbench) GetBundleForGeneration(context.Context, string, string) (core.WorkbenchBundle, error) {
+	w.calls++
+	return core.WorkbenchBundle{}, core.ErrProposalStale
+}
+
+type generationProviderSpy struct{ calls int }
+
+func (p *generationProviderSpy) Generate(context.Context, ai.Request) (ai.Result, error) {
+	p.calls++
+	return ai.Result{}, nil
+}
+
+func TestImplementationGenerationRejectsCompletedManifestBeforeAI(t *testing.T) {
+	t.Parallel()
+
+	workbench := &blockedImplementationWorkbench{}
+	provider := &generationProviderSpy{}
+	service := &Service{workbench: workbench, provider: provider}
+	if _, err := service.GenerateImplementation(
+		context.Background(), "consumed-bundle", "actor", "model", "instruction",
+	); !errors.Is(err, core.ErrBlockingGate) {
+		t.Fatalf("expected completed manifest to block generation, got %v", err)
+	}
+	if workbench.calls != 1 || provider.calls != 0 {
+		t.Fatalf("AI ran before manifest readiness gate: workbench=%d provider=%d", workbench.calls, provider.calls)
+	}
+}
+
+func TestImplementationGenerationRequiresCurrentWorkspaceBeforeAI(t *testing.T) {
+	t.Parallel()
+
+	workbench := &staleImplementationWorkbench{}
+	provider := &generationProviderSpy{}
+	service := &Service{workbench: workbench, provider: provider}
+	if _, err := service.GenerateImplementation(
+		context.Background(), "old-workspace-bundle", "actor", "model", "instruction",
+	); !errors.Is(err, core.ErrProposalStale) {
+		t.Fatalf("expected stale workspace manifest to block generation, got %v", err)
+	}
+	if workbench.calls != 1 || provider.calls != 0 {
+		t.Fatalf("AI ran before exact workspace gate: workbench=%d provider=%d", workbench.calls, provider.calls)
+	}
+}
 
 func TestRedactSensitiveStructuredValues(t *testing.T) {
 	t.Parallel()

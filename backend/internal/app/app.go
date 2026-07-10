@@ -13,11 +13,13 @@ import (
 	"github.com/nats-io/nats.go"
 	"github.com/worksflow/builder/backend/internal/ai"
 	"github.com/worksflow/builder/backend/internal/auth"
+	documentcollaboration "github.com/worksflow/builder/backend/internal/collaboration"
 	"github.com/worksflow/builder/backend/internal/config"
 	"github.com/worksflow/builder/backend/internal/conversation"
 	"github.com/worksflow/builder/backend/internal/core"
 	"github.com/worksflow/builder/backend/internal/dataruntime"
 	"github.com/worksflow/builder/backend/internal/delivery"
+	"github.com/worksflow/builder/backend/internal/designimport"
 	"github.com/worksflow/builder/backend/internal/events"
 	"github.com/worksflow/builder/backend/internal/generation"
 	worksgithub "github.com/worksflow/builder/backend/internal/github"
@@ -47,6 +49,28 @@ func Run(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 			return fmt.Errorf("apply database migrations: %w", err)
 		}
 		logger.Info("database migrations are current")
+	}
+	upgradedMinimumLoops, err := workflowruntime.UpgradeExistingMinimumLoops(
+		startupCtx,
+		dependencies.Postgres,
+		time.Now().UTC(),
+	)
+	if err != nil {
+		return fmt.Errorf("provision minimum workflow versions: %w", err)
+	}
+	if upgradedMinimumLoops > 0 {
+		logger.Info("minimum workflow versions upgraded", "count", upgradedMinimumLoops)
+	}
+	installedSelectionFlows, err := workflowruntime.ProvisionBlueprintSelectionFlows(
+		startupCtx,
+		dependencies.Postgres,
+		time.Now().UTC(),
+	)
+	if err != nil {
+		return fmt.Errorf("provision Blueprint selection workflows: %w", err)
+	}
+	if installedSelectionFlows > 0 {
+		logger.Info("Blueprint selection workflows installed", "count", installedSelectionFlows)
 	}
 	contentStore := content.NewMongoStore(dependencies.MongoDB, cfg.Content.MaxBytes)
 	if cfg.Startup.EnsureMongoIndexes {
@@ -205,6 +229,19 @@ func Run(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 	if err != nil {
 		return fmt.Errorf("create proposal service: %w", err)
 	}
+	designImportService, err := designimport.NewService(
+		dependencies.Postgres, contentStore, accessControl, artifactService, proposalService,
+		designimport.ServiceConfig{MaxSnapshotContentBytes: cfg.Content.MaxBytes},
+	)
+	if err != nil {
+		return fmt.Errorf("create design import service: %w", err)
+	}
+	designImportHandler, err := transport.NewDesignImportHandler(transport.DesignImportDependencies{
+		Service: designImportService, MaxJSONBodyBytes: designimport.MaxRequestBytes,
+	})
+	if err != nil {
+		return fmt.Errorf("create design import transport: %w", err)
+	}
 	workbenchService, err := core.NewWorkbenchService(dependencies.Postgres, contentStore, accessControl)
 	if err != nil {
 		return fmt.Errorf("create workbench service: %w", err)
@@ -229,6 +266,18 @@ func Run(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 	if err != nil {
 		return fmt.Errorf("create generation service: %w", err)
 	}
+	documentCollaborationService, err := documentcollaboration.NewService(
+		dependencies.Postgres,
+		contentStore,
+		accessControl,
+		artifactService,
+		proposalService,
+		generationService,
+		documentcollaboration.WithDownstreamCommandLease(cfg.AI.Timeout+5*time.Minute),
+	)
+	if err != nil {
+		return fmt.Errorf("create document collaboration service: %w", err)
+	}
 	workflowStore, err := workflowruntime.NewGORMStore(dependencies.Postgres, workflowruntime.CoreContentStoreAdapter{Store: contentStore}, nil)
 	if err != nil {
 		return fmt.Errorf("create workflow store: %w", err)
@@ -236,13 +285,17 @@ func Run(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 	workflowEngine, err := workflowruntime.NewPlatformEngine(workflowruntime.PlatformDependencies{
 		Store: workflowStore, CoreProposals: proposalService, Generation: generationService,
 		Workbench: workbenchService, ArtifactInputs: workflowruntime.CoreArtifactInputValidator{Database: dependencies.Postgres},
+		HumanEditOutput:     workflowruntime.CoreHumanEditOutputValidator{Artifacts: artifactService, Proposals: proposalService},
 		TargetArtifacts:     workflowruntime.CoreTargetArtifactInitializer{Artifacts: artifactService},
 		RequirementBaseline: baselineService,
 		WorkbenchCompletion: workflowruntime.CoreWorkbenchCompletionValidator{Database: dependencies.Postgres},
 		ReviewGate:          workflowruntime.CoreReviewGateVerifier{Database: dependencies.Postgres},
 		Access:              accessControl, FanOut: workflowruntime.ContextFanOutResolver{ValueKey: "deliverySlices"},
-		Quality: deliveryServices.WorkflowQuality, Publisher: deliveryServices.WorkflowPublisher,
-		DefaultModel: cfg.AI.DefaultModel,
+		BlueprintPages:  workflowruntime.CoreBlueprintPageFanOutResolver{Artifacts: artifactService, Proposals: proposalService},
+		Quality:         deliveryServices.WorkflowQuality,
+		QualityManifest: workflowruntime.CoreQualityManifestResolver{Database: dependencies.Postgres},
+		Publisher:       deliveryServices.WorkflowPublisher,
+		DefaultModel:    cfg.AI.DefaultModel,
 	})
 	if err != nil {
 		return fmt.Errorf("create workflow engine: %w", err)
@@ -270,11 +323,14 @@ func Run(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 		Artifacts: artifactService, Traces: traceService, Reviews: reviewService, Comments: commentService,
 		Baselines: baselineService, Impacts: impactService, Proposals: proposalService,
 		Workbench: workbenchService, Implementation: implementationService, Activity: activityService,
-		Generation: generationService,
+		Generation: generationService, Collaboration: documentCollaborationService,
 	}, cfg, logger)
 	idempotencyRequestLimit := cfg.HTTP.MaxJSONBodyBytes
 	if idempotencyRequestLimit < worksgithub.MaxRequestBytes {
 		idempotencyRequestLimit = worksgithub.MaxRequestBytes
+	}
+	if idempotencyRequestLimit < designimport.MaxRequestBytes {
+		idempotencyRequestLimit = designimport.MaxRequestBytes
 	}
 	idempotency, err := worksmiddleware.NewIdempotencyRepository(dependencies.Postgres, worksmiddleware.IdempotencyConfig{
 		TTL: cfg.Idempotency.TTL, LockTTL: cfg.Idempotency.LockTTL,
@@ -382,7 +438,7 @@ func Run(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 		Readiness: readiness, WebSocket: websocketHandler,
 		Transport: apiTransport, Authentication: authService, Idempotency: idempotency,
 		Workflow: workflowHandler, Conversation: conversationHandler, GitHub: githubHandler, Data: dataHandler,
-		PublicData: publicDataHandler, Delivery: deliveryHandler,
+		PublicData: publicDataHandler, Delivery: deliveryHandler, DesignImports: designImportHandler,
 	})
 	if err != nil {
 		stopRuntime()

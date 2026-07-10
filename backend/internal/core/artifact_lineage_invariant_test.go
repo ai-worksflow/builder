@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/worksflow/builder/backend/internal/domain"
 	storage "github.com/worksflow/builder/backend/internal/storage/postgres"
 	"gorm.io/gorm"
 )
@@ -44,6 +45,94 @@ func TestArtifactLineageHelpersRequireExactPageIdentity(t *testing.T) {
 	right.AnchorID = &anchor
 	if sameWholeVersionRef(left, right) {
 		t.Fatal("anchored refs must not satisfy a whole PageSpec revision identity")
+	}
+}
+
+func TestGenericArtifactMutationRejectsSystemManagedKinds(t *testing.T) {
+	t.Parallel()
+
+	for _, kind := range []string{"requirement_baseline", "workspace", "quality_report", "test_report"} {
+		if err := ensureGenericArtifactMutationAllowed(kind); !errors.Is(err, ErrForbidden) {
+			t.Fatalf("generic mutation accepted system-managed %s: %v", kind, err)
+		}
+	}
+	for _, kind := range []string{"product_requirements", "blueprint", "page_spec", "prototype"} {
+		if err := ensureGenericArtifactMutationAllowed(kind); err != nil {
+			t.Fatalf("generic mutation rejected human-editable %s: %v", kind, err)
+		}
+	}
+}
+
+func TestArtifactAndOutputProposalServicesCannotMutateSystemManagedArtifacts(t *testing.T) {
+	database, cleanup := baselinePostgresDatabase(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	store, artifacts, projectID, userID := newArtifactLineageFixture(t, database)
+	access, err := NewAccessControl(database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proposals, err := NewProposalService(database, store, access)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, kind := range []string{"requirement_baseline", "workspace", "quality_report", "test_report"} {
+		t.Run(kind, func(t *testing.T) {
+			if _, err := artifacts.Create(
+				ctx, projectID.String(), userID.String(),
+				CreateArtifactInput{Kind: kind, Title: "Forbidden " + kind, Content: json.RawMessage(`{"schemaVersion":1}`)},
+			); !errors.Is(err, ErrForbidden) {
+				t.Fatalf("generic Create accepted %s: %v", kind, err)
+			}
+
+			ref := seedArtifactLineageRevision(
+				t, database, store, projectID, userID, kind, "approved", "current",
+				json.RawMessage(`{"schemaVersion":1,"files":[]}`),
+			)
+			artifactID, revisionID := uuid.MustParse(ref.ArtifactID), uuid.MustParse(ref.RevisionID)
+			var revision storage.ArtifactRevisionModel
+			if err := database.Where("id = ?", revisionID).Take(&revision).Error; err != nil {
+				t.Fatal(err)
+			}
+			now := time.Now().UTC()
+			draftID := uuid.New()
+			draft := storage.ArtifactDraftModel{
+				ID: draftID, ArtifactID: artifactID, BaseRevisionID: &revisionID, Sequence: 1,
+				ETag: draftETag(draftID, 1, revision.ContentHash), SchemaVersion: revision.SchemaVersion,
+				ContentStore: revision.ContentStore, ContentRef: revision.ContentRef,
+				ContentHash: revision.ContentHash, ByteSize: revision.ByteSize, Status: "draft",
+				CreatedBy: userID, UpdatedBy: userID, CreatedAt: now, UpdatedAt: now,
+			}
+			if err := database.Create(&draft).Error; err != nil {
+				t.Fatal(err)
+			}
+			if err := database.Model(&storage.ArtifactModel{}).Where("id = ?", artifactID).
+				Update("latest_draft_id", draftID).Error; err != nil {
+				t.Fatal(err)
+			}
+			if _, err := artifacts.UpdateDraft(
+				ctx, draftID.String(), userID.String(), draft.ETag,
+				UpdateDraftInput{Content: json.RawMessage(`{"schemaVersion":1,"mutated":true}`)},
+			); !errors.Is(err, ErrForbidden) {
+				t.Fatalf("generic UpdateDraft accepted %s: %v", kind, err)
+			}
+			if _, err := artifacts.CreateRevision(
+				ctx, artifactID.String(), userID.String(), draft.ETag,
+				CreateRevisionInput{ChangeSummary: "Forbidden manual revision"},
+			); !errors.Is(err, ErrForbidden) {
+				t.Fatalf("generic CreateRevision accepted %s: %v", kind, err)
+			}
+
+			if _, err := proposals.CreateManifest(
+				ctx, projectID.String(), userID.String(), CreateManifestInput{
+					JobType: "generic_system_mutation", BaseRevision: &ref,
+					Constraints: json.RawMessage(`{}`), OutputSchemaVersion: "proposal/v1",
+				},
+			); !errors.Is(err, ErrForbidden) {
+				t.Fatalf("generic InputManifest accepted system-managed %s base: %v", kind, err)
+			}
+		})
 	}
 }
 
@@ -238,6 +327,72 @@ func TestArtifactServicePrototypeLineageFormalAndExploratory(t *testing.T) {
 		CreateRevisionInput{ChangeSummary: "Freeze invalid Prototype lineage"},
 	); !errors.Is(err, ErrBlockingGate) {
 		t.Fatalf("CreateRevision froze corrupted Prototype lineage: %v", err)
+	}
+}
+
+func TestArtifactRevisionFreezesAppliedOutputProposalIdentity(t *testing.T) {
+	database, cleanup := baselinePostgresDatabase(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	store, artifacts, projectID, userID := newArtifactLineageFixture(t, database)
+	created, err := artifacts.Create(ctx, projectID.String(), userID.String(), CreateArtifactInput{
+		Kind: "product_requirements", Title: "Requirements", Content: json.RawMessage(`{"title":"Before"}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	base, err := artifacts.CreateRevision(ctx, created.Artifact.ID, userID.String(), created.Draft.ETag, CreateRevisionInput{ChangeSummary: "Initial requirements"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	access, err := NewAccessControl(database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proposals, err := NewProposalService(database, store, access)
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseRef := VersionRef{ArtifactID: base.ArtifactID, RevisionID: base.ID, ContentHash: base.ContentHash}
+	manifest, err := proposals.CreateManifest(ctx, projectID.String(), userID.String(), CreateManifestInput{
+		JobType: "derive_requirements", BaseRevision: &baseRef,
+		Sources:     nil,
+		Constraints: json.RawMessage(`{}`), OutputSchemaVersion: "requirements-proposal/v1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	proposal, err := proposals.CreateProposal(ctx, projectID.String(), userID.String(), CreateProposalInput{
+		ManifestID: manifest.ID, ArtifactID: created.Artifact.ID,
+		Operations: []domain.ProposalOperation{{ID: "title", Kind: domain.OperationReplace, Path: "/title", Value: json.RawMessage(`"After"`)}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	proposal, err = proposals.Decide(ctx, proposal.ID, userID.String(), DecideProposalInput{
+		OperationID: "title", Decision: domain.DecisionAccepted, Version: proposal.Version,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	draft, err := proposals.Apply(ctx, proposal.ID, userID.String(), ApplyProposalInput{Version: proposal.Version})
+	if err != nil {
+		t.Fatal(err)
+	}
+	revision, err := artifacts.CreateRevision(ctx, created.Artifact.ID, userID.String(), draft.ETag, CreateRevisionInput{ChangeSummary: "Apply reviewed AI proposal"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if revision.ProposalID == nil || *revision.ProposalID != proposal.ID || revision.SourceManifestID == nil || *revision.SourceManifestID != manifest.ID {
+		t.Fatalf("revision did not freeze applied proposal/manifest identity: %+v", revision)
+	}
+	var dependencyCount int64
+	if err := database.Model(&storage.ArtifactDependencyModel{}).Where("target_artifact_id = ?", created.Artifact.ID).Count(&dependencyCount).Error; err != nil {
+		t.Fatal(err)
+	}
+	if dependencyCount != 0 {
+		t.Fatalf("base-only transform generated %d self/phantom artifact dependencies", dependencyCount)
 	}
 }
 

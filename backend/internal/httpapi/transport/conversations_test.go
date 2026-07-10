@@ -12,6 +12,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/worksflow/builder/backend/internal/config"
 	"github.com/worksflow/builder/backend/internal/conversation"
+	"github.com/worksflow/builder/backend/internal/core"
 	worksmiddleware "github.com/worksflow/builder/backend/internal/httpapi/middleware"
 )
 
@@ -20,6 +21,10 @@ type fakeConversationAPI struct {
 	actorID       string
 	createCalls   int
 	decisionCalls int
+	generateCalls int
+	generateInput conversation.GenerateIntentProposalInput
+	generateErr   error
+	executeInput  conversation.ExecuteCommandInput
 }
 
 func (f *fakeConversationAPI) Create(_ context.Context, projectID, actorID string, input conversation.CreateConversationInput) (conversation.Conversation, error) {
@@ -30,6 +35,12 @@ func (f *fakeConversationAPI) Create(_ context.Context, projectID, actorID strin
 		ID: id, ProjectID: projectID, Title: input.Title, Status: conversation.ConversationActive,
 		Version: 1, ETag: conversation.ConversationETag(id, 1), CreatedBy: actorID,
 	}, nil
+}
+
+func (f *fakeConversationAPI) GenerateIntentProposal(_ context.Context, _, _, _ string, input conversation.GenerateIntentProposalInput) (conversation.GeneratedIntentProposal, error) {
+	f.generateCalls++
+	f.generateInput = input
+	return conversation.GeneratedIntentProposal{}, f.generateErr
 }
 
 type memoryIdempotencyRecord struct {
@@ -109,16 +120,50 @@ func (f *fakeConversationAPI) DecideProposal(_ context.Context, projectID, conve
 	return proposal, &command, nil
 }
 
-func (f *fakeConversationAPI) ExecuteCommand(_ context.Context, projectID, conversationID, commandID, actorID, _ string, _ conversation.ExecuteCommandInput) (conversation.ConversationCommand, error) {
+func (f *fakeConversationAPI) ExecuteCommand(_ context.Context, projectID, conversationID, commandID, actorID, _ string, input conversation.ExecuteCommandInput) (conversation.ConversationCommand, error) {
+	f.executeInput = input
 	return conversation.ConversationCommand{
 		ID: commandID, ProjectID: projectID, ConversationID: conversationID,
 		Status: conversation.CommandExecuted, Version: 3, ETag: conversation.CommandETag(commandID, 3), ExecutedBy: &actorID,
 	}, nil
 }
 
+func TestConversationWorkbenchExecutionDecodesExactImplementationProposalIdentity(t *testing.T) {
+	projectID, conversationID, commandID, userID := uuid.NewString(), uuid.NewString(), uuid.NewString(), uuid.NewString()
+	runID, bundleID, implementationProposalID := uuid.NewString(), uuid.NewString(), uuid.NewString()
+	api := &fakeConversationAPI{}
+	router := conversationRouterForTest(t, api, userID)
+	path := "/v1/projects/" + projectID + "/conversations/" + conversationID + "/commands/" + commandID + "/execute"
+	body := `{"workbenchResult":{"runId":"` + runID + `","bundleId":"` + bundleID + `","implementationProposalId":"` + implementationProposalID + `"}}`
+	response := conversationRequest(router, http.MethodPost, path, body, conversation.CommandETag(commandID, 1), "workbench-result-1")
+	if response.Code != http.StatusOK {
+		t.Fatalf("execute status=%d body=%s", response.Code, response.Body.String())
+	}
+	if api.executeInput.WorkbenchResult == nil || api.executeInput.WorkbenchResult.RunID != runID ||
+		api.executeInput.WorkbenchResult.BundleID != bundleID ||
+		api.executeInput.WorkbenchResult.ImplementationProposalID != implementationProposalID {
+		t.Fatalf("transport lost exact workbench result: %+v", api.executeInput.WorkbenchResult)
+	}
+}
+
+func TestConversationGenerateIntentReturnsInvalidInputForIncompatibleStartCandidate(t *testing.T) {
+	projectID, conversationID, userID := uuid.NewString(), uuid.NewString(), uuid.NewString()
+	triggerID, candidateID := uuid.NewString(), uuid.NewString()
+	api := &fakeConversationAPI{generateErr: core.ErrInvalidInput}
+	router := conversationRouterForTest(t, api, userID)
+	path := "/v1/projects/" + projectID + "/conversations/" + conversationID + "/intent-proposals/generate"
+	body := `{"triggerMessageId":"` + triggerID + `","candidateDefinitionVersionIds":["` + candidateID + `"],"sourceRefs":[],"manifestIntent":{}}`
+	response := conversationRequest(router, http.MethodPost, path, body, "", "generate-incompatible-1")
+	if response.Code != http.StatusUnprocessableEntity || api.generateCalls != 1 {
+		t.Fatalf("generate status=%d calls=%d body=%s", response.Code, api.generateCalls, response.Body.String())
+	}
+	if len(api.generateInput.CandidateDefinitionVersionIDs) != 1 || api.generateInput.CandidateDefinitionVersionIDs[0] != candidateID {
+		t.Fatalf("transport lost candidate identity: %+v", api.generateInput)
+	}
+}
+
 func conversationRouterForTest(t *testing.T, api ConversationAPI, userID string) *gin.Engine {
 	t.Helper()
-	gin.SetMode(gin.TestMode)
 	router := gin.New()
 	security := config.SecurityConfig{Session: config.SessionSecurityConfig{CookieName: "session"}}
 	group := router.Group("/v1", worksmiddleware.RequireAuthentication(workflowAuthenticator{userID: userID}, security))
@@ -168,7 +213,6 @@ func TestConversationCreateIdempotencyReplaysWithoutSecondMutation(t *testing.T)
 	projectID, userID := uuid.NewString(), uuid.NewString()
 	api := &fakeConversationAPI{}
 	store := &memoryIdempotencyStore{}
-	gin.SetMode(gin.TestMode)
 	router := gin.New()
 	security := config.SecurityConfig{Session: config.SessionSecurityConfig{CookieName: "session"}}
 	group := router.Group("/v1", worksmiddleware.RequireAuthentication(workflowAuthenticator{userID: userID}, security))

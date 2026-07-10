@@ -139,6 +139,19 @@ func (s *MemoryStore) PublishDefinitionVersion(_ context.Context, projectID, def
 	return cloneDefinitionRecord(record), nil
 }
 
+func (s *MemoryStore) UnpublishDefinitionVersion(_ context.Context, projectID, definitionID, versionID, _ string) (DefinitionRecord, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	record, exists := s.definitionVersions[versionID]
+	if !exists || record.Definition.ID != definitionID || (record.ProjectID != "" && record.ProjectID != projectID) {
+		return DefinitionRecord{}, domain.ErrNotFound
+	}
+	record.Published = false
+	s.definitionVersions[versionID] = record
+	s.definitions[definitionID][record.Definition.Version] = record
+	return cloneDefinitionRecord(record), nil
+}
+
 func (s *MemoryStore) SaveManifest(_ context.Context, manifest domain.InputManifest) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

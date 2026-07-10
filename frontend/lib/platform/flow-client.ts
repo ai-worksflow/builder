@@ -2,6 +2,7 @@ import type { ClientMutationOptions, ClientRequestOptions, ListOptions } from '.
 import type {
   CreateImplementationProposalInputDto,
   CreateInputManifestDto,
+  BlueprintSelectionCompileInputDto,
   CreateWorkbenchBundleInputDto,
   CreateWorkflowDefinitionInputDto,
   CreateWorkflowDefinitionVersionInputDto,
@@ -12,11 +13,13 @@ import type {
   ManifestRefDto,
   StartWorkflowRunInputDto,
   WorkflowDefinitionRecordDto,
+  WorkflowCapabilitiesDto,
   WorkflowEventDto,
   WorkflowPageDto,
   WorkflowRunDto,
   WorkflowRunSummaryDto,
   WorkbenchBundleDto,
+  WorkbenchBundleLineageStateDto,
   WorkspaceRevisionDto,
 } from './flow-contract'
 import { HttpClient } from './http'
@@ -49,6 +52,13 @@ export class PlatformFlowClient {
   listDefinitions(projectId: string, options?: ListOptions) {
     return this.http.get<WorkflowPageDto<WorkflowDefinitionRecordDto>>(
       `/v1/projects/${segment(projectId)}/workflow-definitions`,
+      requestOptions(options),
+    )
+  }
+
+  capabilities(projectId: string, options?: ClientRequestOptions) {
+    return this.http.get<WorkflowCapabilitiesDto>(
+      `/v1/projects/${segment(projectId)}/workflow-capabilities`,
       requestOptions(options),
     )
   }
@@ -110,6 +120,22 @@ export class PlatformFlowClient {
         })),
       },
       mutationOptions(options),
+    )
+  }
+
+  compileBlueprintSelection(
+    projectId: string,
+    input: BlueprintSelectionCompileInputDto,
+    blueprintETag: string,
+    options?: ClientMutationOptions,
+  ) {
+    return this.http.post<InputManifestDto, BlueprintSelectionCompileInputDto>(
+      `/v1/projects/${segment(projectId)}/blueprint-selections/compile`,
+      {
+        ...input,
+        blueprintRevision: wireVersionRef(input.blueprintRevision),
+      },
+      mutationOptions({ ...options, ifMatch: blueprintETag }),
     )
   }
 
@@ -283,6 +309,27 @@ export class PlatformFlowClient {
     return this.http.get<WorkbenchBundleDto>(
       `/v1/build-manifests/${segment(bundleId)}`,
       requestOptions(options),
+    )
+  }
+
+  getWorkbenchBundleLineageState(rootBundleId: string, options?: ClientRequestOptions) {
+    return this.http.get<WorkbenchBundleLineageStateDto>(
+      `/v1/build-manifests/${segment(rootBundleId)}/lineage-state`,
+      requestOptions(options),
+    )
+  }
+
+  rebaseWorkbenchBundle(
+    bundleId: string,
+    workspaceRevision: ExactArtifactRefDto,
+    options?: ClientMutationOptions,
+  ) {
+    return this.http.post<WorkbenchBundleDto, {
+      readonly workspaceRevision: ExactArtifactRefDto
+    }>(
+      `/v1/build-manifests/${segment(bundleId)}/rebase`,
+      { workspaceRevision: wireVersionRef(workspaceRevision) },
+      mutationOptions(options),
     )
   }
 

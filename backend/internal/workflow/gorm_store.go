@@ -322,6 +322,56 @@ func (s *GORMStore) PublishDefinitionVersion(ctx context.Context, projectID, def
 	return s.loadDefinitionRecord(ctx, version)
 }
 
+func (s *GORMStore) UnpublishDefinitionVersion(ctx context.Context, projectID, definitionID, versionID, actorID string) (DefinitionRecord, error) {
+	projectUUID, err := parseUUID("definition.projectId", projectID)
+	if err != nil {
+		return DefinitionRecord{}, err
+	}
+	definitionUUID, err := parseUUID("definition.id", definitionID)
+	if err != nil {
+		return DefinitionRecord{}, err
+	}
+	versionUUID, err := parseUUID("definition.versionId", versionID)
+	if err != nil {
+		return DefinitionRecord{}, err
+	}
+	actorUUID, err := parseUUID("definition.actorId", actorID)
+	if err != nil {
+		return DefinitionRecord{}, err
+	}
+	var version definitionVersionRow
+	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var base definitionRow
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("id = ? AND project_id = ? AND lifecycle = 'active'", definitionUUID, projectUUID).Take(&base).Error; err != nil {
+			return mapGORMError(err)
+		}
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("id = ? AND definition_id = ?", versionUUID, definitionUUID).Take(&version).Error; err != nil {
+			return mapGORMError(err)
+		}
+		if !version.Published {
+			return nil
+		}
+		result := tx.Model(&definitionVersionRow{}).
+			Where("id = ? AND definition_id = ? AND published = true", versionUUID, definitionUUID).
+			Update("published", false)
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return ErrCASConflict
+		}
+		version.Published = false
+		now := time.Now().UTC()
+		return insertDefinitionActivity(tx, base, version, actorUUID, "workflow.definition_version_unpublished", "worksflow.workflow.definition.version.unpublished", now)
+	})
+	if err != nil {
+		return DefinitionRecord{}, err
+	}
+	return s.loadDefinitionRecord(ctx, version)
+}
+
 func (s *GORMStore) GetDefinition(ctx context.Context, id string, version int) (DefinitionRecord, error) {
 	definitionID, err := parseUUID("definition.id", id)
 	if err != nil {

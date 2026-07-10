@@ -478,6 +478,14 @@ func collectionKind(collection, documentKind string) string {
 			return "product_requirements"
 		case "apiContract":
 			return "api_contract"
+		case "dataContract":
+			return "data_contract"
+		case "permissionContract":
+			return "permission_contract"
+		case "changeRequest":
+			return "change_request"
+		case "glossaryPolicy":
+			return "glossary_policy"
 		case "decisionLog":
 			return "decision_record"
 		case "backendDevelopment", "frontendDevelopment", "uiPrototype":

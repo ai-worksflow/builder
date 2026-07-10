@@ -68,6 +68,7 @@ var traceRelations = map[string]struct{}{
 	"drives": {}, "satisfied_by": {}, "contains": {}, "navigates_to": {},
 	"uses": {}, "calls": {}, "reads": {}, "writes": {}, "requires": {},
 	"realized_by": {}, "implemented_by": {}, "verified_by": {}, "derives_from": {},
+	"compiled_into": {},
 }
 
 func NewTraceService(database *gorm.DB, access *AccessControl, stores ...content.Store) (*TraceService, error) {

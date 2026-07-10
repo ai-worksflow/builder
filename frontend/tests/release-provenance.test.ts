@@ -74,10 +74,11 @@ function bundle(id: string) {
 function queueItem(
   bundleId: string,
   implementationProposal: ImplementationProposalDto | null,
+  activeBundleId = bundleId,
 ): WorkbenchQueueItem {
   return {
     bundleId,
-    bundle: bundle(bundleId),
+    bundle: bundle(activeBundleId),
     proposal: implementationProposal,
   }
 }
@@ -107,6 +108,17 @@ assert.equal(
 assert.equal(
   selectReleaseBuildManifestId([], bundle('forged'), proposal('active', 'different', 'applied')),
   null,
+)
+assert.equal(
+  selectReleaseBuildManifestId([
+    queueItem('root-page-1', proposal('proposal-page-1', 'root-page-1', 'applied')),
+    queueItem(
+      'root-page-2',
+      proposal('proposal-page-2-w1', 'derived-page-2-w1', 'applied'),
+      'derived-page-2-w1',
+    ),
+  ], null, null),
+  'derived-page-2-w1',
 )
 
 console.log('2 release provenance test groups passed.')

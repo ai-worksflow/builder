@@ -29,7 +29,7 @@ var (
 type publishRevisionLoader interface {
 	LoadFrozenWorkspace(context.Context, string, string, core.VersionRef, core.Action) (WorkspaceSnapshot, error)
 	LoadBuildManifest(context.Context, string, string, string, core.Action) (core.WorkbenchBundle, error)
-	ValidateWorkspaceManifestLineage(context.Context, string, string, core.VersionRef, string, core.Action) error
+	ResolveWorkspaceManifestLineage(context.Context, string, string, core.VersionRef, string, core.Action) (string, error)
 }
 
 type publishQualityReader interface {
@@ -283,17 +283,22 @@ func (s *PublishService) resolvePublishSource(ctx context.Context, projectID, ac
 	if err != nil {
 		return publishSource{}, err
 	}
-	manifestUUID, err := uuid.Parse(manifestID)
+	selectorUUID, err := uuid.Parse(manifestID)
 	if err != nil {
 		return publishSource{}, Invalid("buildManifestId", "buildManifestId must be a UUID")
 	}
-	if bundle.ID != manifestUUID.String() || bundle.ProjectID != projectID {
+	if bundle.ID != selectorUUID.String() || bundle.ProjectID != projectID {
 		return publishSource{}, conflict("build manifest does not belong to the publish project")
 	}
-	if err := s.loader.ValidateWorkspaceManifestLineage(ctx, projectID, actorID, revision, manifestID, action); err != nil {
+	producerManifestID, err := s.loader.ResolveWorkspaceManifestLineage(ctx, projectID, actorID, revision, manifestID, action)
+	if err != nil {
 		return publishSource{}, err
 	}
-	return publishSource{workspace: workspace, buildManifestID: &manifestUUID}, nil
+	producerUUID, err := uuid.Parse(producerManifestID)
+	if err != nil {
+		return publishSource{}, conflict("resolved workspace producer manifest is invalid")
+	}
+	return publishSource{workspace: workspace, buildManifestID: &producerUUID}, nil
 }
 
 func (s *PublishService) reserve(

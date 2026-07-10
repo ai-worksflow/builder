@@ -9,8 +9,17 @@ import {
 } from '@/lib/platform/artifact-workspace'
 import {
   createEmptyBlueprintContent,
+  createEmptyDocumentContent,
   useArtifactWorkspace,
 } from '@/lib/platform/artifact-provider'
+import { createEmptyPrototypeContent } from '@/lib/platform/artifact-workspace'
+import {
+  BLUEPRINT_MODULE_TEMPLATES,
+  groupBlueprintNodes,
+  insertBlueprintModule,
+  readBlueprintSelectionScope,
+  type BlueprintModuleTemplate,
+} from '@/lib/platform/blueprint-selection'
 import {
   blueprintGate,
   emptyBlueprintLayout,
@@ -27,25 +36,30 @@ import type {
   BlueprintLayoutDto,
   BlueprintNodeKind,
   ImpactReportDto,
+  PageSpecContentDto,
   ProposalDto,
   VersionRefDto,
 } from '@/lib/platform/dto'
+import { usePlatformFlow } from '@/lib/platform/flow-provider'
 import { cn } from '@/lib/utils'
 import { useWorksflow } from '@/lib/worksflow/store'
 import { PageSpecEditor } from './page-spec-editor'
 import {
   AlertTriangle,
   Bot,
+  Boxes,
   CheckCircle2,
   FileClock,
   FilePlus2,
   GitBranch,
   GitFork,
+  Group,
   Link2,
   Loader2,
   MessageSquare,
   Move,
   Plus,
+  Play,
   RefreshCw,
   Save,
   Send,
@@ -98,11 +112,15 @@ const CANVAS_WIDTH = 980
 const CANVAS_HEIGHT = 560
 const NODE_WIDTH = 160
 const NODE_HEIGHT = 58
+const EMPTY_SEMANTIC_NODES: readonly SemanticNode[] = []
+const EMPTY_SEMANTIC_EDGES: readonly BlueprintEdgeDto[] = []
+const EMPTY_BLUEPRINT_LAYOUT = emptyBlueprintLayout()
 
 export function BlueprintEditor() {
   const workspace = useArtifactWorkspace()
   const collaboration = useCollaboration()
-  const { selectedBlueprintNodeId, setSelectedBlueprintNodeId } = useWorksflow()
+  const flow = usePlatformFlow()
+  const { selectedBlueprintNodeId, setSelectedBlueprintNodeId, setSurface } = useWorksflow()
   const [selectedBlueprintId, setSelectedBlueprintId] = useState('')
   const [selectedPageSpecId, setSelectedPageSpecId] = useState('')
   const [tab, setTab] = useState<EditorTab>('canvas')
@@ -121,6 +139,8 @@ export function BlueprintEditor() {
   const [comment, setComment] = useState('')
   const [reviewSummary, setReviewSummary] = useState('Blueprint is ready for version-level review.')
   const [reviewerId, setReviewerId] = useState('')
+  const [selectedNodeIds, setSelectedNodeIds] = useState<string[]>([])
+  const [selectionMessage, setSelectionMessage] = useState<string | null>(null)
   const canvasRef = useRef<HTMLDivElement | null>(null)
   const dragRef = useRef<{ id: string; pointerId: number; offsetX: number; offsetY: number } | null>(null)
 
@@ -129,9 +149,9 @@ export function BlueprintEditor() {
   const serverContent = resource?.draft?.content ?? resource?.latestRevision?.content
   const serverEtag = resource?.draft?.etag ?? resource?.artifact.etag
   const normalized = useMemo(() => content ? normalizeBlueprintContent(content) : null, [content])
-  const nodes = normalized?.semantic?.nodes ?? []
-  const edges = normalized?.semantic?.edges ?? []
-  const layout = normalized?.layout ?? emptyBlueprintLayout()
+  const nodes = normalized?.semantic?.nodes ?? EMPTY_SEMANTIC_NODES
+  const edges = normalized?.semantic?.edges ?? EMPTY_SEMANTIC_EDGES
+  const layout = normalized?.layout ?? EMPTY_BLUEPRINT_LAYOUT
   const selectedNode = nodes.find((node) => node.id === selectedBlueprintNodeId) ?? null
   const dirty = Boolean(content && serverContent && JSON.stringify(content) !== JSON.stringify(normalizeBlueprintContent(serverContent)))
   const proposals = workspace.proposals.filter((proposal) => proposal.artifactId === resource?.artifact.id)
@@ -176,8 +196,17 @@ export function BlueprintEditor() {
   }, [conflict, resource, selectedBlueprintId, serverContent])
 
   useEffect(() => {
-    if (nodes.some((node) => node.id === selectedBlueprintNodeId)) return
-    setSelectedBlueprintNodeId(nodes[0]?.id ?? null)
+    const selectedExists = nodes.some((node) => node.id === selectedBlueprintNodeId)
+    const preferred = selectedExists ? selectedBlueprintNodeId : nodes[0]?.id ?? null
+    if (!selectedExists && preferred !== selectedBlueprintNodeId) setSelectedBlueprintNodeId(preferred)
+    setSelectedNodeIds((current) => {
+      const retained = current.filter((nodeId) => nodes.some((node) => node.id === nodeId))
+      if (retained.length > 0) return retained.length === current.length ? current : retained
+      const next = preferred ? [preferred] : []
+      return next.length === current.length && next.every((nodeId, index) => current[index] === nodeId)
+        ? current
+        : next
+    })
   }, [nodes, selectedBlueprintNodeId, setSelectedBlueprintNodeId])
 
   useEffect(() => {
@@ -279,6 +308,59 @@ export function BlueprintEditor() {
       },
     }))
     setSelectedBlueprintNodeId(id)
+    setSelectedNodeIds([id])
+  }
+
+  function addModule(
+    template: BlueprintModuleTemplate,
+    origin = { x: 48, y: 48 + Math.floor(nodes.length / 4) * 110 },
+  ) {
+    if (!content) return
+    const inserted = insertBlueprintModule(content, template, origin, stableId)
+    setContent(inserted.content)
+    setSelectedNodeIds(inserted.nodeIds)
+    setSelectedBlueprintNodeId(inserted.nodeIds[0] ?? null)
+    setConflict(false)
+  }
+
+  function groupSelection() {
+    if (!content || selectedNodeIds.length === 0) return
+    const title = selectedNodeIds.length === 1
+      ? nodes.find((node) => node.id === selectedNodeIds[0])?.title ?? 'Capability'
+      : `Capability ${layout.groups.length + 1}`
+    setContent(groupBlueprintNodes(content, selectedNodeIds, title, stableId('group')))
+    setConflict(false)
+  }
+
+  function selectCapabilityGroup(group: BlueprintLayoutDto['groups'][number]) {
+    const nodeIDs = group.nodeIds.filter((nodeId) => nodes.some((node) => node.id === nodeId))
+    setSelectedNodeIds(nodeIDs)
+    setSelectedBlueprintNodeId(nodeIDs[0] ?? null)
+  }
+
+  function renameCapabilityGroup(groupId: string, title: string) {
+    mutateBlueprint((_nodes, _edges, currentLayout) => ({
+      layout: {
+        ...currentLayout,
+        groups: currentLayout.groups.map((group) => group.id === groupId ? { ...group, title } : group),
+      },
+    }))
+  }
+
+  function ungroupCapability(groupId: string) {
+    mutateBlueprint((_nodes, _edges, currentLayout) => ({
+      layout: { ...currentLayout, groups: currentLayout.groups.filter((group) => group.id !== groupId) },
+    }))
+  }
+
+  function selectNode(nodeId: string, additive: boolean) {
+    setSelectedNodeIds((current) => {
+      if (!additive) return [nodeId]
+      return current.includes(nodeId)
+        ? current.filter((item) => item !== nodeId)
+        : [...current, nodeId]
+    })
+    setSelectedBlueprintNodeId(nodeId)
   }
 
   function updateNode(nodeId: string, patch: Partial<SemanticNode>) {
@@ -294,9 +376,16 @@ export function BlueprintEditor() {
       return {
         nodes: currentNodes.filter((node) => node.id !== nodeId),
         edges: currentEdges.filter((edge) => edge.sourceNodeId !== nodeId && edge.targetNodeId !== nodeId),
-        layout: { ...currentLayout, nodePositions: positions },
+        layout: {
+          ...currentLayout,
+          nodePositions: positions,
+          groups: currentLayout.groups
+            .map((group) => ({ ...group, nodeIds: group.nodeIds.filter((item) => item !== nodeId) }))
+            .filter((group) => group.nodeIds.length > 0),
+        },
       }
     })
+    setSelectedNodeIds((current) => current.filter((item) => item !== nodeId))
   }
 
   function moveNode(nodeId: string, x: number, y: number) {
@@ -359,6 +448,141 @@ export function BlueprintEditor() {
     }
   }
 
+  async function freezeSelection() {
+    const approved = resource?.approvedRevision
+    if (!approved) throw new Error('Approve an immutable Blueprint revision before freezing a selection.')
+    if (selectedNodeIds.length === 0) throw new Error('Select at least one Blueprint node.')
+    const approvedNodes = normalizeBlueprintContent(approved.content).semantic?.nodes ?? []
+    const approvedIDs = new Set(approvedNodes.map((node) => node.id))
+    const missing = selectedNodeIds.filter((nodeId) => !approvedIDs.has(nodeId))
+    if (missing.length > 0) {
+      throw new Error('The selection contains draft-only nodes. Create and approve a Blueprint revision first.')
+    }
+    const frozen = await flow.compileBlueprintSelection({
+      blueprintRevision: versionRef(approved),
+      nodeIds: [...selectedNodeIds].sort(),
+    }, resource.artifact.etag)
+    if (!frozen) throw new Error(flow.error ?? 'The Blueprint selection could not be frozen.')
+    return frozen
+  }
+
+  async function generateDocumentsFromSelection() {
+    const project = collaboration.project
+    if (!project) return
+    setSaving(true)
+    setLocalError(null)
+    setSelectionMessage(null)
+    try {
+      const manifest = await freezeSelection()
+      const scope = readBlueprintSelectionScope(manifest)
+      const content = {
+        ...createEmptyDocumentContent('frontendDevelopment'),
+        summary: `Implementation notes for ${scope.nodes.map((node) => node.title).join(', ')}`,
+        blocks: scope.nodes.map((node) => ({
+          id: stableId('selection-block'),
+          type: 'sourceReference' as const,
+          text: `${node.kind}: ${node.title}`,
+          requirementIds: node.requirementIds ?? [],
+          data: { blueprintNodeId: node.id, selectionId: scope.selectionId },
+        })),
+        requirements: [],
+        acceptanceCriteria: [],
+      }
+      const created = await collaboration.platformClient.documents.create(project.id, {
+        title: `Selection notes · ${scope.nodes[0]?.title ?? scope.selectionId.slice(0, 12)}`,
+        kind: content.kind,
+        content,
+        sourceVersions: manifest.sources.map((source) => source.ref),
+      }, { idempotencyKey: true })
+      const draftETag = created.data.draft?.etag ?? created.etag
+      if (!draftETag) throw new Error('The document service did not return a draft ETag.')
+      const revision = await collaboration.platformClient.documents.createRevision(
+        created.data.artifact.id,
+        { changeSummary: 'Freeze Blueprint selection documentation target', changeSource: 'system' },
+        { ifMatch: draftETag, idempotencyKey: true },
+      )
+      await workspace.createProposal({
+        jobType: 'selection.documentation',
+        targetRevision: versionRef(revision.data),
+        instruction: `Generate implementation documentation only for Blueprint selection ${scope.selectionId}. Preserve every stable node anchor and identify assumptions explicitly.`,
+        inputVersions: manifest.sources.map((source) => source.ref),
+        constraints: {
+          parentSelectionManifest: { id: manifest.id, hash: manifest.hash },
+          frozenSelectionScope: scope as unknown as import('@/lib/platform/dto').JsonObject,
+        },
+        outputSchemaVersion: 'selection-document-proposal/v1',
+      })
+      await workspace.refresh()
+      setSelectionMessage(`Documentation proposal created from ${scope.nodeIds.length} frozen nodes.`)
+    } catch (error) {
+      setLocalError(errorMessage(error))
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  async function createPrototypesFromSelection() {
+    const project = collaboration.project
+    if (!project) return
+    setSaving(true)
+    setLocalError(null)
+    setSelectionMessage(null)
+    try {
+      const manifest = await freezeSelection()
+      const scope = readBlueprintSelectionScope(manifest)
+      const pending = scope.pageBindings.filter((binding) => binding.pageSpec && !binding.prototype)
+      if (pending.length === 0) {
+        throw new Error(scope.pageBindings.length === 0
+          ? 'Select at least one approved Blueprint Page with a PageSpec.'
+          : 'Every selected Page already has an approved Prototype in this frozen selection.')
+      }
+      for (const binding of pending) {
+        const pageSpec = binding.pageSpec!
+        const revision = await collaboration.platformClient.artifacts.getRevision<PageSpecContentDto>(pageSpec.revisionId)
+        if (
+          revision.data.artifactId !== pageSpec.artifactId
+          || revision.data.contentHash !== pageSpec.contentHash
+        ) throw new Error(`PageSpec ${binding.nodeId} changed while creating its Prototype.`)
+        const page = scope.nodes.find((node) => node.id === binding.nodeId)
+        await collaboration.platformClient.prototypes.create(project.id, {
+          title: `${page?.title ?? binding.nodeId} Prototype`,
+          pageSpecRevision: pageSpec,
+          exploratory: false,
+          content: createEmptyPrototypeContent(pageSpec, revision.data.content, false),
+        }, { idempotencyKey: true })
+      }
+      await workspace.refresh()
+      setSelectionMessage(`${pending.length} formal Prototype draft${pending.length === 1 ? '' : 's'} created from exact PageSpec revisions; review and approve them before running Workbench.`)
+    } catch (error) {
+      setLocalError(errorMessage(error))
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  async function useSelectionInWorkbench() {
+    setSaving(true)
+    setLocalError(null)
+    setSelectionMessage(null)
+    try {
+      const manifest = await freezeSelection()
+      const scope = readBlueprintSelectionScope(manifest)
+      if (scope.pageBindings.length === 0 || scope.pageBindings.some((binding) => !binding.pageSpec || !binding.prototype)) {
+        throw new Error('Workbench requires every selected Page to have approved PageSpec and Prototype revisions.')
+      }
+      const run = await flow.startFromManifest(manifest, {
+        definitionKey: 'blueprint-selection-app',
+        scope: { blueprintSelection: { selectionId: scope.selectionId } },
+      })
+      if (!run) throw new Error(flow.error ?? 'The selection workflow did not start.')
+      setSurface('workbench')
+    } catch (error) {
+      setLocalError(errorMessage(error))
+    } finally {
+      setSaving(false)
+    }
+  }
+
   return (
     <div className="flex h-full min-h-0 bg-canvas max-lg:flex-col">
       <aside className="w-60 shrink-0 overflow-y-auto border-r border-border bg-panel p-3 scrollbar-thin max-lg:max-h-48 max-lg:w-full max-lg:border-b max-lg:border-r-0">
@@ -386,6 +610,7 @@ export function BlueprintEditor() {
         </header>
 
         {(localError || conflict) && <div role="alert" className="border-b border-warning/30 bg-warning/10 px-4 py-2 text-[10px] text-warning">{localError}{conflict && <button type="button" onClick={() => void reloadServerDraft()} className="ml-3 underline">Reload current server draft</button>}</div>}
+        {selectionMessage && <div role="status" className="border-b border-success/30 bg-success/10 px-4 py-2 text-[10px] text-success">{selectionMessage}</div>}
 
         <nav className="flex overflow-x-auto border-b border-border bg-panel p-1 scrollbar-thin">
           {([
@@ -403,6 +628,24 @@ export function BlueprintEditor() {
           {tab === 'canvas' && (
             <div className="grid min-h-full xl:grid-cols-[1fr_290px]">
               <section className="min-w-0 p-4">
+                <div className="mb-3 rounded-lg border border-border bg-panel p-2">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="mr-1 inline-flex items-center gap-1 text-[9px] font-semibold uppercase tracking-wide text-faint-foreground"><Boxes className="size-3" />Module library</span>
+                    {BLUEPRINT_MODULE_TEMPLATES.map((template) => <button key={template.id} type="button" draggable={!readOnly} title={template.description} onDragStart={(event) => event.dataTransfer.setData('application/x-blueprint-module', template.id)} onClick={() => addModule(template)} disabled={readOnly} className="rounded border border-border bg-background px-2 py-1 text-[9px] font-medium text-foreground hover:border-primary/50 disabled:opacity-40">{template.label}</button>)}
+                    <button type="button" onClick={groupSelection} disabled={readOnly || selectedNodeIds.length === 0} className="ml-auto inline-flex items-center gap-1 rounded border border-primary/40 px-2 py-1 text-[9px] font-semibold text-primary-bright disabled:opacity-40"><Group className="size-3" />Group as capability ({selectedNodeIds.length})</button>
+                  </div>
+                  <div className="mt-2 flex flex-wrap items-center gap-2 border-t border-border pt-2">
+                    <span className="text-[9px] text-faint-foreground">Approved selection actions use exact revision + stable anchors</span>
+                    <button type="button" onClick={() => void generateDocumentsFromSelection()} disabled={readOnly || selectedNodeIds.length === 0 || saving} className="rounded bg-primary/15 px-2 py-1 text-[9px] font-semibold text-primary-bright disabled:opacity-40">Generate docs from selection</button>
+                    <button type="button" onClick={() => void createPrototypesFromSelection()} disabled={readOnly || selectedNodeIds.length === 0 || saving} className="rounded bg-primary/15 px-2 py-1 text-[9px] font-semibold text-primary-bright disabled:opacity-40">Create prototypes from selection</button>
+                    <button type="button" onClick={() => void useSelectionInWorkbench()} disabled={readOnly || selectedNodeIds.length === 0 || saving} className="inline-flex items-center gap-1 rounded bg-primary px-2 py-1 text-[9px] font-semibold text-primary-foreground disabled:opacity-40"><Play className="size-3" />Use selection in workflow / Workbench</button>
+                  </div>
+                  {layout.groups.length > 0 && <div className="mt-2 space-y-1 border-t border-border pt-2">{layout.groups.map((group) => <div key={group.id} className="flex items-center gap-1.5 rounded border border-border bg-background p-1">
+                    <button type="button" aria-label={`Select capability ${group.title}`} onClick={() => selectCapabilityGroup(group)} className="inline-flex shrink-0 items-center gap-1 rounded px-1.5 py-1 text-[9px] font-semibold text-primary-bright hover:bg-primary/10"><Group className="size-3" />{group.nodeIds.length} nodes</button>
+                    <input aria-label={`Capability name ${group.title}`} value={group.title} readOnly={readOnly} onChange={(event) => renameCapabilityGroup(group.id, event.target.value)} className="h-7 min-w-0 flex-1 rounded border border-border bg-panel px-2 text-[9px] text-foreground" />
+                    <button type="button" aria-label={`Ungroup capability ${group.title}`} onClick={() => ungroupCapability(group.id)} disabled={readOnly} className="rounded p-1 text-destructive disabled:opacity-40"><Trash2 className="size-3" /></button>
+                  </div>)}</div>}
+                </div>
                 <div className="mb-3 flex flex-wrap items-center gap-2">
                   <select onChange={(event) => addNode(event.target.value as BlueprintNodeKind)} value="" disabled={readOnly} className="h-8 rounded-md border border-border bg-panel px-2 text-[10px] text-foreground disabled:opacity-50"><option value="" disabled>Add semantic node…</option>{NODE_KINDS.map((kind) => <option key={kind} value={kind}>{kind}</option>)}</select>
                   <select value={edgeSourceId} onChange={(event) => setEdgeSourceId(event.target.value)} className="h-8 rounded-md border border-border bg-panel px-2 text-[10px] text-foreground"><option value="">Source</option>{nodes.map((node) => <option key={node.id} value={node.id}>{node.title}</option>)}</select>
@@ -410,8 +653,29 @@ export function BlueprintEditor() {
                   <select value={edgeTargetId} onChange={(event) => setEdgeTargetId(event.target.value)} className="h-8 rounded-md border border-border bg-panel px-2 text-[10px] text-foreground"><option value="">Target</option>{nodes.map((node) => <option key={node.id} value={node.id}>{node.title}</option>)}</select>
                   <button type="button" onClick={addEdge} disabled={readOnly || !edgeSourceId || !edgeTargetId || edgeSourceId === edgeTargetId} className="h-8 rounded-md bg-primary px-3 text-[10px] font-semibold text-primary-foreground disabled:opacity-40"><Link2 className="mr-1 inline size-3" />Connect</button>
                 </div>
-                <div ref={canvasRef} className="relative overflow-auto rounded-lg border border-border bg-background" style={{ minHeight: CANVAS_HEIGHT }}>
+                <div
+                  ref={canvasRef}
+                  className="relative overflow-auto rounded-lg border border-border bg-background"
+                  style={{ minHeight: CANVAS_HEIGHT }}
+                  onDragOver={(event) => event.preventDefault()}
+                  onDrop={(event) => {
+                    event.preventDefault()
+                    const template = BLUEPRINT_MODULE_TEMPLATES.find((item) => item.id === event.dataTransfer.getData('application/x-blueprint-module'))
+                    const canvas = canvasRef.current
+                    if (!template || !canvas || readOnly) return
+                    const rect = canvas.getBoundingClientRect()
+                    addModule(template, {
+                      x: event.clientX - rect.left + canvas.scrollLeft,
+                      y: event.clientY - rect.top + canvas.scrollTop,
+                    })
+                  }}
+                >
                   <div className="relative" style={{ width: CANVAS_WIDTH, height: CANVAS_HEIGHT, backgroundImage: 'radial-gradient(circle, rgb(148 163 184 / 0.15) 1px, transparent 1px)', backgroundSize: '20px 20px' }}>
+                    {layout.groups.map((group) => {
+                      const bounds = blueprintGroupBounds(group.nodeIds, layout)
+                      if (!bounds) return null
+                      return <div key={group.id} className="pointer-events-none absolute rounded-xl border border-dashed border-primary/45 bg-primary/5" style={{ left: bounds.left, top: bounds.top, width: bounds.width, height: bounds.height }}><button type="button" aria-label={`Select capability ${group.title} on canvas`} onClick={() => selectCapabilityGroup(group)} className="pointer-events-auto absolute -top-5 left-1 rounded bg-panel px-1.5 py-0.5 text-[8px] font-semibold text-primary-bright">{group.title}</button></div>
+                    })}
                     <svg aria-hidden className="pointer-events-none absolute inset-0 size-full">
                       {edges.map((edge) => {
                         const source = layout.nodePositions[edge.sourceNodeId]
@@ -425,6 +689,7 @@ export function BlueprintEditor() {
                       return <button
                         key={node.id}
                         type="button"
+                        aria-pressed={selectedNodeIds.includes(node.id)}
                         onPointerDown={(event) => {
                           if (readOnly || event.button !== 0) return
                           const rect = event.currentTarget.getBoundingClientRect()
@@ -442,8 +707,8 @@ export function BlueprintEditor() {
                           if (dragRef.current?.id === node.id && event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId)
                           dragRef.current = null
                         }}
-                        onClick={() => setSelectedBlueprintNodeId(node.id)}
-                        className={cn('absolute cursor-move rounded-lg border p-2 text-left shadow-sm touch-none', NODE_COLORS[node.kind], selectedBlueprintNodeId === node.id && 'ring-2 ring-primary')}
+                        onClick={(event) => selectNode(node.id, event.metaKey || event.ctrlKey || event.shiftKey)}
+                        className={cn('absolute cursor-move rounded-lg border p-2 text-left shadow-sm touch-none', NODE_COLORS[node.kind], selectedNodeIds.includes(node.id) && 'ring-2 ring-primary')}
                         style={{ width: NODE_WIDTH, height: NODE_HEIGHT, transform: `translate(${position.x}px, ${position.y}px)` }}
                       ><span className="block truncate text-[9px] uppercase tracking-wide text-faint-foreground">{node.kind}</span><span className="block truncate text-[11px] font-semibold text-foreground">{node.title}</span></button>
                     })}
@@ -552,13 +817,24 @@ function Unavailable({ title, detail, loading, action, onAction, onRetry }: { ti
   return <div className="flex h-full items-center justify-center bg-canvas p-6 text-center"><div className="max-w-md rounded-lg border border-dashed border-border bg-panel p-6">{loading ? <Loader2 className="mx-auto size-7 animate-spin text-primary-bright" /> : <AlertTriangle className="mx-auto size-7 text-warning" />}<h1 className="mt-3 text-base font-semibold text-foreground">{title}</h1><p className="mt-2 text-sm text-muted-foreground">{detail}</p>{action && onAction && <button type="button" onClick={onAction} className="mt-4 rounded-md bg-primary px-3 py-2 text-sm font-medium text-primary-foreground">{action}</button>}{onRetry && <button type="button" onClick={() => void onRetry()} className="mt-4 rounded-md bg-primary px-3 py-2 text-sm font-medium text-primary-foreground"><RefreshCw className="mr-1 inline size-4" />Retry</button>}</div></div>
 }
 
-function versionRef(revision: ArtifactRevisionDto<BlueprintContentDto>): VersionRefDto {
+function versionRef<TContent>(revision: ArtifactRevisionDto<TContent>): VersionRefDto {
   return { artifactId: revision.artifactId, revisionId: revision.id, revisionNumber: revision.revisionNumber, contentHash: revision.contentHash }
 }
 
 function stableId(prefix: string) {
   const id = typeof crypto !== 'undefined' && crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(36).slice(2)}`
   return `${prefix}-${id}`
+}
+
+function blueprintGroupBounds(nodeIds: readonly string[], layout: BlueprintLayoutDto) {
+  const positions = nodeIds.flatMap((nodeId) => layout.nodePositions[nodeId] ? [layout.nodePositions[nodeId]] : [])
+  if (positions.length === 0) return null
+  const padding = 18
+  const left = Math.max(0, Math.min(...positions.map((position) => position.x)) - padding)
+  const top = Math.max(0, Math.min(...positions.map((position) => position.y)) - padding)
+  const right = Math.max(...positions.map((position) => position.x + NODE_WIDTH)) + padding
+  const bottom = Math.max(...positions.map((position) => position.y + NODE_HEIGHT)) + padding
+  return { left, top, width: right - left, height: bottom - top }
 }
 
 function commaList(value: string) {

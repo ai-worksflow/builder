@@ -6,9 +6,12 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/google/uuid"
 	"github.com/worksflow/builder/backend/internal/core"
 	"github.com/worksflow/builder/backend/internal/domain"
+	storage "github.com/worksflow/builder/backend/internal/storage/postgres"
 	"github.com/worksflow/builder/backend/internal/workflow"
+	"gorm.io/gorm"
 )
 
 type workflowQualityAPI interface {
@@ -24,7 +27,8 @@ type workflowPublishAPI interface {
 // WorkflowQualityEvaluator binds the workflow quality node to the exact
 // WorkspaceRevision carried by the quality node's exact typed input lineage.
 type WorkflowQualityEvaluator struct {
-	Quality workflowQualityAPI
+	Quality  workflowQualityAPI
+	Database *gorm.DB
 }
 
 func (a WorkflowQualityEvaluator) Evaluate(ctx context.Context, execution workflow.Execution) (workflow.QualityResult, error) {
@@ -35,7 +39,7 @@ func (a WorkflowQualityEvaluator) Evaluate(ctx context.Context, execution workfl
 	if err != nil {
 		return workflow.QualityResult{}, err
 	}
-	reference, err := workspaceRevisionFromExecution(execution)
+	reference, err := workspaceRevisionForQuality(ctx, a.Database, execution)
 	if err != nil {
 		return workflow.QualityResult{}, err
 	}
@@ -130,6 +134,17 @@ func (a WorkflowPublisher) Publish(
 }
 
 func workspaceRevisionFromExecution(execution workflow.Execution) (core.VersionRef, error) {
+	references := workspaceRevisionsFromExecution(execution)
+	if len(references) != 1 {
+		return core.VersionRef{}, conflict(fmt.Sprintf("quality gate requires exactly one WorkspaceRevision from its typed inputs, got %d", len(references)))
+	}
+	for _, reference := range references {
+		return reference, nil
+	}
+	return core.VersionRef{}, conflict("quality gate has no incoming WorkspaceRevision")
+}
+
+func workspaceRevisionsFromExecution(execution workflow.Execution) map[string]core.VersionRef {
 	references := make(map[string]core.VersionRef)
 	for _, binding := range execution.Inputs.Bindings() {
 		for _, raw := range []json.RawMessage{binding.Value, binding.Output} {
@@ -144,13 +159,95 @@ func workspaceRevisionFromExecution(execution workflow.Execution) (core.VersionR
 			references[key] = reference
 		}
 	}
-	if len(references) != 1 {
-		return core.VersionRef{}, conflict(fmt.Sprintf("quality gate requires exactly one WorkspaceRevision from its typed inputs, got %d", len(references)))
+	return references
+}
+
+// workspaceRevisionForQuality accepts several Workbench outputs only when one
+// is the current workspace and every other input is its exact ancestor. This
+// is the assembly rule for parallel or sequential compiler groups converging
+// on one application; unrelated workspace branches remain ambiguous.
+func workspaceRevisionForQuality(
+	ctx context.Context,
+	database *gorm.DB,
+	execution workflow.Execution,
+) (core.VersionRef, error) {
+	references := workspaceRevisionsFromExecution(execution)
+	if len(references) == 1 {
+		for _, reference := range references {
+			return reference, nil
+		}
 	}
+	if len(references) == 0 {
+		return core.VersionRef{}, conflict("quality gate has no incoming WorkspaceRevision")
+	}
+	if database == nil {
+		return core.VersionRef{}, conflict("quality gate cannot assemble multiple WorkspaceRevisions without the authoritative store")
+	}
+	projectID, err := uuid.Parse(execution.Run.ProjectID)
+	if err != nil {
+		return core.VersionRef{}, conflict("quality workflow project id is invalid")
+	}
+	var artifactID uuid.UUID
+	byRevision := make(map[uuid.UUID]core.VersionRef, len(references))
 	for _, reference := range references {
-		return reference, nil
+		if err := ValidateVersionRef(reference); err != nil || reference.AnchorID != nil {
+			return core.VersionRef{}, conflict("quality workspace input is not an exact whole revision")
+		}
+		parsedArtifactID, parseErr := uuid.Parse(reference.ArtifactID)
+		if parseErr != nil {
+			return core.VersionRef{}, conflict("quality workspace artifact id is invalid")
+		}
+		if artifactID == uuid.Nil {
+			artifactID = parsedArtifactID
+		} else if artifactID != parsedArtifactID {
+			return core.VersionRef{}, conflict("quality WorkspaceRevisions belong to different workspace artifacts")
+		}
+		parsedRevisionID, parseErr := uuid.Parse(reference.RevisionID)
+		if parseErr != nil {
+			return core.VersionRef{}, conflict("quality workspace revision id is invalid")
+		}
+		byRevision[parsedRevisionID] = reference
 	}
-	return core.VersionRef{}, conflict("quality gate has no incoming WorkspaceRevision")
+	var artifact storage.ArtifactModel
+	if err := database.WithContext(ctx).Where(
+		"id = ? AND project_id = ? AND kind = ? AND lifecycle = ? AND latest_approved_revision_id IS NOT NULL",
+		artifactID, projectID, "workspace", "active",
+	).Take(&artifact).Error; err != nil {
+		return core.VersionRef{}, conflict("quality workspace artifact is not the active project workspace")
+	}
+	currentID := *artifact.LatestApprovedRevisionID
+	currentReference, exists := byRevision[currentID]
+	if !exists {
+		return core.VersionRef{}, conflict("quality inputs do not contain the exact current WorkspaceRevision")
+	}
+	visited := make(map[uuid.UUID]bool)
+	current := currentID
+	for current != uuid.Nil {
+		if visited[current] || len(visited) > 10_000 {
+			return core.VersionRef{}, conflict("workspace revision ancestry is cyclic or too deep")
+		}
+		visited[current] = true
+		var revision storage.ArtifactRevisionModel
+		if err := database.WithContext(ctx).Where("id = ? AND artifact_id = ?", current, artifactID).Take(&revision).Error; err != nil {
+			return core.VersionRef{}, conflict("workspace revision ancestry is incomplete")
+		}
+		if expected, selected := byRevision[current]; selected && expected.ContentHash != revision.ContentHash {
+			return core.VersionRef{}, conflict("workspace revision ancestry hash does not match the typed input")
+		}
+		if current == currentID && (revision.ContentHash != currentReference.ContentHash || revision.WorkflowStatus != "approved") {
+			return core.VersionRef{}, conflict("current WorkspaceRevision is not the exact approved typed input")
+		}
+		if revision.ParentRevisionID == nil {
+			break
+		}
+		current = *revision.ParentRevisionID
+	}
+	for revisionID := range byRevision {
+		if !visited[revisionID] {
+			return core.VersionRef{}, conflict("quality WorkspaceRevision inputs are not one linear application ancestry")
+		}
+	}
+	return currentReference, nil
 }
 
 func decodeWorkspaceReference(raw json.RawMessage) (core.VersionRef, bool) {

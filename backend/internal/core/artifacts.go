@@ -27,6 +27,33 @@ var validArtifactKinds = map[string]struct{}{
 	"permission_contract": {}, "workspace": {}, "test_report": {}, "quality_report": {},
 }
 
+var systemManagedArtifactKinds = map[string]struct{}{
+	"requirement_baseline": {},
+	"workspace":            {},
+	"quality_report":       {},
+	"test_report":          {},
+}
+
+func IsSystemManagedArtifactKind(kind string) bool {
+	_, systemManaged := systemManagedArtifactKinds[strings.TrimSpace(kind)]
+	return systemManaged
+}
+
+func ensureGenericArtifactMutationAllowed(kind string) error {
+	if IsSystemManagedArtifactKind(kind) {
+		return fmt.Errorf("%w: %s artifacts are system-managed", ErrForbidden, kind)
+	}
+	return nil
+}
+
+func ensureGenericArtifactKeyAllowed(artifactKey string) error {
+	normalized := strings.ToUpper(strings.TrimSpace(artifactKey))
+	if normalized == "REQUIREMENT-BASELINE" || normalized == "WORKSPACE-MAIN" {
+		return fmt.Errorf("%w: artifact key is reserved for a system-managed artifact", ErrForbidden)
+	}
+	return nil
+}
+
 type Artifact struct {
 	ID                       string    `json:"id"`
 	ProjectID                string    `json:"projectId"`
@@ -117,6 +144,166 @@ type ArtifactSource struct {
 	Required bool   `json:"required"`
 }
 
+type SystemRevisionSource struct {
+	Ref      VersionRef
+	Purpose  string
+	Required bool
+	Relation string
+}
+
+func PersistSystemRevisionLineage(
+	transaction *gorm.DB,
+	projectID uuid.UUID,
+	targetArtifactID uuid.UUID,
+	targetRevisionID uuid.UUID,
+	targetDraftID uuid.UUID,
+	actorID uuid.UUID,
+	createdAt time.Time,
+	sources []SystemRevisionSource,
+) ([]ArtifactSource, error) {
+	if transaction == nil {
+		return nil, errors.New("revision lineage transaction is required")
+	}
+	revisionSources := make([]storage.ArtifactRevisionSourceModel, 0, len(sources))
+	draftSources := make([]storage.ArtifactDraftSourceModel, 0, len(sources))
+	dependencies := make([]storage.ArtifactDependencyModel, 0, len(sources))
+	dependencyIndexes := make(map[string]int, len(sources))
+	links := make([]storage.TraceLinkModel, 0, len(sources)*2)
+	seenSources := make(map[string]struct{}, len(sources))
+	seenLinks := make(map[string]struct{}, len(sources)*2)
+	frozen := make([]ArtifactSource, 0, len(sources))
+	for ordinal, source := range sources {
+		source.Purpose = strings.TrimSpace(source.Purpose)
+		source.Relation = strings.TrimSpace(source.Relation)
+		sourceArtifactID, err := uuid.Parse(source.Ref.ArtifactID)
+		if err != nil {
+			return nil, fmt.Errorf("%w: system revision source artifact", ErrInvalidInput)
+		}
+		sourceRevisionID, err := uuid.Parse(source.Ref.RevisionID)
+		if err != nil || !strings.HasPrefix(source.Ref.ContentHash, "sha256:") || source.Purpose == "" {
+			return nil, fmt.Errorf("%w: system revision source", ErrInvalidInput)
+		}
+		var exactRevision storage.ArtifactRevisionModel
+		if err := transaction.Table("artifact_revisions").
+			Select("artifact_revisions.*").
+			Joins("JOIN artifacts ON artifacts.id = artifact_revisions.artifact_id").
+			Where(
+				"artifact_revisions.id = ? AND artifact_revisions.artifact_id = ? AND artifacts.project_id = ?",
+				sourceRevisionID, sourceArtifactID, projectID,
+			).
+			Take(&exactRevision).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return nil, ErrNotFound
+			}
+			return nil, err
+		}
+		if exactRevision.ContentHash != source.Ref.ContentHash {
+			return nil, ErrConflict
+		}
+		if _, valid := traceRelations[source.Relation]; !valid {
+			return nil, fmt.Errorf("%w: system revision source relation", ErrInvalidInput)
+		}
+		var anchorID *string
+		if source.Ref.AnchorID != nil {
+			anchor := strings.TrimSpace(*source.Ref.AnchorID)
+			if anchor != "" {
+				anchorID = &anchor
+			}
+		}
+		sourceKey := sourceRevisionID.String() + "\x00" + source.Purpose
+		if _, duplicate := seenSources[sourceKey]; duplicate {
+			return nil, fmt.Errorf("%w: duplicate system revision source", ErrInvalidInput)
+		}
+		seenSources[sourceKey] = struct{}{}
+		revisionSources = append(revisionSources, storage.ArtifactRevisionSourceModel{
+			RevisionID: targetRevisionID, Ordinal: ordinal, SourceArtifactID: sourceArtifactID,
+			SourceRevisionID: sourceRevisionID, SourceContentHash: source.Ref.ContentHash,
+			SourceAnchorID: cloneStringPointer(anchorID), Purpose: source.Purpose,
+			Required: source.Required, AddedBy: actorID, AddedAt: createdAt,
+		})
+		if targetDraftID != uuid.Nil {
+			draftSources = append(draftSources, storage.ArtifactDraftSourceModel{
+				DraftID: targetDraftID, SourceArtifactID: sourceArtifactID,
+				SourceRevisionID: sourceRevisionID, SourceContentHash: source.Ref.ContentHash,
+				SourceAnchorID: cloneStringPointer(anchorID), Purpose: source.Purpose,
+				Required: source.Required, AddedBy: actorID, AddedAt: createdAt,
+			})
+		}
+		frozen = append(frozen, ArtifactSource{
+			VersionRef: VersionRef{
+				ArtifactID: source.Ref.ArtifactID, RevisionID: source.Ref.RevisionID,
+				ContentHash: source.Ref.ContentHash, AnchorID: cloneStringPointer(anchorID),
+			},
+			Purpose: source.Purpose, Required: source.Required,
+		})
+
+		dependencyKey := sourceRevisionID.String() + "\x00" + source.Relation
+		if sourceArtifactID != targetArtifactID {
+			if index, exists := dependencyIndexes[dependencyKey]; exists {
+				if source.Required {
+					dependencies[index].Required = true
+				}
+			} else {
+				dependencyIndexes[dependencyKey] = len(dependencies)
+				revisionID := targetRevisionID
+				dependencies = append(dependencies, storage.ArtifactDependencyModel{
+					ID: uuid.New(), ProjectID: projectID, SourceArtifactID: sourceArtifactID,
+					SourceRevisionID: sourceRevisionID, SourceContentHash: source.Ref.ContentHash,
+					TargetArtifactID: targetArtifactID, TargetRevisionID: &revisionID,
+					Relation: source.Relation, Required: source.Required, CreatedBy: actorID, CreatedAt: createdAt,
+				})
+			}
+		}
+		wholeLinkKey := dependencyKey + "\x00"
+		if _, exists := seenLinks[wholeLinkKey]; !exists {
+			seenLinks[wholeLinkKey] = struct{}{}
+			revisionID := targetRevisionID
+			links = append(links, storage.TraceLinkModel{
+				ID: uuid.New(), ProjectID: projectID, SourceArtifactID: sourceArtifactID,
+				SourceRevisionID: sourceRevisionID, TargetArtifactID: targetArtifactID,
+				TargetRevisionID: &revisionID, Relation: source.Relation,
+				Metadata:  json.RawMessage(`{"origin":"frozen_revision_source"}`),
+				CreatedBy: actorID, CreatedAt: createdAt,
+			})
+		}
+		if anchorID != nil {
+			anchorLinkKey := dependencyKey + "\x00" + *anchorID
+			if _, exists := seenLinks[anchorLinkKey]; !exists {
+				seenLinks[anchorLinkKey] = struct{}{}
+				revisionID := targetRevisionID
+				links = append(links, storage.TraceLinkModel{
+					ID: uuid.New(), ProjectID: projectID, SourceArtifactID: sourceArtifactID,
+					SourceRevisionID: sourceRevisionID, SourceAnchorID: cloneStringPointer(anchorID),
+					TargetArtifactID: targetArtifactID, TargetRevisionID: &revisionID,
+					Relation: source.Relation, Metadata: json.RawMessage(`{"origin":"frozen_revision_source"}`),
+					CreatedBy: actorID, CreatedAt: createdAt,
+				})
+			}
+		}
+	}
+	if len(revisionSources) > 0 {
+		if err := transaction.Create(&revisionSources).Error; err != nil {
+			return nil, err
+		}
+	}
+	if len(draftSources) > 0 {
+		if err := transaction.Create(&draftSources).Error; err != nil {
+			return nil, err
+		}
+	}
+	if len(dependencies) > 0 {
+		if err := transaction.Create(&dependencies).Error; err != nil {
+			return nil, err
+		}
+	}
+	if len(links) > 0 {
+		if err := transaction.Create(&links).Error; err != nil {
+			return nil, err
+		}
+	}
+	return frozen, nil
+}
+
 type CreateRevisionInput struct {
 	ChangeSummary string `json:"changeSummary"`
 	ChangeSource  string `json:"changeSource,omitempty"`
@@ -137,6 +324,32 @@ func NewArtifactService(database *gorm.DB, contents content.Store, access *Acces
 }
 
 func (s *ArtifactService) Create(ctx context.Context, projectID, actorID string, input CreateArtifactInput) (VersionedArtifact, error) {
+	return s.create(ctx, projectID, actorID, uuid.New(), input)
+}
+
+// CreateWithID is reserved for internal command handlers which persist an
+// idempotency record before creating the artifact. A stable ID lets recovery
+// find a committed artifact even if the command checkpoint update failed.
+// It retains every authorization, kind, lineage, content and audit guard used
+// by Create; callers cannot use it to create system-managed artifacts.
+func (s *ArtifactService) CreateWithID(
+	ctx context.Context,
+	projectID, actorID, artifactID string,
+	input CreateArtifactInput,
+) (VersionedArtifact, error) {
+	stableID, err := uuid.Parse(strings.TrimSpace(artifactID))
+	if err != nil || stableID == uuid.Nil {
+		return VersionedArtifact{}, fmt.Errorf("%w: artifact id", ErrInvalidInput)
+	}
+	return s.create(ctx, projectID, actorID, stableID, input)
+}
+
+func (s *ArtifactService) create(
+	ctx context.Context,
+	projectID, actorID string,
+	artifactID uuid.UUID,
+	input CreateArtifactInput,
+) (VersionedArtifact, error) {
 	if _, err := s.access.Authorize(ctx, projectID, actorID, ActionEdit); err != nil {
 		return VersionedArtifact{}, err
 	}
@@ -149,6 +362,9 @@ func (s *ArtifactService) Create(ctx context.Context, projectID, actorID string,
 	if _, valid := validArtifactKinds[input.Kind]; !valid || input.Title == "" || len(input.Title) > 240 {
 		return VersionedArtifact{}, fmt.Errorf("%w: artifact kind or title", ErrInvalidInput)
 	}
+	if err := ensureGenericArtifactMutationAllowed(input.Kind); err != nil {
+		return VersionedArtifact{}, err
+	}
 	if input.SchemaVersion <= 0 {
 		input.SchemaVersion = 1
 	}
@@ -160,9 +376,11 @@ func (s *ArtifactService) Create(ctx context.Context, projectID, actorID string,
 	); err != nil {
 		return VersionedArtifact{}, err
 	}
-	artifactID := uuid.New()
 	draftID := uuid.New()
 	artifactKey := normalizeArtifactKey(input.ArtifactKey, input.Kind, artifactID)
+	if err := ensureGenericArtifactKeyAllowed(artifactKey); err != nil {
+		return VersionedArtifact{}, err
+	}
 	contentRef, err := s.contents.PutPending(ctx, projectID, "artifact_draft", draftID.String(), input.SchemaVersion, input.Content)
 	if err != nil {
 		return VersionedArtifact{}, fmt.Errorf("store artifact draft: %w", err)
@@ -334,15 +552,18 @@ func (s *ArtifactService) UpdateDraft(ctx context.Context, draftID, actorID, exp
 	if err != nil {
 		return ArtifactDraft{}, err
 	}
+	var artifact storage.ArtifactModel
+	if err := s.database.WithContext(ctx).Where("id = ?", current.ArtifactID).Take(&artifact).Error; err != nil {
+		return ArtifactDraft{}, err
+	}
+	if err := ensureGenericArtifactMutationAllowed(artifact.Kind); err != nil {
+		return ArtifactDraft{}, err
+	}
 	if expectedETag == "" || expectedETag != current.ETag {
 		return ArtifactDraft{}, ErrConflict
 	}
 	if current.Status != "draft" {
 		return ArtifactDraft{}, ErrConflict
-	}
-	var artifact storage.ArtifactModel
-	if err := s.database.WithContext(ctx).Where("id = ?", current.ArtifactID).Take(&artifact).Error; err != nil {
-		return ArtifactDraft{}, err
 	}
 	if input.SchemaVersion <= 0 {
 		input.SchemaVersion = current.SchemaVersion
@@ -442,6 +663,31 @@ func (s *ArtifactService) UpdateDraft(ctx context.Context, draftID, actorID, exp
 }
 
 func (s *ArtifactService) CreateRevision(ctx context.Context, artifactID, actorID, expectedDraftETag string, input CreateRevisionInput) (ArtifactRevision, error) {
+	return s.createRevision(ctx, artifactID, actorID, expectedDraftETag, uuid.New(), input)
+}
+
+// CreateRevisionWithID uses the complete normal revision path with a stable
+// identity reserved by a durable internal command. It intentionally does not
+// turn duplicate IDs into success: recovery must load and validate the exact
+// committed revision before proceeding.
+func (s *ArtifactService) CreateRevisionWithID(
+	ctx context.Context,
+	artifactID, actorID, expectedDraftETag, revisionID string,
+	input CreateRevisionInput,
+) (ArtifactRevision, error) {
+	stableID, err := uuid.Parse(strings.TrimSpace(revisionID))
+	if err != nil || stableID == uuid.Nil {
+		return ArtifactRevision{}, fmt.Errorf("%w: revision id", ErrInvalidInput)
+	}
+	return s.createRevision(ctx, artifactID, actorID, expectedDraftETag, stableID, input)
+}
+
+func (s *ArtifactService) createRevision(
+	ctx context.Context,
+	artifactID, actorID, expectedDraftETag string,
+	revisionID uuid.UUID,
+	input CreateRevisionInput,
+) (ArtifactRevision, error) {
 	artifactUUID, projectID, err := s.authorizeArtifact(ctx, artifactID, actorID, ActionEdit)
 	if err != nil {
 		return ArtifactRevision{}, err
@@ -465,6 +711,9 @@ func (s *ArtifactService) CreateRevision(ctx context.Context, artifactID, actorI
 	err = s.database.WithContext(ctx).Transaction(func(transaction *gorm.DB) error {
 		var artifact storage.ArtifactModel
 		if err := transaction.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id = ?", artifactUUID).Take(&artifact).Error; err != nil {
+			return err
+		}
+		if err := ensureGenericArtifactMutationAllowed(artifact.Kind); err != nil {
 			return err
 		}
 		if artifact.LatestDraftID == nil {
@@ -522,13 +771,31 @@ func (s *ArtifactService) CreateRevision(ctx context.Context, artifactID, actorI
 			Where("artifact_id = ?", artifactUUID).Select("COALESCE(MAX(revision_number), 0)").Scan(&latest).Error; err != nil {
 			return err
 		}
-		revisionID := uuid.New()
+		// Applying an OutputProposal materializes its changes into the active
+		// draft. Freeze that immutable proposal/manifest identity into the first
+		// (and any subsequent manual) revision cut from the same draft so workflow
+		// gates can prove that a submitted edit actually contains the reviewed AI
+		// proposal instead of accepting the proposal base revision itself.
+		var appliedProposal storage.OutputProposalModel
+		proposalQueryErr := transaction.
+			Where("base_draft_id = ? AND artifact_id = ? AND status IN ?", draft.ID, artifactUUID, []string{"applied", "partially_applied"}).
+			Order("applied_at DESC, created_at DESC").Take(&appliedProposal).Error
+		if proposalQueryErr != nil && !errors.Is(proposalQueryErr, gorm.ErrRecordNotFound) {
+			return proposalQueryErr
+		}
+		var proposalID, sourceManifestID *uuid.UUID
+		if proposalQueryErr == nil {
+			proposal := appliedProposal.ID
+			manifest := appliedProposal.InputManifestID
+			proposalID, sourceManifestID = &proposal, &manifest
+		}
 		revisionModel = storage.ArtifactRevisionModel{
 			ID: revisionID, ArtifactID: artifactUUID, RevisionNumber: latest + 1,
 			ParentRevisionID: artifact.LatestRevisionID, SchemaVersion: draft.SchemaVersion,
 			ContentStore: draft.ContentStore, ContentRef: draft.ContentRef, ContentHash: draft.ContentHash,
 			ByteSize: draft.ByteSize, WorkflowStatus: "draft", ChangeSource: input.ChangeSource,
-			ChangeSummary: input.ChangeSummary, CreatedBy: actorUUID, CreatedAt: now,
+			ChangeSummary: input.ChangeSummary, SourceManifestID: sourceManifestID, ProposalID: proposalID,
+			CreatedBy: actorUUID, CreatedAt: now,
 		}
 		if err := transaction.Create(&revisionModel).Error; err != nil {
 			return err
@@ -1106,19 +1373,33 @@ func revisionLineageModelsFromDraft(
 	links := make([]storage.TraceLinkModel, 0, len(sources))
 	seenLinks := make(map[string]struct{}, len(sources))
 	for _, source := range sources {
-		if index, exists := dependencyIndexes[source.SourceRevisionID]; exists {
-			if source.Required {
-				dependencies[index].Required = true
+		// A prior revision of the same artifact is represented by
+		// ParentRevisionID. Emitting an artifact dependency for it violates the
+		// graph's distinct source/target invariant and double-counts ancestry.
+		if source.SourceArtifactID != targetArtifactID {
+			if index, exists := dependencyIndexes[source.SourceRevisionID]; exists {
+				if source.Required {
+					dependencies[index].Required = true
+				}
+			} else {
+				dependencyIndexes[source.SourceRevisionID] = len(dependencies)
+				revisionID := targetRevisionID
+				dependencies = append(dependencies, storage.ArtifactDependencyModel{
+					ID: uuid.New(), ProjectID: projectID, SourceArtifactID: source.SourceArtifactID,
+					SourceRevisionID: source.SourceRevisionID, SourceContentHash: source.SourceContentHash,
+					TargetArtifactID: targetArtifactID, TargetRevisionID: &revisionID,
+					Relation: "derives_from", Required: source.Required, CreatedBy: actorID, CreatedAt: createdAt,
+				})
+				wholeLinkKey := source.SourceRevisionID.String() + "\x00"
+				seenLinks[wholeLinkKey] = struct{}{}
+				links = append(links, storage.TraceLinkModel{
+					ID: uuid.New(), ProjectID: projectID, SourceArtifactID: source.SourceArtifactID,
+					SourceRevisionID: source.SourceRevisionID, TargetArtifactID: targetArtifactID,
+					TargetRevisionID: &revisionID, Relation: "derives_from",
+					Metadata:  json.RawMessage(`{"origin":"required_dependency"}`),
+					CreatedBy: actorID, CreatedAt: createdAt,
+				})
 			}
-		} else {
-			dependencyIndexes[source.SourceRevisionID] = len(dependencies)
-			revisionID := targetRevisionID
-			dependencies = append(dependencies, storage.ArtifactDependencyModel{
-				ID: uuid.New(), ProjectID: projectID, SourceArtifactID: source.SourceArtifactID,
-				SourceRevisionID: source.SourceRevisionID, SourceContentHash: source.SourceContentHash,
-				TargetArtifactID: targetArtifactID, TargetRevisionID: &revisionID,
-				Relation: "derives_from", Required: source.Required, CreatedBy: actorID, CreatedAt: createdAt,
-			})
 		}
 		if source.SourceAnchorID == nil {
 			continue

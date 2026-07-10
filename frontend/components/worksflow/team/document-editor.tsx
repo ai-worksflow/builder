@@ -1,6 +1,7 @@
 'use client'
 
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
+import { collaborationErrorMessage } from '@/lib/collaboration/platform-adapter'
 import { useCollaboration } from '@/lib/collaboration/provider'
 import {
   ArtifactWorkspaceConflictError,
@@ -11,6 +12,10 @@ import {
 import { useArtifactWorkspace } from '@/lib/platform/artifact-provider'
 import type {
   ArtifactRevisionDto,
+  DocumentMemberBindingInputDto,
+  DocumentMemberRole,
+  DownstreamDocumentKind,
+  DocumentSyncBackProvenanceKind,
   DocumentContentDto,
   ProposalDto,
   VersionRefDto,
@@ -32,9 +37,10 @@ import {
   Save,
   Send,
   Trash2,
+  UserRoundCog,
 } from 'lucide-react'
 
-type EditorTab = 'content' | 'versions' | 'proposal' | 'trace' | 'review'
+type EditorTab = 'content' | 'versions' | 'proposal' | 'trace' | 'review' | 'collaboration'
 
 export function DocumentEditor() {
   const {
@@ -55,6 +61,23 @@ export function DocumentEditor() {
   const [comment, setComment] = useState('')
   const [reviewSummary, setReviewSummary] = useState('Ready for version-level review.')
   const [reviewerId, setReviewerId] = useState('')
+  const [memberBindings, setMemberBindings] = useState<DocumentMemberBindingInputDto[]>([])
+  const [bindingsEtag, setBindingsEtag] = useState('')
+  const [bindingUserId, setBindingUserId] = useState('')
+  const [bindingRole, setBindingRole] = useState<DocumentMemberRole>('reviewer')
+  const [bindingsLoading, setBindingsLoading] = useState(false)
+  const [bindingsDirty, setBindingsDirty] = useState(false)
+  const [bindingsRemoteChange, setBindingsRemoteChange] = useState(false)
+  const [downstreamKind, setDownstreamKind] = useState<DownstreamDocumentKind>('api_contract')
+  const [downstreamTitle, setDownstreamTitle] = useState('Derived API contract')
+  const [downstreamInstruction, setDownstreamInstruction] = useState('Generate a reviewable downstream document from this exact approved revision.')
+  const [syncBackKind, setSyncBackKind] = useState<DocumentSyncBackProvenanceKind>('implementationProposal')
+  const [syncBackId, setSyncBackId] = useState('')
+  const [syncBackInstruction, setSyncBackInstruction] = useState('Summarize the applied implementation, preview URL, and exact trace in this reviewed document.')
+  const [collaborationNotice, setCollaborationNotice] = useState<string | null>(null)
+  const bindingsRequest = useRef(0)
+  const bindingsReloadTimer = useRef<number | null>(null)
+  const bindingsDirtyRef = useRef(false)
 
   const resource = workspace.documents.find((item) => item.artifact.id === selectedDocId)
     ?? workspace.documents[0]
@@ -65,11 +88,45 @@ export function DocumentEditor() {
   const latestVersion = resource?.latestRevision
     ? versionRef(resource.latestRevision)
     : undefined
+  const approvedVersion = resource?.approvedRevision
+    ? versionRef(resource.approvedRevision)
+    : undefined
   const comments = collaboration.comments.filter((thread) => thread.target?.artifactId === resource?.artifact.id)
   const currentUserId = collaboration.session.signedIn ? collaboration.session.user.id : null
   const clientGate = content ? documentReviewIssues(content) : []
   const revisionReady = clientGate.length === 0
   const gatePassed = revisionReady && reviewGateReadyForRequest(details?.reviewGate)
+
+  const loadMemberBindings = useCallback(async (discardLocal = false) => {
+    const artifactId = resource?.artifact.id
+    if (bindingsDirtyRef.current && !discardLocal) {
+      setBindingsRemoteChange(true)
+      return
+    }
+    const request = ++bindingsRequest.current
+    if (!artifactId) {
+      setMemberBindings([])
+      setBindingsEtag('')
+      setBindingsLoading(false)
+      return
+    }
+    setBindingsLoading(true)
+    try {
+      const response = await collaboration.platformClient.documents.memberBindings(artifactId)
+      if (bindingsRequest.current !== request) return
+      setMemberBindings(response.data.items.map(({ userId, role, reason }) => ({ userId, role, reason })))
+      setBindingsEtag(response.etag ?? response.data.etag)
+      bindingsDirtyRef.current = false
+      setBindingsDirty(false)
+      setBindingsRemoteChange(false)
+    } catch (error) {
+      if (bindingsRequest.current === request) {
+        setLocalError(collaborationErrorMessage(error, 'Unable to load document member bindings.'))
+      }
+    } finally {
+      if (bindingsRequest.current === request) setBindingsLoading(false)
+    }
+  }, [collaboration.platformClient.documents, resource?.artifact.id])
 
   useEffect(() => {
     if (!resource) {
@@ -91,6 +148,39 @@ export function DocumentEditor() {
       .catch((error) => { if (active) setLocalError(message(error)) })
     return () => { active = false }
   }, [resource?.artifact.id, workspace.loadDetails])
+
+  useEffect(() => {
+    bindingsDirtyRef.current = false
+    setBindingsDirty(false)
+    setBindingsRemoteChange(false)
+    void loadMemberBindings(true)
+    return () => { bindingsRequest.current += 1 }
+  }, [loadMemberBindings])
+
+  useEffect(() => {
+    if (!collaboration.session.signedIn || !collaboration.project || !resource) return
+    const artifactId = resource.artifact.id
+    const unsubscribe = collaboration.platformClient.websocket.subscribeProject(collaboration.project.id, (event) => {
+      if (event.type !== 'artifact.member_bindings_replaced' || event.payload.artifactId !== artifactId) return
+      if (bindingsReloadTimer.current !== null) window.clearTimeout(bindingsReloadTimer.current)
+      bindingsReloadTimer.current = window.setTimeout(() => {
+        bindingsReloadTimer.current = null
+        void loadMemberBindings()
+      }, 120)
+    })
+    collaboration.platformClient.websocket.connect()
+    return () => {
+      unsubscribe()
+      if (bindingsReloadTimer.current !== null) {
+        window.clearTimeout(bindingsReloadTimer.current)
+        bindingsReloadTimer.current = null
+      }
+    }
+  }, [collaboration.platformClient.websocket, collaboration.project, collaboration.session.signedIn, loadMemberBindings, resource?.artifact.id])
+
+  useEffect(() => {
+    if (!bindingUserId && collaboration.members[0]) setBindingUserId(collaboration.members[0].user.id)
+  }, [bindingUserId, collaboration.members])
 
   useEffect(() => {
     if (!resource || !content || !serverEtag || !dirty || conflict) return
@@ -147,6 +237,90 @@ export function DocumentEditor() {
     }
   }
 
+  async function saveMemberBindings() {
+    if (!resource || !bindingsEtag || memberBindings.length === 0) return
+    setSaving(true)
+    setLocalError(null)
+    try {
+      if (!(await collaboration.authorize('edit'))) return
+      const response = await collaboration.platformClient.documents.replaceMemberBindings(
+        resource.artifact.id,
+        memberBindings,
+        { ifMatch: bindingsEtag, idempotencyKey: true },
+      )
+      setMemberBindings(response.data.items.map(({ userId, role, reason }) => ({ userId, role, reason })))
+      setBindingsEtag(response.etag ?? response.data.etag)
+      bindingsDirtyRef.current = false
+      setBindingsDirty(false)
+      setBindingsRemoteChange(false)
+      setCollaborationNotice('Member bindings saved with compare-and-swap protection.')
+    } catch (error) {
+      setBindingsRemoteChange(true)
+      setLocalError(collaborationErrorMessage(error, 'Unable to save document member bindings.'))
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  function editMemberBindings(update: (items: DocumentMemberBindingInputDto[]) => DocumentMemberBindingInputDto[]) {
+    bindingsDirtyRef.current = true
+    setBindingsDirty(true)
+    setBindingsRemoteChange(false)
+    setMemberBindings(update)
+  }
+
+  async function generateDownstreamDocument() {
+    if (!resource || !approvedVersion || !collaboration.project) return
+    setSaving(true)
+    setLocalError(null)
+    try {
+      if (!(await collaboration.authorize('edit'))) return
+      const response = await collaboration.platformClient.documents.generateDownstream(
+        collaboration.project.id,
+        {
+          sourceRevision: approvedVersion,
+          targetKind: downstreamKind,
+          targetTitle: downstreamTitle,
+          instruction: downstreamInstruction,
+        },
+        { idempotencyKey: true },
+      )
+      await workspace.refresh()
+      setSelectedDocId(response.data.document.artifact.id)
+      setTab('proposal')
+      setCollaborationNotice(`Created reviewable proposal ${response.data.proposal.id}.`)
+    } catch (error) {
+      setLocalError(collaborationErrorMessage(error, 'Unable to generate the downstream document.'))
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  async function createSyncBackProposal() {
+    if (!approvedVersion || !collaboration.project || !syncBackId.trim()) return
+    setSaving(true)
+    setLocalError(null)
+    try {
+      if (!(await collaboration.authorize('edit'))) return
+      const response = await collaboration.platformClient.documents.createSyncBackProposal(
+        collaboration.project.id,
+        {
+          targetRevision: approvedVersion,
+          provenance: { kind: syncBackKind, id: syncBackId.trim() },
+          instruction: syncBackInstruction,
+        },
+        { idempotencyKey: true },
+      )
+      await workspace.refresh()
+      setTab('proposal')
+      setCollaborationNotice(`Implementation facts are pending review in proposal ${response.data.proposal.id}.`)
+    } catch (error) {
+      setLocalError(collaborationErrorMessage(error, 'Unable to create the implementation sync-back proposal.'))
+    } finally {
+      setSaving(false)
+    }
+  }
+
   return (
     <div className="flex h-full min-h-0 bg-canvas max-lg:flex-col">
       <aside className="w-64 shrink-0 overflow-y-auto border-r border-border bg-panel p-3 scrollbar-thin max-lg:max-h-52 max-lg:w-full max-lg:border-b max-lg:border-r-0">
@@ -180,6 +354,7 @@ export function DocumentEditor() {
             ['proposal', `AI proposals ${proposals.length}`],
             ['trace', `Trace ${workspace.traces.length}`],
             ['review', `Review ${comments.length}`],
+            ['collaboration', `Collaboration ${memberBindings.length}`],
           ] as const).map(([id, label]) => <button key={id} type="button" onClick={() => setTab(id)} className={cn('shrink-0 rounded px-3 py-1.5 text-[10px] font-medium', tab === id ? 'bg-primary/15 text-primary-bright' : 'text-muted-foreground')}>{label}</button>)}
         </nav>
 
@@ -226,6 +401,40 @@ export function DocumentEditor() {
               {latestVersion && <div className="grid gap-2 sm:grid-cols-[1fr_auto]"><input value={comment} onChange={(event) => setComment(event.target.value)} placeholder="Comment on this exact revision" className="h-9 rounded-md border border-border bg-background px-2 text-[10px] text-foreground" /><button type="button" onClick={() => void collaboration.addComment(comment, undefined, latestVersion).then((ok) => ok && setComment(''))} disabled={!comment.trim() || !collaboration.can('comment')} className="rounded-md bg-primary px-3 text-[10px] font-semibold text-primary-foreground disabled:opacity-50"><MessageSquare className="mr-1 inline size-3" />Comment</button></div>}
               {latestVersion && <div className="grid gap-2 sm:grid-cols-[1fr_180px_auto]"><input value={reviewSummary} onChange={(event) => setReviewSummary(event.target.value)} className="h-9 rounded-md border border-border bg-background px-2 text-[10px] text-foreground" /><select value={reviewerId} onChange={(event) => setReviewerId(event.target.value)} className="h-9 rounded-md border border-border bg-background px-2 text-[10px] text-foreground"><option value="">Reviewer</option>{collaboration.members.filter((member) => member.user.id !== currentUserId && ['owner', 'admin', 'editor'].includes(member.role)).map((member) => <option key={member.user.id} value={member.user.id}>{member.user.name}</option>)}</select><button type="button" onClick={() => void collaboration.requestReview(reviewSummary, latestVersion, [reviewerId])} disabled={!gatePassed || !reviewerId || !reviewSummary.trim()} className="rounded-md bg-primary px-3 text-[10px] font-semibold text-primary-foreground disabled:opacity-50"><Send className="mr-1 inline size-3" />Request review</button></div>}
               {comments.map((thread) => <div key={thread.id} className="rounded-md border border-border bg-panel p-3"><span className="text-[10px] font-medium text-foreground">{thread.author.name}</span><p className="mt-1 text-[10px] text-muted-foreground">{thread.body}</p></div>)}
+            </section>
+          )}
+          {tab === 'collaboration' && (
+            <section className="mx-auto max-w-4xl space-y-4" data-testid="document-collaboration-panel">
+              {collaborationNotice && <p className="rounded-md border border-success/30 bg-success/10 p-2 text-[10px] text-success">{collaborationNotice}</p>}
+              <div className="rounded-lg border border-border bg-panel p-4">
+                <div className="flex items-center justify-between gap-2">
+                  <div><h2 className="text-sm font-semibold text-foreground"><UserRoundCog className="mr-1.5 inline size-4 text-primary-bright" />Document member bindings</h2><p className="mt-1 text-[10px] text-muted-foreground">Owner, assignee, downstream owner, reviewer and watcher are persisted per artifact.</p></div>
+                  <span className="flex items-center gap-2"><code className="text-[9px] text-faint-foreground">{bindingsEtag || 'loading ETag'}{bindingsDirty ? ' · local edits' : ''}</code><button type="button" data-testid="refresh-document-bindings" onClick={() => void loadMemberBindings()} disabled={bindingsLoading} className="rounded border border-border p-1 text-muted-foreground disabled:opacity-40" aria-label="Refresh document bindings"><RefreshCw className={cn('size-3', bindingsLoading && 'animate-spin')} /></button></span>
+                </div>
+                {bindingsRemoteChange && <div data-testid="document-bindings-conflict" role="alert" className="mt-3 flex items-center justify-between gap-3 rounded border border-warning/30 bg-warning/10 p-2 text-[10px] text-warning"><span>Server bindings changed. Your local edits are preserved against the original ETag.</span><button type="button" onClick={() => void loadMemberBindings(true)} className="shrink-0 underline">Reload server bindings</button></div>}
+                {bindingsLoading ? <Loader2 className="mt-3 size-4 animate-spin text-primary-bright" /> : <div className="mt-3 space-y-2">{memberBindings.map((binding, index) => {
+                  const member = collaboration.members.find((item) => item.user.id === binding.userId)
+                  return <div key={`${binding.userId}:${binding.role}`} className="grid gap-2 rounded border border-border bg-background p-2 sm:grid-cols-[1fr_170px_auto]"><span className="self-center text-[10px] text-foreground">{member?.user.name ?? binding.userId}</span><select value={binding.role} disabled={!collaboration.can('edit')} onChange={(event) => editMemberBindings((items) => items.map((item, itemIndex) => itemIndex === index ? { ...item, role: event.target.value as DocumentMemberRole } : item))} className="h-8 rounded border border-border bg-panel px-2 text-[10px] text-foreground"><BindingRoleOptions /></select><button type="button" disabled={!collaboration.can('edit')} onClick={() => editMemberBindings((items) => items.filter((_, itemIndex) => itemIndex !== index))} className="rounded border border-border px-2 text-destructive disabled:opacity-40" aria-label="Remove member binding"><Trash2 className="size-3" /></button></div>
+                })}</div>}
+                <div className="mt-3 grid gap-2 sm:grid-cols-[1fr_170px_auto_auto]"><select value={bindingUserId} onChange={(event) => setBindingUserId(event.target.value)} className="h-9 rounded border border-border bg-background px-2 text-[10px] text-foreground"><option value="">Project member</option>{collaboration.members.map((member) => <option key={member.user.id} value={member.user.id}>{member.user.name}</option>)}</select><select value={bindingRole} onChange={(event) => setBindingRole(event.target.value as DocumentMemberRole)} className="h-9 rounded border border-border bg-background px-2 text-[10px] text-foreground"><BindingRoleOptions /></select><button type="button" disabled={!bindingUserId || memberBindings.some((item) => item.userId === bindingUserId && item.role === bindingRole)} onClick={() => editMemberBindings((items) => [...items, { userId: bindingUserId, role: bindingRole }])} className="rounded border border-border px-3 text-[10px] text-primary-bright disabled:opacity-40"><Plus className="mr-1 inline size-3" />Add</button><button type="button" onClick={() => void saveMemberBindings()} disabled={!collaboration.can('edit') || !bindingsDirty || !bindingsEtag || saving || !memberBindings.some((item) => item.role === 'owner')} className="rounded bg-primary px-3 text-[10px] font-semibold text-primary-foreground disabled:opacity-40">Save bindings</button></div>
+              </div>
+
+              <div className="rounded-lg border border-border bg-panel p-4">
+                <h2 className="text-sm font-semibold text-foreground"><Bot className="mr-1.5 inline size-4 text-primary-bright" />Generate downstream document</h2>
+                <p className="mt-1 text-[10px] text-muted-foreground">The server freezes this exact approved revision and resolves downstreamOwner into the new document owner.</p>
+                <div className="mt-3 grid gap-2 sm:grid-cols-[180px_1fr]"><select value={downstreamKind} onChange={(event) => setDownstreamKind(event.target.value as DownstreamDocumentKind)} className="h-9 rounded border border-border bg-background px-2 text-[10px] text-foreground"><DownstreamKindOptions /></select><input value={downstreamTitle} onChange={(event) => setDownstreamTitle(event.target.value)} placeholder="Target document title" className="h-9 rounded border border-border bg-background px-2 text-[10px] text-foreground" /></div>
+                <textarea value={downstreamInstruction} onChange={(event) => setDownstreamInstruction(event.target.value)} rows={3} className="mt-2 w-full rounded border border-border bg-background p-2 text-[10px] text-foreground" />
+                <button type="button" onClick={() => void generateDownstreamDocument()} disabled={!collaboration.can('edit') || !approvedVersion || saving || !downstreamTitle.trim() || !downstreamInstruction.trim()} className="mt-2 rounded bg-primary px-3 py-2 text-[10px] font-semibold text-primary-foreground disabled:opacity-40">Generate reviewable output</button>
+                {!approvedVersion && <p className="mt-2 text-[9px] text-warning">Canonical approval is required; drafts are never used as downstream truth.</p>}
+              </div>
+
+              <div className="rounded-lg border border-border bg-panel p-4">
+                <h2 className="text-sm font-semibold text-foreground"><GitBranch className="mr-1.5 inline size-4 text-primary-bright" />Sync implementation facts back</h2>
+                <p className="mt-1 text-[10px] text-muted-foreground">Only an applied proposal, consumed build leaf, exact produced workspace or verified deployment can create a document patch proposal.</p>
+                <div className="mt-3 grid gap-2 sm:grid-cols-[200px_1fr]"><select value={syncBackKind} onChange={(event) => setSyncBackKind(event.target.value as DocumentSyncBackProvenanceKind)} className="h-9 rounded border border-border bg-background px-2 text-[10px] text-foreground"><option value="implementationProposal">Implementation proposal</option><option value="workspaceRevision">Workspace revision</option><option value="buildManifest">Build manifest</option><option value="deployment">Deployment</option></select><input value={syncBackId} onChange={(event) => setSyncBackId(event.target.value)} placeholder="Exact provenance ID" className="h-9 rounded border border-border bg-background px-2 font-mono text-[10px] text-foreground" /></div>
+                <textarea value={syncBackInstruction} onChange={(event) => setSyncBackInstruction(event.target.value)} rows={3} className="mt-2 w-full rounded border border-border bg-background p-2 text-[10px] text-foreground" />
+                <button type="button" onClick={() => void createSyncBackProposal()} disabled={!collaboration.can('edit') || !approvedVersion || saving || !syncBackId.trim() || !syncBackInstruction.trim()} className="mt-2 rounded bg-primary px-3 py-2 text-[10px] font-semibold text-primary-foreground disabled:opacity-40">Create reviewed sync-back proposal</button>
+              </div>
             </section>
           )}
         </div>
@@ -339,6 +548,14 @@ function GatePanel({ clientIssues, serverGate }: { clientIssues: string[]; serve
 
 function ProposalPanel({ proposals, selected, onSelected, instruction, onInstruction, canEdit, canCreate, onCreate, onApply }: { proposals: ProposalDto[]; selected: Record<string, string[]>; onSelected: (value: Record<string, string[]>) => void; instruction: string; onInstruction: (value: string) => void; canEdit: boolean; canCreate: boolean; onCreate: () => void; onApply: (proposal: ProposalDto) => void }) {
   return <section className="mx-auto max-w-4xl space-y-3"><div className="flex gap-2"><input value={instruction} onChange={(event) => onInstruction(event.target.value)} className="h-9 min-w-0 flex-1 rounded-md border border-border bg-background px-2 text-[10px] text-foreground" /><button type="button" onClick={onCreate} disabled={!canEdit || !canCreate || !instruction.trim()} className="rounded-md bg-primary px-3 text-[10px] font-semibold text-primary-foreground disabled:opacity-50"><Bot className="mr-1 inline size-3" />Ask AI</button></div>{!canCreate && <p className="rounded border border-warning/30 bg-warning/10 p-2 text-[9px] text-warning">Save and create an immutable revision before asking AI. Draft bytes are never sent as workflow truth.</p>}{proposals.map((proposal) => { const selectedIds = selected[proposal.id] ?? []; const hasAccepted = proposal.operations.some((operation) => operation.decision === 'accepted' || selectedIds.includes(operation.id)); return <div key={proposal.id} className="rounded-lg border border-border bg-panel p-3"><div className="flex items-center gap-2"><span className="text-[11px] font-semibold text-foreground">Manifest {proposal.manifest.id.slice(0, 12)}</span><span className="rounded bg-primary/10 px-1.5 py-0.5 text-[9px] text-primary-bright">{proposal.status}</span><code className="ml-auto text-[9px] text-faint-foreground">base {proposal.baseRevision.contentHash.slice(0, 12)}</code></div><div className="mt-2 space-y-1">{proposal.operations.map((operation) => <label key={operation.id} className="flex gap-2 rounded border border-border bg-background p-2 text-[9px] text-muted-foreground"><input type="checkbox" disabled={operation.decision !== 'pending'} checked={operation.decision === 'accepted' || operation.decision === 'applied' || selectedIds.includes(operation.id)} onChange={(event) => onSelected({ ...selected, [proposal.id]: event.target.checked ? [...selectedIds, operation.id] : selectedIds.filter((item) => item !== operation.id) })} /><span className="min-w-0 flex-1"><code>{operation.kind} {operation.path || '/'}</code><span className="ml-2 text-faint-foreground">{operation.decision}</span>{operation.rationale && <span className="mt-1 block">{operation.rationale}</span>}</span></label>)}</div><button type="button" onClick={() => onApply(proposal)} disabled={!canEdit || !hasAccepted || !['open', 'reviewing', 'ready'].includes(proposal.status)} className="mt-2 rounded bg-primary px-2.5 py-1.5 text-[9px] font-semibold text-primary-foreground disabled:opacity-50">Decide all and apply accepted operations</button></div>})}</section>
+}
+
+function BindingRoleOptions() {
+  return <><option value="owner">owner</option><option value="assignee">assignee</option><option value="downstreamOwner">downstream owner</option><option value="reviewer">reviewer</option><option value="watcher">watcher</option></>
+}
+
+function DownstreamKindOptions() {
+  return <><option value="product_requirements">Requirements</option><option value="project_brief">Project brief</option><option value="api_contract">API contract</option><option value="data_contract">Data contract</option><option value="permission_contract">Permission contract</option><option value="decision_record">Decision record</option><option value="reference_source">Reference source</option><option value="change_request">Change request</option><option value="glossary_policy">Glossary / policy</option></>
 }
 
 function Unavailable({ title, detail, loading, action, onAction, onRetry }: { title: string; detail: string; loading?: boolean; action?: string; onAction?: () => void; onRetry?: () => Promise<void> }) {

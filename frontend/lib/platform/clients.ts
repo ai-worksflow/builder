@@ -28,7 +28,12 @@ import type {
   CreateWorkflowInputDto,
   DecideProposalInputDto,
   DecideReviewInputDto,
+  DocumentGraphDto,
+  DocumentMemberBindingInputDto,
+  DocumentMemberBindingSetDto,
   DocumentContentDto,
+  CreateDocumentSyncBackInputDto,
+  GenerateDownstreamDocumentInputDto,
   ImpactReportDto,
   JsonValue,
   NotificationDto,
@@ -550,6 +555,73 @@ abstract class VersionedDomainClient<TContent, TCreate> extends DomainClient {
 
 export class DocumentsClient extends VersionedDomainClient<DocumentContentDto, CreateDocumentInputDto> {
   protected readonly collection = 'documents'
+
+  graph(projectId: string, options?: ClientRequestOptions) {
+    return this.http.get<DocumentGraphDto>(
+      `/v1/projects/${segment(projectId)}/document-graph`,
+      requestOptions(options),
+    )
+  }
+
+  memberBindings(artifactId: string, options?: ClientRequestOptions) {
+    return this.http.get<DocumentMemberBindingSetDto>(
+      `/v1/artifacts/${segment(artifactId)}/member-bindings`,
+      requestOptions(options),
+    )
+  }
+
+  replaceMemberBindings(
+    artifactId: string,
+    items: readonly DocumentMemberBindingInputDto[],
+    options: ClientMutationOptions,
+  ) {
+    return this.http.put<DocumentMemberBindingSetDto, { readonly items: readonly DocumentMemberBindingInputDto[] }>(
+      `/v1/artifacts/${segment(artifactId)}/member-bindings`,
+      { items },
+      mutationOptions(options, true),
+    )
+  }
+
+  generateDownstream(
+    projectId: string,
+    input: GenerateDownstreamDocumentInputDto,
+    options?: ClientMutationOptions,
+  ) {
+    return this.http.post<{
+      readonly document: VersionedArtifactDto<DocumentContentDto>
+      readonly inputManifest: InputManifestDto
+      readonly proposal: ProposalDto
+      readonly provider: string
+      readonly model: string
+      readonly commandId: string
+      readonly replayed?: boolean
+      readonly resolvedOwnerIds: readonly string[]
+    }, GenerateDownstreamDocumentInputDto>(
+      `/v1/projects/${segment(projectId)}/documents/generate-downstream`,
+      { ...input, sourceRevision: wireVersionRef(input.sourceRevision) },
+      mutationOptions(options, true),
+    )
+  }
+
+  createSyncBackProposal(
+    projectId: string,
+    input: CreateDocumentSyncBackInputDto,
+    options?: ClientMutationOptions,
+  ) {
+    return this.http.post<{
+      readonly inputManifest: InputManifestDto
+      readonly proposal: ProposalDto
+      readonly provenance: CreateDocumentSyncBackInputDto['provenance']
+      readonly workspaceSource?: VersionRefDto
+      readonly previewUrl?: string
+      readonly provider: string
+      readonly model: string
+    }, CreateDocumentSyncBackInputDto>(
+      `/v1/projects/${segment(projectId)}/documents/sync-back`,
+      { ...input, targetRevision: wireVersionRef(input.targetRevision) },
+      mutationOptions(options, true),
+    )
+  }
 }
 
 export class BlueprintsClient extends VersionedDomainClient<BlueprintContentDto, CreateBlueprintInputDto> {

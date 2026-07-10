@@ -138,7 +138,8 @@ func TestWorkflowPublisherUsesPassingRunReportAndCurrentETag(t *testing.T) {
 	}
 	manifest := workflow.BuildManifest{
 		SchemaVersion: 1, ProjectID: projectID, RunID: runID,
-		SliceIDs: []string{uuid.NewString()}, BundleIDs: []string{uuid.NewString()},
+		ManifestGroupKey: uuid.NewString(),
+		SliceIDs:         []string{uuid.NewString()}, BundleIDs: []string{uuid.NewString()},
 		Sources: []domain.ArtifactRef{workflowRef()}, Constraints: json.RawMessage(`{}`), CreatedAt: time.Now().UTC(),
 	}
 	if err := manifest.Freeze(); err != nil {
@@ -163,7 +164,8 @@ func TestWorkflowPublisherRejectsMissingPassingReport(t *testing.T) {
 	publisher := &workflowPublishStub{}
 	manifest := workflow.BuildManifest{
 		SchemaVersion: 1, ProjectID: projectID, RunID: runID,
-		SliceIDs: []string{"slice"}, BundleIDs: []string{"bundle"}, Sources: []domain.ArtifactRef{workflowRef()}, CreatedAt: time.Now().UTC(),
+		ManifestGroupKey: uuid.NewString(),
+		SliceIDs:         []string{"slice"}, BundleIDs: []string{"bundle"}, Sources: []domain.ArtifactRef{workflowRef()}, CreatedAt: time.Now().UTC(),
 	}
 	if err := manifest.Freeze(); err != nil {
 		t.Fatal(err)

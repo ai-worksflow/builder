@@ -9,7 +9,8 @@ rate limits; NATS JetStream carries outbox-backed realtime events.
 
 The application wires authentication and project RBAC, artifacts and
 revisions, reviews and comments, immutable AI manifests and proposals, the
-versioned typed workflow runtime, Workbench generation, the data runtime,
+versioned typed workflow runtime, Blueprint Selection, document collaboration,
+Design Import, Workbench generation, the data runtime,
 quality/export/publish/rollback, GitHub integration, public application data,
 and the realtime hub into one process. The architectural contracts are in
 `docs/platform-architecture.md`.
@@ -110,6 +111,30 @@ The current migration chain is:
 | `000008_public_data_runtime` | default-deny public policies and deployment capabilities |
 | `000009_conversation_control_plane` | project conversations, immutable messages, reviewed workflow intents and controlled commands |
 | `000010_auth_session_receipts` | transactional sign-up/sign-in/refresh idempotency receipts without persisted cookie secrets |
+| `000011_artifact_revision_sources` | ordered immutable source revision, hash, anchor, purpose and required-policy snapshots for every artifact revision |
+| `000012_application_build_manifest_lineage` | tenant-bound build-manifest roots, compiler groups/root ordinals, one-child linear rebase lineage and exact workspace pins |
+| `000013_design_imports` | immutable untrusted-design snapshots and exact PageSpec/Prototype/manifest/proposal/applied-revision lineage |
+| `000014_document_collaboration` | collaboration-state ETags, tenant-safe member responsibilities, recoverable downstream-document commands, and AI provider/model provenance |
+
+Migration `000012` makes each workflow root unique within
+`(project, workflow run, manifest group, root ordinal)`. `manifest_group_key` is
+the stable ManifestCompiler NodeRun ID; derived rows inherit it and the root
+ordinal. Composite foreign keys keep roots and parents in one project and bind
+`(workflow_run_id, project_id)` to the owning run. A partial unique index gives
+each parent at most one direct child, while root/workspace uniqueness prevents
+the same workspace from appearing twice in a root lineage. Pre-group workflow
+rows are deterministically backfilled into the `legacy` group and ordered by
+creation identity so in-flight v1 runs remain readable.
+
+Migration `000013` creates `design_imports`. Its triggers make the imported
+snapshot identity immutable and require every referenced PageSpec, Prototype,
+base revision, InputManifest, OutputProposal and applied Prototype revision to
+belong to the same project and exact lineage. Migration `000014` creates
+`artifact_collaboration_states` and `document_generation_commands`, extends
+OutputProposal metadata with AI provider/model identity, and rejects
+cross-project bindings, resolved owners and downstream generation relations.
+The generation command's request hash, source-binding ETag and owner snapshot
+are immutable so a recovered or replayed command cannot silently change scope.
 
 Large immutable JSON and binary-safe content is stored in MongoDB. PostgreSQL
 stores the content reference and SHA-256 relation. Content creation uses a
@@ -135,11 +160,200 @@ Artifact generation is a two-phase protocol:
    version, base revision and hashes before writing the validated artifact
    draft.
 
+`requirement_baseline`, `workspace`, `quality_report`, and `test_report` are
+system-managed artifacts. Generic artifact create/draft/revision, OutputProposal
+create/decide/apply, and review submit/decide paths reject them; the fixed
+`REQUIREMENT-BASELINE` and `WORKSPACE-MAIN` keys are reserved as well. For
+human-editable targets, generation checks before calling AI that the exact base
+is still latest and that any active draft has the same base, status, schema,
+content hash, and frozen source lineage. Apply repeats that check while holding
+database locks, so schema-only or source-only edits cannot be overwritten.
+
 Application generation uses the same boundary at a larger scale. A frozen
 ApplicationBuildManifest pins all requirement, blueprint, PageSpec, prototype
 and workspace inputs. Workbench returns an ImplementationProposal; applying it
 creates a new immutable WorkspaceRevision rather than mutating the manifest or
 silently overwriting current files.
+
+Every workflow-created root also freezes its ManifestCompiler NodeRun as
+`manifestGroupKey` and its zero-based `rootOrdinal`. Different compiler nodes
+in one WorkflowRun therefore own independent ordered groups and may both have
+ordinal zero. A compiler retry after partial success reuses an existing root
+only when run/project/started-by/compiler-node, ordinal, delivery slice,
+prototype ref, and immutable payload identity all match; otherwise it fails
+closed instead of colliding with or adopting another group.
+
+If those frozen product inputs must be applied on top of a newer workspace,
+`POST /v1/build-manifests/:bundleId/rebase` accepts only
+`{"workspaceRevision":{"artifactId":"...","revisionId":"...","contentHash":"sha256:..."}}`.
+The service validates that exact revision and creates a derived immutable
+ApplicationBuildManifest; it never rewrites the source manifest. The derived
+manifest records both its root and direct parent lineage, while its manifest
+hash covers the newly pinned workspace. The authenticated command requires
+`Idempotency-Key` and returns `201 Created` with the new manifest `Location`
+and `ETag`. Clients generate a new ImplementationProposal from that returned
+manifest instead of retrying a stale proposal against changed workspace state.
+Only the structural leaf may be rebased. Creating its child atomically marks
+the parent `invalidated` and persists every non-final parent Proposal as
+`stale`; an exact retry returns the existing child, while another workspace for
+the same parent conflicts. Database uniqueness and service locks jointly
+prohibit sibling children. Generation also compares the leaf's workspace pin
+with the project's current approved Workspace before invoking AI.
+Once any proposal in a root lineage is applied, that lineage is complete:
+consumed manifests reject proposal regeneration and the service rejects further
+derived manifests from the same root.
+
+The frontend refresh boundary for that lineage is
+`GET /v1/build-manifests/:rootId/lineage-state` (a derived bundle ID is also
+accepted and normalized to its root). It must call this endpoint
+after reconnect, rebase, or implementation-proposal state changes instead of
+selecting a "latest" manifest from local timestamps. The authenticated response
+contains `rootBundleId`, the authoritative `activeBundle`, its optional
+`currentProposal`, the project's exact latest approved
+`currentWorkspaceRevision`, and an ordered `lineage` summary with direct-parent,
+workspace, status, creation time and latest non-stale proposal identity. The
+frontend uses the top-level workspace ref to decide whether the active bundle
+must be rebased; it must not substitute the bundle's older base workspace. A
+deterministic strong `ETag` covers the complete returned state, including the
+current workspace pin and every lineage proposal identity/status/version; a matching
+`If-None-Match` returns `304 Not Modified`. The service authorizes the root
+project's view scope and preserves forbidden/not-found semantics, so clients
+cannot use lineage refresh to inspect another project.
+
+The returned order follows direct-parent edges, not timestamps; a branch,
+cycle, disconnected row, cross-group row, or cross-project row is a conflict.
+Publish accepts a BuildManifest ID as a root-lineage selector, not as trusted
+producer provenance. For the exact approved WorkspaceRevision, the server
+follows its applied ImplementationProposal and resolves the unique consumed,
+non-invalidated structural leaf in the selector's project/run/root lineage.
+The DeploymentVersion stores that resolved root or derived leaf ID; selectors
+from another root, run, project, or a non-consumed/non-leaf producer are
+rejected.
+
+Draft lineage and revision lineage have different lifetimes. The ordered rows
+in `artifact_draft_sources` describe the sources for the next candidate
+revision and may change only through an ETag-guarded draft update. Creating a
+revision copies that exact set into `artifact_revision_sources`, including the
+source artifact/revision/hash, optional anchor, purpose, required flag and
+ordinal. Revision reads project those frozen rows; they never reconstruct
+history from the current draft. Every required source also has a revision-level
+dependency and matching trace coverage so canonical review can prove the
+lineage instead of trusting a client-supplied graph.
+
+### Typed/versioned DAG and built-in definitions
+
+WorkflowDefinition and WorkflowRun are separate persisted records. A run pins
+one published Definition Version, so editing or publishing a newer graph never
+changes an active run. Definition validation checks the DAG, unique entry,
+reachability, typed `fromPort -> toPort` compatibility, complete condition
+branches, fan-out/merge pairing and terminal paths. The runtime then creates a
+canonical immutable NodeInputEnvelope from only the incoming edge lineage and
+validates the target schema again before invoking its runner.
+
+This is the implementation boundary for freely composed processes. AI receives
+only a frozen InputManifest or NodeInputEnvelope and returns a typed Proposal or
+node output. Artifact writes, human review, conditions, fan-out, merge,
+ManifestCompiler, Workbench, quality and publish remain typed nodes controlled
+by the server. The built-in full product loop is an installed versioned
+template, not a hard-coded worker sequence. New projects receive its historical
+v1 and published v2 in the project-creation transaction; the explicit startup
+provisioner upgrades existing projects without performing writes in GET/List
+handlers or altering old runs.
+
+### Blueprint Selection compilation and fan-out
+
+`POST /v1/projects/:projectId/blueprint-selections/compile` is the only route
+that compiles client-selected Blueprint node IDs. It requires
+`Idempotency-Key`, `If-Match` for the current Blueprint Artifact, an exact
+approved Blueprint Revision and 1 to 100 stable node anchors. The service reads
+the immutable Blueprint content, sorts the selected nodes and internal edges,
+resolves current approved PageSpec/Prototype bindings, includes the Blueprint's
+approved source context, and derives `selectionId` from canonical content. It
+returns an immutable `blueprint.selection` InputManifest; clients cannot supply
+the resulting scope, sources or ID.
+
+The product exposes three operations over that same frozen manifest:
+
+1. A documentation operation creates a document scaffold/revision and a
+   `selection.documentation` OutputProposal. Its derived manifest must name the
+   parent Selection Manifest and reproduce its scope and exact source set.
+2. A prototype operation creates formal Prototype drafts only for selected
+   Pages that have an exact PageSpec and no approved Prototype.
+3. A Workbench operation starts the published `blueprint-selection-app` v1
+   definition only when every selected Page has both exact approved bindings.
+
+The selection definition runs `artifact_input -> blueprint_selection_page
+fan_out -> selection_passthrough -> merge -> manifest_compiler ->
+workbench_build -> quality_gate -> publish`. Runtime adapters revalidate the
+manifest's root and node sources, reject bindings outside the selected scope,
+and require compiled DeliverySlices to match every selected Page exactly. A
+different selection therefore requires a new manifest instead of editing an
+old one.
+
+### Document collaboration, downstream generation and sync-back
+
+Document collaboration routes are backed by PostgreSQL facts rather than local
+editor state:
+
+```text
+GET|PUT /v1/artifacts/:artifactId/member-bindings
+GET     /v1/projects/:projectId/document-graph
+POST    /v1/projects/:projectId/documents/generate-downstream
+POST    /v1/projects/:projectId/documents/sync-back
+```
+
+Member-binding replacement requires the binding-set ETag, `edit` permission,
+only same-project users, no duplicate user/role pair, and at least one Owner.
+Supported roles are `owner`, `assignee`, `downstreamOwner`, `reviewer`, and
+`watcher`.
+
+Downstream generation accepts only an exact approved document Revision and a
+durable command key. The service snapshots the source binding ETag and resolved
+downstream owners, deterministically checkpoints the target scaffold Revision,
+InputManifest and OutputProposal, and persists provider/model identity. A
+matching retry resumes or returns that exact result; reusing the key for a
+different request conflicts. The output remains a reviewable Proposal and does
+not become an approved document automatically.
+
+Sync-back also returns only an OutputProposal. The target must still be the
+document's exact current approved Revision. Provenance can name a current
+approved WorkspaceRevision, an applied ImplementationProposal, a consumed
+structural-leaf BuildManifest, or a ready Deployment. Resolution requires the
+same project, the current Workspace and a unique applied implementation chain;
+the resulting workspace, manifest/proposal hashes and optional preview URL are
+frozen into a dedicated sync-back InputManifest.
+
+The document graph is a deterministic read projection over artifacts,
+dependencies, trace links, member bindings, AI manifests/proposals, workflow
+runs, BuildManifests, implementations and deployments. It exposes the platform
+input/output chain for collaboration UI but is not independently editable.
+
+### Design Import Center
+
+The implemented Design Import route family is:
+
+```text
+GET  /v1/projects/:projectId/design-import-capabilities
+GET  /v1/projects/:projectId/design-imports
+GET  /v1/design-imports/:designImportId
+POST /v1/projects/:projectId/design-imports
+POST /v1/design-imports/:designImportId/decision
+```
+
+The capability response is authoritative per deployment. It advertises Figma,
+Penpot, Excalidraw, tldraw, Storybook, Ladle and generic upload formats, with a
+decoded size limit derived from `CONTENT_MAX_BYTES` and capped at 8 MiB.
+Remote connectors currently return `remoteEnabled: false`; the service does not
+fetch remote URLs, simulate OAuth or accept connector credentials.
+
+Creation requires `edit` and durable idempotency. The service validates the
+exported file and active-content policy, stores a content-addressed immutable
+snapshot, pins the exact current approved PageSpec in an InputManifest, and
+creates a canonical Prototype OutputProposal. A decision requires `review`,
+`Idempotency-Key`, `If-Match` and the proposal apply permission. Approval alone
+applies the proposal and creates a Prototype Revision with exact PageSpec,
+proposal and manifest lineage; rejection leaves the target unchanged. Existing
+Prototype updates additionally require an exact required PageSpec source match.
 
 ### Governed conversation control plane
 
@@ -159,6 +373,13 @@ POST      /v1/projects/:projectId/conversations/:conversationId/commands/:comman
 POST      /v1/projects/:projectId/conversations/:conversationId/commands/:commandId/reject
 ```
 
+For AI this control plane is an explicit input/output boundary. Input consists
+of the immutable user message plus server-resolved Definition Versions,
+Manifest refs, exact source revisions and allowable Workbench targets. Output
+is `{proposal,message,provider,model}` under a constrained schema. The model
+cannot append its own authoritative assistant record, accept the proposal,
+execute a command, mutate an Artifact, or schedule a WorkflowRun.
+
 Users with `comment` permission may append user messages; only the server may
 append assistant messages. Creating conversations, generating or submitting
 intent proposals, deciding proposals, and executing or rejecting commands need
@@ -174,12 +395,25 @@ identity, and `workbenchInstruction` into a command payload whose wire key is
 `payload.workbench`. The reviewed instruction is also preserved under
 `scope.conversationIntent.workbenchInstruction`.
 
+The governance InputManifest for a new conversation decision (`M1`) is
+independent from an already-running workflow's original InputManifest (`M0`).
+An accepted M1 command may govern an authoritative active target from the M0
+run without pretending the two manifests are equal; it separately pins M1,
+the run's DefinitionVersion, run ID, and expected root bundle. The server's
+generation context additionally supplies the current active leaf, manifest
+group, and ordinal from frozen lineage, and the AI output schema can select one
+authoritative target but cannot invent another ID. Execution re-resolves the
+leaf instead of freezing a soon-stale leaf ID into the command.
+
 `start_workflow` accepts an empty execution body and creates a run whose ID is
 the command ID. `workbench_instruction` requires
 `workbenchInstruction.expectedRunId` and an execution body containing the exact
-`workbenchResult.runId` and `bundleId`. Before accepting that result, the server
-rechecks project ownership, definition version, manifest ID/hash, frozen bundle
-status, and bundle-to-run linkage. AI generation remains a proposal-only step;
+`workbenchResult.runId`, active-leaf `bundleId`, and
+`implementationProposalId`. This is an exact proposal receipt: before accepting
+it, the server rechecks project ownership, DefinitionVersion, M1 governance
+manifest, M0 run, expected root, current structural leaf/workspace pin, and that
+the named Proposal belongs to that leaf, is open/reviewing/ready, and remains
+unapplied. AI generation remains a proposal-only step;
 it cannot accept or execute its own intent.
 
 WorkflowDefinition and WorkflowRun are separate persisted objects. Every run
@@ -189,6 +423,26 @@ lineage and validates the target schema before invoking a runner. This is what
 lets the frontend freely compose artifact, AI, human, condition, fan-out,
 merge, manifest, Workbench, quality and publish nodes without hardcoding one
 pipeline in the worker.
+
+The frontend likewise keeps Workbench state node-scoped. Each `workbench_build`
+node derives one queue group only from its own frozen NodeInputEnvelope and
+NodeMetadata output; it never merges unrelated node output or a global
+`buildManifest` fallback when several groups exist. Users explicitly select a
+group, which hydrates only that group's root lineage states. Within the group,
+root order comes from frozen `bundleIds`, and completion sends Proposal IDs in
+that order; the server maps every index to the persisted `rootOrdinal` and
+independently verifies the final Workspace ancestor chain.
+
+Every compiler group has an independent NodeRun group key and root ordinals,
+but all groups write revisions of the project's one active Workspace Artifact.
+Within a group, Workbench advances roots in frozen order. If a later root or
+group is still based on an older Workspace, generation waits for an explicit
+rebase to the server-reported current Workspace; stale patches are never
+applied merely because their base is an ancestor. When several Workbench groups
+converge on one quality node, the quality adapter accepts their Workspace
+references only if they belong to the same Artifact, one is the exact current
+approved Revision, and every other reference is its exact ancestor. It then
+selects that current Revision as the final workspace; branches are rejected.
 
 `quality_gate` and `publish` are privileged automatic nodes. They stop in
 `waiting_input` until a real authenticated actor authorizes the node with:
@@ -215,6 +469,26 @@ and versioned mutations require `If-Match`. Durable idempotency captures the
 request fingerprint and only releases a buffered success response after the
 replay record is durable; uncertain completion is sealed fail closed until its
 expiry instead of returning an untracked success.
+
+The newer authenticated planning and collaboration routes follow the same
+rules:
+
+```text
+POST     /v1/projects/:projectId/blueprint-selections/compile
+GET      /v1/projects/:projectId/document-graph
+GET|PUT  /v1/artifacts/:artifactId/member-bindings
+POST     /v1/projects/:projectId/documents/generate-downstream
+POST     /v1/projects/:projectId/documents/sync-back
+GET      /v1/projects/:projectId/design-import-capabilities
+GET|POST /v1/projects/:projectId/design-imports
+GET      /v1/design-imports/:designImportId
+POST     /v1/design-imports/:designImportId/decision
+```
+
+Blueprint selection compilation, binding replacement and Design Import
+decision are conditional commands. All listed mutations pass the authenticated
+CSRF and durable-idempotency middleware; reads remain project-authorized and
+never provision or upgrade data.
 
 Session sign-up, sign-in and refresh deliberately do not persist their HTTP
 responses through the generic middleware because those responses carry
@@ -302,6 +576,16 @@ A passing run captures `dist/`, `out/`, `build/`, or a root static
 Quality metadata records its exact content and build hashes. Preview,
 production, and rollback load that exact artifact; they do not rebuild and do
 not pass a source workspace to the provider.
+
+Workflow quality additionally pins the WorkflowRun ID and the exact final
+WorkspaceRevision selected from typed incoming lineage. Publish requires that
+same run's explicit passing QualityRun and the same Workspace hash. The request
+BuildManifest ID is treated only as a root-lineage selector: the service walks
+the Workspace Revision's applied ImplementationProposal and resolves the
+unique consumed, non-invalidated structural leaf that actually produced it.
+DeploymentVersion stores that resolved leaf together with the QualityRun and
+immutable BuildArtifact, preserving exact final-workspace provenance even when
+earlier compiler groups contributed ancestor Workspace revisions.
 
 ## Health and operational behavior
 

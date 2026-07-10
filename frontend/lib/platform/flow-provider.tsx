@@ -14,7 +14,10 @@ import { useCollaboration } from '../collaboration/provider'
 import { collaborationErrorMessage } from '../collaboration/platform-adapter'
 import { useArtifactWorkspace } from './artifact-provider'
 import { PlatformFlowClient } from './flow-client'
-import { projectBriefWorkflowManifestInput } from './workflow-entry'
+import {
+  projectBriefEntryAction,
+  projectBriefWorkflowManifestInput,
+} from './workflow-entry'
 import { PlatformHttpError } from './http'
 import { wireVersionRef } from './wire-version-ref'
 import {
@@ -25,11 +28,17 @@ import {
   proposalIsApplied,
   replaceWorkbenchQueueProposal,
   upsertWorkbenchBundle,
-  workflowWorkbenchQueueReferences,
+  workbenchBundleNeedsRebase,
+  workbenchQueueItemHasAppliedPredecessors,
+  workbenchQueueItemIndexForProposal,
+  workbenchRootBundleId,
+  workflowWorkbenchQueueGroups,
+  type WorkbenchQueueGroup,
   type WorkbenchQueueItem,
 } from './flow-queue'
 import type {
   CreateImplementationProposalInputDto,
+  BlueprintSelectionCompileInputDto,
   CreateWorkflowDefinitionInputDto,
   CreateWorkflowDefinitionVersionInputDto,
   ExactArtifactRefDto,
@@ -37,6 +46,7 @@ import type {
   ImplementationProposalDto,
   InputManifestDto,
   WorkflowDefinitionRecordDto,
+  WorkflowCapabilitiesDto,
   WorkflowEventDto,
   WorkflowNodeRunDto,
   WorkflowRunDto,
@@ -53,11 +63,16 @@ interface StartRunOptions {
   readonly scope?: JsonObject
 }
 
+interface StartManifestOptions extends StartRunOptions {
+  readonly definitionKey?: string
+}
+
 interface PlatformFlowContextState {
   readonly status: PlatformFlowStatus
   readonly busy: boolean
   readonly error: string | null
   readonly definitions: readonly WorkflowDefinitionRecordDto[]
+  readonly capabilities: WorkflowCapabilitiesDto | null
   readonly definitionVersions: readonly WorkflowDefinitionRecordDto[]
   readonly selectedDefinition: WorkflowDefinitionRecordDto | null
   readonly manifest: InputManifestDto | null
@@ -65,10 +80,13 @@ interface PlatformFlowContextState {
   readonly run: WorkflowRunDto | null
   readonly events: readonly WorkflowEventDto[]
   readonly workbenchQueue: readonly WorkbenchQueueItem[]
+  readonly workbenchGroups: readonly WorkbenchQueueGroup[]
+  readonly selectedWorkbenchNodeKey: string | null
   readonly selectedBundleId: string | null
   readonly workbenchProgress: { readonly applied: number; readonly total: number }
   readonly canApplyProposal: boolean
   readonly canCompleteWorkbench: boolean
+  readonly requiresWorkbenchRebase: boolean
   readonly bundle: WorkbenchBundleDto | null
   readonly proposal: ImplementationProposalDto | null
   readonly workspaceRevision: WorkspaceRevisionDto | null
@@ -84,6 +102,14 @@ interface PlatformFlowContextState {
     versionId: string,
   ) => Promise<WorkflowDefinitionRecordDto | null>
   readonly startFromProjectBrief: (options?: StartRunOptions) => Promise<WorkflowRunDto | null>
+  readonly compileBlueprintSelection: (
+    input: BlueprintSelectionCompileInputDto,
+    blueprintETag: string,
+  ) => Promise<InputManifestDto | null>
+  readonly startFromManifest: (
+    manifest: InputManifestDto,
+    options?: StartManifestOptions,
+  ) => Promise<WorkflowRunDto | null>
   readonly loadRun: (runId: string) => Promise<WorkflowRunDto | null>
   readonly submitNodeRevision: (
     node: WorkflowNodeRunDto,
@@ -102,7 +128,9 @@ interface PlatformFlowContextState {
     prototype: VersionedArtifactDto<PrototypeContentDto>,
   ) => Promise<WorkbenchBundleDto | null>
   readonly selectWorkbenchBundle: (bundleId: string) => void
+  readonly selectWorkbenchGroup: (nodeKey: string) => Promise<void>
   readonly loadBundle: (bundleId: string) => Promise<WorkbenchBundleDto | null>
+  readonly rebaseWorkbenchBundle: () => Promise<WorkbenchBundleDto | null>
   readonly generateImplementation: (
     instruction: string,
     model?: string,
@@ -135,6 +163,7 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [definitions, setDefinitions] = useState<WorkflowDefinitionRecordDto[]>([])
+  const [capabilities, setCapabilities] = useState<WorkflowCapabilitiesDto | null>(null)
   const [definitionVersions, setDefinitionVersions] = useState<WorkflowDefinitionRecordDto[]>([])
   const [runDefinition, setRunDefinition] = useState<WorkflowDefinitionRecordDto | null>(null)
   const [selectedDefinitionId, setSelectedDefinitionId] = useState<string | null>(null)
@@ -143,6 +172,8 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
   const [run, setRun] = useState<WorkflowRunDto | null>(null)
   const [events, setEvents] = useState<WorkflowEventDto[]>([])
   const [workbenchQueue, setWorkbenchQueue] = useState<readonly WorkbenchQueueItem[]>([])
+  const [workbenchGroups, setWorkbenchGroups] = useState<readonly WorkbenchQueueGroup[]>([])
+  const [selectedWorkbenchNodeKey, setSelectedWorkbenchNodeKey] = useState<string | null>(null)
   const [selectedBundleId, setSelectedBundleId] = useState<string | null>(null)
   const [bundle, setBundle] = useState<WorkbenchBundleDto | null>(null)
   const [proposal, setProposal] = useState<ImplementationProposalDto | null>(null)
@@ -154,6 +185,10 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
   const eventsRef = useRef(events)
   const selectedDefinitionIdRef = useRef(selectedDefinitionId)
   const workbenchQueueRef = useRef(workbenchQueue)
+  const workbenchGroupsRef = useRef(workbenchGroups)
+  const selectedWorkbenchNodeKeyRef = useRef<string | null>(
+    selectedWorkbenchNodeKey ?? queryReferences().workbenchNodeKey ?? null,
+  )
   const selectedBundleIdRef = useRef(selectedBundleId)
   const bundleRef = useRef(bundle)
   const proposalRef = useRef(proposal)
@@ -162,6 +197,8 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
   eventsRef.current = events
   selectedDefinitionIdRef.current = selectedDefinitionId
   workbenchQueueRef.current = workbenchQueue
+  workbenchGroupsRef.current = workbenchGroups
+  if (selectedWorkbenchNodeKey) selectedWorkbenchNodeKeyRef.current = selectedWorkbenchNodeKey
   selectedBundleIdRef.current = selectedBundleId
   bundleRef.current = bundle
   proposalRef.current = proposal
@@ -212,6 +249,7 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
     if (!session.signedIn || !projectId) {
       setStatus('idle')
       setDefinitions([])
+      setCapabilities(null)
       setDefinitionVersions([])
       setSelectedDefinitionId(null)
       setRuns([])
@@ -221,15 +259,17 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
     setStatus('loading')
     setError(null)
     try {
-      const [result, runResult] = await Promise.all([
+      const [result, runResult, capabilityResult] = await Promise.all([
         client.listDefinitions(projectId, { limit: 200 }),
         client.listRuns(projectId, {}, { limit: 100 }),
+        client.capabilities(projectId),
       ])
       if (requestId !== requestCounter.current) return
       const items = [...result.data.items].sort((left, right) =>
         left.title.localeCompare(right.title) || right.version - left.version,
       )
       setDefinitions(items)
+      setCapabilities(capabilityResult.data)
       setRuns([...runResult.data.items].sort((left, right) => right.updatedAt.localeCompare(left.updatedAt)))
       const selected = items.find((item) => item.id === selectedDefinitionIdRef.current)
         ?? items.find((item) => item.published)
@@ -253,7 +293,8 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
       const result = await client.getWorkbenchBundle(bundleId)
       const nextQueue = upsertWorkbenchBundle(workbenchQueueRef.current, result.data)
       storeWorkbenchQueue(nextQueue)
-      activateWorkbenchItem(nextQueue.find((item) => item.bundleId === result.data.id) ?? null)
+      const rootBundleId = workbenchRootBundleId(result.data)
+      activateWorkbenchItem(nextQueue.find((item) => item.bundleId === rootBundleId) ?? null)
       if (result.data.currentWorkspaceRevision) {
         const workspace = await client.getWorkspaceRevision(
           result.data.currentWorkspaceRevision.revisionId,
@@ -272,7 +313,7 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
     try {
       const result = await client.getImplementationProposal(proposalId)
       let knownBundle = workbenchQueueRef.current.find(
-        (item) => item.bundleId === result.data.buildManifestId,
+        (item) => item.bundle?.id === result.data.buildManifestId,
       )?.bundle ?? null
       if (!knownBundle) {
         const bundleResult = await client.getWorkbenchBundle(result.data.buildManifestId)
@@ -283,9 +324,8 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
         : workbenchQueueRef.current
       const nextQueue = replaceWorkbenchQueueProposal(withBundle, result.data, knownBundle)
       storeWorkbenchQueue(nextQueue)
-      activateWorkbenchItem(nextQueue.find(
-        (item) => item.bundleId === result.data.buildManifestId,
-      ) ?? null)
+      const itemIndex = workbenchQueueItemIndexForProposal(nextQueue, result.data)
+      activateWorkbenchItem(itemIndex >= 0 ? nextQueue[itemIndex] : null)
       return result.data
     } catch (cause) {
       fail(cause, 'Unable to load the implementation proposal.')
@@ -293,36 +333,88 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
     }
   }, [activateWorkbenchItem, client, fail, storeWorkbenchQueue])
 
-  const hydrateRunOutputs = useCallback(async (nextRun: WorkflowRunDto) => {
-    const references = workflowWorkbenchQueueReferences(nextRun)
+  const hydrateWorkbenchGroup = useCallback(async (
+    nextRun: WorkflowRunDto,
+    group: WorkbenchQueueGroup | null,
+    preserveBundleSelection: boolean,
+  ) => {
+    const references = group?.references ?? []
     if (references.length > 0) {
-      const proposalIds = references.flatMap(
-        (reference) => reference.proposalId ? [reference.proposalId] : [],
+      const lineageResults = await Promise.all(
+        references.map((reference) => client.getWorkbenchBundleLineageState(reference.bundleId)),
       )
-      const [bundleResults, proposalResults] = await Promise.all([
-        Promise.all(references.map((reference) => client.getWorkbenchBundle(reference.bundleId))),
-        Promise.all(proposalIds.map((proposalId) => client.getImplementationProposal(proposalId))),
-      ])
+      if (group && selectedWorkbenchNodeKeyRef.current !== group.nodeKey) return
+      for (const [index, result] of lineageResults.entries()) {
+        const reference = references[index]
+        const state = result.data
+        if (
+          state.rootBundleId !== reference.bundleId
+          || workbenchRootBundleId(state.activeBundle) !== reference.bundleId
+          || (
+            state.currentProposal
+            && state.currentProposal.buildManifestId !== state.activeBundle.id
+          )
+        ) {
+          throw new Error(`Workbench lineage state for ${reference.bundleId} is internally inconsistent.`)
+        }
+      }
+      const currentWorkspaceRevision = lineageResults[0]?.data.currentWorkspaceRevision
+      if (!lineageResults.every((result) => exactArtifactRefEqual(
+        result.data.currentWorkspaceRevision,
+        currentWorkspaceRevision,
+      ))) {
+        throw new Error('Workbench lineage states disagree about the current project workspace revision.')
+      }
+      const hydratedReferences = references.map((reference, index) => {
+        const currentProposal = lineageResults[index].data.currentProposal
+        return {
+          bundleId: reference.bundleId,
+          ...(reference.sliceId ? { sliceId: reference.sliceId } : {}),
+          ...(currentProposal ? { proposalId: currentProposal.id } : {}),
+        }
+      })
       const nextQueue = hydrateWorkbenchQueue(
-        references,
-        bundleResults.map((result) => result.data),
-        proposalResults.map((result) => result.data),
-        workbenchQueueRef.current,
+        hydratedReferences,
+        lineageResults.map((result) => result.data.activeBundle),
+        lineageResults.flatMap((result) =>
+          result.data.currentProposal ? [result.data.currentProposal] : []),
       )
       storeWorkbenchQueue(nextQueue)
-      const retained = nextQueue.find((item) => item.bundleId === selectedBundleIdRef.current)
+      const retained = preserveBundleSelection
+        ? nextQueue.find((item) => item.bundleId === selectedBundleIdRef.current)
+        : undefined
       const pendingIndex = nextPendingWorkbenchQueueIndex(nextQueue)
       const active = retained ?? nextQueue[pendingIndex >= 0 ? pendingIndex : 0] ?? null
       activateWorkbenchItem(active)
+      if (
+        currentWorkspaceRevision
+        && !workspaceRevisionMatchesRef(workspaceRevisionRef.current, currentWorkspaceRevision)
+      ) {
+        const workspace = await client.getWorkspaceRevision(currentWorkspaceRevision.revisionId)
+        if (group && selectedWorkbenchNodeKeyRef.current !== group.nodeKey) return
+        if (!workspaceRevisionMatchesRef(workspace.data, currentWorkspaceRevision)) {
+          throw new Error('The workspace revision response does not match the exact project lineage reference.')
+        }
+        workspaceRevisionRef.current = workspace.data
+        setWorkspaceRevision(workspace.data)
+        setQueryReference('workspaceRevisionId', workspace.data.id)
+      } else if (!currentWorkspaceRevision) {
+        workspaceRevisionRef.current = null
+        setWorkspaceRevision(null)
+        setQueryReference('workspaceRevisionId')
+      }
     } else {
       storeWorkbenchQueue([])
       activateWorkbenchItem(null)
     }
 
-    const revisionId = nextRun.nodes.find((node) => node.type === 'workbench_build')?.outputRevisionId
-    if (revisionId && workspaceRevisionRef.current?.id !== revisionId) {
+    const revisionId = group
+      ? nextRun.nodes.find((node) => node.key === group.nodeKey)?.outputRevisionId
+      : undefined
+    if (references.length === 0 && revisionId && workspaceRevisionRef.current?.id !== revisionId) {
       try {
         const result = await client.getWorkspaceRevision(revisionId)
+        if (group && selectedWorkbenchNodeKeyRef.current !== group.nodeKey) return
         setWorkspaceRevision(result.data)
         setQueryReference('workspaceRevisionId', result.data.id)
       } catch (cause) {
@@ -330,6 +422,49 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
       }
     }
   }, [activateWorkbenchItem, client, fail, storeWorkbenchQueue])
+
+  const hydrateRunOutputs = useCallback(async (nextRun: WorkflowRunDto) => {
+    const groups = workflowWorkbenchQueueGroups(nextRun)
+    workbenchGroupsRef.current = groups
+    setWorkbenchGroups(groups)
+    const query = queryReferences()
+    const previousNodeKey = query.workbenchNodeKey
+      ?? storedWorkbenchNodeKey(nextRun.id)
+      ?? selectedWorkbenchNodeKeyRef.current
+    const selectedGroup = groups.find((group) => group.nodeKey === previousNodeKey)
+      ?? groups.find((group) => group.references.some(
+        (reference) => reference.bundleId === query.bundleId,
+      ))
+      ?? groups.find((group) => group.status === 'waiting_input')
+      ?? groups[0]
+      ?? null
+    selectedWorkbenchNodeKeyRef.current = selectedGroup?.nodeKey ?? null
+    setSelectedWorkbenchNodeKey(selectedGroup?.nodeKey ?? null)
+    storeWorkbenchNodeKey(nextRun.id, selectedGroup?.nodeKey)
+    setQueryReference('workbenchNodeKey', selectedGroup?.nodeKey)
+    await hydrateWorkbenchGroup(
+      nextRun,
+      selectedGroup,
+      selectedGroup?.nodeKey === previousNodeKey,
+    )
+  }, [hydrateWorkbenchGroup])
+
+  const selectWorkbenchGroup = useCallback(async (nodeKey: string) => {
+    const nextRun = runRef.current
+    const group = workbenchGroupsRef.current.find((candidate) => candidate.nodeKey === nodeKey)
+    if (!nextRun || !group || group.nodeKey === selectedWorkbenchNodeKeyRef.current) return
+    selectedWorkbenchNodeKeyRef.current = group.nodeKey
+    setSelectedWorkbenchNodeKey(group.nodeKey)
+    storeWorkbenchNodeKey(nextRun.id, group.nodeKey)
+    setQueryReference('workbenchNodeKey', group.nodeKey)
+    storeWorkbenchQueue([])
+    activateWorkbenchItem(null)
+    try {
+      await hydrateWorkbenchGroup(nextRun, group, false)
+    } catch (cause) {
+      fail(cause, `Unable to load Workbench group ${group.nodeKey}.`)
+    }
+  }, [activateWorkbenchItem, fail, hydrateWorkbenchGroup, storeWorkbenchQueue])
 
   const loadRun = useCallback(async (runId: string) => {
     if (!projectId) return null
@@ -403,6 +538,10 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
     setRuns([])
     setEvents([])
     eventsRef.current = []
+    workbenchGroupsRef.current = []
+    setWorkbenchGroups([])
+    selectedWorkbenchNodeKeyRef.current = initialReferences.workbenchNodeKey ?? null
+    setSelectedWorkbenchNodeKey(initialReferences.workbenchNodeKey ?? null)
     storeWorkbenchQueue([])
     activateWorkbenchItem(null)
     setBundle(null)
@@ -567,7 +706,17 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
       let sourceRevision = requireApproved
         ? projectBrief.approvedRevision
         : projectBrief.latestRevision ?? projectBrief.approvedRevision
-      if (!sourceRevision && !requireApproved && projectBrief.draft) {
+      const entryAction = projectBriefEntryAction({
+        requireApproved,
+        approvedRevision: projectBrief.approvedRevision,
+        latestRevision: projectBrief.latestRevision,
+        draft: projectBrief.draft,
+      })
+      if (entryAction === 'blocked_unapproved_changes') {
+        setError('The Project Brief has changes newer than its approved revision. Review and approve an immutable checkpoint before starting this workflow.')
+        return null
+      }
+      if (entryAction === 'checkpoint_draft' && projectBrief.draft) {
         sourceRevision = await artifacts.createDocumentRevision(
           projectBrief.artifact.id,
           projectBrief.draft.content,
@@ -606,6 +755,72 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
       setBusy(false)
     }
   }, [artifacts, can, client, definitionVersions, definitions, fail, loadRun, projectId])
+
+  const compileBlueprintSelection = useCallback(async (
+    input: BlueprintSelectionCompileInputDto,
+    blueprintETag: string,
+  ) => {
+    if (!projectId || !can('edit')) return null
+    setBusy(true)
+    setError(null)
+    try {
+      const result = await client.compileBlueprintSelection(
+        projectId,
+        input,
+        blueprintETag,
+      )
+      setManifest(result.data)
+      return result.data
+    } catch (cause) {
+      fail(cause, 'Unable to freeze the approved Blueprint selection.')
+      return null
+    } finally {
+      setBusy(false)
+    }
+  }, [can, client, fail, projectId])
+
+  const startFromManifest = useCallback(async (
+    frozenManifest: InputManifestDto,
+    options: StartManifestOptions = {},
+  ) => {
+    if (!projectId || !can('edit') || frozenManifest.projectId !== projectId) return null
+    setBusy(true)
+    setError(null)
+    try {
+      let effectiveDefinitionVersionId = options.definitionVersionId
+      if (!effectiveDefinitionVersionId) {
+        const definitionKey = options.definitionKey ?? 'blueprint-selection-app'
+        const definition = definitions.find((item) => item.key === definitionKey)
+        if (!definition) throw new Error(`Workflow ${definitionKey} is not installed for this project.`)
+        const versions = await client.listDefinitionVersions(projectId, definition.id, { limit: 200 })
+        const published = [...versions.data.items]
+          .filter((item) => item.published)
+          .sort((left, right) => right.version - left.version)[0]
+        if (!published) throw new Error(`Workflow ${definitionKey} has no published version.`)
+        effectiveDefinitionVersionId = published.versionId
+      }
+      const result = await client.startRun(projectId, {
+        definitionVersionId: effectiveDefinitionVersionId,
+        inputManifest: PlatformFlowClient.manifestRef(frozenManifest),
+        scope: options.scope ?? {},
+      })
+      setManifest(frozenManifest)
+      setRun(result.data)
+      setRuns((current) => [
+        result.data,
+        ...current.filter((item) => item.id !== result.data.id),
+      ])
+      setEvents([])
+      setQueryReference('runId', result.data.id)
+      await loadRun(result.data.id)
+      return result.data
+    } catch (cause) {
+      fail(cause, 'Unable to start the workflow from the frozen selection.')
+      return null
+    } finally {
+      setBusy(false)
+    }
+  }, [can, client, definitions, fail, loadRun, projectId])
 
   const submitNodeRevision = useCallback(async (
     node: WorkflowNodeRunDto,
@@ -714,7 +929,6 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
     try {
       const result = await client.createWorkbenchBundle(projectId, {
         prototypeRevision: revisionRef(revision),
-        workflowRunId: run?.id,
       })
       const nextQueue = upsertWorkbenchBundle([], result.data)
       storeWorkbenchQueue(nextQueue)
@@ -729,7 +943,46 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
     } finally {
       setBusy(false)
     }
-  }, [activateWorkbenchItem, can, client, fail, projectId, run?.id, storeWorkbenchQueue])
+  }, [activateWorkbenchItem, can, client, fail, projectId, storeWorkbenchQueue])
+
+  const rebaseWorkbenchBundle = useCallback(async () => {
+    const workspace = workspaceRevisionRef.current
+    const activeBundle = bundleRef.current
+    const queue = workbenchQueueRef.current
+    const activeItem = queue.find((item) => item.bundleId === selectedBundleIdRef.current)
+      ?? queue.find((item) => item.bundle?.id === activeBundle?.id)
+    if (!workspace || !activeBundle || !activeItem || !can('edit')) return null
+    if (!workbenchBundleNeedsRebase(activeBundle, workspace)) return activeBundle
+    if (proposalIsApplied(activeItem.proposal)) {
+      setError('An applied page proposal cannot be moved to a different Workbench input manifest.')
+      return null
+    }
+    setBusy(true)
+    setError(null)
+    try {
+      const result = await client.rebaseWorkbenchBundle(
+        activeBundle.id,
+        revisionRef(workspace),
+      )
+      if (
+        result.data.id === activeBundle.id
+        || workbenchRootBundleId(result.data) !== activeItem.bundleId
+        || workbenchBundleNeedsRebase(result.data, workspace)
+      ) {
+        setError('The server did not return a derived bundle pinned to the exact current workspace revision.')
+        return null
+      }
+      const nextQueue = upsertWorkbenchBundle(queue, result.data)
+      storeWorkbenchQueue(nextQueue)
+      activateWorkbenchItem(nextQueue.find((item) => item.bundleId === activeItem.bundleId) ?? null)
+      return result.data
+    } catch (cause) {
+      fail(cause, 'Unable to rebase the active page bundle onto the exact current workspace revision.')
+      return null
+    } finally {
+      setBusy(false)
+    }
+  }, [activateWorkbenchItem, can, client, fail, storeWorkbenchQueue])
 
   const generateImplementation = useCallback(async (
     instruction: string,
@@ -738,8 +991,38 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
   ) => {
     const activeBundle = bundleRef.current
     if (!activeBundle || !can('edit')) return null
-    if (expectedBundleId && activeBundle.id !== expectedBundleId) {
+    const queue = workbenchQueueRef.current
+    const activeItem = queue.find((item) => item.bundleId === selectedBundleIdRef.current)
+      ?? queue.find((item) => item.bundle?.id === activeBundle.id)
+    if (!activeItem) {
+      setError('The active Workbench manifest is not attached to the frozen root bundle order.')
+      return null
+    }
+    const activeItemIndex = queue.findIndex((item) => item.bundleId === activeItem.bundleId)
+    if (!workbenchQueueItemHasAppliedPredecessors(queue, activeItemIndex)) {
+      const predecessor = queue.slice(0, Math.max(activeItemIndex, 0)).find(
+        (item) => !proposalIsApplied(item.proposal),
+      )
+      setError(predecessor
+        ? `Apply ${predecessor.sliceId ?? predecessor.bundleId} before generating ${activeItem.sliceId ?? activeItem.bundleId}. Workbench follows frozen manifest order.`
+        : 'Select a valid Workbench queue item before generating a proposal.')
+      return null
+    }
+    if (
+      expectedBundleId
+      && activeItem.bundleId !== expectedBundleId
+      && activeBundle.id !== expectedBundleId
+    ) {
       setError('The exact frozen Workbench bundle is not active.')
+      return null
+    }
+    const workspace = workspaceRevisionRef.current
+    if (activeBundle.currentWorkspaceRevision && !workspace) {
+      setError('Load the exact workspace revision pinned by this Workbench bundle before generating.')
+      return null
+    }
+    if (workbenchBundleNeedsRebase(activeBundle, workspace)) {
+      setError('Rebase the active page bundle onto the exact current workspace revision before generating a new proposal.')
       return null
     }
     setBusy(true)
@@ -752,7 +1035,8 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
         activeBundle,
       )
       storeWorkbenchQueue(nextQueue)
-      activateWorkbenchItem(nextQueue.find((item) => item.bundleId === activeBundle.id) ?? null)
+      const itemIndex = workbenchQueueItemIndexForProposal(nextQueue, result.data.proposal)
+      activateWorkbenchItem(itemIndex >= 0 ? nextQueue[itemIndex] : null)
       return result.data.proposal
     } catch (cause) {
       fail(cause, 'AI could not produce a proposal from the frozen build manifest.')
@@ -768,6 +1052,10 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
     reason = '',
   ) => {
     if (!proposal || !can('edit') || operation.decision !== 'pending') return null
+    if (workbenchBundleNeedsRebase(bundle, workspaceRevisionRef.current)) {
+      setError('Rebase and generate a new exact-workspace proposal before recording decisions.')
+      return null
+    }
     setBusy(true)
     setError(null)
     try {
@@ -779,9 +1067,8 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
       )
       const nextQueue = replaceWorkbenchQueueProposal(workbenchQueueRef.current, result.data, bundle)
       storeWorkbenchQueue(nextQueue)
-      activateWorkbenchItem(nextQueue.find(
-        (item) => item.bundleId === result.data.buildManifestId,
-      ) ?? null)
+      const itemIndex = workbenchQueueItemIndexForProposal(nextQueue, result.data)
+      activateWorkbenchItem(itemIndex >= 0 ? nextQueue[itemIndex] : null)
       return result.data
     } catch (cause) {
       fail(cause, 'Unable to record the file operation decision.')
@@ -796,6 +1083,10 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
     reason = '',
   ) => {
     if (!proposal || !can('edit')) return false
+    if (workbenchBundleNeedsRebase(bundle, workspaceRevisionRef.current)) {
+      setError('Rebase and generate a new exact-workspace proposal before recording decisions.')
+      return false
+    }
     setBusy(true)
     setError(null)
     try {
@@ -812,9 +1103,8 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
       }
       const nextQueue = replaceWorkbenchQueueProposal(workbenchQueueRef.current, current, bundle)
       storeWorkbenchQueue(nextQueue)
-      activateWorkbenchItem(nextQueue.find(
-        (item) => item.bundleId === current.buildManifestId,
-      ) ?? null)
+      const itemIndex = workbenchQueueItemIndexForProposal(nextQueue, current)
+      activateWorkbenchItem(itemIndex >= 0 ? nextQueue[itemIndex] : null)
       return true
     } catch (cause) {
       fail(cause, 'Unable to record all file operation decisions.')
@@ -826,11 +1116,17 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
 
   const applyProposal = useCallback(async () => {
     if (!proposal || !can('edit')) return null
+    if (!proposalIsApplied(proposal) && workbenchBundleNeedsRebase(bundle, workspaceRevisionRef.current)) {
+      setError('This proposal is bound to an older Workbench manifest. Rebase the active page bundle and generate a new proposal; prior decisions will not be migrated.')
+      return null
+    }
     const queue = workbenchQueueRef.current.length > 0
       ? workbenchQueueRef.current
       : replaceWorkbenchQueueProposal([], proposal, bundle)
     const workbenchNode = run?.nodes.find(
-      (node) => node.type === 'workbench_build' && node.status === 'waiting_input',
+      (node) => node.key === selectedWorkbenchNodeKeyRef.current
+        && node.type === 'workbench_build'
+        && node.status === 'waiting_input',
     )
     const alreadyAppliedProposalIds = appliedWorkbenchProposalIds(queue)
     if (
@@ -860,7 +1156,7 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
       }
     }
     if (proposal.status !== 'ready') return null
-    const queueIndex = queue.findIndex((item) => item.bundleId === proposal.buildManifestId)
+    const queueIndex = workbenchQueueItemIndexForProposal(queue, proposal)
     if (!canApplyWorkbenchQueueItem(queue, queueIndex)) {
       const previous = queue.slice(0, Math.max(queueIndex, 0)).find(
         (item) => !proposalIsApplied(item.proposal),
@@ -880,9 +1176,8 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
       const updated = await client.getImplementationProposal(proposal.id)
       const nextQueue = replaceWorkbenchQueueProposal(queue, updated.data, bundle)
       storeWorkbenchQueue(nextQueue)
-      activateWorkbenchItem(nextQueue.find(
-        (item) => item.bundleId === updated.data.buildManifestId,
-      ) ?? null)
+      const updatedItemIndex = workbenchQueueItemIndexForProposal(nextQueue, updated.data)
+      activateWorkbenchItem(updatedItemIndex >= 0 ? nextQueue[updatedItemIndex] : null)
       const completedProposalIds = appliedWorkbenchProposalIds(nextQueue)
       if (completedProposalIds && projectId && run && workbenchNode) {
         await client.completeWorkbenchNode(
@@ -897,7 +1192,7 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
         const pendingIndex = nextPendingWorkbenchQueueIndex(nextQueue)
         const active = pendingIndex >= 0
           ? nextQueue[pendingIndex]
-          : nextQueue.find((item) => item.bundleId === updated.data.buildManifestId) ?? null
+          : updatedItemIndex >= 0 ? nextQueue[updatedItemIndex] : null
         activateWorkbenchItem(active)
       }
       return result.data
@@ -916,6 +1211,28 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
     expectedHash?: string,
   ) => {
     if (!projectId || !bundle || !can('edit')) return null
+    const queue = workbenchQueueRef.current
+    const queueIndex = queue.findIndex((item) =>
+      item.bundleId === selectedBundleIdRef.current || item.bundle?.id === bundle.id,
+    )
+    if (!workbenchQueueItemHasAppliedPredecessors(queue, queueIndex)) {
+      const current = queue[queueIndex]
+      const predecessor = queue.slice(0, Math.max(queueIndex, 0)).find(
+        (item) => !proposalIsApplied(item.proposal),
+      )
+      setError(predecessor
+        ? `Apply ${predecessor.sliceId ?? predecessor.bundleId} before proposing a file change for ${current?.sliceId ?? current?.bundleId ?? bundle.id}. Workbench follows frozen manifest order.`
+        : 'Select a valid Workbench queue item before proposing a file change.')
+      return null
+    }
+    if (bundle.currentWorkspaceRevision && !workspaceRevisionRef.current) {
+      setError('Load the exact workspace revision pinned by this Workbench bundle before proposing a file change.')
+      return null
+    }
+    if (workbenchBundleNeedsRebase(bundle, workspaceRevisionRef.current)) {
+      setError('Rebase the active page bundle onto the exact current workspace revision before proposing a file change.')
+      return null
+    }
     const operation: CreateImplementationProposalInputDto['operations'][number] = {
       id: randomId('file-operation'),
       kind: 'file.upsert',
@@ -937,7 +1254,8 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
       })
       const nextQueue = replaceWorkbenchQueueProposal(workbenchQueueRef.current, result.data, bundle)
       storeWorkbenchQueue(nextQueue)
-      activateWorkbenchItem(nextQueue.find((item) => item.bundleId === bundle.id) ?? null)
+      const itemIndex = workbenchQueueItemIndexForProposal(nextQueue, result.data)
+      activateWorkbenchItem(itemIndex >= 0 ? nextQueue[itemIndex] : null)
       return result.data
     } catch (cause) {
       fail(cause, 'Unable to create a reviewable file change proposal.')
@@ -958,12 +1276,17 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
     applied: workbenchQueue.filter((item) => proposalIsApplied(item.proposal)).length,
     total: workbenchQueue.length,
   }), [workbenchQueue])
-  const canApplyProposal = canApplyWorkbenchQueueItem(workbenchQueue, selectedQueueIndex)
+  const requiresWorkbenchRebase = !proposalIsApplied(proposal)
+    && workbenchBundleNeedsRebase(bundle, workspaceRevision)
+  const canApplyProposal = !requiresWorkbenchRebase
+    && canApplyWorkbenchQueueItem(workbenchQueue, selectedQueueIndex)
   const canCompleteWorkbench = Boolean(
     appliedWorkbenchProposalIds(workbenchQueue)
     && workspaceRevision
     && run?.nodes.some(
-      (node) => node.type === 'workbench_build' && node.status === 'waiting_input',
+      (node) => node.key === selectedWorkbenchNodeKey
+        && node.type === 'workbench_build'
+        && node.status === 'waiting_input',
     ),
   )
 
@@ -972,6 +1295,7 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
     busy,
     error: backendStatus === 'error' ? error ?? 'The Go platform service is unavailable.' : error,
     definitions,
+    capabilities,
     definitionVersions,
     selectedDefinition,
     manifest,
@@ -979,10 +1303,13 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
     run,
     events,
     workbenchQueue,
+    workbenchGroups,
+    selectedWorkbenchNodeKey,
     selectedBundleId,
     workbenchProgress,
     canApplyProposal,
     canCompleteWorkbench,
+    requiresWorkbenchRebase,
     bundle,
     proposal,
     workspaceRevision,
@@ -992,6 +1319,8 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
     createDefinitionVersion,
     publishDefinitionVersion,
     startFromProjectBrief,
+    compileBlueprintSelection,
+    startFromManifest,
     loadRun,
     submitNodeRevision,
     authorizeExecution,
@@ -999,8 +1328,10 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
     retryNode,
     cancelRun,
     createBundle,
+    selectWorkbenchGroup,
     selectWorkbenchBundle,
     loadBundle,
+    rebaseWorkbenchBundle,
     generateImplementation,
     loadProposal,
     decideOperation,
@@ -1017,6 +1348,7 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
     canApplyProposal,
     canCompleteWorkbench,
     cancelRun,
+    compileBlueprintSelection,
     createBundle,
     createDefinition,
     createDefinitionVersion,
@@ -1036,22 +1368,50 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
     proposeFileChange,
     publishDefinitionVersion,
     refresh,
+    rebaseWorkbenchBundle,
+    requiresWorkbenchRebase,
     resolveReview,
     retryNode,
     run,
     runs,
+    selectWorkbenchGroup,
     selectWorkbenchBundle,
     selectedBundleId,
+    selectedWorkbenchNodeKey,
     selectedDefinition,
     startFromProjectBrief,
+    startFromManifest,
     status,
     submitNodeRevision,
     workbenchProgress,
+    workbenchGroups,
     workbenchQueue,
     workspaceRevision,
   ])
 
   return <PlatformFlowContext.Provider value={value}>{children}</PlatformFlowContext.Provider>
+}
+
+function exactArtifactRefEqual(
+  left: ExactArtifactRefDto | undefined,
+  right: ExactArtifactRefDto | undefined,
+) {
+  if (!left || !right) return left === right
+  return left.artifactId === right.artifactId
+    && left.revisionId === right.revisionId
+    && left.contentHash === right.contentHash
+}
+
+function workspaceRevisionMatchesRef(
+  workspace: WorkspaceRevisionDto | null | undefined,
+  reference: ExactArtifactRefDto,
+) {
+  return Boolean(
+    workspace
+    && workspace.artifactId === reference.artifactId
+    && workspace.id === reference.revisionId
+    && workspace.contentHash === reference.contentHash,
+  )
 }
 
 export function usePlatformFlow() {
@@ -1115,6 +1475,7 @@ function queryReferences() {
     bundleId: query.get('bundleId') ?? undefined,
     proposalId: query.get('proposalId') ?? undefined,
     workspaceRevisionId: query.get('workspaceRevisionId') ?? undefined,
+    workbenchNodeKey: query.get('workbenchNodeKey') ?? undefined,
   }
 }
 
@@ -1124,6 +1485,18 @@ function setQueryReference(key: string, value?: string) {
   if (value) url.searchParams.set(key, value)
   else url.searchParams.delete(key)
   window.history.replaceState(null, '', `${url.pathname}${url.search}${url.hash}`)
+}
+
+function storedWorkbenchNodeKey(runId: string) {
+  if (typeof window === 'undefined') return undefined
+  return window.sessionStorage.getItem(`worksflow:workbench-group:${runId}`) ?? undefined
+}
+
+function storeWorkbenchNodeKey(runId: string, nodeKey?: string) {
+  if (typeof window === 'undefined') return
+  const key = `worksflow:workbench-group:${runId}`
+  if (nodeKey) window.sessionStorage.setItem(key, nodeKey)
+  else window.sessionStorage.removeItem(key)
 }
 
 function randomId(prefix: string) {

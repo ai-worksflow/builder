@@ -27,8 +27,16 @@ import {
 import { useCollaboration } from '@/lib/collaboration/provider'
 import { useArtifactWorkspace } from '@/lib/platform/artifact-provider'
 import { usePlatformFlow } from '@/lib/platform/flow-provider'
-import type { FileOperationDto, ImplementationProposalDto } from '@/lib/platform/flow-contract'
-import type { WorkbenchQueueItem } from '@/lib/platform/flow-queue'
+import type {
+  FileOperationDto,
+  ImplementationProposalDto,
+  WorkspaceRevisionDto,
+} from '@/lib/platform/flow-contract'
+import {
+  workbenchBundleNeedsRebase,
+  workbenchQueueItemHasAppliedPredecessors,
+  type WorkbenchQueueItem,
+} from '@/lib/platform/flow-queue'
 import { cn } from '@/lib/utils'
 import { useWorksflow } from '@/lib/worksflow/store'
 import type { WorkbenchView } from '@/lib/worksflow/types'
@@ -192,6 +200,13 @@ function ImplementationWorkspace() {
   const currentQueueItem = selectedQueueIndex >= 0
     ? flow.workbenchQueue[selectedQueueIndex]
     : undefined
+  const orderedGenerationAllowed = workbenchQueueItemHasAppliedPredecessors(
+    flow.workbenchQueue,
+    selectedQueueIndex,
+  )
+  const blockingPredecessor = flow.workbenchQueue
+    .slice(0, Math.max(selectedQueueIndex, 0))
+    .find((item) => !proposalApplied(item.proposal))
 
   useEffect(() => {
     if (!selectedPath && selectedFile) setSelectedPath(selectedFile.path)
@@ -200,15 +215,19 @@ function ImplementationWorkspace() {
 
   if (!flow.bundle) {
     return (
-      <ServiceGate
-        title="Freeze an approved prototype first"
-        description="Select an approved prototype above. The server will compile its exact PageSpec, requirement, blueprint, fixture, token, component, and trace revisions into a build manifest."
-      />
+      <div className="flex h-full min-h-0 flex-col">
+        <WorkbenchGroupTabs />
+        <ServiceGate
+          title={flow.workbenchGroups.length > 0 ? 'Loading selected Workbench group' : 'Freeze an approved prototype first'}
+          description={flow.workbenchGroups.length > 0 ? 'Resolving only this workflow node’s frozen manifest lineage.' : 'Select an approved prototype above. The server will compile its exact PageSpec, requirement, blueprint, fixture, token, component, and trace revisions into a build manifest.'}
+        />
+      </div>
     )
   }
 
   return (
     <div className="flex h-full min-h-0 flex-col">
+      <WorkbenchGroupTabs />
       <section className="shrink-0 border-b border-border bg-background/40 p-3">
         <div className="flex flex-wrap items-start gap-3">
           <div className="min-w-0 flex-1">
@@ -223,22 +242,45 @@ function ImplementationWorkspace() {
               <button type="button" onClick={() => setShowManifest((value) => !value)} className="rounded p-1 text-faint-foreground hover:text-foreground" aria-label="Toggle manifest details"><ChevronDown className={cn('size-3 transition-transform', !showManifest && '-rotate-90')} /></button>
             </div>
             <p className="mt-1 truncate font-mono text-[9px] text-faint-foreground" title={flow.bundle.contentHash}>
-              {flow.bundle.id} · {flow.bundle.contentHash}
+              {currentQueueItem && flow.bundle.id !== currentQueueItem.bundleId
+                ? `${currentQueueItem.bundleId} → ${flow.bundle.id}`
+                : flow.bundle.id} · {flow.bundle.contentHash}
             </p>
           </div>
           <div className="flex min-w-[320px] flex-1 gap-1.5 max-md:min-w-0 max-md:basis-full">
             <input value={model} onChange={(event) => setModel(event.target.value)} className="h-8 w-24 rounded-md border border-border bg-panel px-2 text-[10px] text-foreground outline-none" aria-label="Generation model" />
             <input value={instruction} onChange={(event) => setInstruction(event.target.value)} className="h-8 min-w-0 flex-1 rounded-md border border-border bg-panel px-2 text-[10px] text-foreground outline-none" aria-label="Implementation instruction" />
-            <button type="button" onClick={() => void flow.generateImplementation(instruction, model)} disabled={!can('edit') || flow.busy || !instruction.trim() || !model.trim() || proposalApplied(currentQueueItem?.proposal)} className="inline-flex h-8 shrink-0 items-center gap-1 rounded-md bg-primary px-3 text-[10px] font-semibold text-primary-foreground disabled:opacity-40">
-              {flow.busy ? <LoaderCircle className="size-3 animate-spin" /> : <Sparkles className="size-3" />} {currentQueueItem?.proposal ? 'Regenerate proposal' : 'Generate proposal'}
+            <button type="button" onClick={() => void flow.generateImplementation(instruction, model)} disabled={!can('edit') || flow.busy || !instruction.trim() || !model.trim() || !orderedGenerationAllowed || flow.requiresWorkbenchRebase || proposalApplied(currentQueueItem?.proposal)} className="inline-flex h-8 shrink-0 items-center gap-1 rounded-md bg-primary px-3 text-[10px] font-semibold text-primary-foreground disabled:opacity-40">
+              {flow.busy ? <LoaderCircle className="size-3 animate-spin" /> : <Sparkles className="size-3" />} {!orderedGenerationAllowed ? 'Blocked by order' : currentQueueItem?.proposal ? 'Regenerate proposal' : 'Generate proposal'}
             </button>
           </div>
         </div>
+        {!orderedGenerationAllowed && currentQueueItem && blockingPredecessor && (
+          <div role="status" className="mt-3 flex items-center gap-2 rounded-md border border-warning/35 bg-warning/10 px-3 py-2 text-[9px] leading-relaxed text-warning">
+            <CircleAlert className="size-4 shrink-0" />
+            <span>Blocked by frozen manifest order. Apply {blockingPredecessor.sliceId ?? blockingPredecessor.bundleId} before generating or proposing file changes for {currentQueueItem.sliceId ?? currentQueueItem.bundleId}.</span>
+          </div>
+        )}
+        {flow.requiresWorkbenchRebase && flow.workspaceRevision && currentQueueItem && (
+          <div role="status" className="mt-3 flex items-center gap-3 rounded-md border border-warning/35 bg-warning/10 px-3 py-2">
+            <GitCompareArrows className="size-4 shrink-0 text-warning" />
+            <p className="min-w-0 flex-1 text-[9px] leading-relaxed text-warning">
+              Rebase active page bundle {flow.bundle.id} (order root {currentQueueItem.bundleId}) onto exact workspace r{flow.workspaceRevision.revisionNumber} ({flow.workspaceRevision.id}) before generation. The server creates a new derived manifest; prior proposal decisions are not migrated.
+            </p>
+            <button type="button" onClick={() => void flow.rebaseWorkbenchBundle()} disabled={!can('edit') || flow.busy} className="inline-flex h-7 shrink-0 items-center gap-1 rounded bg-warning px-2 text-[9px] font-semibold text-black disabled:opacity-40">
+              <GitCompareArrows className="size-3" /> Rebase next bundle
+            </button>
+          </div>
+        )}
         {flow.workbenchQueue.length > 1 && (
           <div className="mt-3 flex items-center gap-1.5 overflow-x-auto pb-0.5 scrollbar-thin" aria-label="Page build queue">
             <span className="mr-1 shrink-0 text-[8px] font-semibold uppercase tracking-wider text-faint-foreground">Manifest order</span>
             {flow.workbenchQueue.map((item, index) => {
-              const state = workbenchQueueItemState(item)
+              const state = workbenchQueueItemState(
+                flow.workbenchQueue,
+                index,
+                flow.workspaceRevision,
+              )
               return (
                 <button
                   key={item.bundleId}
@@ -305,9 +347,9 @@ function ImplementationWorkspace() {
                   selectedFile?.language,
                   selectedFile?.contentHash,
                 )}
-                disabled={!can('edit') || flow.busy || (!selectedPath && !selectedFile) || draft === selectedFile?.content}
+                disabled={!can('edit') || flow.busy || !orderedGenerationAllowed || (!selectedPath && !selectedFile) || draft === selectedFile?.content}
                 className="inline-flex h-7 items-center gap-1 rounded bg-primary px-2 text-[9px] font-semibold text-primary-foreground disabled:opacity-35"
-                title="Create a reviewable implementation proposal; never mutate the workspace directly"
+                title={orderedGenerationAllowed ? 'Create a reviewable implementation proposal; never mutate the workspace directly' : 'Apply earlier page bundles before proposing a file change'}
               >
                 <Save className="size-3" /> Propose change
               </button>
@@ -374,11 +416,13 @@ function ProposalReview() {
       : 'Apply accepted operations'
   const applyDescription = flow.canCompleteWorkbench
     ? 'Every frozen page has an applied proposal. Submit the ordered proposal set and final workspace revision to continue the workflow.'
-    : proposal?.status === 'ready' && !flow.canApplyProposal
-      ? 'Apply earlier pages first. Each proposal is rebased onto the latest workspace in frozen manifest order.'
-      : queueTotal > 1
-        ? 'Apply creates an immutable workspace revision, then advances to the next frozen page bundle.'
-        : 'Apply creates an approved immutable workspace revision and consumes this exact build manifest.'
+    : flow.requiresWorkbenchRebase
+      ? 'This proposal is bound to an older manifest. Rebase the active page bundle; prior operation decisions will not be copied.'
+      : proposal?.status === 'ready' && !flow.canApplyProposal
+        ? 'Apply earlier pages first. Each proposal is rebased onto the latest workspace in frozen manifest order.'
+        : queueTotal > 1
+          ? 'Apply creates an immutable workspace revision, then advances to the next frozen page bundle.'
+          : 'Apply creates an approved immutable workspace revision and consumes this exact build manifest.'
 
   return (
     <aside className="flex w-[330px] shrink-0 flex-col border-l border-border bg-panel max-xl:w-72 max-md:h-80 max-md:w-full max-md:border-l-0 max-md:border-t">
@@ -402,8 +446,8 @@ function ProposalReview() {
               <span className="min-w-0 flex-1 truncate font-mono text-faint-foreground" title={proposal.payloadHash}>{proposal.payloadHash}</span>
             </div>
             <div className="mt-2 grid grid-cols-2 gap-1">
-              <button type="button" onClick={() => void flow.decideAllPending('accepted')} disabled={!can('edit') || flow.busy || proposal.operations.every((operation) => operation.decision !== 'pending')} className="inline-flex h-7 items-center justify-center gap-1 rounded bg-success/15 text-[9px] font-medium text-success disabled:opacity-35"><Check className="size-3" /> Accept pending</button>
-              <button type="button" onClick={() => void flow.decideAllPending('rejected', rejectionReason)} disabled={!can('edit') || flow.busy || proposal.operations.every((operation) => operation.decision !== 'pending')} className="inline-flex h-7 items-center justify-center gap-1 rounded bg-destructive/10 text-[9px] font-medium text-destructive disabled:opacity-35"><X className="size-3" /> Reject pending</button>
+              <button type="button" onClick={() => void flow.decideAllPending('accepted')} disabled={!can('edit') || flow.busy || flow.requiresWorkbenchRebase || proposal.operations.every((operation) => operation.decision !== 'pending')} className="inline-flex h-7 items-center justify-center gap-1 rounded bg-success/15 text-[9px] font-medium text-success disabled:opacity-35"><Check className="size-3" /> Accept pending</button>
+              <button type="button" onClick={() => void flow.decideAllPending('rejected', rejectionReason)} disabled={!can('edit') || flow.busy || flow.requiresWorkbenchRebase || proposal.operations.every((operation) => operation.decision !== 'pending')} className="inline-flex h-7 items-center justify-center gap-1 rounded bg-destructive/10 text-[9px] font-medium text-destructive disabled:opacity-35"><X className="size-3" /> Reject pending</button>
             </div>
             <input value={rejectionReason} onChange={(event) => setRejectionReason(event.target.value)} className="mt-1.5 h-7 w-full rounded border border-border bg-background px-2 text-[9px] text-foreground outline-none" aria-label="Operation rejection reason" />
           </div>
@@ -490,8 +534,8 @@ function OperationCard({ operation }: { operation: FileOperationDto }) {
           {operation.content !== undefined && <pre className="max-h-36 overflow-auto whitespace-pre-wrap rounded bg-black/20 p-2 font-mono text-[8px] leading-relaxed text-faint-foreground scrollbar-thin">{operation.content}</pre>}
           {operation.decision === 'pending' && (
             <div className="mt-2 grid grid-cols-2 gap-1">
-              <button type="button" onClick={() => void flow.decideOperation(operation, 'accepted')} disabled={!can('edit') || flow.busy} className="inline-flex h-6 items-center justify-center gap-1 rounded bg-success/15 text-[8px] font-medium text-success disabled:opacity-35"><Check className="size-2.5" />Accept</button>
-              <button type="button" onClick={() => void flow.decideOperation(operation, 'rejected', 'Rejected during file review')} disabled={!can('edit') || flow.busy} className="inline-flex h-6 items-center justify-center gap-1 rounded bg-destructive/10 text-[8px] font-medium text-destructive disabled:opacity-35"><X className="size-2.5" />Reject</button>
+              <button type="button" onClick={() => void flow.decideOperation(operation, 'accepted')} disabled={!can('edit') || flow.busy || flow.requiresWorkbenchRebase} className="inline-flex h-6 items-center justify-center gap-1 rounded bg-success/15 text-[8px] font-medium text-success disabled:opacity-35"><Check className="size-2.5" />Accept</button>
+              <button type="button" onClick={() => void flow.decideOperation(operation, 'rejected', 'Rejected during file review')} disabled={!can('edit') || flow.busy || flow.requiresWorkbenchRebase} className="inline-flex h-6 items-center justify-center gap-1 rounded bg-destructive/10 text-[8px] font-medium text-destructive disabled:opacity-35"><X className="size-2.5" />Reject</button>
             </div>
           )}
         </div>
@@ -550,6 +594,35 @@ function ServiceGate({ title, description, loading, onRetry }: { title: string; 
   )
 }
 
+function WorkbenchGroupTabs() {
+  const flow = usePlatformFlow()
+  if (flow.workbenchGroups.length <= 1) return null
+  return (
+    <div className="flex shrink-0 items-center gap-1.5 overflow-x-auto border-b border-border bg-background/60 px-3 py-2 scrollbar-thin" aria-label="Workbench groups">
+      <span className="mr-1 shrink-0 text-[8px] font-semibold uppercase tracking-wider text-faint-foreground">DAG groups</span>
+      {flow.workbenchGroups.map((group, index) => (
+        <button
+          key={group.nodeKey}
+          type="button"
+          onClick={() => void flow.selectWorkbenchGroup(group.nodeKey)}
+          className={cn(
+            'inline-flex h-7 shrink-0 items-center gap-1.5 rounded border px-2 text-[9px]',
+            group.nodeKey === flow.selectedWorkbenchNodeKey
+              ? 'border-primary/50 bg-primary/10 text-primary-bright'
+              : 'border-border bg-panel text-muted-foreground hover:text-foreground',
+          )}
+          aria-label={`Workbench group ${group.nodeKey} ${group.status.replaceAll('_', ' ')}`}
+          title={`${group.manifestGroupKey ?? group.nodeKey} · ${group.references.length} root bundle(s)`}
+        >
+          <span className="font-semibold">{index + 1}</span>
+          <span>{group.sliceId ?? group.nodeKey}</span>
+          <span className="rounded bg-white/5 px-1 py-0.5 text-[7px] uppercase">{group.status.replaceAll('_', ' ')}</span>
+        </button>
+      ))}
+    </div>
+  )
+}
+
 function OperationIcon({ kind }: { kind: FileOperationDto['kind'] }) {
   if (kind === 'file.delete') return <X className="mt-0.5 size-3 shrink-0 text-destructive" />
   if (kind === 'file.rename') return <PencilLine className="mt-0.5 size-3 shrink-0 text-warning" />
@@ -564,8 +637,15 @@ function proposalApplied(proposal: ImplementationProposalDto | null | undefined)
   return proposal?.status === 'applied' || proposal?.status === 'partially_applied'
 }
 
-function workbenchQueueItemState(item: WorkbenchQueueItem) {
+function workbenchQueueItemState(
+  queue: readonly WorkbenchQueueItem[],
+  index: number,
+  workspace: WorkspaceRevisionDto | null,
+) {
+  const item = queue[index]
   if (proposalApplied(item.proposal)) return 'applied'
+  if (!workbenchQueueItemHasAppliedPredecessors(queue, index)) return 'blocked'
+  if (workbenchBundleNeedsRebase(item.bundle, workspace)) return 'rebase'
   if (!item.proposal) return 'generate'
   if (item.proposal.status === 'ready') return 'ready'
   if (item.proposal.status === 'stale') return 'stale'

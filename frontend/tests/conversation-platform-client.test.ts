@@ -69,7 +69,7 @@ async function main() {
     etag: '"conversation-command:1"',
   } as ConversationCommandDto
   await client.executeCommand('project/1', 'conversation/1', command, {
-    workbenchResult: { runId: 'run-1', bundleId: 'bundle-1' },
+    workbenchResult: { runId: 'run-1', bundleId: 'bundle-1', implementationProposalId: 'proposal-1' },
   })
 
   assert.deepEqual(calls.map((call) => [call.method, call.path]), [
@@ -92,14 +92,17 @@ async function main() {
   assert.deepEqual(calls[4].body, {})
   assert.equal(calls[5].headers.get('if-match'), '"conversation-command:1"')
   assert.deepEqual(calls[5].body, {
-    workbenchResult: { runId: 'run-1', bundleId: 'bundle-1' },
+    workbenchResult: { runId: 'run-1', bundleId: 'bundle-1', implementationProposalId: 'proposal-1' },
   })
 
   const callCount = calls.length
   assert.throws(() => client.executeCommand('project/1', 'conversation/1', startCommand, {
-    workbenchResult: { runId: 'run-1', bundleId: 'bundle-1' },
+    workbenchResult: { runId: 'run-1', bundleId: 'bundle-1', implementationProposalId: 'proposal-1' },
   }), /does not accept/)
   assert.throws(() => client.executeCommand('project/1', 'conversation/1', command), /requires an exact run/)
+  assert.throws(() => client.executeCommand('project/1', 'conversation/1', command, {
+    workbenchResult: { runId: 'run-1', bundleId: 'bundle-1', implementationProposalId: '' },
+  }), /identities must be non-empty/)
   assert.equal(calls.length, callCount, 'invalid command shapes reached the server')
   console.log('✓ governed conversation client preserves immutable intent and command boundaries')
 }

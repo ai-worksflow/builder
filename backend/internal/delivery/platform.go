@@ -72,7 +72,7 @@ func NewPlatformServices(dependencies PlatformDependencies) (*PlatformServices, 
 	}
 	services := &PlatformServices{
 		Loader: loader, Quality: quality, Export: exporter, Publish: publisher,
-		WorkflowQuality:   WorkflowQualityEvaluator{Quality: quality},
+		WorkflowQuality:   WorkflowQualityEvaluator{Quality: quality, Database: dependencies.Database},
 		WorkflowPublisher: WorkflowPublisher{Quality: quality, Publisher: publisher},
 	}
 	if local, ok := dependencies.Provider.(*LocalStaticProvider); ok {

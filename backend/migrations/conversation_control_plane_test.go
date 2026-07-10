@@ -76,6 +76,9 @@ func TestConversationControlPlaneImmutabilityOnPostgres(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer transaction.Rollback()
+	if _, err := transaction.ExecContext(ctx, "SELECT pg_advisory_xact_lock($1)", advisoryLockID); err != nil {
+		t.Fatal(err)
+	}
 	schema := "conversation_test_" + strings.ReplaceAll(uuid.NewString(), "-", "")
 	if _, err := transaction.ExecContext(ctx, `CREATE SCHEMA "`+schema+`"`); err != nil {
 		t.Fatal(err)

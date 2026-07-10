@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -35,6 +36,7 @@ func TestBusinessRouteRegistrationCoversCoreResources(t *testing.T) {
 		"POST /v1/projects/:projectId/requirement-baselines",
 		"POST /v1/projects/:projectId/impact-reports",
 		"POST /v1/projects/:projectId/input-manifests",
+		"POST /v1/projects/:projectId/blueprint-selections/compile",
 		"POST /v1/output-proposals/:proposalId/decisions",
 		"POST /v1/output-proposals/:proposalId/apply",
 		"POST /v1/projects/:projectId/workbench-bundles",
@@ -207,6 +209,84 @@ func TestGenericAndCollectionArtifactRoutesShareTheServiceLineageGate(t *testing
 	}
 }
 
+func TestInputManifestTransportPreservesBaseOnlyTransform(t *testing.T) {
+	service := &fakeProposalService{}
+	router := newBusinessRouter(t, transport.Services{Proposals: service})
+	artifactID, revisionID := uuid.NewString(), uuid.NewString()
+	hash := strings.Repeat("b", 64)
+	body := []byte(`{
+		"jobType":"refine_project_brief",
+		"baseRevision":{"artifactId":"` + artifactID + `","revisionId":"` + revisionID + `","contentHash":"` + hash + `"},
+		"sources":[],
+		"constraints":{"reviewedIntent":true},
+		"outputSchemaVersion":"project-brief-proposal/v1"
+	}`)
+	headers := authenticatedHeaders(true)
+	headers.Set("Content-Type", "application/json")
+	headers.Set("Idempotency-Key", "base-only-project-brief-manifest")
+	response := performRequest(router, http.MethodPost, "/v1/projects/"+testProjectID+"/input-manifests", body, headers)
+	if response.Code != http.StatusCreated {
+		t.Fatalf("base-only manifest transport status=%d body=%s", response.Code, response.Body.String())
+	}
+	if service.manifest.BaseRevision == nil || service.manifest.BaseRevision.ArtifactID != artifactID || service.manifest.BaseRevision.RevisionID != revisionID || service.manifest.BaseRevision.ContentHash != hash || len(service.manifest.Sources) != 0 {
+		t.Fatalf("transport rewrote base-only manifest lineage: %+v", service.manifest)
+	}
+}
+
+func TestSelectionDocumentationManifestWithoutParentIsRejected(t *testing.T) {
+	service := &fakeProposalService{manifestErr: core.ErrInvalidInput}
+	router := newBusinessRouter(t, transport.Services{Proposals: service})
+	headers := authenticatedHeaders(true)
+	headers.Set("Content-Type", "application/json")
+	headers.Set("Idempotency-Key", "selection-doc-without-parent")
+	response := performRequest(router, http.MethodPost, "/v1/projects/"+testProjectID+"/input-manifests", []byte(`{
+		"jobType":"selection.documentation",
+		"sources":[{"ref":{"artifactId":"a","revisionId":"r","contentHash":"sha256:`+strings.Repeat("a", 64)+`"},"purpose":"approved_upstream"}],
+		"constraints":{"instruction":"forged"},
+		"outputSchemaVersion":"selection-document-proposal/v1"
+	}`), headers)
+	assertProblem(t, response, http.StatusUnprocessableEntity, "invalid_input")
+	if service.manifest.JobType != core.SelectionDocumentationJobType {
+		t.Fatalf("reserved selection documentation job was rewritten: %#v", service.manifest)
+	}
+}
+
+func TestBlueprintSelectionCompileRequiresPreconditionsAndForwardsOnlyServerJob(t *testing.T) {
+	service := &fakeProposalService{}
+	router := newBusinessRouter(t, transport.Services{Proposals: service})
+	artifactID, revisionID := uuid.NewString(), uuid.NewString()
+	body := []byte(`{
+		"blueprintRevision":{"artifactId":"` + artifactID + `","revisionId":"` + revisionID + `","contentHash":"sha256:` + strings.Repeat("b", 64) + `"},
+		"nodeIds":["page-orders","api-orders"]
+	}`)
+	headers := authenticatedHeaders(true)
+	headers.Set("Content-Type", "application/json")
+	headers.Set("Idempotency-Key", "selection-compile-1")
+	path := "/v1/projects/" + testProjectID + "/blueprint-selections/compile"
+
+	missingETag := performRequest(router, http.MethodPost, path, body, headers)
+	assertProblem(t, missingETag, http.StatusPreconditionRequired, "if_match_required")
+
+	headers.Set("If-Match", `"artifact:`+artifactID+`:4"`)
+	response := performRequest(router, http.MethodPost, path, body, headers)
+	if response.Code != http.StatusCreated {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+	}
+	if service.manifest.JobType != core.BlueprintSelectionJobType ||
+		service.manifest.ExpectedBlueprintETag != headers.Get("If-Match") ||
+		service.manifest.BlueprintSelection == nil ||
+		service.manifest.BlueprintSelection.BlueprintRevision.ArtifactID != artifactID ||
+		len(service.manifest.BlueprintSelection.NodeIDs) != 2 {
+		t.Fatalf("selection transport input = %#v", service.manifest)
+	}
+	if service.manifest.Sources != nil || service.manifest.BaseRevision != nil || len(service.manifest.Constraints) != 0 {
+		t.Fatalf("client forged compiled selection fields: %#v", service.manifest)
+	}
+	if response.Header().Get("ETag") == "" || response.Header().Get("Location") == "" {
+		t.Fatalf("response headers = %#v", response.Header())
+	}
+}
+
 func TestProposalDecisionUsesETagVersionAndRejectsStaleRequest(t *testing.T) {
 	proposalID := uuid.NewString()
 	proposals := &fakeProposalService{proposal: domain.OutputProposal{
@@ -319,7 +399,6 @@ func TestGenerationProviderErrorsHaveStableProblemStatus(t *testing.T) {
 
 func newBusinessRouter(t *testing.T, services transport.Services, persistence ...gin.HandlerFunc) *gin.Engine {
 	t.Helper()
-	gin.SetMode(gin.TestMode)
 	if services.Auth == nil {
 		services.Auth = &fakeAuthService{}
 	}
@@ -420,13 +499,20 @@ func (*fakeReviewService) Decide(context.Context, string, string, core.DecideRev
 type fakeProposalService struct {
 	proposal    domain.OutputProposal
 	decision    core.DecideProposalInput
+	manifest    core.CreateManifestInput
 	actor       string
 	decideCalls int
 	createErr   error
+	manifestErr error
 }
 
-func (*fakeProposalService) CreateManifest(context.Context, string, string, core.CreateManifestInput) (domain.InputManifest, error) {
-	return domain.InputManifest{}, nil
+func (f *fakeProposalService) CreateManifest(_ context.Context, projectID, actorID string, input core.CreateManifestInput) (domain.InputManifest, error) {
+	f.manifest = input
+	if f.manifestErr != nil {
+		return domain.InputManifest{}, f.manifestErr
+	}
+	hash := strings.Repeat("a", 64)
+	return domain.InputManifest{ID: uuid.NewString(), ProjectID: projectID, CreatedBy: actorID, Hash: hash}, nil
 }
 
 func (f *fakeProposalService) CreateProposal(context.Context, string, string, core.CreateProposalInput) (domain.OutputProposal, error) {

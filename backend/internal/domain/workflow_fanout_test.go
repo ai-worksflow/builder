@@ -24,4 +24,12 @@ func TestFanOutItemKindIsExplicitAndClosed(t *testing.T) {
 	if err == nil {
 		t.Fatal("unknown fan-out itemKind was accepted")
 	}
+	nodes[1].FanOut.ItemKind = "blueprint_page"
+	if _, err := NewWorkflowDefinition(
+		uuid.NewString(), 1, "Blueprint page fan-out", "2", nodes,
+		[]WorkflowEdge{{ID: "a", From: "source", To: "fan"}, {ID: "b", From: "fan", To: "work"}, {ID: "c", From: "work", To: "merge"}},
+		uuid.NewString(), time.Now().UTC(),
+	); err != nil {
+		t.Fatalf("blueprint_page fan-out contract was rejected: %v", err)
+	}
 }

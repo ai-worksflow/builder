@@ -56,6 +56,8 @@ import type {
   PrototypeFixtureDto,
   PrototypeLayerDto,
   PrototypeLayerKind,
+  ProposalDto,
+  ProposalOperationDto,
   VersionedArtifactDto,
 } from '@/lib/platform/dto'
 import {
@@ -135,6 +137,7 @@ export function PrototypeStudio() {
   const [details, setDetails] = useState<Awaited<ReturnType<typeof workspace.loadDetails<PrototypeContentDto>>> | null>(null)
   const [selectedPageSpecId, setSelectedPageSpecId] = useState('')
   const [newPrototypeTitle, setNewPrototypeTitle] = useState('')
+  const [proposalBusyId, setProposalBusyId] = useState('')
   const [drag, setDrag] = useState<{
     id: string
     pointerX: number
@@ -420,6 +423,71 @@ export function PrototypeStudio() {
     }
   }
 
+  async function decideProposalOperation(
+    proposal: ProposalDto,
+    operation: ProposalOperationDto,
+    decision: 'accepted' | 'rejected',
+  ) {
+    if (!canEdit || operation.decision !== 'pending') return proposal
+    if (saveState === 'dirty' || saveState === 'saving' || saveState === 'conflict') {
+      setError('Finish or reload the current human draft before deciding an AI proposal.')
+      return null
+    }
+    setProposalBusyId(proposal.id)
+    setError(null)
+    try {
+      return await workspace.decideProposalOperation(
+        proposal,
+        operation.id,
+        decision,
+        decision === 'rejected' ? 'Rejected during prototype proposal review.' : undefined,
+      )
+    } catch (cause) {
+      setError(message(cause))
+      return null
+    } finally {
+      setProposalBusyId('')
+    }
+  }
+
+  async function decideAllProposalOperations(
+    proposal: ProposalDto,
+    decision: 'accepted' | 'rejected',
+  ) {
+    let current: ProposalDto | null = proposal
+    for (const operation of proposal.operations) {
+      if (!current || operation.decision !== 'pending') continue
+      current = await decideProposalOperation(current, operation, decision)
+    }
+  }
+
+  async function applyPrototypeProposal(proposal: ProposalDto) {
+    if (!canEdit || proposal.status !== 'ready') return
+    if (saveState === 'dirty' || saveState === 'saving' || saveState === 'conflict') {
+      setError('Finish or reload the current human draft before applying an AI proposal.')
+      return
+    }
+    setProposalBusyId(proposal.id)
+    setError(null)
+    try {
+      const draft = await workspace.applyProposal(
+        proposal.id,
+        proposal.operations
+          .filter((operation) => operation.decision === 'accepted')
+          .map((operation) => operation.id),
+      )
+      const nextContent = draft.content as unknown as PrototypeContentDto
+      setContent(cloneContent(nextContent))
+      setDraftEtag(draft.etag)
+      setSaveState('saved')
+      setDetails(await workspace.loadDetails<PrototypeContentDto>(proposal.artifactId))
+    } catch (cause) {
+      setError(message(cause))
+    } finally {
+      setProposalBusyId('')
+    }
+  }
+
   async function createRevisionAndRequestReview() {
     if (!activeResource || !content || !canEdit) return
     const issues = prototypeReviewIssues(content)
@@ -637,7 +705,7 @@ export function PrototypeStudio() {
               {panel === 'properties' && <PropertiesPanel layer={selectedLayer} rootLayerId={frame?.rootLayerId} canEdit={canEdit} onUpdate={updateLayer} onLayout={updateLayerLayout} onStyle={updateLayerStyle} onDuplicate={duplicateLayer} onDelete={deleteLayer} />}
               {panel === 'variants' && <VariantsPanel content={content} selectedStateId={state?.id} selectedBreakpointId={breakpoint?.id} canEdit={canEdit} onChange={updateContent} onSelectState={setSelectedStateId} onSelectBreakpoint={setSelectedBreakpointId} onError={setError} />}
               {panel === 'data' && <DataPanel content={content} stateId={state?.id} canEdit={canEdit} onChange={updateContent} />}
-              {panel === 'trace' && <TracePanel resource={activeResource} content={content} details={details} proposals={proposals} review={review} clientIssues={clientIssues} canReview={canReview} onRefresh={() => void workspace.refresh()} />}
+              {panel === 'trace' && <TracePanel resource={activeResource} content={content} details={details} proposals={proposals} review={review} clientIssues={clientIssues} canEdit={canEdit} canReview={canReview} proposalBusyId={proposalBusyId} onDecide={(proposal, operation, decision) => void decideProposalOperation(proposal, operation, decision)} onDecideAll={(proposal, decision) => void decideAllProposalOperations(proposal, decision)} onApply={(proposal) => void applyPrototypeProposal(proposal)} onRefresh={() => void workspace.refresh()} />}
             </div>
           </aside>
         </>
@@ -825,13 +893,60 @@ function DataPanel({ content, stateId, canEdit, onChange }: { content: Prototype
   </div>
 }
 
-function TracePanel({ resource, content, details, proposals, review, clientIssues, canReview, onRefresh }: { resource: VersionedArtifactDto<PrototypeContentDto>; content: PrototypeContentDto; details: Awaited<ReturnType<ReturnType<typeof useArtifactWorkspace>['loadDetails']>> | null; proposals: ReturnType<typeof useArtifactWorkspace>['proposals']; review?: ReturnType<typeof useCollaboration>['reviews'][number]; clientIssues: readonly string[]; canReview: boolean; onRefresh: () => void }) {
+function TracePanel({ resource, content, details, proposals, review, clientIssues, canEdit, canReview, proposalBusyId, onDecide, onDecideAll, onApply, onRefresh }: { resource: VersionedArtifactDto<PrototypeContentDto>; content: PrototypeContentDto; details: Awaited<ReturnType<ReturnType<typeof useArtifactWorkspace>['loadDetails']>> | null; proposals: ReturnType<typeof useArtifactWorkspace>['proposals']; review?: ReturnType<typeof useCollaboration>['reviews'][number]; clientIssues: readonly string[]; canEdit: boolean; canReview: boolean; proposalBusyId: string; onDecide: (proposal: ProposalDto, operation: ProposalOperationDto, decision: 'accepted' | 'rejected') => void; onDecideAll: (proposal: ProposalDto, decision: 'accepted' | 'rejected') => void; onApply: (proposal: ProposalDto) => void; onRefresh: () => void }) {
   return <div className="space-y-4">
     <section><div className="flex items-center justify-between"><PanelLabel>Exact source</PanelLabel><button type="button" onClick={onRefresh} className="rounded p-1 text-faint-foreground hover:text-foreground" aria-label="Refresh trace"><RefreshCw className="size-3" /></button></div><div className="mt-2 rounded border border-border bg-background p-2 font-mono text-[8px] leading-relaxed text-faint-foreground">PageSpec<br />{content.pageSpecRevision.artifactId}<br />{content.pageSpecRevision.revisionId}<br />{content.pageSpecRevision.contentHash}</div></section>
     <section><PanelLabel>Revision and dependency evidence</PanelLabel><div className="mt-2 grid grid-cols-2 gap-2"><Info label="Revisions" value={details?.versions.length ?? 0} /><Info label="Dependencies" value={details?.dependencies.length ?? 0} /><Info label="Trace links" value={content.traceLinks.length} /><Info label="Coverage" value={`${Math.round((details?.reviewGate.traceCoverage ?? 0) * 100)}%`} /></div></section>
     <PrototypeReviewGatePanel clientIssues={clientIssues} gate={details?.reviewGate} />
     <section><PanelLabel>Review gate</PanelLabel><div className={cn('mt-2 rounded border p-2 text-[9px]', review?.decision === 'approve' ? 'border-success/30 bg-success/10 text-success' : review?.decision === 'request_changes' ? 'border-destructive/30 bg-destructive/10 text-destructive' : 'border-warning/30 bg-warning/10 text-warning')}><div className="flex items-center gap-2"><CheckCircle2 className="size-3" /><span className="flex-1">{review?.decision ?? resource.artifact.status}</span></div><p className="mt-1 text-[8px] leading-relaxed opacity-80">{review?.summary ?? 'Create an immutable revision and request another project member to review it.'}</p></div>{canReview && <p className="mt-1 text-[8px] text-faint-foreground">Use Review Center for canonical reviewer decisions and blocking comment resolution.</p>}</section>
-    <section><PanelLabel>AI output proposals</PanelLabel><div className="mt-2 space-y-1.5">{proposals.map((proposal) => <div key={proposal.id} className="rounded border border-border bg-background p-2"><div className="flex items-center gap-2"><Wand2 className="size-3 text-primary-bright" /><span className="min-w-0 flex-1 truncate font-mono text-[8px] text-foreground">{proposal.id}</span><span className="text-[8px] text-faint-foreground">{proposal.status}</span></div><p className="mt-1 text-[8px] text-faint-foreground">{proposal.operations.length} reviewable operation(s); apply through the proposal decision flow.</p></div>)}{proposals.length === 0 && <PanelEmpty text="No AI proposal targets this prototype." />}</div></section>
+    <section>
+      <PanelLabel>AI output proposals</PanelLabel>
+      <div className="mt-2 space-y-2">
+        {proposals.map((proposal) => {
+          const pending = proposal.operations.filter((operation) => operation.decision === 'pending')
+          const busy = proposalBusyId === proposal.id
+          return (
+            <div key={proposal.id} className="rounded border border-border bg-background p-2">
+              <div className="flex items-center gap-2">
+                <Wand2 className="size-3 text-primary-bright" />
+                <span className="min-w-0 flex-1 truncate font-mono text-[8px] text-foreground">{proposal.id}</span>
+                <span className="rounded bg-primary/10 px-1 py-0.5 text-[8px] text-primary-bright">{proposal.status}</span>
+              </div>
+              <p className="mt-1 text-[8px] text-faint-foreground">Manifest {proposal.manifest.id} · exact base {proposal.baseRevision.contentHash.slice(0, 12)}</p>
+              <div className="mt-2 space-y-1.5">
+                {proposal.operations.map((operation) => (
+                  <div key={operation.id} className="rounded border border-border/70 bg-panel p-2">
+                    <div className="flex items-start gap-1.5 text-[8px]">
+                      <code className="min-w-0 flex-1 break-all text-muted-foreground">{operation.kind} {operation.path || '/'}</code>
+                      <span className={cn('shrink-0', operation.decision === 'accepted' || operation.decision === 'applied' ? 'text-success' : operation.decision === 'rejected' ? 'text-destructive' : 'text-warning')}>{operation.decision}</span>
+                    </div>
+                    {operation.rationale && <p className="mt-1 text-[8px] leading-relaxed text-faint-foreground">{operation.rationale}</p>}
+                    {operation.decision === 'pending' && (
+                      <div className="mt-2 grid grid-cols-2 gap-1">
+                        <button type="button" aria-label={`Accept proposal operation ${operation.id}`} onClick={() => onDecide(proposal, operation, 'accepted')} disabled={!canEdit || busy} className="rounded bg-success/15 px-1.5 py-1 text-[8px] font-medium text-success disabled:opacity-35">Accept</button>
+                        <button type="button" aria-label={`Reject proposal operation ${operation.id}`} onClick={() => onDecide(proposal, operation, 'rejected')} disabled={!canEdit || busy} className="rounded bg-destructive/10 px-1.5 py-1 text-[8px] font-medium text-destructive disabled:opacity-35">Reject</button>
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </div>
+              {pending.length > 0 && (
+                <div className="mt-2 grid grid-cols-2 gap-1">
+                  <button type="button" aria-label="Accept all pending proposal operations" onClick={() => onDecideAll(proposal, 'accepted')} disabled={!canEdit || busy} className="rounded border border-success/25 bg-success/10 px-1.5 py-1 text-[8px] text-success disabled:opacity-35">Accept all pending</button>
+                  <button type="button" aria-label="Reject all pending proposal operations" onClick={() => onDecideAll(proposal, 'rejected')} disabled={!canEdit || busy} className="rounded border border-destructive/20 bg-destructive/10 px-1.5 py-1 text-[8px] text-destructive disabled:opacity-35">Reject all pending</button>
+                </div>
+              )}
+              <button type="button" aria-label="Apply reviewed prototype proposal" onClick={() => onApply(proposal)} disabled={!canEdit || busy || proposal.status !== 'ready'} className="mt-2 inline-flex h-7 w-full items-center justify-center gap-1 rounded bg-primary text-[8px] font-semibold text-primary-foreground disabled:opacity-35">
+                {busy ? <LoaderCircle className="size-3 animate-spin" /> : <CheckCircle2 className="size-3" />}
+                Apply reviewed proposal
+              </button>
+              {proposal.status === 'applied' && <p className="mt-1.5 text-[8px] leading-relaxed text-success">Applied to the server draft. The next immutable revision preserves this proposal and manifest ancestry.</p>}
+            </div>
+          )
+        })}
+        {proposals.length === 0 && <PanelEmpty text="No AI proposal targets this prototype." />}
+      </div>
+    </section>
     <section><PanelLabel>Formal delivery readiness</PanelLabel><div className="mt-2 space-y-1"><Readiness passed={Boolean(resource.approvedRevision)} label="Approved immutable revision" /><Readiness passed={!content.exploratory} label="Formal, non-exploratory prototype" /><Readiness passed={content.states.some((item) => item.required)} label="Required state coverage" /><Readiness passed={content.breakpoints.length > 0} label="Responsive breakpoint" /><Readiness passed={content.fixtures.every((item) => item.sanitized)} label="Sanitized fixtures" /></div></section>
   </div>
 }

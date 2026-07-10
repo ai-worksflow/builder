@@ -215,10 +215,17 @@ export interface ArtifactRevisionDto<TContent> {
   readonly revisionNumber: number
   readonly basedOnRevisionId?: EntityId
   readonly sourceVersions?: readonly ArtifactSourceDto[]
+  readonly schemaVersion?: number
   readonly content: TContent
   readonly contentHash: ContentHash
+  readonly status?: ArtifactStatus | string
+  readonly changeSource?: 'human' | 'ai_proposal' | 'import' | 'merge' | 'rollback' | 'system'
+  readonly changeSummary?: string
+  readonly sourceManifestId?: EntityId
+  readonly proposalId?: EntityId
   readonly createdBy: EntityId
   readonly createdAt: IsoDateTime
+  readonly approvedAt?: IsoDateTime
 }
 
 export interface VersionedArtifactDto<TContent> {
@@ -287,6 +294,10 @@ export type DocumentKind =
   | 'uiPrototype'
   | 'frontendDevelopment'
   | 'decisionLog'
+  | 'dataContract'
+  | 'permissionContract'
+  | 'changeRequest'
+  | 'glossaryPolicy'
 
 export interface DocumentBlockDto {
   readonly id: EntityId
@@ -986,6 +997,8 @@ export interface RenderedFrameRefDto extends AssetRefDto {
 
 export interface WorkbenchBundleDto {
   readonly id: EntityId
+  readonly rootBuildManifestId?: EntityId
+  readonly derivedFromBuildManifestId?: EntityId
   readonly projectId: EntityId
   readonly pageSpecRevision: VersionRefDto
   readonly prototypeRevision: VersionRefDto
@@ -1001,6 +1014,109 @@ export interface WorkbenchBundleDto {
   readonly acceptanceManifest: AssetRefDto
   readonly contentHash: ContentHash
   readonly createdAt: IsoDateTime
+}
+
+export type DocumentMemberRole = 'owner' | 'assignee' | 'downstreamOwner' | 'reviewer' | 'watcher'
+
+export interface DocumentMemberBindingDto {
+  readonly userId: EntityId
+  readonly role: DocumentMemberRole
+  readonly reason?: string
+  readonly assignedBy: EntityId
+  readonly assignedAt: IsoDateTime
+}
+
+export interface DocumentMemberBindingInputDto {
+  readonly userId: EntityId
+  readonly role: DocumentMemberRole
+  readonly reason?: string
+}
+
+export interface DocumentMemberBindingSetDto {
+  readonly artifactId: EntityId
+  readonly projectId: EntityId
+  readonly version: number
+  readonly etag: string
+  readonly items: readonly DocumentMemberBindingDto[]
+  readonly updatedAt?: IsoDateTime
+}
+
+export type DocumentGraphEntityType =
+  | 'document'
+  | 'feature'
+  | 'page'
+  | 'api'
+  | 'data'
+  | 'workspace'
+  | 'inputManifest'
+  | 'outputProposal'
+  | 'workflowRun'
+  | 'workbenchVersion'
+  | 'implementation'
+  | 'deployment'
+
+export interface DocumentGraphNodeDto {
+  readonly id: EntityId
+  readonly entityId: EntityId
+  readonly entityType: DocumentGraphEntityType
+  readonly artifactKind?: ArtifactKind
+  readonly title: string
+  readonly status: string
+  readonly revision?: VersionRefDto
+  readonly memberBindings?: readonly DocumentMemberBindingDto[]
+  readonly metadata: JsonObject
+  readonly updatedAt: IsoDateTime
+}
+
+export interface DocumentGraphEdgeDto {
+  readonly id: EntityId
+  readonly sourceId: EntityId
+  readonly targetId: EntityId
+  readonly relation: string
+  readonly required: boolean
+  readonly metadata: JsonObject
+}
+
+export interface DocumentGraphDto {
+  readonly projectId: EntityId
+  readonly nodes: readonly DocumentGraphNodeDto[]
+  readonly edges: readonly DocumentGraphEdgeDto[]
+}
+
+export type DownstreamDocumentKind =
+  | 'project_brief'
+  | 'product_requirements'
+  | 'decision_record'
+  | 'glossary_policy'
+  | 'reference_source'
+  | 'change_request'
+  | 'api_contract'
+  | 'data_contract'
+  | 'permission_contract'
+
+export interface GenerateDownstreamDocumentInputDto {
+  readonly sourceRevision: VersionRefDto
+  readonly targetKind: DownstreamDocumentKind
+  readonly targetTitle: string
+  readonly targetKey?: string
+  readonly instruction: string
+  readonly model?: string
+}
+
+export type DocumentSyncBackProvenanceKind =
+  | 'workspaceRevision'
+  | 'implementationProposal'
+  | 'buildManifest'
+  | 'deployment'
+
+export interface CreateDocumentSyncBackInputDto {
+  readonly targetRevision: VersionRefDto
+  readonly provenance: {
+    readonly kind: DocumentSyncBackProvenanceKind
+    readonly id: EntityId
+  }
+  readonly instruction: string
+  readonly model?: string
 }
 
 export interface CreateWorkbenchBundleInputDto {

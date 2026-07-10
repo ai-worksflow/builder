@@ -52,6 +52,13 @@ export interface WorkbenchInstructionDto {
   readonly expectedBundleId?: string
 }
 
+export interface WorkbenchExecutionResultDto {
+  readonly runId: string
+  /** Exact active leaf manifest that produced the proposal. */
+  readonly bundleId: string
+  readonly implementationProposalId: string
+}
+
 export type ConversationIntentKind = 'start_workflow' | 'workbench_instruction'
 
 export interface WorkflowIntentProposalDto {

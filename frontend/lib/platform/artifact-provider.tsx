@@ -111,6 +111,12 @@ interface ArtifactWorkspaceContextState extends ArtifactWorkspaceSnapshot {
     proposalId: string,
     acceptedOperationIds: readonly string[],
   ) => Promise<ArtifactDraftDto<JsonValue>>
+  readonly decideProposalOperation: (
+    proposal: Pick<ProposalDto, 'id' | 'version'>,
+    operationId: string,
+    decision: 'accepted' | 'rejected',
+    reason?: string,
+  ) => Promise<ProposalDto>
   readonly impact: (blueprintArtifactId: string) => Promise<ImpactReportDto>
 }
 
@@ -389,6 +395,16 @@ export function ArtifactWorkspaceProvider({ children }: { children: ReactNode })
       await refreshRef.current()
       return result.data
     },
+    decideProposalOperation: async (proposal, operationId, decision, reason) => {
+      const result = await gateway.decideProposalOperation(
+        proposal,
+        operationId,
+        decision,
+        reason,
+      )
+      await refreshRef.current()
+      return result.data
+    },
     impact: async (artifactId) => (await gateway.impact(artifactId)).data,
   }), [
     error,
@@ -571,6 +587,7 @@ function documentKind(kind: DocumentContentDto['kind']): DocType {
   if (kind === 'backendDevelopment') return 'backendDev'
   if (kind === 'frontendDevelopment') return 'frontendDev'
   if (kind === 'decisionLog') return 'requirement'
+	if (kind === 'dataContract' || kind === 'permissionContract' || kind === 'changeRequest' || kind === 'glossaryPolicy') return 'requirement'
   return kind
 }
 

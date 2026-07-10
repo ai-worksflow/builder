@@ -4,6 +4,7 @@ import {
 } from './clients'
 import { DataRuntimeClient } from './data-client'
 import { PlatformConversationClient } from './conversation-client'
+import { DesignImportsClient } from './design-import-client'
 import { PlatformFlowClient } from './flow-client'
 import { HttpClient, type HttpClientOptions } from './http'
 import {
@@ -42,6 +43,7 @@ export class PlatformClient implements PlatformDomainClients {
   readonly data: DataRuntimeClient
   readonly flow: PlatformFlowClient
   readonly conversation: PlatformConversationClient
+  readonly designImports: DesignImportsClient
 
   constructor(options: PlatformClientOptions = {}) {
     this.http = options.httpClient ?? new HttpClient(options.http)
@@ -72,6 +74,7 @@ export class PlatformClient implements PlatformDomainClients {
     this.data = new DataRuntimeClient(this.http)
     this.flow = new PlatformFlowClient(this.http)
     this.conversation = new PlatformConversationClient(this.http)
+    this.designImports = new DesignImportsClient(this.http)
   }
 }
 

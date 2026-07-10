@@ -246,6 +246,12 @@ func domainEventFromRaw(subject string, header nats.Header, data []byte, sequenc
 		eventID = uuid.NewString()
 	}
 	eventType := normalizeEventType(header.Get("Worksflow-Event-Type"))
+	// Workflow node event names are intentionally extensible. The wire contract
+	// exposes their stable envelope type and keeps the concrete node event in
+	// the payload instead of requiring every frontend to know every node type.
+	if subject == "worksflow.workflow.run.event" {
+		eventType = "run.event"
+	}
 	if eventType == "" {
 		eventType = normalizeEventType(subject)
 	}

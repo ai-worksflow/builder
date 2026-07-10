@@ -26,6 +26,7 @@ type RouterOptions struct {
 	Data           *transport.DataHandler
 	PublicData     *transport.PublicDataHandler
 	Delivery       *transport.DeliveryHandler
+	DesignImports  *transport.DesignImportHandler
 }
 
 func NewRouter(cfg config.Config, logger *slog.Logger, options RouterOptions) (*gin.Engine, error) {
@@ -37,6 +38,9 @@ func NewRouter(cfg config.Config, logger *slog.Logger, options RouterOptions) (*
 	}
 	if options.Conversation != nil && options.Idempotency == nil {
 		return nil, errors.New("conversation control-plane routes require durable idempotency")
+	}
+	if options.DesignImports != nil && options.Idempotency == nil {
+		return nil, errors.New("design import routes require durable idempotency")
 	}
 	if cfg.Environment == config.EnvironmentProduction {
 		gin.SetMode(gin.ReleaseMode)
@@ -138,6 +142,12 @@ func NewRouter(cfg config.Config, logger *slog.Logger, options RouterOptions) (*
 		protected.POST("/invitations/accept", csrf, captureIdempotency, persistIdempotency, api.AcceptInvitation)
 
 		transport.RegisterBusinessRoutes(protected, api, persistIdempotency)
+		if options.DesignImports != nil {
+			designImportMutation := []gin.HandlerFunc{csrf, worksmiddleware.CaptureIdempotencyKey(true), persistIdempotency}
+			if err := transport.RegisterDesignImportRoutes(protected, options.DesignImports, designImportMutation...); err != nil {
+				return nil, err
+			}
+		}
 		if options.Workflow != nil {
 			workflowMutation := []gin.HandlerFunc{csrf, worksmiddleware.CaptureIdempotencyKey(true), persistIdempotency}
 			if err := transport.RegisterWorkflowRoutes(protected, options.Workflow, workflowMutation...); err != nil {

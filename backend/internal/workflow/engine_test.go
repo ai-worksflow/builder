@@ -60,11 +60,17 @@ func testManifestForEngine(t *testing.T, projectID, userID string, now time.Time
 	t.Helper()
 	hash, _ := domain.CanonicalHash(map[string]any{"source": 1})
 	source := domain.ArtifactRef{ArtifactID: uuid.NewString(), RevisionID: uuid.NewString(), ContentHash: hash}
-	manifest, err := domain.NewInputManifest(uuid.NewString(), projectID, "workflow_start", "", nil, []domain.ManifestSource{{Ref: source, Purpose: "approved input"}}, json.RawMessage(`{"strict":true}`), "workflow/v1", userID, now)
+	manifest, err := domain.NewInputManifest(uuid.NewString(), projectID, "workflow_start", "", nil, []domain.ManifestSource{{Ref: source, Purpose: "project_brief"}}, json.RawMessage(`{"strict":true}`), "workflow-input/v1", userID, now)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return manifest
+}
+
+type startArtifactKindResolverFunc func(context.Context, domain.InputManifest) ([]string, error)
+
+func (f startArtifactKindResolverFunc) ResolveStartArtifactKinds(ctx context.Context, manifest domain.InputManifest) ([]string, error) {
+	return f(ctx, manifest)
 }
 
 func saveEngineDefinition(t *testing.T, store Store, projectID, userID string, definition domain.WorkflowDefinition) DefinitionRecord {
@@ -90,6 +96,30 @@ func newTestEngine(t *testing.T, definition domain.WorkflowDefinition, registry 
 	engine.Clock = clock
 	engine.Runners = registry
 	engine.RetryBackoff = func(int) time.Duration { return 0 }
+	engine.StartArtifactKinds = startArtifactKindResolverFunc(func(context.Context, domain.InputManifest) ([]string, error) {
+		return []string{"project_brief"}, nil
+	})
+	engine.HumanEditOutput = HumanEditOutputValidatorFunc(func(_ context.Context, execution Execution, output json.RawMessage, _ string) (HumanEditValidation, error) {
+		refs, err := artifactRefsFromNodeOutput(output)
+		if err != nil {
+			return HumanEditValidation{}, err
+		}
+		if len(refs) == 0 {
+			return HumanEditValidation{}, errors.New("missing artifact revision")
+		}
+		kind := execution.Definition.HumanEdit.ArtifactKind
+		if kind == "" {
+			switch execution.Definition.HumanEdit.ArtifactType {
+			case domain.ArtifactDocument:
+				kind = "project_brief"
+			case domain.ArtifactBlueprint:
+				kind = "blueprint"
+			case domain.ArtifactPrototype:
+				kind = "prototype"
+			}
+		}
+		return HumanEditValidation{ArtifactRefs: refs, Primary: refs[len(refs)-1], ArtifactKind: kind}, nil
+	})
 	return engine, store, clock, record, manifest, projectID, userID
 }
 
@@ -102,6 +132,55 @@ func simpleDefinition(t *testing.T, id, userID string, now time.Time) domain.Wor
 		t.Fatal(err)
 	}
 	return definition
+}
+
+func TestEngineStartRejectsManifestDefinitionContractMismatchBeforeCreatingRun(t *testing.T) {
+	t.Run("selection workflow with conversation manifest", func(t *testing.T) {
+		userID := uuid.NewString()
+		definition, err := blueprintSelectionFlowDefinitionForVersion(uuid.NewString(), 1, userID, time.Now().UTC())
+		if err != nil {
+			t.Fatal(err)
+		}
+		engine, store, _, record, manifest, projectID, startedBy := newTestEngine(t, definition, nil)
+		runID := uuid.NewString()
+		_, err = engine.Start(context.Background(), StartRequest{
+			RunID: runID, ProjectID: projectID, DefinitionVersionID: record.VersionID,
+			InputManifest: manifest.Ref(), StartedBy: startedBy,
+		})
+		if !errors.Is(err, domain.ErrInvalidArgument) {
+			t.Fatalf("selection workflow mismatch error = %v", err)
+		}
+		if _, loadErr := store.GetRun(context.Background(), runID); !errors.Is(loadErr, domain.ErrNotFound) {
+			t.Fatalf("incompatible start persisted a run: %v", loadErr)
+		}
+	})
+
+	t.Run("selection manifest with ordinary workflow", func(t *testing.T) {
+		userID := uuid.NewString()
+		definition := simpleDefinition(t, uuid.NewString(), userID, time.Now().UTC())
+		engine, store, clock, record, ordinaryManifest, projectID, startedBy := newTestEngine(t, definition, nil)
+		selectionManifest, err := domain.NewInputManifest(
+			uuid.NewString(), projectID, core.BlueprintSelectionJobType, "", nil,
+			ordinaryManifest.Sources, json.RawMessage(`{"selectionId":"frozen"}`), "blueprint-selection/v1", startedBy, clock.Now(),
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := store.SaveManifest(context.Background(), selectionManifest); err != nil {
+			t.Fatal(err)
+		}
+		runID := uuid.NewString()
+		_, err = engine.Start(context.Background(), StartRequest{
+			RunID: runID, ProjectID: projectID, DefinitionVersionID: record.VersionID,
+			InputManifest: selectionManifest.Ref(), StartedBy: startedBy,
+		})
+		if !errors.Is(err, domain.ErrInvalidArgument) {
+			t.Fatalf("ordinary workflow mismatch error = %v", err)
+		}
+		if _, loadErr := store.GetRun(context.Background(), runID); !errors.Is(loadErr, domain.ErrNotFound) {
+			t.Fatalf("incompatible start persisted a run: %v", loadErr)
+		}
+	})
 }
 
 func TestConcurrentClaimHasSingleWinnerAndMonotonicEventSequence(t *testing.T) {

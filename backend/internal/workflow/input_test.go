@@ -113,7 +113,7 @@ func TestTwoFanOutRegionsKeepManifestInputsIsolated(t *testing.T) {
 		return domain.NodeDefinition{ID: id, Name: id, Type: domain.NodeMerge, InputSchema: schema, OutputSchema: schema, Merge: &domain.MergeNodeConfig{FanOutNodeID: fanOut, Policy: domain.MergeAll}}
 	}
 	compile := func(id string) domain.NodeDefinition {
-		return domain.NodeDefinition{ID: id, Name: id, Type: domain.NodeManifestCompiler, InputSchema: schema, OutputSchema: schema, ManifestCompiler: &domain.ManifestCompilerNodeConfig{ManifestKind: "application_build", SchemaVersion: 1, Hook: "v1"}}
+		return domain.NodeDefinition{ID: id, Name: id, Type: domain.NodeManifestCompiler, InputSchema: schema, OutputSchema: schema, ManifestCompiler: &domain.ManifestCompilerNodeConfig{ManifestKind: "application_build", SchemaVersion: 1, Hook: "application-build-manifest/v1"}}
 	}
 	nodes := []domain.NodeDefinition{transform("entry"), fan("fan-a", "merge-a"), transform("work-a"), merge("merge-a", "fan-a"), compile("compile-a"), fan("fan-b", "merge-b"), transform("work-b"), merge("merge-b", "fan-b"), compile("compile-b"), transform("join")}
 	edges := []domain.WorkflowEdge{
@@ -192,7 +192,7 @@ func TestMinimumLoopRuntimeInputsConnectArtifactToPublish(t *testing.T) {
 	source := addSyntheticNode(run, "source", "source", "", NodeCompleted)
 	run.Context.Nodes[source.Key] = NodeMetadata{DefinitionNodeID: "source", Output: json.RawMessage(`{"payload":{"manifestId":"input"}}`)}
 	previous := source
-	for _, nodeID := range []string{"project-brief-edit", "project-brief-review", "requirements-ai", "requirements-edit", "requirements-review", "blueprint-ai", "blueprint-edit", "blueprint-review"} {
+	for _, nodeID := range []string{"project-brief-ai", "project-brief-edit", "project-brief-review", "requirements-ai", "requirements-edit", "requirements-review", "blueprint-ai", "blueprint-edit", "blueprint-review"} {
 		node := addSyntheticNode(run, nodeID, nodeID, "", NodeRunning)
 		inputs, err := buildNodeInputEnvelope(run, definition, node)
 		if err != nil {
@@ -200,9 +200,7 @@ func TestMinimumLoopRuntimeInputsConnectArtifactToPublish(t *testing.T) {
 		}
 		metadata := run.Context.Nodes[node.Key]
 		metadata.Input = inputs.Canonical()
-		if strings.HasSuffix(nodeID, "-edit") {
-			metadata.Output = json.RawMessage(`{"payload":{"accepted":true}}`)
-		}
+		metadata.Output = mustJSON(map[string]any{"payload": map[string]any{"completedNode": nodeID}})
 		run.Context.Nodes[node.Key] = metadata
 		node.Status = NodeCompleted
 		previous = node
@@ -219,7 +217,7 @@ func TestMinimumLoopRuntimeInputsConnectArtifactToPublish(t *testing.T) {
 	pages.Status = NodeCompleted
 	run.Context.Nodes[pages.Key] = NodeMetadata{DefinitionNodeID: "pages", Input: pageInputs.Canonical(), FanOutOutputs: map[string]json.RawMessage{slice.ID: mustJSON(FanOutItem{Key: slice.Key, Title: slice.Title, Blueprint: slice.Blueprint, Prototype: slice.Prototype})}}
 
-	for _, nodeID := range []string{"prototype-ai", "prototype-edit", "prototype-review"} {
+	for _, nodeID := range []string{"page-spec-ai", "page-spec-edit", "page-spec-review", "prototype-ai", "prototype-edit", "prototype-review"} {
 		key := instanceKey(nodeID, slice.ID)
 		node := addSyntheticNode(run, key, nodeID, slice.ID, NodeRunning)
 		inputs, err := buildNodeInputEnvelope(run, definition, node)
@@ -228,9 +226,7 @@ func TestMinimumLoopRuntimeInputsConnectArtifactToPublish(t *testing.T) {
 		}
 		metadata := run.Context.Nodes[key]
 		metadata.Input = inputs.Canonical()
-		if nodeID == "prototype-edit" {
-			metadata.Output = json.RawMessage(`{"payload":{"prototype":"approved"}}`)
-		}
+		metadata.Output = mustJSON(map[string]any{"payload": map[string]any{"completedNode": nodeID}})
 		run.Context.Nodes[key] = metadata
 		node.Status = NodeCompleted
 	}
@@ -248,7 +244,7 @@ func TestMinimumLoopRuntimeInputsConnectArtifactToPublish(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertOnlySlice(t, compilerInputs.SliceRefs(), slice)
-	buildManifest := BuildManifest{SchemaVersion: 1, ProjectID: run.ProjectID, RunID: run.ID, SliceIDs: []string{slice.ID}, BundleIDs: []string{uuid.NewString()}, Sources: []domain.ArtifactRef{*slice.Prototype}, Constraints: json.RawMessage(`{}`), CreatedAt: now}
+	buildManifest := BuildManifest{SchemaVersion: 1, ProjectID: run.ProjectID, RunID: run.ID, ManifestGroupKey: uuid.NewString(), SliceIDs: []string{slice.ID}, BundleIDs: []string{uuid.NewString()}, Sources: []domain.ArtifactRef{*slice.Prototype}, Constraints: json.RawMessage(`{}`), CreatedAt: now}
 	if err := buildManifest.Freeze(); err != nil {
 		t.Fatal(err)
 	}

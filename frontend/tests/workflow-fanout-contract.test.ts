@@ -7,11 +7,11 @@ import {
 const starter = starterWorkflowDefinition()
 const pageFanOut = starter.nodes.find((node) => node.id === 'pages')?.fanOut
 assert.deepEqual(pageFanOut, {
-  itemsPath: '/workflowContext/deliverySlices',
+  itemsPath: '/blueprintPages',
   sliceKeyPath: '/key',
   mergeNodeId: 'pages-merged',
   maxParallel: 4,
-  itemKind: 'delivery_slice',
+  itemKind: 'blueprint_page',
 })
 
 const generic = {
@@ -41,4 +41,4 @@ assert.match(
   /fanOut is malformed/,
 )
 
-console.log('✓ workflow fan-out distinguishes generic input items from exact delivery slices')
+console.log('✓ workflow fan-out distinguishes generic input items from exact Blueprint page branches')

@@ -7,6 +7,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/worksflow/builder/backend/internal/core"
 	"github.com/worksflow/builder/backend/internal/domain"
+	worksmiddleware "github.com/worksflow/builder/backend/internal/httpapi/middleware"
 )
 
 func (s *Server) CompileRequirementBaseline(context *gin.Context) {
@@ -94,6 +95,43 @@ func (s *Server) CreateInputManifest(context *gin.Context) {
 	manifest, err := s.services.Proposals.CreateManifest(context.Request.Context(), context.Param("projectId"), actor, input)
 	if err != nil {
 		s.businessError(context, err)
+		return
+	}
+	context.Header("ETag", entityHashETag("input-manifest", manifest.ID, manifest.Hash))
+	context.Header("Location", "/v1/input-manifests/"+manifest.ID)
+	context.JSON(http.StatusCreated, manifest)
+}
+
+// CompileBlueprintSelection freezes a user-selected subset of an approved
+// Blueprint into an immutable InputManifest. The Blueprint ETag is checked in
+// the same transaction boundary as manifest compilation so a selection can
+// never silently drift to a newer graph.
+func (s *Server) CompileBlueprintSelection(context *gin.Context) {
+	if s.services.Proposals == nil {
+		serviceUnavailable(context, "proposal")
+		return
+	}
+	var input core.BlueprintSelectionInput
+	if err := DecodeJSON(context, &input, s.config.HTTP.MaxJSONBodyBytes); err != nil {
+		WriteJSONError(context, err)
+		return
+	}
+	actor, ok := actorID(context)
+	if !ok {
+		return
+	}
+	manifest, err := s.services.Proposals.CreateManifest(
+		context.Request.Context(),
+		context.Param("projectId"),
+		actor,
+		core.CreateManifestInput{
+			JobType:               core.BlueprintSelectionJobType,
+			BlueprintSelection:    &input,
+			ExpectedBlueprintETag: worksmiddleware.IfMatch(context),
+		},
+	)
+	if err != nil {
+		conditionalServiceError(s, context, "Blueprint", err)
 		return
 	}
 	context.Header("ETag", entityHashETag("input-manifest", manifest.ID, manifest.Hash))

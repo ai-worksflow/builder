@@ -28,15 +28,16 @@ import { usePlatformFlow } from '@/lib/platform/flow-provider'
 import type {
   CreateWorkflowDefinitionInputDto,
   WorkflowDefinitionRecordDto,
+  WorkflowCapabilitiesDto,
   WorkflowNodeRunDto,
 } from '@/lib/platform/flow-contract'
 import {
-  deliverySliceContext as resolveDeliverySliceContext,
   exactArtifactRefsEqual,
   parseEditableDefinition as parseWorkflowContract,
   resolveCandidateSelection as resolveLineageSelection,
   revisionCandidates as resolveLineageCandidates,
   starterWorkflowDefinition,
+  workflowRoleSatisfies,
 } from '@/lib/platform/workflow-ui-contract'
 import { cn } from '@/lib/utils'
 import { WorkflowGraphEditor } from './workflow-graph-editor'
@@ -68,6 +69,8 @@ export function FlowPanel() {
       setDefinitionJSON(JSON.stringify({
         name: source.name,
         schemaVersion: source.schemaVersion,
+        inputContract: source.inputContract ?? flow.capabilities?.inputContracts.at(0),
+        outputContract: source.outputContract ?? flow.capabilities?.outputContracts.at(0),
         nodes: source.nodes,
         edges: source.edges,
       }, null, 2))
@@ -79,7 +82,7 @@ export function FlowPanel() {
   async function saveDefinition() {
     setEditorError(null)
     try {
-      const parsed = parseDefinitionJSON(definitionJSON)
+      const parsed = parseDefinitionJSON(definitionJSON, flow.capabilities)
       if (editorMode === 'create') {
         const input: CreateWorkflowDefinitionInputDto = {
           key: draftKey.trim(),
@@ -320,6 +323,7 @@ export function FlowPanel() {
           definitionJSON={definitionJSON}
           error={editorError}
           busy={flow.busy}
+          capabilities={flow.capabilities}
           onKeyChange={setDraftKey}
           onTitleChange={setDraftTitle}
           onDescriptionChange={setDraftDescription}
@@ -335,7 +339,7 @@ export function FlowPanel() {
 function RunNodeCard({ node }: { node: WorkflowNodeRunDto }) {
   const flow = usePlatformFlow()
   const artifacts = useArtifactWorkspace()
-  const { can } = useCollaboration()
+  const { can, project } = useCollaboration()
   const [revisionKey, setRevisionKey] = useState('')
   const [reason, setReason] = useState('')
   const [selectionError, setSelectionError] = useState<string | null>(null)
@@ -348,16 +352,14 @@ function RunNodeCard({ node }: { node: WorkflowNodeRunDto }) {
   )
   const candidates = candidateResolution.candidates
   const selected = resolveLineageSelection(candidates, revisionKey)
-  const sliceContextResolution = selected && definitionNode?.humanEdit?.artifactType === 'blueprint'
-    ? resolveDeliverySliceContext(selected.ref, artifacts)
-    : { context: undefined, error: undefined }
   const staleSelection = Boolean(revisionKey && !selected)
   const selectionRequired = candidates.length > 1 && !selected
   const submitError = candidateResolution.error
     ?? (staleSelection ? 'The previously selected revision is no longer part of this node lineage.' : undefined)
     ?? (selectionRequired ? 'Multiple lineage revisions match. Select one exact revision.' : undefined)
-    ?? sliceContextResolution.error
   const active = ['waiting_input', 'waiting_review', 'failed'].includes(node.status)
+  const reviewRequiredRole = definitionNode?.reviewGate?.requiredRole ?? 'editor'
+  const canApproveReview = Boolean(project && workflowRoleSatisfies(project.role, reviewRequiredRole))
 
   function submitSelectedRevision() {
     setSelectionError(null)
@@ -372,15 +374,7 @@ function RunNodeCard({ node }: { node: WorkflowNodeRunDto }) {
       setSelectionError('The selected revision is no longer part of this node input lineage.')
       return
     }
-    if (definitionNode?.humanEdit?.artifactType === 'blueprint' && !sliceContextResolution.context) {
-      setSelectionError(sliceContextResolution.error ?? 'Blueprint delivery slices could not be resolved.')
-      return
-    }
-    void flow.submitNodeRevision(
-      node,
-      stillAllowed.ref,
-      sliceContextResolution.context,
-    )
+    void flow.submitNodeRevision(node, stillAllowed.ref)
   }
 
   return (
@@ -480,7 +474,7 @@ function RunNodeCard({ node }: { node: WorkflowNodeRunDto }) {
             className="h-7 w-full rounded border border-border bg-panel px-2 text-[9px] text-foreground outline-none placeholder:text-faint-foreground"
           />
           <div className="mt-1.5 grid grid-cols-2 gap-1">
-            <button type="button" onClick={() => void flow.resolveReview(node, 'approve', reason)} disabled={!can('publish') || flow.busy} className="inline-flex h-7 items-center justify-center gap-1 rounded bg-success/15 text-[9px] font-medium text-success disabled:opacity-35">
+            <button type="button" onClick={() => void flow.resolveReview(node, 'approve', reason)} disabled={!canApproveReview || flow.busy} className="inline-flex h-7 items-center justify-center gap-1 rounded bg-success/15 text-[9px] font-medium text-success disabled:opacity-35">
               <Check className="size-3" /> Approve
             </button>
             <button type="button" onClick={() => void flow.resolveReview(node, 'changes_requested', reason || 'Changes requested in Workbench')} disabled={!can('edit') || flow.busy} className="inline-flex h-7 items-center justify-center gap-1 rounded bg-warning/15 text-[9px] font-medium text-warning disabled:opacity-35">
@@ -488,7 +482,7 @@ function RunNodeCard({ node }: { node: WorkflowNodeRunDto }) {
             </button>
           </div>
           <p className="mt-1 text-[8px] leading-relaxed text-faint-foreground">
-            Approval succeeds only after the canonical artifact review is approved and blocking comments are resolved.
+            Required reviewer role: {reviewRequiredRole} or higher. Approval succeeds only after the canonical artifact review is approved and blocking comments are resolved.
           </p>
         </div>
       )}
@@ -505,6 +499,7 @@ function DefinitionEditor({
   definitionJSON,
   error,
   busy,
+  capabilities,
   onKeyChange,
   onTitleChange,
   onDescriptionChange,
@@ -520,6 +515,7 @@ function DefinitionEditor({
   definitionJSON: string
   error: string | null
   busy: boolean
+  capabilities?: WorkflowCapabilitiesDto | null
   onKeyChange: (value: string) => void
   onTitleChange: (value: string) => void
   onDescriptionChange: (value: string) => void
@@ -551,7 +547,7 @@ function DefinitionEditor({
           <div className="text-[10px] font-semibold uppercase tracking-wider text-faint-foreground">
             Definition graph and contracts
             <div className="mt-2 normal-case tracking-normal">
-              <WorkflowGraphEditor value={definitionJSON} onChange={onJSONChange} />
+              <WorkflowGraphEditor value={definitionJSON} onChange={onJSONChange} capabilities={capabilities} />
             </div>
           </div>
           {error && <p role="alert" className="mt-2 text-[10px] text-destructive">{error}</p>}
@@ -565,8 +561,8 @@ function DefinitionEditor({
   )
 }
 
-export function parseDefinitionJSON(value: string) {
-  const parsed = parseWorkflowContract(value, true)
+export function parseDefinitionJSON(value: string, capabilities?: WorkflowCapabilitiesDto | null) {
+  const parsed = parseWorkflowContract(value, true, capabilities)
   if (!parsed.definition) throw new Error(parsed.error ?? 'Definition JSON is invalid.')
   return parsed.definition
 }

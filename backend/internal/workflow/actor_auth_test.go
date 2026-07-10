@@ -43,7 +43,8 @@ type actorBuildManifestHook struct {
 func (h actorBuildManifestHook) Compile(_ context.Context, execution Execution) (BuildManifest, error) {
 	manifest := BuildManifest{
 		SchemaVersion: 1, ProjectID: execution.Run.ProjectID, RunID: execution.Run.ID,
-		SliceIDs: []string{"slice"}, BundleIDs: []string{"bundle"}, Sources: []domain.ArtifactRef{h.source},
+		ManifestGroupKey: uuid.NewString(),
+		SliceIDs:         []string{"slice"}, BundleIDs: []string{"bundle"}, Sources: []domain.ArtifactRef{h.source},
 		Constraints: json.RawMessage(`{}`), CreatedAt: time.Date(2026, 7, 10, 11, 0, 0, 0, time.UTC),
 	}
 	return manifest, manifest.Freeze()

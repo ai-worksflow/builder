@@ -117,7 +117,7 @@ func (s *ImplementationService) Create(ctx context.Context, projectID, actorID s
 	if err != nil {
 		return ImplementationProposal{}, err
 	}
-	bundle, err := s.workbench.GetBundle(ctx, input.BuildManifestID, actorID)
+	bundle, err := s.workbench.GetBundleForGeneration(ctx, input.BuildManifestID, actorID)
 	if err != nil {
 		return ImplementationProposal{}, err
 	}
@@ -173,6 +173,16 @@ func (s *ImplementationService) Create(ctx context.Context, projectID, actorID s
 		CreatedBy: actorUUID, CreatedAt: now,
 	}
 	err = s.database.WithContext(ctx).Transaction(func(transaction *gorm.DB) error {
+		if err := ensureManifestRootHasNoAppliedProposal(transaction, model); err != nil {
+			return err
+		}
+		manifest, err := lockFrozenManifestLeaf(transaction, model.BuildManifestID, model.ProjectID)
+		if err != nil {
+			return err
+		}
+		if err := ensureWorkflowManifestOrdinalReady(ctx, transaction, manifest); err != nil {
+			return err
+		}
 		if err := transaction.Create(&model).Error; err != nil {
 			return err
 		}
@@ -218,6 +228,16 @@ func (s *ImplementationService) Decide(ctx context.Context, proposalID, actorID 
 	if proposal.Version != input.Version || proposal.Status == "applied" || proposal.Status == "partially_applied" || proposal.Status == "stale" {
 		return ImplementationProposal{}, ErrConflict
 	}
+	// Lineage staleness is authoritative for every interaction with an otherwise
+	// mutable proposal. Persist it before validating the requested operation so a
+	// client cannot keep an obsolete ready/partially-decided proposal visible by
+	// submitting an already-decided or otherwise invalid operation.
+	if _, err := s.workbench.GetBundleForGeneration(ctx, proposal.BuildManifestID, actorID); err != nil {
+		if errors.Is(err, ErrBlockingGate) || errors.Is(err, ErrConflict) || errors.Is(err, ErrProposalStale) {
+			return ImplementationProposal{}, s.persistProposalStale(ctx, proposal, model, actorID)
+		}
+		return ImplementationProposal{}, err
+	}
 	if input.Decision != ImplementationAccepted && input.Decision != ImplementationRejected {
 		return ImplementationProposal{}, fmt.Errorf("%w: implementation decision", ErrInvalidInput)
 	}
@@ -237,6 +257,8 @@ func (s *ImplementationService) Decide(ctx context.Context, proposalID, actorID 
 	if input.Decision == ImplementationRejected && strings.TrimSpace(input.Reason) == "" {
 		return ImplementationProposal{}, fmt.Errorf("%w: rejection reason", ErrInvalidInput)
 	}
+	staleProposal := proposal
+	staleProposal.Operations = append([]FileOperation(nil), proposal.Operations...)
 	proposal.Operations[operationIndex].Decision = input.Decision
 	proposal.Operations[operationIndex].DecidedBy = actorID
 	proposal.Operations[operationIndex].Reason = strings.TrimSpace(input.Reason)
@@ -260,6 +282,25 @@ func (s *ImplementationService) Decide(ctx context.Context, proposalID, actorID 
 	actorUUID := uuid.MustParse(actorID)
 	now := s.now().UTC()
 	err = s.database.WithContext(ctx).Transaction(func(transaction *gorm.DB) error {
+		if err := ensureManifestRootHasNoAppliedProposal(transaction, model); err != nil {
+			if errors.Is(err, ErrBlockingGate) || errors.Is(err, ErrConflict) {
+				return ErrProposalStale
+			}
+			return err
+		}
+		manifest, err := lockFrozenManifestLeaf(transaction, model.BuildManifestID, model.ProjectID)
+		if err != nil {
+			if errors.Is(err, ErrBlockingGate) || errors.Is(err, ErrConflict) {
+				return ErrProposalStale
+			}
+			return err
+		}
+		if err := ensureWorkflowManifestOrdinalReady(ctx, transaction, manifest); err != nil {
+			if errors.Is(err, ErrBlockingGate) || errors.Is(err, ErrConflict) {
+				return ErrProposalStale
+			}
+			return err
+		}
 		result := transaction.Model(&storage.ImplementationProposalModel{}).
 			Where("id = ? AND version = ?", model.ID, input.Version).
 			Updates(map[string]any{
@@ -288,6 +329,9 @@ func (s *ImplementationService) Decide(ctx context.Context, proposalID, actorID 
 		})
 	})
 	if err != nil {
+		if errors.Is(err, ErrProposalStale) {
+			return ImplementationProposal{}, s.persistProposalStale(ctx, staleProposal, model, actorID)
+		}
 		return ImplementationProposal{}, err
 	}
 	abortPending = false
@@ -311,11 +355,19 @@ func (s *ImplementationService) Apply(ctx context.Context, proposalID, actorID s
 	if proposal.Version != input.Version || proposal.Status != "ready" {
 		return ArtifactRevision{}, ErrConflict
 	}
-	bundle, err := s.workbench.GetBundle(ctx, proposal.BuildManifestID, actorID)
+	staleProposal := proposal
+	staleProposal.Operations = append([]FileOperation(nil), proposal.Operations...)
+	bundle, err := s.workbench.GetBundleForGeneration(ctx, proposal.BuildManifestID, actorID)
 	if err != nil {
+		if errors.Is(err, ErrBlockingGate) || errors.Is(err, ErrConflict) || errors.Is(err, ErrProposalStale) {
+			return ArtifactRevision{}, s.persistProposalStale(ctx, staleProposal, proposalModel, actorID)
+		}
 		return ArtifactRevision{}, err
 	}
 	if bundle.ProjectID != proposalModel.ProjectID.String() {
+		return ArtifactRevision{}, ErrConflict
+	}
+	if !optionalVersionRefsEqual(bundle.CurrentWorkspaceRevision, proposal.BaseWorkspaceRevision) {
 		return ArtifactRevision{}, ErrConflict
 	}
 	accepted, err := acceptedImplementationOperations(proposal.Operations)
@@ -324,10 +376,16 @@ func (s *ImplementationService) Apply(ctx context.Context, proposalID, actorID s
 	}
 	workspace, workspaceArtifact, baseRevision, err := s.loadWorkspace(ctx, proposalModel.ProjectID, proposal.BaseWorkspaceRevision)
 	if err != nil {
+		if errors.Is(err, ErrProposalStale) {
+			return ArtifactRevision{}, s.persistProposalStale(ctx, staleProposal, proposalModel, actorID)
+		}
 		return ArtifactRevision{}, err
 	}
 	workspace, err = applyFileOperations(workspace, accepted)
 	if err != nil {
+		if errors.Is(err, ErrProposalStale) {
+			return ArtifactRevision{}, s.persistProposalStale(ctx, staleProposal, proposalModel, actorID)
+		}
 		return ArtifactRevision{}, err
 	}
 	now := s.now().UTC()
@@ -372,8 +430,24 @@ func (s *ImplementationService) Apply(ctx context.Context, proposalID, actorID s
 	}()
 	actorUUID := uuid.MustParse(actorID)
 	var revision storage.ArtifactRevisionModel
+	var frozenSources []ArtifactSource
 	err = s.database.WithContext(ctx).Transaction(func(transaction *gorm.DB) error {
 		if workspaceArtifact.ID == uuid.Nil {
+			var project storage.ProjectModel
+			if err := transaction.Clauses(clause.Locking{Strength: "UPDATE"}).
+				Select("id").Where("id = ?", proposalModel.ProjectID).Take(&project).Error; err != nil {
+				return err
+			}
+			var existing storage.ArtifactModel
+			err := transaction.Clauses(clause.Locking{Strength: "UPDATE"}).
+				Where("project_id = ? AND kind = 'workspace' AND lifecycle = 'active'", proposalModel.ProjectID).
+				Take(&existing).Error
+			if err == nil {
+				return ErrProposalStale
+			}
+			if !errors.Is(err, gorm.ErrRecordNotFound) {
+				return err
+			}
 			workspaceArtifact = storage.ArtifactModel{
 				ID: uuid.New(), ProjectID: proposalModel.ProjectID, Kind: "workspace", ArtifactKey: "WORKSPACE-MAIN",
 				Title: "Application Workspace", Lifecycle: "active", Version: 1,
@@ -391,6 +465,27 @@ func (s *ImplementationService) Apply(ctx context.Context, proposalID, actorID s
 				return ErrProposalStale
 			}
 			workspaceArtifact = locked
+		}
+		if err := ensureManifestRootHasNoAppliedProposal(transaction, proposalModel); err != nil {
+			if errors.Is(err, ErrBlockingGate) || errors.Is(err, ErrConflict) {
+				return ErrProposalStale
+			}
+			return err
+		}
+		manifest, err := lockFrozenManifestLeaf(
+			transaction, proposalModel.BuildManifestID, proposalModel.ProjectID,
+		)
+		if err != nil {
+			if errors.Is(err, ErrBlockingGate) || errors.Is(err, ErrConflict) {
+				return ErrProposalStale
+			}
+			return err
+		}
+		if err := ensureWorkflowManifestOrdinalReady(ctx, transaction, manifest); err != nil {
+			if errors.Is(err, ErrBlockingGate) || errors.Is(err, ErrConflict) {
+				return ErrProposalStale
+			}
+			return err
 		}
 		var latest uint64
 		if err := transaction.Model(&storage.ArtifactRevisionModel{}).Where("artifact_id = ?", workspaceArtifact.ID).
@@ -427,6 +522,13 @@ func (s *ImplementationService) Apply(ctx context.Context, proposalID, actorID s
 		if err := transaction.Create(&draft).Error; err != nil {
 			return err
 		}
+		frozenSources, err = PersistSystemRevisionLineage(
+			transaction, proposalModel.ProjectID, workspaceArtifact.ID, revision.ID, draft.ID,
+			actorUUID, now, implementationRevisionLineageSources(bundle),
+		)
+		if err != nil {
+			return err
+		}
 		if err := transaction.Model(&storage.ArtifactModel{}).Where("id = ?", workspaceArtifact.ID).
 			Updates(map[string]any{
 				"latest_revision_id": revision.ID, "latest_approved_revision_id": revision.ID,
@@ -447,23 +549,14 @@ func (s *ImplementationService) Apply(ctx context.Context, proposalID, actorID s
 		if result.RowsAffected != 1 {
 			return ErrConflict
 		}
-		if err := transaction.Model(&storage.ApplicationBuildManifestModel{}).
+		consumed := transaction.Model(&storage.ApplicationBuildManifestModel{}).
 			Where("id = ? AND status = 'frozen'", proposalModel.BuildManifestID).
-			Update("status", "consumed").Error; err != nil {
-			return err
+			Update("status", "consumed")
+		if consumed.Error != nil {
+			return consumed.Error
 		}
-		for _, source := range buildManifestSources(bundle) {
-			sourceArtifactID := uuid.MustParse(source.ArtifactID)
-			sourceRevisionID := uuid.MustParse(source.RevisionID)
-			link := storage.TraceLinkModel{
-				ID: uuid.New(), ProjectID: proposalModel.ProjectID, SourceArtifactID: sourceArtifactID,
-				SourceRevisionID: sourceRevisionID, TargetArtifactID: workspaceArtifact.ID,
-				TargetRevisionID: &revision.ID, Relation: "implemented_by", Metadata: json.RawMessage(`{}`),
-				CreatedBy: actorUUID, CreatedAt: now,
-			}
-			if err := transaction.Create(&link).Error; err != nil {
-				return err
-			}
+		if consumed.RowsAffected != 1 {
+			return ErrConflict
 		}
 		applyMetadata := map[string]any{"proposalId": proposalID, "appliedBaseRevisionId": nullableUUIDString(baseRevision.ID)}
 		if proposal.BaseWorkspaceRevision != nil {
@@ -479,6 +572,9 @@ func (s *ImplementationService) Apply(ctx context.Context, proposalID, actorID s
 		})
 	})
 	if err != nil {
+		if errors.Is(err, ErrProposalStale) {
+			return ArtifactRevision{}, s.persistProposalStale(ctx, staleProposal, proposalModel, actorID)
+		}
 		return ArtifactRevision{}, err
 	}
 	pending = nil
@@ -491,7 +587,67 @@ func (s *ImplementationService) Apply(ctx context.Context, proposalID, actorID s
 	if err := errors.Join(finalizeErrors...); err != nil {
 		return ArtifactRevision{}, fmt.Errorf("%w: %v", ErrContentNotReady, err)
 	}
-	return revisionFromModel(revision, workspacePayload, nil), nil
+	return revisionFromModel(revision, workspacePayload, frozenSources), nil
+}
+
+func ensureManifestRootHasNoAppliedProposal(
+	transaction *gorm.DB,
+	proposal storage.ImplementationProposalModel,
+) error {
+	var manifest storage.ApplicationBuildManifestModel
+	if err := transaction.Where("id = ? AND project_id = ?", proposal.BuildManifestID, proposal.ProjectID).
+		Take(&manifest).Error; err != nil {
+		return err
+	}
+	rootID := manifest.RootManifestID
+	if rootID == uuid.Nil {
+		rootID = manifest.ID
+	}
+	var root storage.ApplicationBuildManifestModel
+	if err := transaction.Clauses(clause.Locking{Strength: "UPDATE"}).
+		Where("id = ? AND project_id = ?", rootID, proposal.ProjectID).Take(&root).Error; err != nil {
+		return err
+	}
+	if root.RootManifestID != uuid.Nil && root.RootManifestID != root.ID {
+		return ErrConflict
+	}
+	var applied int64
+	if err := transaction.Table("implementation_proposals AS proposals").
+		Joins("JOIN application_build_manifests AS manifests ON manifests.id = proposals.build_manifest_id").
+		Where(
+			"proposals.project_id = ? AND manifests.root_manifest_id = ? AND proposals.id <> ? AND proposals.status IN ?",
+			proposal.ProjectID, rootID, proposal.ID, []string{"applied", "partially_applied"},
+		).Count(&applied).Error; err != nil {
+		return err
+	}
+	if applied != 0 {
+		return fmt.Errorf("%w: build manifest root already has an applied proposal", ErrBlockingGate)
+	}
+	return nil
+}
+
+func lockFrozenManifestLeaf(
+	transaction *gorm.DB,
+	manifestID uuid.UUID,
+	projectID uuid.UUID,
+) (storage.ApplicationBuildManifestModel, error) {
+	var manifest storage.ApplicationBuildManifestModel
+	if err := transaction.Clauses(clause.Locking{Strength: "UPDATE"}).
+		Where("id = ? AND project_id = ?", manifestID, projectID).Take(&manifest).Error; err != nil {
+		return manifest, err
+	}
+	if manifest.Status != "frozen" {
+		return manifest, fmt.Errorf("%w: build manifest is not frozen", ErrBlockingGate)
+	}
+	var childCount int64
+	if err := transaction.Model(&storage.ApplicationBuildManifestModel{}).
+		Where("derived_from_id = ?", manifest.ID).Count(&childCount).Error; err != nil {
+		return manifest, err
+	}
+	if childCount != 0 {
+		return manifest, fmt.Errorf("%w: build manifest is not the active lineage leaf", ErrBlockingGate)
+	}
+	return manifest, nil
 }
 
 func (s *ImplementationService) load(ctx context.Context, proposalID string) (ImplementationProposal, storage.ImplementationProposalModel, error) {
@@ -538,18 +694,18 @@ func (s *ImplementationService) loadWorkspace(ctx context.Context, projectID uui
 	if artifact.LatestApprovedRevisionID == nil {
 		return nil, artifact, storage.ArtifactRevisionModel{}, ErrProposalStale
 	}
-	if expected != nil {
-		expectedArtifactID, expectedRevisionID, err := (&TraceService{database: s.database}).validateRef(ctx, projectID, *expected)
-		if err != nil || expectedArtifactID != artifact.ID {
+	if expected == nil {
+		return nil, artifact, storage.ArtifactRevisionModel{}, ErrProposalStale
+	}
+	expectedArtifactID, expectedRevisionID, err := (&TraceService{database: s.database}).validateRef(ctx, projectID, *expected)
+	if err != nil {
+		if errors.Is(err, ErrNotFound) || errors.Is(err, ErrConflict) || errors.Is(err, ErrInvalidInput) {
 			return nil, artifact, storage.ArtifactRevisionModel{}, ErrProposalStale
 		}
-		descends, err := s.workspaceRevisionDescendsFrom(ctx, artifact.ID, *artifact.LatestApprovedRevisionID, expectedRevisionID)
-		if err != nil {
-			return nil, artifact, storage.ArtifactRevisionModel{}, err
-		}
-		if !descends {
-			return nil, artifact, storage.ArtifactRevisionModel{}, ErrProposalStale
-		}
+		return nil, artifact, storage.ArtifactRevisionModel{}, err
+	}
+	if expectedArtifactID != artifact.ID || *artifact.LatestApprovedRevisionID != expectedRevisionID {
+		return nil, artifact, storage.ArtifactRevisionModel{}, ErrProposalStale
 	}
 	var revision storage.ArtifactRevisionModel
 	if err := s.database.WithContext(ctx).Where("id = ? AND artifact_id = ?", *artifact.LatestApprovedRevisionID, artifact.ID).Take(&revision).Error; err != nil {
@@ -566,21 +722,109 @@ func (s *ImplementationService) loadWorkspace(ctx context.Context, projectID uui
 	return workspace, artifact, revision, nil
 }
 
-func (s *ImplementationService) workspaceRevisionDescendsFrom(ctx context.Context, artifactID, latestID, ancestorID uuid.UUID) (bool, error) {
-	var count int64
-	err := s.database.WithContext(ctx).Raw(`
-WITH RECURSIVE lineage(id, parent_revision_id) AS (
-  SELECT id, parent_revision_id
-  FROM artifact_revisions
-  WHERE id = ? AND artifact_id = ?
-  UNION
-  SELECT parent.id, parent.parent_revision_id
-  FROM artifact_revisions AS parent
-  JOIN lineage AS child ON child.parent_revision_id = parent.id
-  WHERE parent.artifact_id = ?
-)
-SELECT count(*) FROM lineage WHERE id = ?`, latestID, artifactID, artifactID, ancestorID).Scan(&count).Error
-	return count == 1, err
+func (s *ImplementationService) persistProposalStale(
+	ctx context.Context,
+	proposal ImplementationProposal,
+	model storage.ImplementationProposalModel,
+	actorID string,
+) error {
+	if proposal.Status == "stale" || model.Status == "stale" {
+		return ErrProposalStale
+	}
+	if model.Status == "applied" || model.Status == "partially_applied" {
+		return ErrConflict
+	}
+	proposal.Status = "stale"
+	proposal.Version = model.Version + 1
+	proposal.AppliedAt = nil
+	payload, err := json.Marshal(proposal)
+	if err != nil {
+		return fmt.Errorf("%w: encode stale proposal: %v", ErrProposalStale, err)
+	}
+	contentRef, err := s.contents.PutPending(
+		ctx, model.ProjectID.String(), "implementation_proposal", model.ID.String(), 1, payload,
+	)
+	if err != nil {
+		return fmt.Errorf("%w: store stale proposal: %v", ErrProposalStale, err)
+	}
+	abortPending := true
+	defer func() {
+		if abortPending {
+			_ = s.contents.Abort(context.Background(), contentRef.ID)
+		}
+	}()
+	actorUUID, err := uuid.Parse(actorID)
+	if err != nil {
+		return fmt.Errorf("%w: actor id", ErrInvalidInput)
+	}
+	alreadyStale := false
+	err = s.database.WithContext(ctx).Transaction(func(transaction *gorm.DB) error {
+		updated := transaction.Model(&storage.ImplementationProposalModel{}).
+			Where("id = ? AND version = ? AND status = ?", model.ID, model.Version, model.Status).
+			Updates(map[string]any{
+				"status": proposal.Status, "version": proposal.Version,
+				"content_ref": contentRef.ID, "content_hash": contentRef.ContentHash,
+			})
+		if updated.Error != nil {
+			return updated.Error
+		}
+		if updated.RowsAffected != 1 {
+			var current storage.ImplementationProposalModel
+			if err := transaction.Select("status").Where("id = ?", model.ID).Take(&current).Error; err != nil {
+				return err
+			}
+			if current.Status == "stale" {
+				alreadyStale = true
+				return nil
+			}
+			return ErrConflict
+		}
+		metadata := map[string]any{
+			"buildManifestId":         model.BuildManifestID.String(),
+			"baseWorkspaceRevisionId": nullableUUIDPointerString(model.BaseWorkspaceRevisionID),
+		}
+		if err := insertAudit(
+			transaction, model.ProjectID, actorUUID, "implementation.proposal_stale",
+			"implementation_proposal", model.ID.String(), metadata,
+		); err != nil {
+			return err
+		}
+		return enqueue(
+			transaction, "implementation_proposal", model.ID.String(), "implementation.proposal_stale",
+			"worksflow.implementation.proposal.stale", map[string]any{
+				"projectId": model.ProjectID.String(), "proposalId": model.ID.String(),
+				"buildManifestId": model.BuildManifestID.String(),
+			},
+		)
+	})
+	if err != nil {
+		return fmt.Errorf("%w: persist stale proposal: %v", ErrProposalStale, err)
+	}
+	if alreadyStale {
+		return ErrProposalStale
+	}
+	abortPending = false
+	if err := s.contents.Finalize(ctx, contentRef.ID); err != nil {
+		return fmt.Errorf("%w: finalize stale proposal: %v", ErrProposalStale, err)
+	}
+	return ErrProposalStale
+}
+
+func optionalVersionRefsEqual(left, right *VersionRef) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	return left.ArtifactID == right.ArtifactID &&
+		left.RevisionID == right.RevisionID &&
+		left.ContentHash == right.ContentHash &&
+		stringPointerEqual(left.AnchorID, right.AnchorID)
+}
+
+func nullableUUIDPointerString(value *uuid.UUID) any {
+	if value == nil || *value == uuid.Nil {
+		return nil
+	}
+	return value.String()
 }
 
 func nullableUUIDString(value uuid.UUID) any {
@@ -887,6 +1131,29 @@ func buildManifestSources(bundle WorkbenchBundle) []VersionRef {
 		}
 	}
 	return values
+}
+
+func implementationRevisionLineageSources(bundle WorkbenchBundle) []SystemRevisionSource {
+	result := []SystemRevisionSource{
+		{Ref: bundle.BlueprintRevision, Purpose: "blueprint", Required: true, Relation: "implemented_by"},
+		{Ref: bundle.PageSpecRevision, Purpose: "page_spec", Required: true, Relation: "implemented_by"},
+		{Ref: bundle.PrototypeRevision, Purpose: "prototype", Required: true, Relation: "implemented_by"},
+	}
+	for _, source := range bundle.RequirementRevisions {
+		result = append(result, SystemRevisionSource{Ref: source, Purpose: "requirement", Required: true, Relation: "implemented_by"})
+	}
+	for _, source := range bundle.ContractRevisions {
+		result = append(result, SystemRevisionSource{Ref: source, Purpose: "contract", Required: true, Relation: "implemented_by"})
+	}
+	for _, source := range bundle.DesignSystemRevisions {
+		result = append(result, SystemRevisionSource{Ref: source, Purpose: "design_system", Required: true, Relation: "implemented_by"})
+	}
+	if bundle.CurrentWorkspaceRevision != nil {
+		result = append(result, SystemRevisionSource{
+			Ref: *bundle.CurrentWorkspaceRevision, Purpose: "workspace_base", Required: true, Relation: "derives_from",
+		})
+	}
+	return result
 }
 
 func hashText(value string) string {

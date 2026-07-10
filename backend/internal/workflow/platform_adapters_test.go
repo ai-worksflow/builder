@@ -6,6 +6,8 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -16,6 +18,7 @@ import (
 	"github.com/worksflow/builder/backend/internal/domain"
 	"github.com/worksflow/builder/backend/internal/generation"
 	"github.com/worksflow/builder/backend/internal/storage/content"
+	storage "github.com/worksflow/builder/backend/internal/storage/postgres"
 )
 
 func platformHash(value string) string {
@@ -141,6 +144,35 @@ func TestCoreManifestFreezerCompilesExactRequirementsIntoBaseline(t *testing.T) 
 	}
 }
 
+func TestCoreManifestFreezerAllowsBaseOnlyProjectBriefRefinement(t *testing.T) {
+	t.Parallel()
+	execution, _ := adapterExecution(t)
+	brief := platformRef("entry-project-brief")
+	upstream, err := domain.NewInputManifest(
+		uuid.NewString(), execution.Run.ProjectID, "workflow_start", "", &brief,
+		[]domain.ManifestSource{{Ref: brief, Purpose: "project_brief"}}, json.RawMessage(`{}`),
+		"workflow-input/v1", execution.Run.StartedBy, time.Now().UTC(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	execution.Run.InputManifest = ptrManifest(upstream.Ref())
+	execution.Run.Scope = json.RawMessage(`{"conversationIntent":{"conversationId":"conversation","proposalId":"intent-proposal","workbenchInstruction":{"objective":"Refine the reviewed brief"}}}`)
+	execution.Definition.AITransform.JobType = "refine_project_brief"
+	execution.Definition.AITransform.OutputSchemaVersion = "project-brief-proposal/v1"
+	proposals := &fakeCoreProposals{manifest: upstream}
+	frozen, err := (CoreManifestFreezer{Proposals: proposals}).Freeze(context.Background(), execution)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if frozen.BaseRevision == nil || !frozen.BaseRevision.Equal(brief) || len(frozen.Sources) != 0 {
+		t.Fatalf("base-only Project Brief manifest was not frozen exactly: %+v", frozen)
+	}
+	if proposals.created.BaseRevision == nil || !sameCoreVersionRef(*proposals.created.BaseRevision, toCoreVersionRef(brief)) || len(proposals.created.Sources) != 0 || !strings.Contains(string(proposals.created.Constraints), "intent-proposal") {
+		t.Fatalf("reviewed conversation intent/base did not reach the immutable refine manifest: %+v", proposals.created)
+	}
+}
+
 type fakeArtifactGenerator struct {
 	manifest domain.InputManifest
 	called   bool
@@ -183,6 +215,7 @@ type fakeCoreTargetArtifacts struct {
 	artifacts     map[string]core.VersionedArtifact
 	byKind        map[string][]core.Artifact
 	createdInputs []core.CreateArtifactInput
+	revisionCalls int
 }
 
 func newFakeCoreTargetArtifacts(projectID string) *fakeCoreTargetArtifacts {
@@ -219,7 +252,7 @@ func (f *fakeCoreTargetArtifacts) Create(
 		Draft: &core.ArtifactDraft{
 			ID: draftID, ArtifactID: artifactID, Content: append(json.RawMessage(nil), input.Content...),
 			ContentHash: platformHash(string(input.Content)), SourceVersions: sources, ETag: `"draft:target:1"`,
-			CreatedBy: actorID, UpdatedBy: actorID,
+			Status: "draft", CreatedBy: actorID, UpdatedBy: actorID,
 		},
 	}
 	f.addExistingTarget(value)
@@ -249,10 +282,55 @@ func (f *fakeCoreTargetArtifacts) CreateRevision(
 	if value.Draft == nil {
 		return core.ArtifactRevision{}, core.ErrNotFound
 	}
-	return core.ArtifactRevision{
-		ID: uuid.NewString(), ArtifactID: artifactID, ContentHash: value.Draft.ContentHash,
-		Content: value.Draft.Content, SourceVersions: value.Draft.SourceVersions,
-	}, nil
+	f.revisionCalls++
+	revisionID := uuid.NewString()
+	var parent *string
+	if value.LatestRevision != nil {
+		id := value.LatestRevision.ID
+		parent = &id
+	}
+	revision := core.ArtifactRevision{
+		ID: revisionID, ArtifactID: artifactID, ParentRevisionID: parent,
+		RevisionNumber: uint64(f.revisionCalls), ContentHash: value.Draft.ContentHash,
+		Content:        append(json.RawMessage(nil), value.Draft.Content...),
+		SourceVersions: append([]core.ArtifactSource(nil), value.Draft.SourceVersions...),
+	}
+	value.LatestRevision = &revision
+	value.Artifact.LatestRevisionID = &revisionID
+	value.Draft.BaseRevisionID = &revisionID
+	f.artifacts[artifactID] = value
+	for index := range f.byKind[value.Artifact.Kind] {
+		if f.byKind[value.Artifact.Kind][index].ID == artifactID {
+			f.byKind[value.Artifact.Kind][index] = value.Artifact
+		}
+	}
+	return revision, nil
+}
+
+func (f *fakeCoreTargetArtifacts) applyAndCheckpoint(
+	t *testing.T,
+	artifactID string,
+	input core.CreateArtifactInput,
+) core.ArtifactRevision {
+	t.Helper()
+	value, exists := f.artifacts[artifactID]
+	if !exists || value.Draft == nil {
+		t.Fatalf("target %s has no draft to apply", artifactID)
+	}
+	sources := make([]core.ArtifactSource, len(input.SourceVersions))
+	for index, source := range input.SourceVersions {
+		sources[index] = core.ArtifactSource{VersionRef: source.Ref, Purpose: source.Purpose, Required: source.Required}
+	}
+	value.Draft.Content = append(json.RawMessage(nil), input.Content...)
+	value.Draft.ContentHash = platformHash(string(input.Content))
+	value.Draft.SourceVersions = sources
+	value.Draft.ETag = fmt.Sprintf(`"draft:target:%d"`, f.revisionCalls+1)
+	f.artifacts[artifactID] = value
+	revision, err := f.CreateRevision(context.Background(), artifactID, "", value.Draft.ETag, core.CreateRevisionInput{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return revision
 }
 
 func TestCoreTargetArtifactInitializerPinsGovernedLineage(t *testing.T) {
@@ -388,21 +466,317 @@ func TestCoreTargetArtifactInitializerFailsClosedOnMissingOrWrongLineage(t *test
 	}
 }
 
+func TestPrototypeTargetKeysDoNotCollideAfterSliceKeyNormalization(t *testing.T) {
+	t.Parallel()
+	execution, _ := adapterExecution(t)
+	artifacts := newFakeCoreTargetArtifacts(execution.Run.ProjectID)
+	pageSpecA := toCoreVersionRef(platformRef("page-spec-a"))
+	pageSpecB := toCoreVersionRef(platformRef("page-spec-b"))
+	artifacts.addSource(pageSpecA, "page_spec")
+	artifacts.addSource(pageSpecB, "page_spec")
+	initializer := CoreTargetArtifactInitializer{Artifacts: artifacts}
+
+	for index, item := range []struct {
+		sliceID string
+		key     string
+		page    core.VersionRef
+	}{
+		{sliceID: "slice-a", key: "page.orders", page: pageSpecA},
+		{sliceID: "slice-b", key: "page-orders", page: pageSpecB},
+	} {
+		current := execution
+		current.Node.Key = "prototype-ai:" + item.sliceID
+		current.Node.SliceID = item.sliceID
+		current.Run.Context.Nodes[current.Node.Key] = NodeMetadata{DefinitionNodeID: "prototype-ai", SliceID: item.sliceID}
+		current.Run.Context.Slices[item.sliceID] = SliceContext{ID: item.sliceID, Key: item.key, Title: item.key}
+		if _, err := initializer.EnsureTarget(context.Background(), current, "generate_prototype", []core.ManifestSourceInput{{Ref: item.page, Purpose: "delivery_slice_page_spec"}}); err != nil {
+			t.Fatalf("initialize colliding prototype %d: %v", index, err)
+		}
+	}
+	if len(artifacts.createdInputs) != 2 {
+		t.Fatalf("normalized slice-key collision reused a prototype target: %+v", artifacts.createdInputs)
+	}
+	first, second := artifacts.createdInputs[0].ArtifactKey, artifacts.createdInputs[1].ArtifactKey
+	if first == second || !strings.HasPrefix(first, "PROTOTYPE-PAGE-ORDERS-") || !strings.HasPrefix(second, "PROTOTYPE-PAGE-ORDERS-") {
+		t.Fatalf("prototype keys are not stable PageSpec-scoped identities: %q %q", first, second)
+	}
+}
+
+func desiredTargetInput(
+	t *testing.T,
+	initializer CoreTargetArtifactInitializer,
+	execution Execution,
+	jobType string,
+	sources []core.ManifestSourceInput,
+) core.CreateArtifactInput {
+	t.Helper()
+	kind, key, title, content, ok := targetArtifactTemplate(execution, jobType)
+	if !ok {
+		t.Fatalf("job %s has no target template", jobType)
+	}
+	input, err := initializer.targetArtifactInput(context.Background(), execution, kind, key, title, content, sources)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return input
+}
+
+func targetIterationRef(artifactID, label string) core.VersionRef {
+	ref := toCoreVersionRef(platformRef(label))
+	ref.ArtifactID = artifactID
+	return ref
+}
+
+func TestCoreTargetArtifactInitializerReusesStableArtifactsAcrossSourceRevisions(t *testing.T) {
+	t.Run("Baseline r1 to r2 reuses Blueprint", func(t *testing.T) {
+		execution, _ := adapterExecution(t)
+		artifacts := newFakeCoreTargetArtifacts(execution.Run.ProjectID)
+		baselineID := uuid.NewString()
+		baselineR1 := targetIterationRef(baselineID, "baseline-r1")
+		baselineR2 := targetIterationRef(baselineID, "baseline-r2")
+		artifacts.addSource(baselineR1, "requirement_baseline")
+		initializer := CoreTargetArtifactInitializer{Artifacts: artifacts}
+		firstSources := []core.ManifestSourceInput{{Ref: baselineR1, Purpose: "requirement_baseline"}}
+		first, err := initializer.EnsureTarget(context.Background(), execution, "decompose_pages", firstSources)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		artifacts.addSource(baselineR2, "requirement_baseline")
+		secondSources := []core.ManifestSourceInput{{Ref: baselineR2, Purpose: "requirement_baseline"}}
+		second, err := initializer.EnsureTarget(context.Background(), execution, "decompose_pages", secondSources)
+		if err != nil {
+			t.Fatalf("second Blueprint iteration rejected new Baseline revision: %v", err)
+		}
+		if first == nil || second == nil || !sameCoreVersionRef(*first, *second) || len(artifacts.createdInputs) != 1 || artifacts.revisionCalls != 1 {
+			t.Fatalf("Blueprint stable artifact/base was not reused: first=%+v second=%+v creates=%d revisions=%d", first, second, len(artifacts.createdInputs), artifacts.revisionCalls)
+		}
+		desired := desiredTargetInput(t, initializer, execution, "decompose_pages", secondSources)
+		next := artifacts.applyAndCheckpoint(t, first.ArtifactID, desired)
+		if next.ParentRevisionID == nil || *next.ParentRevisionID != first.RevisionID || len(next.SourceVersions) != 1 || next.SourceVersions[0].RevisionID != baselineR2.RevisionID {
+			t.Fatalf("second Blueprint checkpoint lost new Baseline lineage: %+v", next)
+		}
+		third, err := initializer.EnsureTarget(context.Background(), execution, "decompose_pages", secondSources)
+		if err != nil || third == nil || third.ArtifactID != first.ArtifactID || third.RevisionID != next.ID {
+			t.Fatalf("new Blueprint revision did not become the next immutable proposal base: base=%+v err=%v", third, err)
+		}
+	})
+
+	t.Run("Blueprint r1 to r2 on same page reuses PageSpec", func(t *testing.T) {
+		execution, _ := adapterExecution(t)
+		execution.Node.Key = "page-spec-ai:slice-orders"
+		execution.Node.SliceID = "slice-orders"
+		execution.Run.Context.Nodes[execution.Node.Key] = NodeMetadata{DefinitionNodeID: "page-spec-ai", SliceID: "slice-orders"}
+		execution.Run.Context.Slices["slice-orders"] = SliceContext{
+			ID: "slice-orders", Key: "page.orders", Title: "Orders",
+			Payload: json.RawMessage(`{"route":"/orders","userGoal":"Manage orders"}`),
+		}
+		artifacts := newFakeCoreTargetArtifacts(execution.Run.ProjectID)
+		blueprintID := uuid.NewString()
+		blueprintR1 := targetIterationRef(blueprintID, "blueprint-r1")
+		blueprintR2 := targetIterationRef(blueprintID, "blueprint-r2")
+		pageAnchor := "page-orders"
+		blueprintR1.AnchorID, blueprintR2.AnchorID = &pageAnchor, &pageAnchor
+		artifacts.addSource(blueprintR1, "blueprint")
+		initializer := CoreTargetArtifactInitializer{Artifacts: artifacts}
+		firstSources := []core.ManifestSourceInput{{Ref: blueprintR1, Purpose: "delivery_slice_blueprint"}}
+		first, err := initializer.EnsureTarget(context.Background(), execution, "generate_page_spec", firstSources)
+		if err != nil {
+			t.Fatal(err)
+		}
+		firstKey := artifacts.createdInputs[0].ArtifactKey
+		if !strings.HasSuffix(firstKey, stableArtifactIdentitySuffix(blueprintID)+"-"+stableArtifactIdentitySuffix(pageAnchor)) {
+			t.Fatalf("PageSpec key does not include stable Blueprint/page identity: %s", firstKey)
+		}
+
+		artifacts.addSource(blueprintR2, "blueprint")
+		secondSources := []core.ManifestSourceInput{{Ref: blueprintR2, Purpose: "delivery_slice_blueprint"}}
+		second, err := initializer.EnsureTarget(context.Background(), execution, "generate_page_spec", secondSources)
+		if err != nil {
+			t.Fatalf("second PageSpec iteration rejected the same Blueprint page at r2: %v", err)
+		}
+		if first == nil || second == nil || !sameCoreVersionRef(*first, *second) || len(artifacts.createdInputs) != 1 {
+			t.Fatalf("PageSpec logical artifact was not reused: first=%+v second=%+v creates=%d", first, second, len(artifacts.createdInputs))
+		}
+		desired := desiredTargetInput(t, initializer, execution, "generate_page_spec", secondSources)
+		if desired.ArtifactKey != firstKey {
+			t.Fatalf("PageSpec key changed across Blueprint revisions: %s != %s", desired.ArtifactKey, firstKey)
+		}
+		next := artifacts.applyAndCheckpoint(t, first.ArtifactID, desired)
+		if next.ParentRevisionID == nil || *next.ParentRevisionID != first.RevisionID || next.SourceVersions[0].RevisionID != blueprintR2.RevisionID {
+			t.Fatalf("second PageSpec checkpoint lost Blueprint r2 lineage: %+v", next)
+		}
+	})
+
+	t.Run("PageSpec r1 to r2 reuses Prototype", func(t *testing.T) {
+		execution, _ := adapterExecution(t)
+		execution.Node.Key = "prototype-ai:slice-orders"
+		execution.Node.SliceID = "slice-orders"
+		execution.Run.Context.Nodes[execution.Node.Key] = NodeMetadata{DefinitionNodeID: "prototype-ai", SliceID: "slice-orders"}
+		execution.Run.Context.Slices["slice-orders"] = SliceContext{ID: "slice-orders", Key: "page.orders", Title: "Orders"}
+		artifacts := newFakeCoreTargetArtifacts(execution.Run.ProjectID)
+		pageSpecID := uuid.NewString()
+		pageSpecR1 := targetIterationRef(pageSpecID, "page-spec-r1")
+		pageSpecR2 := targetIterationRef(pageSpecID, "page-spec-r2")
+		artifacts.addSource(pageSpecR1, "page_spec")
+		initializer := CoreTargetArtifactInitializer{Artifacts: artifacts}
+		firstSources := []core.ManifestSourceInput{{Ref: pageSpecR1, Purpose: "delivery_slice_page_spec"}}
+		first, err := initializer.EnsureTarget(context.Background(), execution, "generate_prototype", firstSources)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		artifacts.addSource(pageSpecR2, "page_spec")
+		secondSources := []core.ManifestSourceInput{{Ref: pageSpecR2, Purpose: "delivery_slice_page_spec"}}
+		second, err := initializer.EnsureTarget(context.Background(), execution, "generate_prototype", secondSources)
+		if err != nil {
+			t.Fatalf("second Prototype iteration rejected PageSpec r2: %v", err)
+		}
+		if first == nil || second == nil || !sameCoreVersionRef(*first, *second) || len(artifacts.createdInputs) != 1 {
+			t.Fatalf("Prototype logical artifact was not reused: first=%+v second=%+v creates=%d", first, second, len(artifacts.createdInputs))
+		}
+		desired := desiredTargetInput(t, initializer, execution, "generate_prototype", secondSources)
+		next := artifacts.applyAndCheckpoint(t, first.ArtifactID, desired)
+		var content struct {
+			PageSpecRevision core.VersionRef `json:"pageSpecRevision"`
+		}
+		if next.ParentRevisionID == nil || *next.ParentRevisionID != first.RevisionID || json.Unmarshal(next.Content, &content) != nil ||
+			!sameCoreVersionRef(content.PageSpecRevision, pageSpecR2) || next.SourceVersions[0].RevisionID != pageSpecR2.RevisionID {
+			t.Fatalf("second Prototype checkpoint lost PageSpec r2 lineage: %+v content=%s", next, next.Content)
+		}
+	})
+}
+
+func TestCoreTargetArtifactInitializerRejectsDirtyReusableDraft(t *testing.T) {
+	t.Parallel()
+	for _, testCase := range []struct {
+		name   string
+		mutate func(*core.VersionedArtifact, core.VersionRef)
+	}{
+		{
+			name: "content hash mismatch",
+			mutate: func(value *core.VersionedArtifact, _ core.VersionRef) {
+				value.Draft.Content = json.RawMessage(`{"nodes":[{"id":"uncheckpointed"}]}`)
+				value.Draft.ContentHash = platformHash("uncheckpointed-draft")
+			},
+		},
+		{
+			name: "source-only dirty",
+			mutate: func(value *core.VersionedArtifact, next core.VersionRef) {
+				value.Draft.SourceVersions[0].VersionRef = next
+			},
+		},
+		{
+			name: "schema-only dirty",
+			mutate: func(value *core.VersionedArtifact, _ core.VersionRef) {
+				value.Draft.SchemaVersion++
+			},
+		},
+		{
+			name: "base mismatch",
+			mutate: func(value *core.VersionedArtifact, _ core.VersionRef) {
+				mismatch := uuid.NewString()
+				value.Draft.BaseRevisionID = &mismatch
+			},
+		},
+		{
+			name: "status mismatch",
+			mutate: func(value *core.VersionedArtifact, _ core.VersionRef) {
+				value.Draft.Status = "frozen"
+			},
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			execution, _ := adapterExecution(t)
+			artifacts := newFakeCoreTargetArtifacts(execution.Run.ProjectID)
+			baselineID := uuid.NewString()
+			baselineR1 := targetIterationRef(baselineID, "dirty-baseline-r1")
+			baselineR2 := targetIterationRef(baselineID, "dirty-baseline-r2")
+			artifacts.addSource(baselineR1, "requirement_baseline")
+			initializer := CoreTargetArtifactInitializer{Artifacts: artifacts}
+			first, err := initializer.EnsureTarget(context.Background(), execution, "decompose_pages", []core.ManifestSourceInput{{Ref: baselineR1}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			value := artifacts.artifacts[first.ArtifactID]
+			testCase.mutate(&value, baselineR2)
+			artifacts.artifacts[first.ArtifactID] = value
+			artifacts.addSource(baselineR2, "requirement_baseline")
+			if _, err := initializer.EnsureTarget(context.Background(), execution, "decompose_pages", []core.ManifestSourceInput{{Ref: baselineR2}}); err == nil || !strings.Contains(err.Error(), "uncheckpointed draft") {
+				t.Fatalf("dirty draft did not block target reuse: %v", err)
+			}
+			if len(artifacts.createdInputs) != 1 || artifacts.revisionCalls != 1 {
+				t.Fatalf("dirty draft failure mutated target state: creates=%d revisions=%d", len(artifacts.createdInputs), artifacts.revisionCalls)
+			}
+		})
+	}
+}
+
+func TestReusableTargetLineageRejectsLogicalIdentityDrift(t *testing.T) {
+	t.Parallel()
+	blueprintID := uuid.NewString()
+	pageAnchor, otherAnchor := "page-orders", "page-other"
+	blueprintR1 := targetIterationRef(blueprintID, "logical-blueprint-r1")
+	blueprintR2 := targetIterationRef(blueprintID, "logical-blueprint-r2")
+	blueprintR1.AnchorID, blueprintR2.AnchorID = &pageAnchor, &pageAnchor
+	desiredPageSpec := core.CreateArtifactInput{
+		Kind: "page_spec", ArtifactKey: "PAGE-SPEC-ORDERS",
+		Content:        json.RawMessage(`{"blueprintPageNodeId":"page-orders"}`),
+		SourceVersions: []core.ArtifactSourceInput{{Ref: blueprintR2, Purpose: "blueprint", Required: true}},
+	}
+	driftedBlueprint := blueprintR1
+	driftedBlueprint.AnchorID = &otherAnchor
+	if err := validateReusableTargetLineage("page_spec", json.RawMessage(`{"blueprintPageNodeId":"page-orders"}`), []core.ArtifactSource{{
+		VersionRef: driftedBlueprint, Purpose: "blueprint", Required: true,
+	}}, desiredPageSpec); err == nil {
+		t.Fatal("PageSpec logical identity accepted a different Blueprint page anchor")
+	}
+
+	pageSpecA, pageSpecB := uuid.NewString(), uuid.NewString()
+	pageSpecR1 := targetIterationRef(pageSpecA, "logical-page-spec-r1")
+	pageSpecR2 := targetIterationRef(pageSpecA, "logical-page-spec-r2")
+	otherPageSpec := targetIterationRef(pageSpecB, "logical-page-spec-other")
+	desiredPrototypeContent, _ := domain.CanonicalJSON(map[string]any{"pageSpecRevision": pageSpecR2, "exploratory": false})
+	actualPrototypeContent, _ := domain.CanonicalJSON(map[string]any{"pageSpecRevision": otherPageSpec, "exploratory": false})
+	desiredPrototype := core.CreateArtifactInput{
+		Kind: "prototype", ArtifactKey: "PROTOTYPE-ORDERS", Content: desiredPrototypeContent,
+		SourceVersions: []core.ArtifactSourceInput{{Ref: pageSpecR2, Purpose: "page_spec", Required: true}},
+	}
+	if err := validateReusableTargetLineage("prototype", actualPrototypeContent, []core.ArtifactSource{{
+		VersionRef: pageSpecR1, Purpose: "page_spec", Required: true,
+	}}, desiredPrototype); err == nil {
+		t.Fatal("Prototype logical identity accepted content for another PageSpec artifact")
+	}
+}
+
 type fakeWorkbench struct {
 	calls      int
 	prototypes []core.VersionRef
+	inputs     []core.CreateWorkbenchBundleInput
+	states     map[string]core.WorkbenchLineageState
 }
 
 func (f *fakeWorkbench) CreateBundle(_ context.Context, projectID, actorID string, input core.CreateWorkbenchBundleInput) (core.WorkbenchBundle, error) {
 	f.calls++
 	prototype := input.PrototypeRevision
 	f.prototypes = append(f.prototypes, prototype)
+	f.inputs = append(f.inputs, input)
 	return core.WorkbenchBundle{ID: uuid.NewString(), ProjectID: projectID, PrototypeRevision: prototype, PageSpecRevision: toCoreVersionRef(platformRef("page")), BlueprintRevision: toCoreVersionRef(platformRef("blueprint")), RequirementRevisions: []core.VersionRef{toCoreVersionRef(platformRef("requirements"))}, CreatedBy: actorID, CreatedAt: time.Now()}, nil
+}
+
+func (f *fakeWorkbench) GetLineageState(_ context.Context, rootID, _ string) (core.WorkbenchLineageState, error) {
+	if state, exists := f.states[rootID]; exists {
+		return state, nil
+	}
+	return core.WorkbenchLineageState{
+		RootBundleID: rootID,
+		ActiveBundle: core.WorkbenchBundle{ID: rootID, RootBuildManifestID: rootID},
+	}, nil
 }
 
 func TestWorkbenchHookCreatesPerSliceBundlesAndFrozenBuildManifest(t *testing.T) {
 	execution, _ := adapterExecution(t)
-	execution.Definition = domain.NodeDefinition{ID: "compile", Name: "Compile", Type: domain.NodeManifestCompiler, InputSchema: engineSchema(), OutputSchema: engineSchema(), ManifestCompiler: &domain.ManifestCompilerNodeConfig{ManifestKind: "application_build", SchemaVersion: 1, Hook: "v1"}}
+	execution.Definition = domain.NodeDefinition{ID: "compile", Name: "Compile", Type: domain.NodeManifestCompiler, InputSchema: engineSchema(), OutputSchema: engineSchema(), ManifestCompiler: &domain.ManifestCompilerNodeConfig{ManifestKind: "application_build", SchemaVersion: 1, Hook: "application-build-manifest/v1"}}
 	prototypeA, prototypeB := platformRef("prototype-a"), platformRef("prototype-b")
 	sliceA := SliceContext{ID: uuid.NewString(), Key: "a", Title: "A", FanOutNodeID: "pages", Blueprint: platformRef("bp-a"), Prototype: &prototypeA}
 	sliceB := SliceContext{ID: uuid.NewString(), Key: "b", Title: "B", FanOutNodeID: "pages", Blueprint: platformRef("bp-b"), Prototype: &prototypeB}
@@ -422,6 +796,139 @@ func TestWorkbenchHookCreatesPerSliceBundlesAndFrozenBuildManifest(t *testing.T)
 	if service.calls != 2 || len(manifest.BundleIDs) != 2 || len(manifest.Sources) < 6 {
 		t.Fatalf("unexpected build manifest: %+v", manifest)
 	}
+	for ordinal, input := range service.inputs {
+		if input.ManifestGroupKey == nil || *input.ManifestGroupKey != execution.Node.ID || input.RootOrdinal == nil || *input.RootOrdinal != ordinal {
+			t.Fatalf("bundle %d lost stable compiler group/root order: %#v", ordinal, input)
+		}
+	}
+	if manifest.ManifestGroupKey != execution.Node.ID {
+		t.Fatalf("frozen BuildManifest group = %q, want node run %q", manifest.ManifestGroupKey, execution.Node.ID)
+	}
+}
+
+func TestWorkbenchHookKeepsSelectionGroupsIsolatedAndFailsClosedBeforeWrites(t *testing.T) {
+	execution, _ := adapterExecution(t)
+	execution.Definition = domain.NodeDefinition{ID: "compile", Name: "Compile", Type: domain.NodeManifestCompiler, InputSchema: engineSchema(), OutputSchema: engineSchema(), ManifestCompiler: &domain.ManifestCompilerNodeConfig{ManifestKind: "application_build", SchemaVersion: 1, Hook: "application-build-manifest/v1"}}
+	blueprint := platformRef("selection-compiler-blueprint")
+	pageSpecA, prototypeA := platformRef("selection-compiler-page-a"), platformRef("selection-compiler-prototype-a")
+	pageSpecB, prototypeB := platformRef("selection-compiler-page-b"), platformRef("selection-compiler-prototype-b")
+	manifestA := workflowSelectionManifest(t, execution.Run.ProjectID, execution.Run.StartedBy, blueprint, "page-a", pageSpecA, prototypeA)
+	manifestB := workflowSelectionManifest(t, execution.Run.ProjectID, execution.Run.StartedBy, blueprint, "page-b", pageSpecB, prototypeB)
+	service := &fakeWorkbench{}
+
+	compile := func(manifest domain.InputManifest, nodeID string, pageSpec, prototype domain.ArtifactRef) BuildManifest {
+		anchored := blueprint
+		anchored.AnchorID = nodeID
+		slice := SliceContext{ID: uuid.NewString(), Key: nodeID, Title: nodeID, FanOutNodeID: "pages", Blueprint: anchored, PageSpec: &pageSpec, Prototype: &prototype}
+		current := execution
+		current.Run.InputManifest = ptrManifest(manifest.Ref())
+		current.Run.Context.Slices = map[string]SliceContext{slice.ID: slice}
+		current.Node.ID = uuid.NewString()
+		current.Inputs = adapterInputs(t, current, json.RawMessage(`{}`), slice)
+		compiled, err := (CoreWorkbenchManifestHook{Workbench: service, Proposals: &fakeCoreProposals{manifest: manifest}}).Compile(context.Background(), current)
+		if err != nil {
+			t.Fatalf("compile %s selection: %v", nodeID, err)
+		}
+		return compiled
+	}
+
+	compiledA := compile(manifestA, "page-a", pageSpecA, prototypeA)
+	compiledB := compile(manifestB, "page-b", pageSpecB, prototypeB)
+	if compiledA.ManifestGroupKey == compiledB.ManifestGroupKey || len(compiledA.SliceIDs) != 1 || len(compiledB.SliceIDs) != 1 || service.calls != 2 {
+		t.Fatalf("selection compiler groups collapsed: A=%#v B=%#v calls=%d", compiledA, compiledB, service.calls)
+	}
+	if service.prototypes[0].RevisionID != prototypeA.RevisionID || service.prototypes[1].RevisionID != prototypeB.RevisionID {
+		t.Fatalf("selection compiler groups crossed prototype inputs: %#v", service.prototypes)
+	}
+
+	missingPrototype := workflowSelectionManifestMissingPrototype(t, execution.Run.ProjectID, execution.Run.StartedBy, blueprint, "page-a", pageSpecA)
+	anchored := blueprint
+	anchored.AnchorID = "page-a"
+	badSlice := SliceContext{ID: uuid.NewString(), Key: "page-a", Title: "Page A", FanOutNodeID: "pages", Blueprint: anchored, PageSpec: &pageSpecA}
+	execution.Run.InputManifest = ptrManifest(missingPrototype.Ref())
+	execution.Run.Context.Slices = map[string]SliceContext{badSlice.ID: badSlice}
+	execution.Node.ID = uuid.NewString()
+	execution.Inputs = adapterInputs(t, execution, json.RawMessage(`{}`), badSlice)
+	if _, err := (CoreWorkbenchManifestHook{Workbench: service, Proposals: &fakeCoreProposals{manifest: missingPrototype}}).Compile(context.Background(), execution); err == nil {
+		t.Fatal("selection without an exact approved Prototype reached Workbench bundle creation")
+	}
+	if service.calls != 2 {
+		t.Fatalf("fail-closed selection wrote a Workbench bundle; calls=%d", service.calls)
+	}
+}
+
+func TestValidateBlueprintSelectionSlicesFailsClosed(t *testing.T) {
+	blueprint, pageSpec, prototype := platformRef("selection-scope-blueprint"), platformRef("selection-scope-page-spec"), platformRef("selection-scope-prototype")
+	anchored := blueprint
+	anchored.AnchorID = "page-a"
+	validScope := workflowBlueprintSelectionScope{
+		SchemaVersion: 1, SelectionID: platformHash("selection-scope"), Blueprint: blueprint,
+		NodeIDs:      []string{"page-a"},
+		PageBindings: []workflowBlueprintSelectionPageBinding{{NodeID: "page-a", PageSpec: &pageSpec, Prototype: &prototype}},
+	}
+	validSlice := SliceContext{ID: uuid.NewString(), Key: "page-a", Blueprint: anchored, PageSpec: &pageSpec, Prototype: &prototype}
+	if err := validateBlueprintSelectionSlices(validScope, []SliceContext{validSlice}); err != nil {
+		t.Fatalf("valid selection slices failed: %v", err)
+	}
+
+	missingPageSpec := validScope
+	missingPageSpec.PageBindings = []workflowBlueprintSelectionPageBinding{{NodeID: "page-a", Prototype: &prototype}}
+	missingPrototype := validScope
+	missingPrototype.PageBindings = []workflowBlueprintSelectionPageBinding{{NodeID: "page-a", PageSpec: &pageSpec}}
+	crossPrototype := validSlice
+	otherPrototype := platformRef("other-selection-prototype")
+	crossPrototype.Prototype = &otherPrototype
+	extraSlice := validSlice
+	extraSlice.ID = uuid.NewString()
+	extraSlice.Key = "page-outside"
+	extraSlice.Blueprint.AnchorID = "page-outside"
+
+	for _, testCase := range []struct {
+		name   string
+		scope  workflowBlueprintSelectionScope
+		slices []SliceContext
+	}{
+		{name: "missing PageSpec", scope: missingPageSpec, slices: []SliceContext{validSlice}},
+		{name: "missing Prototype", scope: missingPrototype, slices: []SliceContext{validSlice}},
+		{name: "extra slice", scope: validScope, slices: []SliceContext{validSlice, extraSlice}},
+		{name: "cross selection Prototype", scope: validScope, slices: []SliceContext{crossPrototype}},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			if err := validateBlueprintSelectionSlices(testCase.scope, testCase.slices); err == nil {
+				t.Fatal("invalid selection slices reached Workbench compilation")
+			}
+		})
+	}
+}
+
+func workflowSelectionManifestMissingPrototype(
+	t *testing.T,
+	projectID, actorID string,
+	blueprint domain.ArtifactRef,
+	nodeID string,
+	pageSpec domain.ArtifactRef,
+) domain.InputManifest {
+	t.Helper()
+	selectionID := platformHash(blueprint.RevisionID + "\x00missing\x00" + nodeID)
+	anchored := blueprint
+	anchored.AnchorID = nodeID
+	scope := workflowBlueprintSelectionScope{
+		SchemaVersion: 1, SelectionID: selectionID, Blueprint: blueprint, NodeIDs: []string{nodeID},
+		PageBindings: []workflowBlueprintSelectionPageBinding{{NodeID: nodeID, PageSpec: &pageSpec}},
+	}
+	constraints, err := domain.CanonicalJSON(map[string]any{"blueprintSelection": scope})
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := domain.NewInputManifest(
+		uuid.NewString(), projectID, core.BlueprintSelectionJobType, selectionID, nil,
+		[]domain.ManifestSource{{Ref: blueprint, Purpose: "blueprint_selection_root"}, {Ref: anchored, Purpose: "blueprint_selection_node"}, {Ref: pageSpec, Purpose: "selected_page_spec"}},
+		constraints, "blueprint-selection/v1", actorID, time.Now().UTC(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return manifest
 }
 
 type fakeImplementationGenerator struct {
@@ -436,31 +943,176 @@ func (f *fakeImplementationGenerator) GenerateImplementation(_ context.Context, 
 }
 func TestWorkbenchRunnerOnlyReturnsImplementationProposalRefs(t *testing.T) {
 	execution, _ := adapterExecution(t)
-	manifest := BuildManifest{SchemaVersion: 1, ProjectID: execution.Run.ProjectID, RunID: execution.Run.ID, SliceIDs: []string{uuid.NewString(), uuid.NewString()}, BundleIDs: []string{uuid.NewString(), uuid.NewString()}, Sources: []domain.ArtifactRef{platformRef("source")}, CreatedAt: time.Now()}
+	manifest := BuildManifest{SchemaVersion: 1, ProjectID: execution.Run.ProjectID, RunID: execution.Run.ID, ManifestGroupKey: uuid.NewString(), SliceIDs: []string{uuid.NewString(), uuid.NewString()}, BundleIDs: []string{uuid.NewString(), uuid.NewString()}, Sources: []domain.ArtifactRef{platformRef("source")}, CreatedAt: time.Now()}
 	if err := manifest.Freeze(); err != nil {
 		t.Fatal(err)
 	}
 	execution.Inputs = adapterInputs(t, execution, mustJSON(manifest))
 	generator := &fakeImplementationGenerator{}
-	result, err := (GenerationWorkbenchRunner{Generation: generator, DefaultModel: "model"}).Run(context.Background(), execution)
+	result, err := (GenerationWorkbenchRunner{Generation: generator, Workbench: &fakeWorkbench{}, DefaultModel: "model"}).Run(context.Background(), execution)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if generator.calls != 2 || result.Disposition != ResultWaitInput || len(result.Output) == 0 {
+	if generator.calls != 1 || result.Disposition != ResultWaitInput || len(result.Output) == 0 {
 		t.Fatalf("unexpected workbench result: %+v", result)
+	}
+	var output struct {
+		ImplementationProposals []struct {
+			BundleID string `json:"bundleId"`
+		} `json:"implementationProposals"`
+		PendingBundleIDs []string `json:"pendingBundleIds"`
+	}
+	if err := json.Unmarshal(result.Output, &output); err != nil {
+		t.Fatal(err)
+	}
+	if len(output.ImplementationProposals) != 1 || output.ImplementationProposals[0].BundleID != manifest.BundleIDs[0] ||
+		len(output.PendingBundleIDs) != 1 || output.PendingBundleIDs[0] != manifest.BundleIDs[1] {
+		t.Fatalf("runner did not hold later bundles for exact rebase: %+v", output)
+	}
+}
+
+func TestWorkbenchRunnerWaitsForRebaseWithoutCallingAI(t *testing.T) {
+	t.Parallel()
+
+	execution, _ := adapterExecution(t)
+	rootID, laterRootID := uuid.NewString(), uuid.NewString()
+	manifest := BuildManifest{
+		SchemaVersion: 1, ProjectID: execution.Run.ProjectID, RunID: execution.Run.ID,
+		ManifestGroupKey: uuid.NewString(), SliceIDs: []string{uuid.NewString(), uuid.NewString()},
+		BundleIDs: []string{rootID, laterRootID}, Sources: []domain.ArtifactRef{platformRef("source")},
+		CreatedAt: time.Now(),
+	}
+	if err := manifest.Freeze(); err != nil {
+		t.Fatal(err)
+	}
+	execution.Inputs = adapterInputs(t, execution, mustJSON(manifest))
+	oldWorkspace := toCoreVersionRef(platformRef("workspace-old"))
+	currentWorkspace := toCoreVersionRef(platformRef("workspace-current"))
+	workbench := &fakeWorkbench{states: map[string]core.WorkbenchLineageState{
+		rootID: {
+			RootBundleID: rootID,
+			ActiveBundle: core.WorkbenchBundle{
+				ID: rootID, RootBuildManifestID: rootID, CurrentWorkspaceRevision: &oldWorkspace,
+			},
+			CurrentWorkspaceRevision: &currentWorkspace,
+		},
+	}}
+	generator := &fakeImplementationGenerator{}
+	result, err := (GenerationWorkbenchRunner{
+		Generation: generator, Workbench: workbench, DefaultModel: "model",
+	}).Run(context.Background(), execution)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if generator.calls != 0 || result.Disposition != ResultWaitInput {
+		t.Fatalf("runner called AI before rebase: calls=%d result=%+v", generator.calls, result)
+	}
+	var output struct {
+		ImplementationProposals []map[string]any `json:"implementationProposals"`
+		PendingBundleIDs        []string         `json:"pendingBundleIds"`
+	}
+	if err := json.Unmarshal(result.Output, &output); err != nil {
+		t.Fatal(err)
+	}
+	if len(output.ImplementationProposals) != 0 || !reflect.DeepEqual(output.PendingBundleIDs, manifest.BundleIDs) {
+		t.Fatalf("rebase wait payload = %#v", output)
+	}
+}
+
+func TestWorkbenchRunnerRecoversDerivedActiveProposalWithoutCallingAI(t *testing.T) {
+	t.Parallel()
+
+	execution, _ := adapterExecution(t)
+	rootID, derivedID := uuid.NewString(), uuid.NewString()
+	manifest := BuildManifest{
+		SchemaVersion: 1, ProjectID: execution.Run.ProjectID, RunID: execution.Run.ID,
+		ManifestGroupKey: uuid.NewString(), SliceIDs: []string{uuid.NewString()}, BundleIDs: []string{rootID},
+		Sources: []domain.ArtifactRef{platformRef("source")}, CreatedAt: time.Now(),
+	}
+	if err := manifest.Freeze(); err != nil {
+		t.Fatal(err)
+	}
+	execution.Inputs = adapterInputs(t, execution, mustJSON(manifest))
+	workspace := toCoreVersionRef(platformRef("workspace"))
+	proposal := core.ImplementationProposal{
+		ID: uuid.NewString(), BuildManifestID: derivedID, Status: "ready", PayloadHash: platformHash("proposal"),
+	}
+	workbench := &fakeWorkbench{states: map[string]core.WorkbenchLineageState{
+		rootID: {
+			RootBundleID: rootID,
+			ActiveBundle: core.WorkbenchBundle{
+				ID: derivedID, RootBuildManifestID: rootID, CurrentWorkspaceRevision: &workspace,
+			},
+			CurrentWorkspaceRevision: &workspace, CurrentProposal: &proposal,
+		},
+	}}
+	generator := &fakeImplementationGenerator{}
+	result, err := (GenerationWorkbenchRunner{
+		Generation: generator, Workbench: workbench, DefaultModel: "model",
+	}).Run(context.Background(), execution)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if generator.calls != 0 {
+		t.Fatal("runner regenerated an existing active derived proposal")
+	}
+	var output struct {
+		ImplementationProposals []struct {
+			BundleID       string `json:"bundleId"`
+			ActiveBundleID string `json:"activeBundleId"`
+			ProposalID     string `json:"proposalId"`
+		} `json:"implementationProposals"`
+	}
+	if err := json.Unmarshal(result.Output, &output); err != nil {
+		t.Fatal(err)
+	}
+	if len(output.ImplementationProposals) != 1 || output.ImplementationProposals[0].BundleID != rootID ||
+		output.ImplementationProposals[0].ActiveBundleID != derivedID || output.ImplementationProposals[0].ProposalID != proposal.ID {
+		t.Fatalf("derived proposal recovery payload = %#v", output)
+	}
+}
+
+func TestBuildManifestRootLineageRejectsAnotherWorkflowRun(t *testing.T) {
+	t.Parallel()
+
+	rootID := uuid.New()
+	projectID := uuid.New()
+	actualRunID := uuid.New()
+	otherRunID := uuid.New()
+	manifestGroupKey := uuid.NewString()
+	manifest := storage.ApplicationBuildManifestModel{
+		ID: rootID, ProjectID: projectID, RootManifestID: rootID, WorkflowRunID: &actualRunID,
+		ManifestGroupKey: &manifestGroupKey,
+	}
+	if err := validateBuildManifestRootLineage(
+		context.Background(), nil, manifest, rootID, projectID, otherRunID,
+	); err == nil {
+		t.Fatal("same-project manifest from another workflow run was accepted")
+	}
+	manifest.WorkflowRunID = nil
+	if err := validateBuildManifestRootLineage(
+		context.Background(), nil, manifest, rootID, projectID, actualRunID,
+	); err == nil {
+		t.Fatal("manifest without an exact workflow run was accepted")
+	}
+	manifest.WorkflowRunID = &actualRunID
+	if err := validateBuildManifestRootLineage(
+		context.Background(), nil, manifest, rootID, projectID, actualRunID,
+	); err != nil {
+		t.Fatalf("exact root workflow lineage was rejected: %v", err)
 	}
 }
 
 func TestWorkbenchRunnerConsumesReviewedConversationInstructionFromScope(t *testing.T) {
 	execution, _ := adapterExecution(t)
-	manifest := BuildManifest{SchemaVersion: 1, ProjectID: execution.Run.ProjectID, RunID: execution.Run.ID, SliceIDs: []string{uuid.NewString()}, BundleIDs: []string{uuid.NewString()}, Sources: []domain.ArtifactRef{platformRef("source")}, CreatedAt: time.Now()}
+	manifest := BuildManifest{SchemaVersion: 1, ProjectID: execution.Run.ProjectID, RunID: execution.Run.ID, ManifestGroupKey: uuid.NewString(), SliceIDs: []string{uuid.NewString()}, BundleIDs: []string{uuid.NewString()}, Sources: []domain.ArtifactRef{platformRef("source")}, CreatedAt: time.Now()}
 	if err := manifest.Freeze(); err != nil {
 		t.Fatal(err)
 	}
 	execution.Inputs = adapterInputs(t, execution, mustJSON(manifest))
 	execution.Run.Scope = json.RawMessage(`{"conversationIntent":{"workbenchInstruction":{"objective":"Build the approved dashboard","constraints":["Use exact API contracts"]}}}`)
 	generator := &fakeImplementationGenerator{}
-	if _, err := (GenerationWorkbenchRunner{Generation: generator, DefaultModel: "model", Instruction: "fallback"}).Run(context.Background(), execution); err != nil {
+	if _, err := (GenerationWorkbenchRunner{Generation: generator, Workbench: &fakeWorkbench{}, DefaultModel: "model", Instruction: "fallback"}).Run(context.Background(), execution); err != nil {
 		t.Fatal(err)
 	}
 	if len(generator.instructions) != 1 || !strings.Contains(generator.instructions[0], "Build the approved dashboard") || strings.Contains(generator.instructions[0], "fallback") {
@@ -484,7 +1136,8 @@ func TestPublishRunnerUsesTypedQualityBranchNotGlobalManifest(t *testing.T) {
 	}}
 	selected := BuildManifest{
 		SchemaVersion: 1, ProjectID: execution.Run.ProjectID, RunID: execution.Run.ID,
-		SliceIDs: []string{"selected-slice"}, BundleIDs: []string{"selected-bundle"},
+		ManifestGroupKey: uuid.NewString(),
+		SliceIDs:         []string{"selected-slice"}, BundleIDs: []string{"selected-bundle"},
 		Sources: []domain.ArtifactRef{platformRef("selected")}, CreatedAt: time.Now().UTC(),
 	}
 	if err := selected.Freeze(); err != nil {
@@ -518,6 +1171,27 @@ func TestPublishRunnerUsesTypedQualityBranchNotGlobalManifest(t *testing.T) {
 	}
 	if received.BuildManifest.Hash != selected.Hash || received.BuildManifest.Hash == unrelated.Hash || received.WorkspaceRevision != workspace {
 		t.Fatalf("publish crossed workflow branches: received=%+v selected=%s unrelated=%s", received, selected.Hash, unrelated.Hash)
+	}
+}
+
+func TestSelectedImplementationProposalOrderMatchesWorkspaceAncestry(t *testing.T) {
+	t.Parallel()
+
+	first, second, third := uuid.NewString(), uuid.NewString(), uuid.NewString()
+	if err := validateSelectedProposalOrder(
+		[]string{first, second, third}, []string{third, second, first},
+	); err != nil {
+		t.Fatalf("valid root-to-leaf apply order rejected: %v", err)
+	}
+	if err := validateSelectedProposalOrder(
+		[]string{first, second, third}, []string{second, third, first},
+	); err == nil {
+		t.Fatal("workspace ancestry accepted proposals applied outside frozen root order")
+	}
+	if err := validateSelectedProposalOrder(
+		[]string{first, second, third}, []string{third, first},
+	); err == nil {
+		t.Fatal("workspace ancestry accepted a missing selected proposal")
 	}
 }
 

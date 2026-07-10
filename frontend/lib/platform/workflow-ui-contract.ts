@@ -12,16 +12,21 @@ import type {
 import type {
   CreateWorkflowDefinitionInputDto,
   ExactArtifactRefDto,
+  WorkflowCapabilitiesDto,
   WorkflowEdgeDto,
+  WorkflowInputContractDto,
   WorkflowNodeDefinitionDto,
   WorkflowNodeRunDto,
   WorkflowNodeType,
+  WorkflowOutputContractDto,
   WorkflowRunDto,
 } from './flow-contract'
 
 export interface EditableWorkflowDefinition {
   readonly name: string
   readonly schemaVersion: string
+  readonly inputContract: WorkflowInputContractDto
+  readonly outputContract: WorkflowOutputContractDto
   readonly nodes: readonly WorkflowNodeDefinitionDto[]
   readonly edges: readonly WorkflowEdgeDto[]
 }
@@ -74,27 +79,53 @@ const WORKFLOW_NODE_TYPES: readonly WorkflowNodeType[] = [
   'workbench_build',
   'quality_gate',
   'publish',
+  'transform',
 ]
 
 export function starterWorkflowDefinition(): {
   name: string
   schemaVersion: string
+  inputContract: WorkflowInputContractDto
+  outputContract: WorkflowOutputContractDto
   nodes: WorkflowNodeDefinitionDto[]
   edges: CreateWorkflowDefinitionInputDto['edges']
 } {
   const envelope: JsonObject = { type: 'object', additionalProperties: true }
   return {
     name: 'Minimum product delivery loop',
-    schemaVersion: '1',
+    schemaVersion: '3',
+    inputContract: {
+      capability: 'project_brief',
+      manifestJobTypes: ['conversation.workflow_intent', 'workflow_start'],
+      artifactKinds: ['project_brief'],
+      requiredSourcePurposes: ['project_brief'],
+      manifestSchemaContracts: {
+        'conversation.workflow_intent': 'workflow-intent-input/v1',
+        workflow_start: 'workflow-input/v1',
+      },
+    },
+    outputContract: {
+      capability: 'application',
+      producedArtifactKinds: ['workspace'],
+      terminalOutcome: 'deployment',
+      terminalNodeType: 'publish',
+    },
     nodes: [
       node('source', 'Project brief input', 'artifact_input', envelope, {
-        artifactInput: { allowedTypes: ['document'], requireApproved: false, minimumArtifacts: 1 },
+        artifactInput: { allowedTypes: ['document'], allowedKinds: ['project_brief'], requireApproved: false, minimumArtifacts: 1 },
+      }),
+      node('project-brief-ai', 'Refine project brief proposal', 'ai_transform', envelope, {
+        aiTransform: {
+          jobType: 'refine_project_brief', modelPolicy: 'project-default',
+          outputSchemaVersion: 'project-brief-proposal/v1', maxAttempts: 3, timeout: 300_000_000_000,
+        },
       }),
       node('project-brief-edit', 'Interview and edit project brief', 'human_edit', envelope, {
         humanEdit: {
           artifactType: 'document',
+          artifactKind: 'project_brief',
           requiredRole: 'editor',
-          instructions: 'Resolve blocking questions with AI assistance and create an exact Project Brief revision.',
+          instructions: 'Review the AI proposal, resolve blocking questions, and create an exact Project Brief revision.',
         },
       }),
       node('project-brief-review', 'Approve project brief', 'review_gate', envelope, {
@@ -108,7 +139,7 @@ export function starterWorkflowDefinition(): {
       }),
       node('requirements-edit', 'Edit requirements', 'human_edit', envelope, {
         humanEdit: {
-          artifactType: 'document', requiredRole: 'editor',
+          artifactType: 'document', artifactKind: 'product_requirements', requiredRole: 'editor',
           instructions: 'Resolve questions and produce stable requirement and acceptance IDs without bypassing the proposal review.',
         },
       }),
@@ -121,17 +152,32 @@ export function starterWorkflowDefinition(): {
           outputSchemaVersion: 'blueprint-proposal/v1', maxAttempts: 3, timeout: 300_000_000_000,
         },
       }),
-      node('blueprint-edit', 'Edit blueprint and PageSpecs', 'human_edit', envelope, {
+      node('blueprint-edit', 'Edit blueprint', 'human_edit', envelope, {
         humanEdit: {
-          artifactType: 'blueprint', requiredRole: 'editor',
-          instructions: 'Review the proposal, close coverage gaps, and create exact Blueprint and PageSpec revisions.',
+          artifactType: 'blueprint', artifactKind: 'blueprint', requiredRole: 'editor',
+          instructions: 'Review the proposal, close coverage gaps, and create one exact Blueprint revision. PageSpecs are created after Blueprint approval.',
         },
       }),
-      node('blueprint-review', 'Review blueprint proposal', 'review_gate', envelope, {
+      node('blueprint-review', 'Approve blueprint', 'review_gate', envelope, {
         reviewGate: { requiredRole: 'owner', minimumApprovals: 1, prohibitSelfReview: true, allowWaiver: false },
       }),
-      node('pages', 'Create page delivery slices', 'fan_out', envelope, {
-        fanOut: { itemsPath: '/workflowContext/deliverySlices', sliceKeyPath: '/key', mergeNodeId: 'pages-merged', maxParallel: 4, itemKind: 'delivery_slice' },
+      node('pages', 'Create Blueprint page branches', 'fan_out', envelope, {
+        fanOut: { itemsPath: '/blueprintPages', sliceKeyPath: '/key', mergeNodeId: 'pages-merged', maxParallel: 4, itemKind: 'blueprint_page' },
+      }),
+      node('page-spec-ai', 'Generate page specification proposal', 'ai_transform', envelope, {
+        aiTransform: {
+          jobType: 'generate_page_spec', modelPolicy: 'project-default',
+          outputSchemaVersion: 'page-spec-proposal/v1', maxAttempts: 3, timeout: 300_000_000_000,
+        },
+      }),
+      node('page-spec-edit', 'Edit page specification', 'human_edit', envelope, {
+        humanEdit: {
+          artifactType: 'blueprint', artifactKind: 'page_spec', requiredRole: 'editor',
+          instructions: "Review the proposal and create one exact PageSpec revision anchored to this branch's approved Blueprint page.",
+        },
+      }),
+      node('page-spec-review', 'Approve page specification', 'review_gate', envelope, {
+        reviewGate: { requiredRole: 'owner', minimumApprovals: 1, prohibitSelfReview: true, allowWaiver: false },
       }),
       node('prototype-ai', 'Generate page prototype proposal', 'ai_transform', envelope, {
         aiTransform: {
@@ -141,14 +187,14 @@ export function starterWorkflowDefinition(): {
       }),
       node('prototype-edit', 'Edit page prototype', 'human_edit', envelope, {
         humanEdit: {
-          artifactType: 'prototype', requiredRole: 'editor',
+          artifactType: 'prototype', artifactKind: 'prototype', requiredRole: 'editor',
           instructions: 'Adjust all required responsive states without changing the approved PageSpec.',
         },
       }),
       node('prototype-review', 'Approve page prototype', 'review_gate', envelope, {
         reviewGate: { requiredRole: 'owner', minimumApprovals: 1, prohibitSelfReview: true, allowWaiver: false },
       }),
-      node('pages-merged', 'Merge approved page slices', 'merge', envelope, {
+      node('pages-merged', 'Merge approved page branches', 'merge', envelope, {
         merge: { fanOutNodeId: 'pages', policy: 'all', allowWaiver: false },
       }),
       node('compile-manifest', 'Freeze application build manifest', 'manifest_compiler', envelope, {
@@ -165,23 +211,27 @@ export function starterWorkflowDefinition(): {
       }),
     ],
     edges: [
-      edge(1, 'source', 'project-brief-edit'),
-      edge(2, 'project-brief-edit', 'project-brief-review'),
-      edge(3, 'project-brief-review', 'requirements-ai'),
-      edge(4, 'requirements-ai', 'requirements-edit'),
-      edge(5, 'requirements-edit', 'requirements-review'),
-      edge(6, 'requirements-review', 'blueprint-ai'),
-      edge(7, 'blueprint-ai', 'blueprint-edit'),
-      edge(8, 'blueprint-edit', 'blueprint-review'),
-      edge(9, 'blueprint-review', 'pages'),
-      edge(10, 'pages', 'prototype-ai'),
-      edge(11, 'prototype-ai', 'prototype-edit'),
-      edge(12, 'prototype-edit', 'prototype-review'),
-      edge(13, 'prototype-review', 'pages-merged'),
-      edge(14, 'pages-merged', 'compile-manifest'),
-      edge(15, 'compile-manifest', 'workbench'),
-      edge(16, 'workbench', 'quality'),
-      edge(17, 'quality', 'publish'),
+      edge(1, 'source', 'project-brief-ai'),
+      edge(2, 'project-brief-ai', 'project-brief-edit'),
+      edge(3, 'project-brief-edit', 'project-brief-review'),
+      edge(4, 'project-brief-review', 'requirements-ai'),
+      edge(5, 'requirements-ai', 'requirements-edit'),
+      edge(6, 'requirements-edit', 'requirements-review'),
+      edge(7, 'requirements-review', 'blueprint-ai'),
+      edge(8, 'blueprint-ai', 'blueprint-edit'),
+      edge(9, 'blueprint-edit', 'blueprint-review'),
+      edge(10, 'blueprint-review', 'pages'),
+      edge(11, 'pages', 'page-spec-ai'),
+      edge(12, 'page-spec-ai', 'page-spec-edit'),
+      edge(13, 'page-spec-edit', 'page-spec-review'),
+      edge(14, 'page-spec-review', 'prototype-ai'),
+      edge(15, 'prototype-ai', 'prototype-edit'),
+      edge(16, 'prototype-edit', 'prototype-review'),
+      edge(17, 'prototype-review', 'pages-merged'),
+      edge(18, 'pages-merged', 'compile-manifest'),
+      edge(19, 'compile-manifest', 'workbench'),
+      edge(20, 'workbench', 'quality'),
+      edge(21, 'quality', 'publish'),
     ],
   }
 }
@@ -203,10 +253,11 @@ function edge(index: number, from: string, to: string): WorkflowEdgeDto {
 export function parseEditableDefinition(
   value: string,
   requireExecutable = false,
+  capabilities?: WorkflowCapabilitiesDto | null,
 ): { readonly definition?: EditableWorkflowDefinition; readonly error?: string } {
   try {
     const parsed = JSON.parse(value) as unknown
-    const error = validateWorkflowDefinition(parsed, requireExecutable)
+    const error = validateWorkflowDefinition(parsed, requireExecutable, capabilities)
     if (error) return { error }
     return { definition: parsed as EditableWorkflowDefinition }
   } catch (cause) {
@@ -214,10 +265,18 @@ export function parseEditableDefinition(
   }
 }
 
-export function validateWorkflowDefinition(value: unknown, requireExecutable = true): string | undefined {
+export function validateWorkflowDefinition(
+  value: unknown,
+  requireExecutable = true,
+  capabilities?: WorkflowCapabilitiesDto | null,
+): string | undefined {
   if (!object(value)) return 'Definition must be a JSON object.'
   if (!nonEmpty(value.name)) return 'Definition name is required.'
   if (!nonEmpty(value.schemaVersion)) return 'schemaVersion is required.'
+  const inputContractError = validateInputContract(value.inputContract)
+  if (inputContractError) return inputContractError
+  const outputContractError = validateOutputContract(value.outputContract)
+  if (outputContractError) return outputContractError
   if (!Array.isArray(value.nodes)) return 'nodes must be an array.'
   if (!Array.isArray(value.edges)) return 'edges must be an array.'
   if (value.nodes.length === 0) return 'nodes must contain at least one node.'
@@ -266,6 +325,12 @@ export function validateWorkflowDefinition(value: unknown, requireExecutable = t
   if (reachable(entries.at(0)!, adjacency).size !== nodes.size) return 'Every node must be reachable from the entry node.'
   if (reachable(terminals.at(0)!, reverse).size !== nodes.size) return 'Every node must have a path to the terminal node.'
   if (containsCycle(nodes.keys(), adjacency)) return 'Workflow graph must be acyclic.'
+  const entry = nodes.get(entries[0])
+  const inputContract = value.inputContract as unknown as WorkflowInputContractDto
+  if (entry?.type !== 'artifact_input') return 'inputContract requires artifact_input as the single entry node.'
+  if (!sameStringSet(entry.artifactInput?.allowedKinds ?? [], inputContract.artifactKinds)) return 'Entry allowedKinds must exactly match inputContract.artifactKinds.'
+  const outputContract = value.outputContract as unknown as WorkflowOutputContractDto
+  if (nodes.get(terminals[0])?.type !== outputContract.terminalNodeType) return 'outputContract.terminalNodeType must match the executable terminal node.'
   for (const workflowNode of nodes.values()) {
     if (workflowNode.type === 'fan_out') {
       const merge = workflowNode.fanOut && nodes.get(workflowNode.fanOut.mergeNodeId)
@@ -275,6 +340,13 @@ export function validateWorkflowDefinition(value: unknown, requireExecutable = t
       const fanOut = workflowNode.merge && nodes.get(workflowNode.merge.fanOutNodeId)
       if (!fanOut || fanOut.type !== 'fan_out' || fanOut.fanOut?.mergeNodeId !== workflowNode.id) return `Node ${workflowNode.id} must reference a reciprocal fan-out node.`
     }
+  }
+  if (capabilities) {
+    const capabilityError = validateRegisteredCapabilities(
+      value as unknown as EditableWorkflowDefinition,
+      capabilities,
+    )
+    if (capabilityError) return capabilityError
   }
   return undefined
 }
@@ -309,6 +381,7 @@ export function validateWorkflowNode(value: unknown, path = 'node'): string | un
     review_gate: 'reviewGate', condition: 'condition', fan_out: 'fanOut', merge: 'merge',
     quality_gate: 'qualityGate', manifest_compiler: 'manifestCompiler',
     workbench_build: 'workbenchBuild', publish: 'publish',
+    transform: 'transform',
   }
   if (configs.at(0) !== expected[type]) return `${path}.${expected[type]} must match type ${type}.`
   const config = value[expected[type]]
@@ -316,16 +389,90 @@ export function validateWorkflowNode(value: unknown, path = 'node'): string | un
   return validateNodeConfig(type, config, path)
 }
 
+function validateInputContract(value: unknown) {
+  if (!object(value)) return 'inputContract is required.'
+  if (!nonEmpty(value.capability)) return 'inputContract.capability is required.'
+  if (!nonEmptyStringArray(value.manifestJobTypes)) return 'inputContract.manifestJobTypes must contain supported job types.'
+  if (!nonEmptyStringArray(value.artifactKinds) || !value.artifactKinds.every(validArtifactKind)) return 'inputContract.artifactKinds must contain exact artifact kinds.'
+  if (!nonEmptyStringArray(value.requiredSourcePurposes)) return 'inputContract.requiredSourcePurposes must not be empty.'
+  if (!stringRecord(value.manifestSchemaContracts)) return 'inputContract.manifestSchemaContracts must map job types to schema versions.'
+  const schemaContracts = value.manifestSchemaContracts
+  const jobs = new Set(value.manifestJobTypes)
+  const schemaJobs = Object.keys(schemaContracts)
+  if (schemaJobs.length !== jobs.size || schemaJobs.some((jobType) => !jobs.has(jobType) || !nonEmpty(schemaContracts[jobType]))) return 'inputContract.manifestSchemaContracts must exactly map every manifestJobType.'
+  return undefined
+}
+
+function validateOutputContract(value: unknown) {
+  if (!object(value)) return 'outputContract is required.'
+  if (!nonEmpty(value.capability)) return 'outputContract.capability is required.'
+  if (!nonEmptyStringArray(value.producedArtifactKinds) || !value.producedArtifactKinds.every(validArtifactKind)) return 'outputContract.producedArtifactKinds must contain exact artifact kinds.'
+  if (!['application', 'deployment'].includes(String(value.terminalOutcome))) return 'outputContract.terminalOutcome is unsupported.'
+  if (!WORKFLOW_NODE_TYPES.includes(value.terminalNodeType as WorkflowNodeType)) return 'outputContract.terminalNodeType is unsupported.'
+  return undefined
+}
+
+function validateRegisteredCapabilities(
+  definition: EditableWorkflowDefinition,
+  capabilities: WorkflowCapabilitiesDto,
+) {
+  const inputRegistered = capabilities.inputContracts.some((contract) =>
+    contract.capability === definition.inputContract.capability
+    && sameStringSet(contract.manifestJobTypes, definition.inputContract.manifestJobTypes)
+    && sameStringSet(contract.artifactKinds, definition.inputContract.artifactKinds)
+    && sameStringSet(contract.requiredSourcePurposes, definition.inputContract.requiredSourcePurposes)
+    && sameStringRecord(contract.manifestSchemaContracts, definition.inputContract.manifestSchemaContracts))
+  if (!inputRegistered) return 'inputContract is not registered by the workflow service.'
+  const outputRegistered = capabilities.outputContracts.some((contract) =>
+    contract.capability === definition.outputContract.capability
+    && contract.terminalOutcome === definition.outputContract.terminalOutcome
+    && contract.terminalNodeType === definition.outputContract.terminalNodeType
+    && sameStringSet(contract.producedArtifactKinds, definition.outputContract.producedArtifactKinds))
+  if (!outputRegistered) return 'outputContract is not registered by the workflow service.'
+  for (const node of definition.nodes) {
+    if (!capabilities.nodeTypes.includes(node.type)) return `Node ${node.id} uses an unregistered node type.`
+    if (node.aiTransform && !capabilities.aiTransforms.some((capability) =>
+      capability.jobType === node.aiTransform?.jobType
+      && capability.outputSchemaVersion === node.aiTransform?.outputSchemaVersion
+      && capability.modelPolicies.includes(node.aiTransform?.modelPolicy ?? ''))) return `Node ${node.id} uses an unregistered AI transform.`
+    if (node.manifestCompiler && !capabilities.manifestCompilers.some((capability) =>
+      capability.manifestKind === node.manifestCompiler?.manifestKind
+      && capability.schemaVersion === node.manifestCompiler?.schemaVersion
+      && capability.hook === node.manifestCompiler?.hook)) return `Node ${node.id} uses an unregistered manifest compiler.`
+    if (node.transform && !capabilities.transforms.includes(node.transform.transform)) return `Node ${node.id} uses an unregistered transform.`
+    const fanOutKind = node.fanOut?.itemKind ?? (node.fanOut ? 'generic' : undefined)
+    if (fanOutKind && !capabilities.fanOutItemKinds.includes(fanOutKind)) return `Node ${node.id} uses an unregistered fan-out resolver.`
+    if (node.qualityGate && !capabilities.qualityGates.includes(node.qualityGate.gateName)) return `Node ${node.id} uses an unregistered quality gate.`
+    if (node.publish && !capabilities.publishEnvironments.includes(node.publish.environment)) return `Node ${node.id} uses an unregistered publish environment.`
+    if (node.workbenchBuild && !capabilities.workbenchSchemaVersions.includes(node.workbenchBuild.buildManifestSchemaVersion)) return `Node ${node.id} uses an unregistered Workbench schema.`
+  }
+  return undefined
+}
+
+function sameStringSet(left: readonly string[], right: readonly string[]) {
+  return [...new Set(left)].sort().join('\u0000') === [...new Set(right)].sort().join('\u0000')
+}
+
+function sameStringRecord(left: Readonly<Record<string, string>>, right: Readonly<Record<string, string>>) {
+  const leftEntries = Object.entries(left).sort(([leftKey], [rightKey]) => leftKey.localeCompare(rightKey))
+  const rightEntries = Object.entries(right).sort(([leftKey], [rightKey]) => leftKey.localeCompare(rightKey))
+  return JSON.stringify(leftEntries) === JSON.stringify(rightEntries)
+}
+
+function nonEmptyStringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.length > 0 && value.every(nonEmpty) && new Set(value).size === value.length
+}
+
 function validateNodeConfig(type: WorkflowNodeType, config: Record<string, unknown>, path: string) {
   switch (type) {
     case 'artifact_input':
-      if (!Array.isArray(config.allowedTypes) || config.allowedTypes.length === 0 || !config.allowedTypes.every(validArtifactType) || typeof config.requireApproved !== 'boolean' || !positiveInteger(config.minimumArtifacts)) return `${path}.artifactInput is malformed.`
+      if (!Array.isArray(config.allowedTypes) || config.allowedTypes.length === 0 || !config.allowedTypes.every(validArtifactType) || (config.allowedKinds !== undefined && (!nonEmptyStringArray(config.allowedKinds) || !config.allowedKinds.every(validArtifactKind))) || typeof config.requireApproved !== 'boolean' || !positiveInteger(config.minimumArtifacts)) return `${path}.artifactInput is malformed.`
       break
     case 'ai_transform':
       if (!nonEmpty(config.jobType) || !nonEmpty(config.modelPolicy) || !nonEmpty(config.outputSchemaVersion) || !positiveInteger(config.maxAttempts) || !positiveNumber(config.timeout)) return `${path}.aiTransform is malformed.`
       break
     case 'human_edit':
-      if (!validArtifactType(config.artifactType) || !validRole(config.requiredRole) || (config.instructions !== undefined && typeof config.instructions !== 'string')) return `${path}.humanEdit is malformed.`
+      if (!validArtifactType(config.artifactType) || (config.artifactKind !== undefined && !validArtifactKind(config.artifactKind)) || !validRole(config.requiredRole) || (config.instructions !== undefined && typeof config.instructions !== 'string')) return `${path}.humanEdit is malformed.`
       break
     case 'review_gate':
       if (!validRole(config.requiredRole) || !positiveInteger(config.minimumApprovals) || typeof config.prohibitSelfReview !== 'boolean' || typeof config.allowWaiver !== 'boolean') return `${path}.reviewGate is malformed.`
@@ -337,7 +484,7 @@ function validateNodeConfig(type: WorkflowNodeType, config: Record<string, unkno
       if (config.branches.some((branch) => object(branch) && branch.default === false && !nonEmpty(branch.expression))) return `${path}.condition non-default branches require an expression.`
       break
     case 'fan_out':
-      if (!jsonPointer(config.itemsPath) || !jsonPointer(config.sliceKeyPath) || !nonEmpty(config.mergeNodeId) || !positiveInteger(config.maxParallel) || (config.itemKind !== undefined && !['generic', 'delivery_slice'].includes(String(config.itemKind)))) return `${path}.fanOut is malformed.`
+      if (!jsonPointer(config.itemsPath) || !jsonPointer(config.sliceKeyPath) || !nonEmpty(config.mergeNodeId) || !positiveInteger(config.maxParallel) || (config.itemKind !== undefined && !['generic', 'delivery_slice', 'blueprint_page', 'blueprint_selection_page'].includes(String(config.itemKind)))) return `${path}.fanOut is malformed.`
       break
     case 'merge':
       if (!nonEmpty(config.fanOutNodeId) || !['all', 'any', 'quorum'].includes(String(config.policy)) || typeof config.allowWaiver !== 'boolean' || (config.policy === 'quorum' && !positiveInteger(config.quorum))) return `${path}.merge is malformed.`
@@ -353,6 +500,9 @@ function validateNodeConfig(type: WorkflowNodeType, config: Record<string, unkno
       break
     case 'publish':
       if (!nonEmpty(config.environment) || !validRole(config.requiredRole) || typeof config.allowRollback !== 'boolean') return `${path}.publish is malformed.`
+      break
+    case 'transform':
+      if (config.transform !== 'selection_passthrough') return `${path}.transform must be selection_passthrough.`
       break
   }
   return undefined
@@ -373,6 +523,17 @@ export function resolveCandidateSelection(
   return candidates.length === 1 ? candidates.at(0) : undefined
 }
 
+export function workflowRoleSatisfies(actual: string, required: string) {
+  const rank: Readonly<Record<string, number>> = {
+    viewer: 1,
+    commenter: 2,
+    editor: 3,
+    admin: 4,
+    owner: 5,
+  }
+  return (rank[actual] ?? 0) >= (rank[required] ?? Number.POSITIVE_INFINITY)
+}
+
 export function revisionCandidates(
   definitionNode: WorkflowNodeDefinitionDto | undefined,
   nodeRun: WorkflowNodeRunDto,
@@ -380,6 +541,7 @@ export function revisionCandidates(
   artifacts: WorkflowArtifactSnapshot,
 ): WorkflowRevisionCandidateResolution {
   const type = definitionNode?.humanEdit?.artifactType
+  const kind = definitionNode?.humanEdit?.artifactKind
   if (nodeRun.type !== 'human_edit' || !type) return { candidates: [], error: 'This node is not a typed Human Edit node.' }
   const lineage = nodeInputLineage(run, nodeRun)
   if (lineage.error) return { candidates: [], error: lineage.error }
@@ -388,18 +550,27 @@ export function revisionCandidates(
     bindings = bindings.filter((binding) => binding.deliverySliceRefs.some((slice) => slice.id === nodeRun.sliceId))
     if (bindings.length === 0) return { candidates: [], error: `The current node input has no delivery-slice lineage for ${nodeRun.sliceId}.` }
   }
-  const resources = type === 'document'
-    ? artifacts.documents
-    : type === 'blueprint'
-      ? artifacts.blueprints
-      : type === 'prototype'
-        ? artifacts.prototypes
-        : []
+  const allResources: readonly VersionedArtifactDto<unknown>[] = [
+    ...artifacts.documents,
+    ...artifacts.blueprints,
+    ...artifacts.pageSpecs,
+    ...artifacts.prototypes,
+  ]
+  const resources: readonly VersionedArtifactDto<unknown>[] = kind
+    ? allResources.filter((resource) => resource.artifact.kind === kind)
+    : type === 'document'
+      ? artifacts.documents
+      : type === 'blueprint'
+        ? [...artifacts.blueprints, ...artifacts.pageSpecs]
+        : type === 'prototype'
+          ? artifacts.prototypes
+          : []
   const proposalRefs = uniqueBy(
     bindings.flatMap((binding) => binding.outputProposal ? [binding.outputProposal] : []),
     (proposal) => `${proposal.id}:${proposal.payloadHash}`,
   )
   const proposalTargetIds = new Set<string>()
+  const appliedProposalIds = new Set<string>()
   for (const proposalRef of proposalRefs) {
     const proposal = artifacts.proposals.find((item) => item.id === proposalRef.id && item.payloadHash === proposalRef.payloadHash)
     if (!proposal) return { candidates: [], error: `Proposal ${proposalRef.id} from the typed input lineage is unavailable or has a different payload hash.` }
@@ -407,12 +578,22 @@ export function revisionCandidates(
       return { candidates: [], error: `Proposal ${proposalRef.id} has an invalid target revision.` }
     }
     proposalTargetIds.add(proposal.artifactId)
+    if (proposal.status !== 'applied' && proposal.status !== 'partially_applied') {
+      return { candidates: [], error: 'Review and apply the linked Proposal in the corresponding editor before creating an immutable revision.' }
+    }
+    appliedProposalIds.add(proposal.id)
   }
   const sliceTargetIds = new Set<string>()
   for (const binding of bindings) {
     for (const slice of binding.deliverySliceRefs) {
       if (nodeRun.sliceId && slice.id !== nodeRun.sliceId) continue
-      const target = type === 'blueprint' ? slice.blueprint : type === 'prototype' ? slice.prototype : undefined
+      const target = kind === 'page_spec'
+        ? slice.pageSpec
+        : kind === 'blueprint' || (!kind && type === 'blueprint')
+          ? slice.blueprint
+          : type === 'prototype'
+            ? slice.prototype
+            : undefined
       if (target) sliceTargetIds.add(target.artifactId)
     }
   }
@@ -426,7 +607,17 @@ export function revisionCandidates(
   if (allowedIds.size === 0) return { candidates: [], error: 'The current typed input contains no artifact, proposal target, or delivery-slice target for this Human Edit type.' }
   const candidates = resources.flatMap((resource) => {
     if (!allowedIds.has(resource.artifact.id)) return []
-    const revision = resource.latestRevision ?? resource.approvedRevision
+    const availableRevisions = uniqueBy(
+      [resource.latestRevision, resource.approvedRevision].filter(
+        (revision): revision is ArtifactRevisionDto<unknown> => Boolean(revision),
+      ),
+      (revision) => revision.id,
+    )
+    const revision = appliedProposalIds.size > 0
+      ? [...availableRevisions]
+          .sort((left, right) => right.revisionNumber - left.revisionNumber)
+          .find((candidate) => revisionContainsAppliedProposal(candidate, availableRevisions, appliedProposalIds))
+      : resource.latestRevision ?? resource.approvedRevision
     if (!revision) return []
     return [{
       key: `${revision.artifactId}:${revision.id}`,
@@ -438,7 +629,25 @@ export function revisionCandidates(
   }).sort((left, right) => left.label.localeCompare(right.label))
   return candidates.length > 0
     ? { candidates }
-    : { candidates, error: `No immutable ${type} revision matches the current node ${lineageSource.replaceAll('_', ' ')}.` }
+    : appliedProposalIds.size > 0
+      ? { candidates, error: 'Apply the linked Proposal in the corresponding editor, then create an immutable revision before submitting this node.' }
+      : { candidates, error: `No immutable ${kind ?? type} revision matches the current node ${lineageSource.replaceAll('_', ' ')}.` }
+}
+
+function revisionContainsAppliedProposal(
+  candidate: ArtifactRevisionDto<unknown>,
+  available: readonly ArtifactRevisionDto<unknown>[],
+  proposalIds: ReadonlySet<string>,
+) {
+  const byId = new Map(available.map((revision) => [revision.id, revision]))
+  const visited = new Set<string>()
+  let current: ArtifactRevisionDto<unknown> | undefined = candidate
+  while (current && !visited.has(current.id)) {
+    if (current.proposalId && proposalIds.has(current.proposalId)) return true
+    visited.add(current.id)
+    current = current.basedOnRevisionId ? byId.get(current.basedOnRevisionId) : undefined
+  }
+  return false
 }
 
 export function deliverySliceContext(
@@ -667,10 +876,20 @@ function validArtifactType(value: unknown): boolean {
   return typeof value === 'string' && ['document', 'blueprint', 'prototype', 'implementation', 'test'].includes(value)
 }
 
+function validArtifactKind(value: unknown): boolean {
+  return typeof value === 'string' && [
+    'project_brief', 'product_requirements', 'decision_record', 'glossary_policy',
+    'reference_source', 'change_request', 'requirement_baseline', 'blueprint',
+    'page_spec', 'prototype', 'prototype_flow', 'fixture_bundle', 'design_system',
+    'token_set', 'component_registry', 'api_contract', 'data_contract',
+    'permission_contract', 'workspace', 'test_report', 'quality_report',
+  ].includes(value)
+}
+
 function validRole(value: unknown): boolean {
   return typeof value === 'string' && ['owner', 'admin', 'editor', 'commenter', 'viewer'].includes(value)
 }
 
-function stringRecord(value: unknown) {
+function stringRecord(value: unknown): value is Record<string, string> {
   return object(value) && Object.values(value).every((item) => typeof item === 'string')
 }

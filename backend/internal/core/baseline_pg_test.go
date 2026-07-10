@@ -179,6 +179,134 @@ func TestBaselineCompilePersistsOnlyCanonicalFinalPayload(t *testing.T) {
 	if report := ValidateArtifactContent("requirement_baseline", revision.Content); !report.Valid {
 		t.Fatalf("persisted baseline failed its own gate: %#v", report.Findings)
 	}
+	if len(revision.SourceVersions) != 1 || revision.SourceVersions[0].RevisionID != requirementsRef.RevisionID ||
+		revision.SourceVersions[0].ContentHash != requirementsRef.ContentHash ||
+		revision.SourceVersions[0].Purpose != "baseline_input" || !revision.SourceVersions[0].Required {
+		t.Fatalf("baseline response lost its exact frozen source: %#v", revision.SourceVersions)
+	}
+	assertPersistedBaselineLineage(t, database, revision, requirementsRef)
+}
+
+func TestPersistSystemRevisionLineageRejectsNonExactSource(t *testing.T) {
+	database, cleanup := baselinePostgresDatabase(t)
+	defer cleanup()
+
+	now := time.Now().UTC()
+	userID := uuid.New()
+	projectID := uuid.New()
+	if err := database.Create(&storage.UserModel{
+		ID: userID, Email: "lineage-" + uuid.NewString() + "@example.com",
+		DisplayName: "Lineage Owner", PasswordHash: "not-used", CreatedAt: now, UpdatedAt: now,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Create(&storage.ProjectModel{
+		ID: projectID, Name: "Lineage integration", Lifecycle: "active", Version: 1,
+		CreatedBy: userID, CreatedAt: now, UpdatedAt: now,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	store := newBaselineContentStoreSpy()
+	valid := seedApprovedBaselineSource(
+		t, database, store, projectID, userID, "product_requirements",
+		json.RawMessage(`{"requirements":[{"id":"REQ-001","statement":"Exact source"}]}`),
+	)
+
+	wrongArtifact := valid
+	wrongArtifact.ArtifactID = uuid.NewString()
+	wrongRevision := valid
+	wrongRevision.RevisionID = uuid.NewString()
+	wrongHash := valid
+	wrongHash.ContentHash = "sha256:" + strings.Repeat("f", 64)
+	for _, test := range []struct {
+		name      string
+		projectID uuid.UUID
+		ref       VersionRef
+		want      error
+	}{
+		{name: "project", projectID: uuid.New(), ref: valid, want: ErrNotFound},
+		{name: "artifact", projectID: projectID, ref: wrongArtifact, want: ErrNotFound},
+		{name: "revision", projectID: projectID, ref: wrongRevision, want: ErrNotFound},
+		{name: "content hash", projectID: projectID, ref: wrongHash, want: ErrConflict},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			err := database.Transaction(func(transaction *gorm.DB) error {
+				_, err := PersistSystemRevisionLineage(
+					transaction, test.projectID, uuid.New(), uuid.New(), uuid.Nil, userID, now,
+					[]SystemRevisionSource{{
+						Ref: test.ref, Purpose: "exact_source", Required: true, Relation: "derives_from",
+					}},
+				)
+				return err
+			})
+			if !errors.Is(err, test.want) {
+				t.Fatalf("expected %v for non-exact %s, got %v", test.want, test.name, err)
+			}
+		})
+	}
+	var frozenCount int64
+	if err := database.Model(&storage.ArtifactRevisionSourceModel{}).Count(&frozenCount).Error; err != nil {
+		t.Fatal(err)
+	}
+	if frozenCount != 0 {
+		t.Fatalf("rejected non-exact sources leaked %d frozen lineage rows", frozenCount)
+	}
+}
+
+func assertPersistedBaselineLineage(
+	t *testing.T,
+	database *gorm.DB,
+	revision ArtifactRevision,
+	source VersionRef,
+) {
+	t.Helper()
+	revisionID := uuid.MustParse(revision.ID)
+	artifactID := uuid.MustParse(revision.ArtifactID)
+	sourceRevisionID := uuid.MustParse(source.RevisionID)
+
+	var artifact storage.ArtifactModel
+	if err := database.Where("id = ?", artifactID).Take(&artifact).Error; err != nil {
+		t.Fatal(err)
+	}
+	if artifact.LatestDraftID == nil {
+		t.Fatal("compiled baseline did not retain its generated draft")
+	}
+	var revisionSources []storage.ArtifactRevisionSourceModel
+	if err := database.Where("revision_id = ?", revisionID).Find(&revisionSources).Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(revisionSources) != 1 || revisionSources[0].SourceRevisionID != sourceRevisionID ||
+		revisionSources[0].SourceContentHash != source.ContentHash ||
+		revisionSources[0].Purpose != "baseline_input" || !revisionSources[0].Required {
+		t.Fatalf("unexpected immutable baseline revision sources: %#v", revisionSources)
+	}
+	var draftSources []storage.ArtifactDraftSourceModel
+	if err := database.Where("draft_id = ?", *artifact.LatestDraftID).Find(&draftSources).Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(draftSources) != 1 || draftSources[0].SourceRevisionID != sourceRevisionID ||
+		draftSources[0].SourceContentHash != source.ContentHash || draftSources[0].Purpose != "baseline_input" {
+		t.Fatalf("unexpected generated baseline draft sources: %#v", draftSources)
+	}
+	var dependencies []storage.ArtifactDependencyModel
+	if err := database.Where("target_revision_id = ?", revisionID).Find(&dependencies).Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(dependencies) != 1 || dependencies[0].SourceRevisionID != sourceRevisionID ||
+		dependencies[0].SourceContentHash != source.ContentHash ||
+		dependencies[0].Relation != "compiled_into" || !dependencies[0].Required {
+		t.Fatalf("unexpected required baseline dependencies: %#v", dependencies)
+	}
+	var wholeTraceCount int64
+	if err := database.Model(&storage.TraceLinkModel{}).Where(
+		"source_revision_id = ? AND target_revision_id = ? AND relation = ? AND source_anchor_id IS NULL",
+		sourceRevisionID, revisionID, "compiled_into",
+	).Count(&wholeTraceCount).Error; err != nil {
+		t.Fatal(err)
+	}
+	if wholeTraceCount != 1 {
+		t.Fatalf("required baseline dependency must have one whole-source trace, got %d", wholeTraceCount)
+	}
 }
 
 func seedApprovedBaselineSource(

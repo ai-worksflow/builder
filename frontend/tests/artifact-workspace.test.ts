@@ -544,6 +544,10 @@ test('AI proposals freeze an immutable input manifest before generation', async 
     targetRevision,
     instruction: 'Clarify the brief.',
     inputVersions: [upstreamRevision],
+    constraints: {
+      parentSelectionManifest: { id: 'selection-manifest-1', hash: 'sha256:selection' },
+      frozenSelectionScope: { selectionId: 'sha256:scope', nodeIds: ['page-orders'] },
+    },
     outputSchemaVersion: 'document.patch.v1',
   })
 
@@ -568,7 +572,11 @@ test('AI proposals freeze an immutable input manifest before generation', async 
       },
       purpose: 'approved_upstream',
     }],
-    constraints: { instruction: 'Clarify the brief.' },
+    constraints: {
+      instruction: 'Clarify the brief.',
+      parentSelectionManifest: { id: 'selection-manifest-1', hash: 'sha256:selection' },
+      frozenSelectionScope: { selectionId: 'sha256:scope', nodeIds: ['page-orders'] },
+    },
     outputSchemaVersion: 'document.patch.v1',
   })
   assert.deepEqual(calls[1].body, { model: 'gpt-5' })

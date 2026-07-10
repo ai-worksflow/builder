@@ -11,6 +11,7 @@ import {
   Trash2,
 } from 'lucide-react'
 import type {
+  WorkflowCapabilitiesDto,
   WorkflowEdgeDto,
   WorkflowNodeDefinitionDto,
   WorkflowNodeType,
@@ -26,6 +27,7 @@ import { cn } from '@/lib/utils'
 interface WorkflowGraphEditorProps {
   readonly value: string
   readonly onChange: (value: string) => void
+  readonly capabilities?: WorkflowCapabilitiesDto | null
 }
 
 const NODE_TYPES: readonly { readonly value: WorkflowNodeType; readonly label: string }[] = [
@@ -40,6 +42,7 @@ const NODE_TYPES: readonly { readonly value: WorkflowNodeType; readonly label: s
   { value: 'workbench_build', label: 'Workbench build' },
   { value: 'quality_gate', label: 'Quality gate' },
   { value: 'publish', label: 'Publish' },
+  { value: 'transform', label: 'Passthrough transform' },
 ]
 
 const NODE_WIDTH = 176
@@ -48,7 +51,7 @@ const COLUMN_GAP = 70
 const ROW_GAP = 34
 const PADDING = 30
 
-export function WorkflowGraphEditor({ value, onChange }: WorkflowGraphEditorProps) {
+export function WorkflowGraphEditor({ value, onChange, capabilities }: WorkflowGraphEditorProps) {
   const [mode, setMode] = useState<'graph' | 'json'>('graph')
   const [selectedNodeId, setSelectedNodeId] = useState('')
   const [newNodeType, setNewNodeType] = useState<WorkflowNodeType>('ai_transform')
@@ -100,18 +103,33 @@ export function WorkflowGraphEditor({ value, onChange }: WorkflowGraphEditorProp
 
   function addNode() {
     if (!definition) return
+    if (newNodeType === 'fan_out' || newNodeType === 'merge') {
+      const fanOutId = uniqueNodeId('fan-out', definition.nodes)
+      const mergeId = uniqueNodeId('merge', definition.nodes)
+      const fanOut = createNode(fanOutId, 'fan_out', capabilities, mergeId)
+      const merge = createNode(mergeId, 'merge', capabilities, fanOutId)
+      const edge: WorkflowEdgeDto = {
+        id: uniqueEdgeId(`${fanOutId}-${mergeId}`, definition.edges), from: fanOutId, to: mergeId,
+      }
+      commit({ ...definition, nodes: [...definition.nodes, fanOut, merge], edges: [...definition.edges, edge] })
+      setSelectedNodeId(newNodeType === 'fan_out' ? fanOutId : mergeId)
+      return
+    }
     const id = uniqueNodeId(newNodeType.replaceAll('_', '-'), definition.nodes)
-    const node = createNode(id, newNodeType)
+    const node = createNode(id, newNodeType, capabilities)
     commit({ ...definition, nodes: [...definition.nodes, node] })
     setSelectedNodeId(id)
   }
 
   function deleteNode(nodeId: string) {
     if (!definition) return
+    const selected = definition.nodes.find((node) => node.id === nodeId)
+    const pairedId = selected?.fanOut?.mergeNodeId ?? selected?.merge?.fanOutNodeId
+    const removed = new Set([nodeId, ...(pairedId ? [pairedId] : [])])
     commit({
       ...definition,
-      nodes: definition.nodes.filter((node) => node.id !== nodeId),
-      edges: definition.edges.filter((edge) => edge.from !== nodeId && edge.to !== nodeId),
+      nodes: definition.nodes.filter((node) => !removed.has(node.id)),
+      edges: definition.edges.filter((edge) => !removed.has(edge.from) && !removed.has(edge.to)),
     })
   }
 
@@ -126,9 +144,19 @@ export function WorkflowGraphEditor({ value, onChange }: WorkflowGraphEditorProp
       if (definition.nodes.some((node) => node.id === nextId && node.id !== selectedNode.id)) {
         throw new Error(`Node id ${nextId} already exists.`)
       }
+      const renamedNodes = definition.nodes.map((node) => {
+        if (node.id === selectedNode.id) return nextNode
+        if (node.fanOut?.mergeNodeId === selectedNode.id) {
+          return { ...node, fanOut: { ...node.fanOut, mergeNodeId: nextId } }
+        }
+        if (node.merge?.fanOutNodeId === selectedNode.id) {
+          return { ...node, merge: { ...node.merge, fanOutNodeId: nextId } }
+        }
+        return node
+      })
       commit({
         ...definition,
-        nodes: definition.nodes.map((node) => node.id === selectedNode.id ? nextNode : node),
+        nodes: renamedNodes,
         edges: definition.edges.map((edge) => ({
           ...edge,
           from: edge.from === selectedNode.id ? nextId : edge.from,
@@ -201,7 +229,7 @@ export function WorkflowGraphEditor({ value, onChange }: WorkflowGraphEditorProp
         <div className="flex min-h-0 flex-col bg-background">
           <div className="flex flex-wrap items-center gap-1.5 border-b border-border p-2">
             <select value={newNodeType} onChange={(event) => setNewNodeType(event.target.value as WorkflowNodeType)} className="h-8 min-w-40 rounded border border-border bg-panel px-2 text-[10px] text-foreground">
-              {NODE_TYPES.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}
+              {NODE_TYPES.filter((item) => !capabilities || capabilities.nodeTypes.includes(item.value)).map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}
             </select>
             <button type="button" onClick={addNode} className="inline-flex h-8 items-center gap-1 rounded bg-primary px-2.5 text-[10px] font-semibold text-primary-foreground"><CirclePlus className="size-3" /> Add node</button>
             <span className="ml-auto text-[9px] text-faint-foreground">{definition.nodes.length} nodes · {definition.edges.length} edges</span>
@@ -316,21 +344,30 @@ function NodePortSelect({ label, nodeId, port, nodes, direction, onNodeChange, o
   )
 }
 
-function createNode(id: string, type: WorkflowNodeType): WorkflowNodeDefinitionDto {
+function createNode(
+  id: string,
+  type: WorkflowNodeType,
+  capabilities?: WorkflowCapabilitiesDto | null,
+  reciprocalId?: string,
+): WorkflowNodeDefinitionDto {
   const schema = { type: 'object', additionalProperties: true } as const
   const base = { id, name: NODE_TYPES.find((item) => item.value === type)?.label ?? type, type, inputSchema: schema, outputSchema: schema }
   switch (type) {
-    case 'artifact_input': return { ...base, artifactInput: { allowedTypes: ['document'], requireApproved: true, minimumArtifacts: 1 } }
-    case 'ai_transform': return { ...base, aiTransform: { jobType: 'custom_transform', modelPolicy: 'default', outputSchemaVersion: 'artifact/v1', maxAttempts: 2, timeout: 120_000_000_000 } }
-    case 'human_edit': return { ...base, humanEdit: { artifactType: 'document', requiredRole: 'editor', instructions: 'Submit an exact immutable revision.' } }
+    case 'artifact_input': return { ...base, artifactInput: { allowedTypes: ['document'], allowedKinds: ['project_brief'], requireApproved: true, minimumArtifacts: 1 } }
+    case 'ai_transform': {
+      const registered = capabilities?.aiTransforms.at(0) ?? { jobType: 'derive_requirements', outputSchemaVersion: 'requirements-proposal/v1', modelPolicies: ['project-default'] }
+      return { ...base, aiTransform: { jobType: registered.jobType, outputSchemaVersion: registered.outputSchemaVersion, modelPolicy: registered.modelPolicies.at(0) ?? 'project-default', maxAttempts: 2, timeout: 120_000_000_000 } }
+    }
+    case 'human_edit': return { ...base, humanEdit: { artifactType: 'document', artifactKind: 'product_requirements', requiredRole: 'editor', instructions: 'Submit an exact immutable revision.' } }
     case 'review_gate': return { ...base, reviewGate: { requiredRole: 'admin', minimumApprovals: 1, prohibitSelfReview: true, allowWaiver: false } }
     case 'condition': return { ...base, outputPorts: { yes: { schema }, otherwise: { schema } }, condition: { branches: [{ name: 'yes', expression: 'true', default: false }, { name: 'otherwise', default: true }] } }
-    case 'fan_out': return { ...base, fanOut: { itemsPath: '/items', sliceKeyPath: '/id', mergeNodeId: 'merge', maxParallel: 4 } }
-    case 'merge': return { ...base, merge: { fanOutNodeId: 'fan-out', policy: 'all', allowWaiver: false } }
-    case 'manifest_compiler': return { ...base, manifestCompiler: { manifestKind: 'application_build', schemaVersion: 1, hook: 'v1' } }
-    case 'workbench_build': return { ...base, workbenchBuild: { buildManifestSchemaVersion: 1, maxAttempts: 2, timeout: 300_000_000_000 } }
-    case 'quality_gate': return { ...base, qualityGate: { gateName: 'application_quality', blocking: true } }
-    case 'publish': return { ...base, publish: { environment: 'preview', requiredRole: 'admin', allowRollback: true } }
+    case 'fan_out': return { ...base, fanOut: { itemsPath: '/items', sliceKeyPath: '/id', mergeNodeId: reciprocalId ?? `${id}-merge`, maxParallel: 4, itemKind: capabilities?.fanOutItemKinds.at(0) ?? 'generic' } }
+    case 'merge': return { ...base, merge: { fanOutNodeId: reciprocalId ?? `${id}-fan-out`, policy: 'all', allowWaiver: false } }
+    case 'manifest_compiler': return { ...base, manifestCompiler: capabilities?.manifestCompilers.at(0) ?? { manifestKind: 'application_build', schemaVersion: 1, hook: 'application-build-manifest/v1' } }
+    case 'workbench_build': return { ...base, workbenchBuild: { buildManifestSchemaVersion: capabilities?.workbenchSchemaVersions.at(0) ?? 1, maxAttempts: 2, timeout: 300_000_000_000 } }
+    case 'quality_gate': return { ...base, qualityGate: { gateName: capabilities?.qualityGates.at(0) ?? 'release', blocking: true } }
+    case 'publish': return { ...base, publish: { environment: capabilities?.publishEnvironments.at(0) ?? 'preview', requiredRole: 'admin', allowRollback: true } }
+    case 'transform': return { ...base, transform: { transform: capabilities?.transforms.at(0) ?? 'selection_passthrough' } }
   }
 }
 

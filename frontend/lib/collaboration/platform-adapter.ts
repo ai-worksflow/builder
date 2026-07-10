@@ -39,6 +39,7 @@ export interface CollaborationPlatformClient {
   readonly data: PlatformClient['data']
   readonly flow: PlatformClient['flow']
   readonly conversation: PlatformClient['conversation']
+  readonly designImports: PlatformClient['designImports']
   readonly session: Pick<PlatformClient['session'], 'get' | 'signUp' | 'signIn' | 'signOut'>
   readonly projects: Pick<
     PlatformClient['projects'],
