@@ -178,7 +178,10 @@ func writeDesignImportProblem(c *gin.Context, err error) {
 		problem.Write(c, problem.New(http.StatusUnprocessableEntity, "design_import_capability_unavailable", "Design connector is not configured", "This deployment does not fetch remote design URLs. Export the source and upload its file instead."))
 	case errors.Is(err, designimport.ErrProcessing):
 		c.Header("Retry-After", "1")
-		problem.Write(c, problem.New(http.StatusConflict, "design_import_processing", "Design import is processing", "Another worker holds the durable creation lease. Retry after the current checkpoint completes or the lease expires."))
+		// A retryable processing response must not be sealed as a completed
+		// idempotency replay. PersistIdempotency releases 5xx claims, allowing the
+		// same command key to recover the durable Design Import lease later.
+		problem.Write(c, problem.New(http.StatusServiceUnavailable, "design_import_processing", "Design import is processing", "Another worker holds the durable creation lease. Retry with the same idempotency key after the current checkpoint completes or the lease expires."))
 	case errors.Is(err, designimport.ErrConflict):
 		problem.Write(c, problem.New(http.StatusConflict, "design_import_conflict", "Design import conflict", "The import command conflicts with the frozen snapshot or current target."))
 	case errors.Is(err, core.ErrConflict), errors.Is(err, core.ErrProposalStale):

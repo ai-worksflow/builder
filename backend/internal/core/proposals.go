@@ -562,6 +562,33 @@ func (s *ProposalService) ListProposals(ctx context.Context, projectID, actorID,
 	return result, nil
 }
 
+func (s *ProposalService) ensureIndependentDesignImportMutation(
+	ctx context.Context,
+	proposal storage.OutputProposalModel,
+	actorID uuid.UUID,
+) error {
+	if proposal.Kind != "design_import_to_prototype" {
+		return nil
+	}
+	var owner struct {
+		CreatedBy uuid.UUID
+	}
+	err := s.database.WithContext(ctx).Table("design_imports").
+		Select("created_by").
+		Where("project_id = ? AND (output_proposal_id = ? OR expected_output_proposal_id = ?)", proposal.ProjectID, proposal.ID, proposal.ID).
+		Take(&owner).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return ErrConflict
+	}
+	if err != nil {
+		return err
+	}
+	if owner.CreatedBy == actorID {
+		return ErrForbidden
+	}
+	return nil
+}
+
 func (s *ProposalService) Decide(ctx context.Context, proposalID, actorID string, input DecideProposalInput) (domain.OutputProposal, error) {
 	proposal, model, err := s.loadProposal(ctx, proposalID)
 	if err != nil {
@@ -578,6 +605,13 @@ func (s *ProposalService) Decide(ctx context.Context, proposalID, actorID string
 		return domain.OutputProposal{}, err
 	}
 	if err := ensureGenericArtifactMutationAllowed(artifact.Kind); err != nil {
+		return domain.OutputProposal{}, err
+	}
+	actorUUID, err := uuid.Parse(actorID)
+	if err != nil {
+		return domain.OutputProposal{}, fmt.Errorf("%w: actor id", ErrInvalidInput)
+	}
+	if err := s.ensureIndependentDesignImportMutation(ctx, model, actorUUID); err != nil {
 		return domain.OutputProposal{}, err
 	}
 	if input.Version == 0 {
@@ -601,7 +635,6 @@ func (s *ProposalService) Decide(ctx context.Context, proposalID, actorID string
 		}
 	}()
 	accepted, rejected := proposalDecisionCounts(proposal.Operations)
-	actorUUID := uuid.MustParse(actorID)
 	now := s.now().UTC()
 	err = s.database.WithContext(ctx).Transaction(func(transaction *gorm.DB) error {
 		result := transaction.Model(&storage.OutputProposalModel{}).
@@ -651,6 +684,13 @@ func (s *ProposalService) Apply(ctx context.Context, proposalID, actorID string,
 	if _, err := s.access.Authorize(ctx, proposalModel.ProjectID.String(), actorID, ActionEdit); err != nil {
 		return ArtifactDraft{}, err
 	}
+	actorUUID, err := uuid.Parse(actorID)
+	if err != nil {
+		return ArtifactDraft{}, fmt.Errorf("%w: actor id", ErrInvalidInput)
+	}
+	if err := s.ensureIndependentDesignImportMutation(ctx, proposalModel, actorUUID); err != nil {
+		return ArtifactDraft{}, err
+	}
 	manifest, _, err := s.loadManifest(ctx, proposal.Manifest.ID)
 	if err != nil || manifest.Ref() != proposal.Manifest {
 		if err != nil {
@@ -683,7 +723,6 @@ func (s *ProposalService) Apply(ctx context.Context, proposalID, actorID string,
 	if err != nil {
 		return ArtifactDraft{}, err
 	}
-	actorUUID := uuid.MustParse(actorID)
 	draftID := uuid.New()
 	var existingDraft *storage.ArtifactDraftModel
 	var artifact storage.ArtifactModel

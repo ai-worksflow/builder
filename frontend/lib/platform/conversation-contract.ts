@@ -16,6 +16,7 @@ export interface ConversationDto {
   readonly createdAt: string
   readonly updatedAt: string
   readonly archivedAt?: string
+  readonly summaryCheckpointHeadId?: string
 }
 
 export interface ConversationMessageDto {
@@ -27,6 +28,76 @@ export interface ConversationMessageDto {
   readonly proposalId?: string
   readonly createdBy: string
   readonly createdAt: string
+}
+
+export type ConversationSummaryCheckpointStatus =
+  | 'pending_review'
+  | 'approved'
+  | 'rejected'
+  | 'superseded'
+
+export interface ConversationSummaryCheckpointDto {
+  readonly id: string
+  readonly projectId: string
+  readonly conversationId: string
+  readonly previousCheckpointId?: string
+  readonly throughMessageId: string
+  readonly throughSequence: number
+  readonly messageCount: number
+  readonly contentBytes: number
+  readonly prefixHash: string
+  readonly hashAlgorithm: 'conversation-prefix-chain/v1'
+  readonly summary: string
+  readonly summaryHash: string
+  readonly status: ConversationSummaryCheckpointStatus
+  readonly version: number
+  readonly etag: string
+  readonly createdBy: string
+  readonly createdAt: string
+  readonly reviewedBy?: string
+  readonly reviewedAt?: string
+  readonly reviewReason?: string
+}
+
+export interface CreateConversationSummaryCheckpointDto {
+  readonly throughMessageId: string
+  readonly summary: string
+}
+
+export interface ConversationContextProvenanceDto {
+  readonly version: number
+  readonly mode: 'legacy_unrecorded' | 'submitted' | 'full_prefix' | 'checkpoint_tail'
+  readonly triggerMessageId?: string
+  readonly checkpoint?: {
+    readonly id: string
+    readonly throughMessageId: string
+    readonly throughSequence: number
+    readonly prefixHash: string
+    readonly summaryHash: string
+    readonly summary: string
+  }
+  readonly tail?: {
+    readonly fromSequence: number
+    readonly toSequence: number
+    readonly messageCount: number
+    readonly contentBytes: number
+    readonly hash: string
+  }
+  readonly contextHash?: string
+  readonly providerInputHash?: string
+}
+
+export interface ConversationSummaryCheckpointRequiredExtensionsDto {
+  readonly triggerMessageId: string
+  readonly triggerSequence: number
+  readonly messageCount: number
+  readonly messageContentBytes: number
+  readonly contextBytes: number
+  readonly currentApprovedCheckpointId?: string
+  readonly currentThroughSequence?: number
+  readonly recommendedThroughMessageId: string
+  readonly recommendedThroughSequence: number
+  readonly createHref: string
 }
 
 export interface ConversationArtifactRefDto {
@@ -50,13 +121,14 @@ export interface WorkbenchInstructionDto {
   readonly constraints?: readonly string[]
   readonly expectedRunId?: string
   readonly expectedBundleId?: string
+  readonly sliceId?: string
+  readonly sliceKey?: string
+  readonly sliceTitle?: string
 }
 
-export interface WorkbenchExecutionResultDto {
+export interface WorkbenchTargetHintDto {
   readonly runId: string
-  /** Exact active leaf manifest that produced the proposal. */
-  readonly bundleId: string
-  readonly implementationProposalId: string
+  readonly rootBundleId: string
 }
 
 export type ConversationIntentKind = 'start_workflow' | 'workbench_instruction'
@@ -72,6 +144,7 @@ export interface WorkflowIntentProposalDto {
   readonly version: number
   readonly etag: string
   readonly suggestedDefinitionVersionId: string
+  readonly desiredOutputCapability: 'application'
   readonly scope: JsonObject
   readonly sourceRefs: readonly ConversationArtifactRefDto[]
   readonly manifestIntent: ConversationManifestIntentDto
@@ -82,6 +155,7 @@ export interface WorkflowIntentProposalDto {
     readonly model: string
     readonly responseId?: string
   }
+  readonly conversationContext?: ConversationContextProvenanceDto
   readonly decisionReason?: string
   readonly proposedBy: string
   readonly decidedBy?: string
@@ -114,18 +188,21 @@ export interface CreateWorkflowIntentProposalDto {
 
 export interface GenerateWorkflowIntentProposalDto {
   readonly triggerMessageId: string
-  readonly candidateDefinitionVersionIds: readonly string[]
+  readonly desiredOutputCapability: 'application' | string
   readonly sourceRefs: readonly ConversationArtifactRefDto[]
   readonly manifestIntent: ConversationManifestIntentDto
+  readonly workbenchTargetHint?: WorkbenchTargetHintDto
   readonly model?: string
 }
 
 export interface ConversationCommandPayloadDto {
   readonly definitionVersionId: string
+  readonly desiredOutputCapability: 'application'
   readonly scope: JsonObject
   readonly sourceRefs: readonly ConversationArtifactRefDto[]
   readonly manifestIntent: ConversationManifestIntentDto
   readonly workbench: WorkbenchInstructionDto
+  readonly conversationContext?: ConversationContextProvenanceDto
 }
 
 export interface ConversationCommandDto {

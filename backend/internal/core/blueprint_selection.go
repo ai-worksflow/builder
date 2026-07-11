@@ -30,6 +30,8 @@ type blueprintSelectionNode struct {
 	Key            string   `json:"key"`
 	Kind           string   `json:"kind"`
 	Title          string   `json:"title"`
+	Route          string   `json:"route,omitempty"`
+	UserGoal       string   `json:"userGoal,omitempty"`
 	RequirementIDs []string `json:"requirementIds,omitempty"`
 }
 
@@ -55,6 +57,35 @@ type BlueprintSelectionScope struct {
 	Nodes         []blueprintSelectionNode        `json:"nodes"`
 	Edges         []blueprintSelectionEdge        `json:"edges"`
 	PageBindings  []BlueprintSelectionPageBinding `json:"pageBindings"`
+}
+
+// BlueprintSelectionIdentity is the canonical semantic identity shared by the
+// compiler and workflow start validation. Ordering from a generic manifest API
+// cannot create a second identity for the same frozen selection.
+func BlueprintSelectionIdentity(
+	blueprint VersionRef,
+	nodeIDs []string,
+	pageBindings []BlueprintSelectionPageBinding,
+	sources []ManifestSourceInput,
+) (string, error) {
+	nodeIDs = append([]string(nil), nodeIDs...)
+	pageBindings = append([]BlueprintSelectionPageBinding(nil), pageBindings...)
+	sources = append([]ManifestSourceInput(nil), sources...)
+	sort.Strings(nodeIDs)
+	sort.Slice(pageBindings, func(i, j int) bool { return pageBindings[i].NodeID < pageBindings[j].NodeID })
+	sort.Slice(sources, func(i, j int) bool {
+		left, right := sources[i].Ref, sources[j].Ref
+		leftKey := left.ArtifactID + "\x00" + left.RevisionID + "\x00" + dereferenceString(left.AnchorID)
+		rightKey := right.ArtifactID + "\x00" + right.RevisionID + "\x00" + dereferenceString(right.AnchorID)
+		return leftKey < rightKey
+	})
+	identityPayload := struct {
+		Blueprint    VersionRef                      `json:"blueprint"`
+		NodeIDs      []string                        `json:"nodeIds"`
+		PageBindings []BlueprintSelectionPageBinding `json:"pageBindings"`
+		Sources      []ManifestSourceInput           `json:"sources"`
+	}{Blueprint: blueprint, NodeIDs: nodeIDs, PageBindings: pageBindings, Sources: sources}
+	return domain.CanonicalHash(identityPayload)
 }
 
 func (s *ProposalService) compileBlueprintSelection(
@@ -196,13 +227,7 @@ func (s *ProposalService) compileBlueprintSelection(
 	})
 	sort.Slice(pageBindings, func(i, j int) bool { return pageBindings[i].NodeID < pageBindings[j].NodeID })
 
-	identityPayload := struct {
-		Blueprint    VersionRef                      `json:"blueprint"`
-		NodeIDs      []string                        `json:"nodeIds"`
-		PageBindings []BlueprintSelectionPageBinding `json:"pageBindings"`
-		Sources      []ManifestSourceInput           `json:"sources"`
-	}{Blueprint: root, NodeIDs: nodeIDs, PageBindings: pageBindings, Sources: sources}
-	selectionID, err := domain.CanonicalHash(identityPayload)
+	selectionID, err := BlueprintSelectionIdentity(root, nodeIDs, pageBindings, sources)
 	if err != nil {
 		return CreateManifestInput{}, err
 	}
@@ -306,33 +331,25 @@ func selectionDomainRefKey(ref domain.ArtifactRef) string {
 }
 
 func decodeBlueprintSelectionGraph(payload json.RawMessage) ([]blueprintSelectionNode, []blueprintSelectionEdge, error) {
-	var content struct {
-		Nodes    []blueprintSelectionNode `json:"nodes"`
-		Edges    []blueprintSelectionEdge `json:"edges"`
-		Semantic *struct {
-			Nodes []blueprintSelectionNode `json:"nodes"`
-			Edges []blueprintSelectionEdge `json:"edges"`
-		} `json:"semantic"`
+	decodedNodes, decodedEdges, err := DecodeBlueprintSemanticGraph(payload)
+	if err != nil {
+		return nil, nil, fmt.Errorf("%w: %v", ErrBlockingGate, err)
 	}
-	if err := json.Unmarshal(payload, &content); err != nil {
-		return nil, nil, fmt.Errorf("%w: decode Blueprint selection graph", ErrInvalidInput)
+	nodes := make([]blueprintSelectionNode, 0, len(decodedNodes))
+	for _, node := range decodedNodes {
+		nodes = append(nodes, blueprintSelectionNode{
+			ID: node.ID, Key: node.Key, Kind: node.Kind, Title: node.Title,
+			Route: node.Route, UserGoal: node.UserGoal,
+			RequirementIDs: append([]string(nil), node.RequirementIDs...),
+		})
 	}
-	if content.Semantic != nil {
-		content.Nodes, content.Edges = content.Semantic.Nodes, content.Semantic.Edges
+	edges := make([]blueprintSelectionEdge, 0, len(decodedEdges))
+	for _, edge := range decodedEdges {
+		edges = append(edges, blueprintSelectionEdge{
+			ID: edge.ID, SourceID: edge.SourceID, TargetID: edge.TargetID, Kind: edge.Kind, Required: edge.Required,
+		})
 	}
-	if len(content.Nodes) == 0 {
-		return nil, nil, fmt.Errorf("%w: Blueprint selection graph has no semantic nodes", ErrBlockingGate)
-	}
-	seen := map[string]bool{}
-	for index := range content.Nodes {
-		node := &content.Nodes[index]
-		node.ID, node.Key, node.Kind, node.Title = strings.TrimSpace(node.ID), strings.TrimSpace(node.Key), strings.TrimSpace(node.Kind), strings.TrimSpace(node.Title)
-		if node.ID == "" || node.Key == "" || node.Kind == "" || node.Title == "" || seen[node.ID] {
-			return nil, nil, fmt.Errorf("%w: Blueprint semantic node identity", ErrBlockingGate)
-		}
-		seen[node.ID] = true
-	}
-	return content.Nodes, content.Edges, nil
+	return nodes, edges, nil
 }
 
 func (s *ProposalService) resolveBlueprintSelectionPageBinding(
@@ -343,13 +360,16 @@ func (s *ProposalService) resolveBlueprintSelectionPageBinding(
 	type revisionRow struct {
 		ID          uuid.UUID
 		ArtifactID  uuid.UUID
+		ContentRef  string
 		ContentHash string
+		SyncStatus  *string
 	}
 	var pageSpecs []revisionRow
 	if err := s.database.WithContext(ctx).Table("artifact_revision_sources AS source").
-		Select("revision.id, revision.artifact_id, revision.content_hash").
+		Select("revision.id, revision.artifact_id, revision.content_hash, health.sync_status").
 		Joins("JOIN artifact_revisions AS revision ON revision.id = source.revision_id").
 		Joins("JOIN artifacts AS artifact ON artifact.id = revision.artifact_id").
+		Joins("LEFT JOIN artifact_health AS health ON health.artifact_id = artifact.id").
 		Where("source.source_revision_id = ? AND source.source_anchor_id = ?", blueprintRevisionID, nodeID).
 		Where("source.purpose = 'blueprint' AND source.required = TRUE").
 		Where("artifact.project_id = ? AND artifact.kind = 'page_spec' AND artifact.lifecycle = 'active'", projectID).
@@ -364,28 +384,79 @@ func (s *ProposalService) resolveBlueprintSelectionPageBinding(
 	if len(pageSpecs) != 1 {
 		return BlueprintSelectionPageBinding{}, fmt.Errorf("%w: Blueprint page has multiple current approved PageSpecs", ErrConflict)
 	}
+	if pageSpecs[0].SyncStatus == nil || *pageSpecs[0].SyncStatus != "current" {
+		return BlueprintSelectionPageBinding{}, fmt.Errorf("%w: Blueprint PageSpec binding is not current", ErrBlockingGate)
+	}
 	pageRef := VersionRef{ArtifactID: pageSpecs[0].ArtifactID.String(), RevisionID: pageSpecs[0].ID.String(), ContentHash: pageSpecs[0].ContentHash}
 	binding.PageSpec = &pageRef
 	var prototypes []revisionRow
 	if err := s.database.WithContext(ctx).Table("artifact_revision_sources AS source").
-		Select("revision.id, revision.artifact_id, revision.content_hash").
+		Select("revision.id, revision.artifact_id, revision.content_ref, revision.content_hash, health.sync_status").
 		Joins("JOIN artifact_revisions AS revision ON revision.id = source.revision_id").
 		Joins("JOIN artifacts AS artifact ON artifact.id = revision.artifact_id").
+		Joins("LEFT JOIN artifact_health AS health ON health.artifact_id = artifact.id").
 		Where("source.source_revision_id = ? AND source.source_anchor_id IS NULL", pageSpecs[0].ID).
 		Where("source.purpose = 'page_spec' AND source.required = TRUE").
 		Where("artifact.project_id = ? AND artifact.kind = 'prototype' AND artifact.lifecycle = 'active'", projectID).
 		Where("artifact.latest_approved_revision_id = revision.id AND revision.workflow_status = 'approved'").
-		Order("artifact.id ASC").Limit(2).Scan(&prototypes).Error; err != nil {
+		Order("artifact.id ASC").Scan(&prototypes).Error; err != nil {
 		return BlueprintSelectionPageBinding{}, err
 	}
-	if len(prototypes) > 1 {
+	formalPrototypes := make([]revisionRow, 0, 2)
+	for _, prototype := range prototypes {
+		stored, err := s.contents.Get(ctx, prototype.ContentRef, prototype.ContentHash)
+		if err != nil {
+			return BlueprintSelectionPageBinding{}, fmt.Errorf(
+				"%w: approved Prototype content cannot be inspected: %v", ErrBlockingGate, err,
+			)
+		}
+		formal, err := prototypeEligibleForBlueprintSelection(stored.Payload)
+		if err != nil {
+			return BlueprintSelectionPageBinding{}, fmt.Errorf(
+				"%w: approved Prototype %s mode is malformed: %v", ErrBlockingGate, prototype.ID, err,
+			)
+		}
+		if formal {
+			if prototype.SyncStatus == nil || *prototype.SyncStatus != "current" {
+				return BlueprintSelectionPageBinding{}, fmt.Errorf(
+					"%w: approved formal Prototype %s is not current", ErrBlockingGate, prototype.ID,
+				)
+			}
+			formalPrototypes = append(formalPrototypes, prototype)
+		}
+	}
+	if len(formalPrototypes) > 1 {
 		return BlueprintSelectionPageBinding{}, fmt.Errorf("%w: PageSpec has multiple current approved Prototypes", ErrConflict)
 	}
-	if len(prototypes) == 1 {
-		prototypeRef := VersionRef{ArtifactID: prototypes[0].ArtifactID.String(), RevisionID: prototypes[0].ID.String(), ContentHash: prototypes[0].ContentHash}
+	if len(formalPrototypes) == 1 {
+		prototypeRef := VersionRef{
+			ArtifactID: formalPrototypes[0].ArtifactID.String(), RevisionID: formalPrototypes[0].ID.String(),
+			ContentHash: formalPrototypes[0].ContentHash,
+		}
 		binding.Prototype = &prototypeRef
 	}
 	return binding, nil
+}
+
+func prototypeEligibleForBlueprintSelection(payload json.RawMessage) (bool, error) {
+	var content map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &content); err != nil || content == nil {
+		return false, errors.New("Prototype content must be a JSON object")
+	}
+	raw, exists := content["exploratory"]
+	if !exists {
+		// Older formal Prototype revisions predate the explicit flag. Preserve
+		// their meaning while requiring an explicit boolean whenever it is set.
+		return true, nil
+	}
+	if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return false, errors.New("exploratory must be a boolean")
+	}
+	var exploratory bool
+	if err := json.Unmarshal(raw, &exploratory); err != nil {
+		return false, errors.New("exploratory must be a boolean")
+	}
+	return !exploratory, nil
 }
 
 func (s *ProposalService) blueprintSelectionContextRefs(

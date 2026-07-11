@@ -27,10 +27,16 @@ type GORMStore struct {
 }
 
 const claimRunnableSQL = `WITH candidate AS (
-  SELECT id FROM workflow_node_runs
-  WHERE (status = 'ready' AND available_at <= @now)
-     OR (status = 'running' AND lease_expires_at < @now)
-  ORDER BY available_at, id
+  SELECT node.id FROM workflow_node_runs AS node
+  JOIN workflow_runs AS run ON run.id = node.run_id
+  JOIN jsonb_to_recordset(CAST(@profiles AS jsonb)) AS profile(version text, hash text)
+    ON profile.version = run.execution_profile_version AND profile.hash = run.execution_profile_hash
+	WHERE run.status NOT IN ('completed', 'failed', 'cancelled', 'stale')
+	  AND (
+	    (node.status = 'ready' AND node.available_at <= @now)
+	    OR (node.status = 'running' AND node.lease_expires_at < @now)
+	  )
+  ORDER BY node.available_at, node.id
   FOR UPDATE SKIP LOCKED
   LIMIT 1
 )
@@ -69,16 +75,18 @@ type definitionRow struct {
 func (definitionRow) TableName() string { return "workflow_definitions" }
 
 type definitionVersionRow struct {
-	ID               uuid.UUID `gorm:"type:uuid;primaryKey"`
-	DefinitionID     uuid.UUID `gorm:"type:uuid"`
-	Version          int
-	SchemaVersion    int
-	Content          json.RawMessage `gorm:"type:jsonb"`
-	ContentHash      string
-	ValidationReport json.RawMessage `gorm:"type:jsonb"`
-	Published        bool
-	CreatedBy        uuid.UUID `gorm:"type:uuid"`
-	CreatedAt        time.Time
+	ID                      uuid.UUID `gorm:"type:uuid;primaryKey"`
+	DefinitionID            uuid.UUID `gorm:"type:uuid"`
+	Version                 int
+	SchemaVersion           int
+	Content                 json.RawMessage `gorm:"type:jsonb"`
+	ContentHash             string
+	ExecutionProfileVersion string
+	ExecutionProfileHash    string
+	ValidationReport        json.RawMessage `gorm:"type:jsonb"`
+	Published               bool
+	CreatedBy               uuid.UUID `gorm:"type:uuid"`
+	CreatedAt               time.Time
 }
 
 func (definitionVersionRow) TableName() string { return "workflow_definition_versions" }
@@ -125,21 +133,23 @@ type proposalRow struct {
 func (proposalRow) TableName() string { return "output_proposals" }
 
 type runRow struct {
-	ID                  uuid.UUID `gorm:"type:uuid;primaryKey"`
-	ProjectID           uuid.UUID `gorm:"type:uuid"`
-	DefinitionVersionID uuid.UUID `gorm:"type:uuid"`
-	Status              string
-	InputManifestID     *uuid.UUID      `gorm:"type:uuid"`
-	Scope               json.RawMessage `gorm:"type:jsonb"`
-	Context             json.RawMessage `gorm:"type:jsonb"`
-	EventCursor         uint64
-	StartedBy           uuid.UUID `gorm:"type:uuid"`
-	StartedAt           *time.Time
-	CompletedAt         *time.Time
-	CancelledAt         *time.Time
-	Failure             json.RawMessage `gorm:"type:jsonb"`
-	CreatedAt           time.Time
-	UpdatedAt           time.Time
+	ID                      uuid.UUID `gorm:"type:uuid;primaryKey"`
+	ProjectID               uuid.UUID `gorm:"type:uuid"`
+	DefinitionVersionID     uuid.UUID `gorm:"type:uuid"`
+	ExecutionProfileVersion string
+	ExecutionProfileHash    string
+	Status                  string
+	InputManifestID         *uuid.UUID      `gorm:"type:uuid"`
+	Scope                   json.RawMessage `gorm:"type:jsonb"`
+	Context                 json.RawMessage `gorm:"type:jsonb"`
+	EventCursor             uint64
+	StartedBy               uuid.UUID `gorm:"type:uuid"`
+	StartedAt               *time.Time
+	CompletedAt             *time.Time
+	CancelledAt             *time.Time
+	Failure                 json.RawMessage `gorm:"type:jsonb"`
+	CreatedAt               time.Time
+	UpdatedAt               time.Time
 }
 
 func (runRow) TableName() string { return "workflow_runs" }
@@ -197,7 +207,10 @@ type sliceRow struct {
 func (sliceRow) TableName() string { return "delivery_slices" }
 
 func (s *GORMStore) SaveDefinition(ctx context.Context, record DefinitionRecord) error {
-	if err := record.Definition.Validate(); err != nil {
+	if err := normalizeDefinitionRecordProfile(&record); err != nil {
+		return err
+	}
+	if err := ValidateDefinitionForExecutionProfile(record.Definition, record.ExecutionProfile); err != nil {
 		return err
 	}
 	definitionID, err := parseUUID("definition.id", record.Definition.ID)
@@ -229,7 +242,7 @@ func (s *GORMStore) SaveDefinition(ctx context.Context, record DefinitionRecord)
 		return err
 	}
 	base := definitionRow{ID: definitionID, ProjectID: projectID, WorkflowKey: record.Key, Title: record.Title, Description: record.Description, Lifecycle: "active", CreatedBy: createdBy, CreatedAt: record.Definition.CreatedAt, UpdatedAt: record.Definition.CreatedAt}
-	version := definitionVersionRow{ID: versionID, DefinitionID: definitionID, Version: record.Definition.Version, SchemaVersion: schemaVersion, Content: content, ContentHash: record.Definition.Hash, ValidationReport: json.RawMessage(`{"valid":true}`), Published: record.Published, CreatedBy: createdBy, CreatedAt: record.Definition.CreatedAt}
+	version := definitionVersionRow{ID: versionID, DefinitionID: definitionID, Version: record.Definition.Version, SchemaVersion: schemaVersion, Content: content, ContentHash: record.Definition.Hash, ExecutionProfileVersion: record.ExecutionProfile.Version, ExecutionProfileHash: record.ExecutionProfile.Hash, ValidationReport: json.RawMessage(`{"valid":true}`), Published: record.Published, CreatedBy: createdBy, CreatedAt: record.Definition.CreatedAt}
 	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var existing definitionRow
 		err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&existing, "id = ?", definitionID).Error
@@ -273,6 +286,19 @@ func (s *GORMStore) SaveDefinition(ctx context.Context, record DefinitionRecord)
 }
 
 func (s *GORMStore) PublishDefinitionVersion(ctx context.Context, projectID, definitionID, versionID, actorID string) (DefinitionRecord, error) {
+	record, err := s.GetDefinitionVersion(ctx, versionID)
+	if err != nil {
+		return DefinitionRecord{}, err
+	}
+	if record.Definition.ID != definitionID || record.ProjectID != projectID {
+		return DefinitionRecord{}, domain.ErrNotFound
+	}
+	if record.ExecutionProfile != CurrentWorkflowExecutionProfileRef() {
+		return DefinitionRecord{}, &domain.DomainError{Kind: domain.ErrValidation, Field: "workflow.executionProfile", Message: "only the current execution profile can be newly published"}
+	}
+	if err := ValidateDefinitionForExecutionProfile(record.Definition, record.ExecutionProfile); err != nil {
+		return DefinitionRecord{}, err
+	}
 	projectUUID, err := parseUUID("definition.projectId", projectID)
 	if err != nil {
 		return DefinitionRecord{}, err
@@ -454,17 +480,22 @@ func (s *GORMStore) loadDefinitionRecord(ctx context.Context, version definition
 	if err := json.Unmarshal(version.Content, &definition); err != nil {
 		return DefinitionRecord{}, fmt.Errorf("decode workflow definition: %w", err)
 	}
-	if err := definition.Validate(); err != nil {
-		return DefinitionRecord{}, err
-	}
 	if definition.Hash != version.ContentHash {
 		return DefinitionRecord{}, fmt.Errorf("workflow definition content hash mismatch")
+	}
+	profile := domain.WorkflowExecutionProfileRef{Version: version.ExecutionProfileVersion, Hash: version.ExecutionProfileHash}
+	record := DefinitionRecord{ExecutionProfile: profile, Definition: definition}
+	if err := normalizeDefinitionRecordProfile(&record); err != nil {
+		return DefinitionRecord{}, err
+	}
+	if err := ValidateDefinitionForExecutionProfile(definition, profile); err != nil {
+		return DefinitionRecord{}, err
 	}
 	projectID := ""
 	if base.ProjectID != nil {
 		projectID = base.ProjectID.String()
 	}
-	return DefinitionRecord{VersionID: version.ID.String(), ProjectID: projectID, Key: base.WorkflowKey, Title: base.Title, Description: base.Description, Published: version.Published, Definition: definition}, nil
+	return DefinitionRecord{VersionID: version.ID.String(), ProjectID: projectID, Key: base.WorkflowKey, Title: base.Title, Description: base.Description, Published: version.Published, ExecutionProfile: profile, Definition: definition}, nil
 }
 
 func (s *GORMStore) SaveManifest(ctx context.Context, manifest domain.InputManifest) error {
@@ -697,7 +728,7 @@ func (s *GORMStore) runToRows(run *RunRecord) (runRow, []nodeRunRow, error) {
 	if len(scope) == 0 {
 		scope = json.RawMessage(`{}`)
 	}
-	row := runRow{ID: id, ProjectID: projectID, DefinitionVersionID: versionID, Status: string(run.Status), InputManifestID: manifestID, Scope: scope, Context: contextJSON, EventCursor: run.EventCursor, StartedBy: startedBy, StartedAt: run.StartedAt, CompletedAt: run.CompletedAt, CancelledAt: run.CancelledAt, Failure: run.Failure, CreatedAt: run.CreatedAt, UpdatedAt: run.UpdatedAt}
+	row := runRow{ID: id, ProjectID: projectID, DefinitionVersionID: versionID, ExecutionProfileVersion: run.ExecutionProfile.Version, ExecutionProfileHash: run.ExecutionProfile.Hash, Status: string(run.Status), InputManifestID: manifestID, Scope: scope, Context: contextJSON, EventCursor: run.EventCursor, StartedBy: startedBy, StartedAt: run.StartedAt, CompletedAt: run.CompletedAt, CancelledAt: run.CancelledAt, Failure: run.Failure, CreatedAt: run.CreatedAt, UpdatedAt: run.UpdatedAt}
 	nodes := make([]nodeRunRow, 0, len(run.Nodes))
 	for _, node := range run.Nodes {
 		converted, err := nodeToRow(node)
@@ -761,6 +792,10 @@ func (s *GORMStore) GetRun(ctx context.Context, id string) (*RunRecord, error) {
 	if err != nil {
 		return nil, err
 	}
+	profile := domain.WorkflowExecutionProfileRef{Version: row.ExecutionProfileVersion, Hash: row.ExecutionProfileHash}
+	if profile != definition.ExecutionProfile {
+		return nil, fmt.Errorf("workflow run execution profile does not match its definition version")
+	}
 	var runContext RunContext
 	if err := json.Unmarshal(row.Context, &runContext); err != nil {
 		return nil, fmt.Errorf("decode workflow run context: %w", err)
@@ -779,7 +814,7 @@ func (s *GORMStore) GetRun(ctx context.Context, id string) (*RunRecord, error) {
 	if err := s.db.WithContext(ctx).Where("run_id = ?", runID).Find(&nodeRows).Error; err != nil {
 		return nil, err
 	}
-	run := &RunRecord{ID: row.ID.String(), ProjectID: row.ProjectID.String(), DefinitionVersionID: row.DefinitionVersionID.String(), Definition: definition.Definition.Ref(), InputManifest: manifestRef, Status: RunStatus(row.Status), Scope: row.Scope, Context: runContext, EventCursor: row.EventCursor, StartedBy: row.StartedBy.String(), StartedAt: row.StartedAt, CompletedAt: row.CompletedAt, CancelledAt: row.CancelledAt, Failure: row.Failure, CreatedAt: row.CreatedAt, UpdatedAt: row.UpdatedAt, Nodes: map[string]*NodeRecord{}}
+	run := &RunRecord{ID: row.ID.String(), ProjectID: row.ProjectID.String(), DefinitionVersionID: row.DefinitionVersionID.String(), Definition: definition.Definition.RefForExecutionProfile(profile), ExecutionProfile: profile, InputManifest: manifestRef, Status: RunStatus(row.Status), Scope: row.Scope, Context: runContext, EventCursor: row.EventCursor, StartedBy: row.StartedBy.String(), StartedAt: row.StartedAt, CompletedAt: row.CompletedAt, CancelledAt: row.CancelledAt, Failure: row.Failure, CreatedAt: row.CreatedAt, UpdatedAt: row.UpdatedAt, Nodes: map[string]*NodeRecord{}}
 	for _, nodeRow := range nodeRows {
 		node, err := s.rowToNode(ctx, nodeRow, runContext)
 		if err != nil {
@@ -824,10 +859,33 @@ func (s *GORMStore) ListRuns(ctx context.Context, projectID string, filter Store
 func summaryFromRow(row runRow) RunSummary {
 	return RunSummary{
 		ID: row.ID.String(), ProjectID: row.ProjectID.String(), DefinitionVersionID: row.DefinitionVersionID.String(),
-		Status: RunStatus(row.Status), EventCursor: row.EventCursor, StartedBy: row.StartedBy.String(),
+		ExecutionProfile: domain.WorkflowExecutionProfileRef{Version: row.ExecutionProfileVersion, Hash: row.ExecutionProfileHash},
+		Status:           RunStatus(row.Status), EventCursor: row.EventCursor, StartedBy: row.StartedBy.String(),
 		StartedAt: row.StartedAt, CompletedAt: row.CompletedAt, CancelledAt: row.CancelledAt,
 		Failure: cloneRaw(row.Failure), CreatedAt: row.CreatedAt, UpdatedAt: row.UpdatedAt,
 	}
+}
+
+func (s *GORMStore) ListActiveExecutionProfiles(ctx context.Context) ([]domain.WorkflowExecutionProfileRef, error) {
+	var rows []struct {
+		ExecutionProfileVersion string
+		ExecutionProfileHash    string
+	}
+	if err := s.db.WithContext(ctx).Model(&runRow{}).
+		Select("DISTINCT execution_profile_version, execution_profile_hash").
+		Where("status NOT IN ?", []RunStatus{RunCompleted, RunFailed, RunCancelled, RunStale}).
+		Order("execution_profile_version, execution_profile_hash").Scan(&rows).Error; err != nil {
+		return nil, err
+	}
+	result := make([]domain.WorkflowExecutionProfileRef, 0, len(rows))
+	for _, row := range rows {
+		ref := domain.WorkflowExecutionProfileRef{Version: row.ExecutionProfileVersion, Hash: row.ExecutionProfileHash}
+		if err := ref.Validate(); err != nil {
+			return nil, fmt.Errorf("active workflow run has an invalid execution profile: %w", err)
+		}
+		result = append(result, ref)
+	}
+	return result, nil
 }
 
 func (s *GORMStore) rowToNode(ctx context.Context, row nodeRunRow, runContext RunContext) (*NodeRecord, error) {
@@ -857,14 +915,30 @@ func (s *GORMStore) rowToNode(ctx context.Context, row nodeRunRow, runContext Ru
 	return node, nil
 }
 
-func (s *GORMStore) ClaimRunnable(ctx context.Context, workerID string, now time.Time, leaseDuration time.Duration) (Lease, error) {
+func (s *GORMStore) ClaimRunnable(ctx context.Context, workerID string, now time.Time, leaseDuration time.Duration, supported ...domain.WorkflowExecutionProfileRef) (Lease, error) {
 	if strings.TrimSpace(workerID) == "" || leaseDuration <= 0 {
 		return Lease{}, fmt.Errorf("worker and positive lease duration are required")
 	}
+	profiles := make([]domain.WorkflowExecutionProfileRef, 0, len(supported))
+	seen := map[domain.WorkflowExecutionProfileRef]bool{}
+	for _, ref := range supported {
+		if ref.Validate() != nil || seen[ref] {
+			continue
+		}
+		seen[ref] = true
+		profiles = append(profiles, ref)
+	}
+	if len(profiles) == 0 {
+		return Lease{}, ErrNoRunnableNode
+	}
+	profileJSON, err := json.Marshal(profiles)
+	if err != nil {
+		return Lease{}, err
+	}
 	var claimed nodeRunRow
 	expires := now.UTC().Add(leaseDuration)
-	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		result := tx.Raw(claimRunnableSQL, map[string]any{"now": now.UTC(), "owner": workerID, "expires": expires}).Scan(&claimed)
+	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		result := tx.Raw(claimRunnableSQL, map[string]any{"now": now.UTC(), "owner": workerID, "expires": expires, "profiles": string(profileJSON)}).Scan(&claimed)
 		if result.Error != nil {
 			return result.Error
 		}
@@ -932,6 +1006,9 @@ func (s *GORMStore) Commit(ctx context.Context, mutation RunMutation) error {
 			if updated.RowsAffected != 1 {
 				return ErrLeaseLost
 			}
+		}
+		if err := validateCompletedManifestCompilerGroupsTx(ctx, tx, runID, mutation); err != nil {
+			return err
 		}
 		if len(mutation.NewNodes) > 0 {
 			rows := make([]nodeRunRow, 0, len(mutation.NewNodes))

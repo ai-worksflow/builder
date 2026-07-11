@@ -40,12 +40,16 @@ export interface WorkflowArtifactInputConfigDto {
   readonly allowedKinds?: readonly ArtifactKind[]
   readonly requireApproved: boolean
   readonly minimumArtifacts: number
+  readonly maximumArtifacts: number
 }
 
 export interface WorkflowInputContractDto {
   readonly capability: 'project_brief' | 'blueprint_selection' | string
   readonly manifestJobTypes: readonly string[]
   readonly artifactKinds: readonly ArtifactKind[]
+  readonly minimumArtifacts: number
+  readonly maximumArtifacts: number
+  readonly requireApproved: boolean
   readonly requiredSourcePurposes: readonly string[]
   readonly manifestSchemaContracts: Readonly<Record<string, string>>
 }
@@ -55,6 +59,11 @@ export interface WorkflowOutputContractDto {
   readonly producedArtifactKinds: readonly ArtifactKind[]
   readonly terminalOutcome: 'application' | 'deployment'
   readonly terminalNodeType: WorkflowNodeType
+}
+
+export interface WorkflowExecutionProfileRefDto {
+  readonly version: string
+  readonly hash: string
 }
 
 export interface WorkflowAITransformConfigDto {
@@ -93,6 +102,8 @@ export interface WorkflowFanOutConfigDto {
   readonly sliceKeyPath: string
   readonly mergeNodeId: string
   readonly maxParallel: number
+  /** Omitted only by historical workflow versions; governed authoring requires it. */
+  readonly maxItems?: number
   readonly itemKind?: 'generic' | 'delivery_slice' | 'blueprint_page' | 'blueprint_selection_page'
 }
 
@@ -164,6 +175,8 @@ export interface WorkflowDefinitionDto {
   readonly version: number
   readonly name: string
   readonly schemaVersion: string
+  /** Absent only in immutable pre-pin definition JSON; the record still returns its legacy ref. */
+  readonly executionProfile?: WorkflowExecutionProfileRefDto
   readonly nodes: readonly WorkflowNodeDefinitionDto[]
   readonly edges: readonly WorkflowEdgeDto[]
   /** Absent only on immutable historical versions created before contracts. */
@@ -185,6 +198,7 @@ export interface WorkflowDefinitionRecordDto {
   readonly published: boolean
   readonly version: number
   readonly contentHash: string
+  readonly executionProfile: WorkflowExecutionProfileRefDto
   readonly definition: WorkflowDefinitionDto
 }
 
@@ -213,12 +227,20 @@ export interface WorkflowAITransformCapabilityDto {
   readonly jobType: string
   readonly outputSchemaVersion: string
   readonly modelPolicies: readonly string[]
+  readonly requiredArtifactKinds: readonly ArtifactKind[]
+  readonly requiredApprovedKinds: readonly ArtifactKind[]
+  readonly producedArtifactKinds: readonly ArtifactKind[]
 }
 
 export interface WorkflowManifestCompilerCapabilityDto {
   readonly manifestKind: string
   readonly schemaVersion: number
   readonly hook: string
+  readonly requiredArtifactKinds: readonly ArtifactKind[]
+  readonly requiredApprovedKinds: readonly ArtifactKind[]
+  readonly requiresMergedSlices: boolean
+  readonly producedSemanticKinds: readonly string[]
+  readonly allowedContextArtifactKinds: readonly ArtifactKind[]
 }
 
 export interface WorkflowCapabilitiesDto {
@@ -230,9 +252,16 @@ export interface WorkflowCapabilitiesDto {
   readonly manifestCompilers: readonly WorkflowManifestCompilerCapabilityDto[]
   readonly transforms: readonly string[]
   readonly fanOutItemKinds: readonly ('generic' | 'delivery_slice' | 'blueprint_page' | 'blueprint_selection_page')[]
+  readonly fanOutMaximumItems: Readonly<Record<string, number>>
   readonly qualityGates: readonly string[]
   readonly publishEnvironments: readonly string[]
   readonly workbenchSchemaVersions: readonly number[]
+  readonly analysisLimits: {
+    readonly maximumDefinitionNodes: number
+    readonly maximumDefinitionEdges: number
+    readonly maxSemanticPathStates: number
+    readonly maximumConditionExpressionBytes: number
+  }
 }
 
 export interface ExactArtifactRefDto {
@@ -351,6 +380,23 @@ export interface WorkflowNodeRunDto {
   readonly updatedAt: IsoDateTime
 }
 
+export interface WorkflowProposalLineagePinDto {
+  readonly proposal: { readonly id: string; readonly payloadHash: string }
+  readonly manifest: ManifestRefDto
+  readonly producerNodeKey: string
+  readonly producerDefinitionNodeId: string
+}
+
+export interface WorkflowNodeOutputReferenceDto {
+  readonly runId: string
+  readonly nodeKey: string
+  readonly definitionNodeId: string
+  readonly inputManifest?: ManifestRefDto
+  readonly outputProposal?: { readonly id: string; readonly payloadHash: string }
+  readonly proposalPins?: readonly WorkflowProposalLineagePinDto[]
+  readonly artifactRevisions?: readonly ExactArtifactRefDto[]
+}
+
 export interface WorkflowSliceContextDto {
   readonly id: string
   readonly key: string
@@ -395,7 +441,8 @@ export interface WorkflowRunDto {
   readonly id: string
   readonly projectId: string
   readonly definitionVersionId: string
-  readonly definition: { readonly id: string; readonly version: number; readonly hash: string }
+  readonly definition: { readonly id: string; readonly version: number; readonly hash: string; readonly executionProfile: WorkflowExecutionProfileRefDto }
+  readonly executionProfile: WorkflowExecutionProfileRefDto
   readonly inputManifest?: ManifestRefDto
   readonly status: WorkflowRunStatus
   readonly scope?: JsonValue
@@ -416,6 +463,7 @@ export interface WorkflowRunSummaryDto {
   readonly id: string
   readonly projectId: string
   readonly definitionVersionId: string
+  readonly executionProfile: WorkflowExecutionProfileRefDto
   readonly status: WorkflowRunStatus
   readonly eventCursor: number
   readonly startedBy: string
@@ -453,6 +501,22 @@ export interface AssetRefDto {
   readonly name?: string
 }
 
+export interface ApplicationBuildContextDto {
+  readonly definition: {
+    readonly id: string
+    readonly version: number
+    readonly hash: string
+    /** Absent only on immutable Workbench bundles frozen before execution-profile pinning. */
+    readonly executionProfile?: WorkflowExecutionProfileRefDto
+  }
+  /** Required on every newly created bundle; absent only for historical frozen payloads. */
+  readonly executionProfile?: WorkflowExecutionProfileRefDto
+  readonly inputManifest: InputManifestDto
+  readonly deliverySliceId?: string
+  readonly runScope?: JsonValue
+  readonly outputContract?: WorkflowOutputContractDto
+}
+
 export interface WorkbenchBundleDto {
   readonly id: string
   /** Stable manifest-order identity shared by every exact-workspace derivative. */
@@ -461,6 +525,7 @@ export interface WorkbenchBundleDto {
   readonly derivedFromBuildManifestId?: string
   readonly projectId: string
   readonly workflowRunId?: string
+  readonly manifestGroupKey?: string
   readonly deliverySliceId?: string
   readonly pageSpecRevision: ExactArtifactRefDto
   readonly prototypeRevision: ExactArtifactRefDto
@@ -468,6 +533,11 @@ export interface WorkbenchBundleDto {
   readonly blueprintRevision: ExactArtifactRefDto
   readonly contractRevisions: readonly ExactArtifactRefDto[]
   readonly designSystemRevisions: readonly ExactArtifactRefDto[]
+  readonly contextRevisions?: readonly {
+    readonly kind: string
+    readonly revision: ExactArtifactRefDto
+  }[]
+  readonly workflowContext?: ApplicationBuildContextDto
   readonly currentWorkspaceRevision?: ExactArtifactRefDto
   readonly sceneGraph: AssetRefDto
   readonly renderedFrames: readonly (AssetRefDto & {
@@ -538,6 +608,12 @@ export interface ImplementationProposalDto {
   readonly projectId: string
   readonly buildManifestId: string
   readonly baseWorkspaceRevision?: ExactArtifactRefDto
+  readonly executionSource: 'manual_submission' | 'manual_generation' | 'workflow_runner' | 'conversation_command'
+  readonly conversationCommandId?: string
+  readonly supersedesProposalId?: string
+  readonly instructionHash?: string
+  readonly aiProvider?: string
+  readonly aiModel?: string
   readonly operations: readonly FileOperationDto[]
   readonly routes: readonly JsonValue[]
   readonly apis: readonly JsonValue[]

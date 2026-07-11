@@ -63,7 +63,8 @@ func adapterExecution(t *testing.T) (Execution, domain.InputManifest) {
 	definition := domain.NodeDefinition{ID: "ai", Name: "AI", Type: domain.NodeAITransform, InputSchema: engineSchema(), OutputSchema: engineSchema(), AITransform: &domain.AITransformNodeConfig{JobType: "decompose_pages", ModelPolicy: "default", OutputSchemaVersion: "blueprint/v1", MaxAttempts: 2, Timeout: time.Minute}}
 	contextState := NewRunContext()
 	contextState.Nodes["ai"] = NodeMetadata{DefinitionNodeID: "ai", MaxAttempts: 2, TimeoutNanos: int64(time.Minute)}
-	execution := Execution{Run: RunRecord{ID: uuid.NewString(), ProjectID: projectID, Definition: domain.WorkflowDefinitionRef{ID: uuid.NewString(), Version: 1, Hash: platformHash("definition")}, InputManifest: ptrManifest(manifest.Ref()), Status: RunRunning, Scope: json.RawMessage(`{"feature":"orders"}`), Context: contextState, StartedBy: actorID, Nodes: map[string]*NodeRecord{}}, Node: NodeRecord{ID: uuid.NewString(), Key: "ai", DefinitionNodeID: "ai", Type: domain.NodeAITransform, Status: NodeRunning}, Definition: definition}
+	outputContract := &domain.WorkflowOutputContract{Capability: domain.WorkflowOutputApplication, ProducedArtifactKinds: []string{"workspace"}, TerminalOutcome: domain.WorkflowOutcomeApplication, TerminalNodeType: domain.NodeWorkbenchBuild}
+	execution := Execution{Run: RunRecord{ID: uuid.NewString(), ProjectID: projectID, Definition: domain.WorkflowDefinitionRef{ID: uuid.NewString(), Version: 1, Hash: platformHash("definition")}, InputManifest: ptrManifest(manifest.Ref()), Status: RunRunning, Scope: json.RawMessage(`{"feature":"orders"}`), Context: contextState, StartedBy: actorID, Nodes: map[string]*NodeRecord{}}, Node: NodeRecord{ID: uuid.NewString(), Key: "ai", DefinitionNodeID: "ai", Type: domain.NodeAITransform, Status: NodeRunning}, Definition: definition, Workflow: domain.WorkflowDefinition{OutputContract: outputContract}}
 	return execution, manifest
 }
 func ptrManifest(value domain.ManifestRef) *domain.ManifestRef { return &value }
@@ -144,6 +145,58 @@ func TestCoreManifestFreezerCompilesExactRequirementsIntoBaseline(t *testing.T) 
 	}
 }
 
+func TestCoreManifestFreezerRerunUsesLatestBriefAndRequirementsOnly(t *testing.T) {
+	execution, _ := adapterExecution(t)
+	blueprintBase := platformRef("blueprint-target")
+	b0 := platformRef("brief-b0")
+	b1 := platformRef("brief-b1")
+	b1.ArtifactID = b0.ArtifactID
+	r0 := platformRef("requirements-r0")
+	r1 := platformRef("requirements-r1")
+	r1.ArtifactID = r0.ArtifactID
+	upstream, err := domain.NewInputManifest(
+		uuid.NewString(), execution.Run.ProjectID, "workflow_start", "", &blueprintBase,
+		[]domain.ManifestSource{{Ref: b0, Purpose: "project_brief"}, {Ref: r0, Purpose: "product_requirements"}},
+		json.RawMessage(`{}`), "workflow-input/v1", execution.Run.StartedBy, time.Now().UTC(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	execution.Run.InputManifest = ptrManifest(upstream.Ref())
+	execution.Inputs, err = domain.NewNodeInputEnvelope([]domain.NodeInputBinding{{
+		EdgeID: "requirements-review-blueprint-ai", FromPort: "default", ToPort: "default",
+		Source: domain.NodeOutputReference{
+			RunID: execution.Run.ID, NodeKey: "requirements-review", DefinitionNodeID: "requirements-review",
+			ArtifactRevisions: []domain.ArtifactRef{b1, r1},
+		},
+		Output: json.RawMessage(`{}`), Value: json.RawMessage(`{}`),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	baselineRef := platformRef("rerun-baseline")
+	baseline := &fakeRequirementBaselineCompiler{result: core.ArtifactRevision{
+		ID: baselineRef.RevisionID, ArtifactID: baselineRef.ArtifactID, ContentHash: baselineRef.ContentHash,
+	}}
+	if _, err := (CoreManifestFreezer{
+		Proposals: &fakeCoreProposals{manifest: upstream}, RequirementBaseline: baseline,
+	}).Freeze(context.Background(), execution); err != nil {
+		t.Fatal(err)
+	}
+	if len(baseline.sources) != 2 || !containsCoreVersionRef(baseline.sources, toCoreVersionRef(b1)) || !containsCoreVersionRef(baseline.sources, toCoreVersionRef(r1)) || containsCoreVersionRef(baseline.sources, toCoreVersionRef(b0)) || containsCoreVersionRef(baseline.sources, toCoreVersionRef(r0)) {
+		t.Fatalf("rerun baseline must receive exactly B1+R1, never stale B0/R0: %+v", baseline.sources)
+	}
+}
+
+func containsCoreVersionRef(refs []core.VersionRef, candidate core.VersionRef) bool {
+	for _, ref := range refs {
+		if sameCoreVersionRef(ref, candidate) {
+			return true
+		}
+	}
+	return false
+}
+
 func TestCoreManifestFreezerAllowsBaseOnlyProjectBriefRefinement(t *testing.T) {
 	t.Parallel()
 	execution, _ := adapterExecution(t)
@@ -157,6 +210,17 @@ func TestCoreManifestFreezerAllowsBaseOnlyProjectBriefRefinement(t *testing.T) {
 		t.Fatal(err)
 	}
 	execution.Run.InputManifest = ptrManifest(upstream.Ref())
+	execution.Inputs, err = domain.NewNodeInputEnvelope([]domain.NodeInputBinding{{
+		EdgeID: "source-refine", FromPort: "default", ToPort: "default",
+		Source: domain.NodeOutputReference{
+			RunID: execution.Run.ID, NodeKey: "source", DefinitionNodeID: "source",
+			ArtifactRevisions: []domain.ArtifactRef{brief},
+		},
+		Output: json.RawMessage(`{}`), Value: json.RawMessage(`{}`),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
 	execution.Run.Scope = json.RawMessage(`{"conversationIntent":{"conversationId":"conversation","proposalId":"intent-proposal","workbenchInstruction":{"objective":"Refine the reviewed brief"}}}`)
 	execution.Definition.AITransform.JobType = "refine_project_brief"
 	execution.Definition.AITransform.OutputSchemaVersion = "project-brief-proposal/v1"
@@ -171,6 +235,104 @@ func TestCoreManifestFreezerAllowsBaseOnlyProjectBriefRefinement(t *testing.T) {
 	if proposals.created.BaseRevision == nil || !sameCoreVersionRef(*proposals.created.BaseRevision, toCoreVersionRef(brief)) || len(proposals.created.Sources) != 0 || !strings.Contains(string(proposals.created.Constraints), "intent-proposal") {
 		t.Fatalf("reviewed conversation intent/base did not reach the immutable refine manifest: %+v", proposals.created)
 	}
+}
+
+func TestCoreManifestFreezerRefineRerunUsesCurrentBriefBase(t *testing.T) {
+	execution, _ := adapterExecution(t)
+	b0 := platformRef("brief-b0")
+	b1 := platformRef("brief-b1")
+	b1.ArtifactID = b0.ArtifactID
+	upstream, err := domain.NewInputManifest(
+		uuid.NewString(), execution.Run.ProjectID, "workflow_start", "", &b0,
+		[]domain.ManifestSource{{Ref: b0, Purpose: "project_brief"}}, json.RawMessage(`{}`),
+		"workflow-input/v1", execution.Run.StartedBy, time.Now().UTC(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	execution.Run.InputManifest = ptrManifest(upstream.Ref())
+	execution.Definition.AITransform.JobType = "refine_project_brief"
+	execution.Definition.AITransform.OutputSchemaVersion = "project-brief-proposal/v1"
+	execution.Inputs, err = domain.NewNodeInputEnvelope([]domain.NodeInputBinding{{
+		EdgeID: "brief-review-refine-again", FromPort: "default", ToPort: "default",
+		Source: domain.NodeOutputReference{
+			RunID: execution.Run.ID, NodeKey: "brief-review", DefinitionNodeID: "brief-review",
+			ArtifactRevisions: []domain.ArtifactRef{b1},
+		},
+		Output: json.RawMessage(`{}`), Value: json.RawMessage(`{}`),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	proposals := &fakeCoreProposals{manifest: upstream}
+	frozen, err := (CoreManifestFreezer{Proposals: proposals}).Freeze(context.Background(), execution)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if frozen.BaseRevision == nil || !frozen.BaseRevision.Equal(b1) || frozen.BaseRevision.Equal(b0) {
+		t.Fatalf("second refinement must base on current B1, never entry B0: %+v", frozen.BaseRevision)
+	}
+	if proposals.created.BaseRevision == nil || !sameCoreVersionRef(*proposals.created.BaseRevision, toCoreVersionRef(b1)) {
+		t.Fatalf("current Project Brief base did not reach proposal manifest: %+v", proposals.created.BaseRevision)
+	}
+}
+
+func TestCoreManifestFreezerUsesPrunedSlicePinsInsteadOfMutableContext(t *testing.T) {
+	execution, upstream := adapterExecution(t)
+	blueprint := platformRef("slice-blueprint")
+	pageSpec := platformRef("page-spec-v2")
+	stalePrototype := platformRef("prototype-v1")
+	sliceID := "slice-page"
+	execution.Node.SliceID = sliceID
+	execution.Node.Key = "page-spec-ai:" + sliceID
+	execution.Definition.AITransform.JobType = "generate_page_spec"
+	execution.Definition.AITransform.OutputSchemaVersion = "page-spec-proposal/v1"
+	execution.Run.Context.Nodes[execution.Node.Key] = NodeMetadata{DefinitionNodeID: execution.Definition.ID, SliceID: sliceID}
+	execution.Run.Context.Slices[sliceID] = SliceContext{
+		ID: sliceID, Key: "page", FanOutNodeID: "pages", Blueprint: blueprint,
+		PageSpec: &pageSpec, Prototype: &stalePrototype,
+	}
+	execution.Inputs = mustNodeInputEnvelope(t, domain.NodeOutputReference{
+		RunID: execution.Run.ID, NodeKey: "page-spec-review", DefinitionNodeID: "page-spec-review", SliceID: sliceID,
+		ArtifactRevisions: []domain.ArtifactRef{blueprint, pageSpec},
+		DeliverySliceRefs: []domain.WorkflowSliceRef{{
+			ID: sliceID, Key: "page", FanOutNodeID: "pages", Blueprint: &blueprint, PageSpec: &pageSpec,
+		}},
+	})
+	proposals := &fakeCoreProposals{manifest: upstream}
+	frozen, err := (CoreManifestFreezer{Proposals: proposals}).Freeze(context.Background(), execution)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, source := range frozen.Sources {
+		if sameArtifactRevision(source.Ref, stalePrototype) {
+			t.Fatalf("mutable slice context reintroduced stale Prototype into PageSpec rerun: %+v", frozen.Sources)
+		}
+	}
+	if !manifestSourcesContain(frozen.Sources, blueprint) || !manifestSourcesContain(frozen.Sources, pageSpec) {
+		t.Fatalf("pruned immutable slice pins did not reach the manifest: %+v", frozen.Sources)
+	}
+}
+
+func mustNodeInputEnvelope(t *testing.T, source domain.NodeOutputReference) domain.NodeInputEnvelope {
+	t.Helper()
+	envelope, err := domain.NewNodeInputEnvelope([]domain.NodeInputBinding{{
+		EdgeID: "incoming", FromPort: "default", ToPort: "default", Source: source,
+		Output: json.RawMessage(`{}`), Value: json.RawMessage(`{}`),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return envelope
+}
+
+func manifestSourcesContain(sources []domain.ManifestSource, candidate domain.ArtifactRef) bool {
+	for _, source := range sources {
+		if sameArtifactRevision(source.Ref, candidate) {
+			return true
+		}
+	}
+	return false
 }
 
 type fakeArtifactGenerator struct {
@@ -761,21 +923,27 @@ func (f *fakeWorkbench) CreateBundle(_ context.Context, projectID, actorID strin
 	prototype := input.PrototypeRevision
 	f.prototypes = append(f.prototypes, prototype)
 	f.inputs = append(f.inputs, input)
-	return core.WorkbenchBundle{ID: uuid.NewString(), ProjectID: projectID, PrototypeRevision: prototype, PageSpecRevision: toCoreVersionRef(platformRef("page")), BlueprintRevision: toCoreVersionRef(platformRef("blueprint")), RequirementRevisions: []core.VersionRef{toCoreVersionRef(platformRef("requirements"))}, CreatedBy: actorID, CreatedAt: time.Now()}, nil
+	return core.WorkbenchBundle{ID: uuid.NewString(), ProjectID: projectID, PrototypeRevision: prototype, PageSpecRevision: toCoreVersionRef(platformRef("page")), BlueprintRevision: toCoreVersionRef(platformRef("blueprint")), RequirementRevisions: []core.VersionRef{toCoreVersionRef(platformRef("requirements"))}, WorkflowContext: input.TrustedWorkflowContext(), CreatedBy: actorID, CreatedAt: time.Now()}, nil
 }
 
 func (f *fakeWorkbench) GetLineageState(_ context.Context, rootID, _ string) (core.WorkbenchLineageState, error) {
 	if state, exists := f.states[rootID]; exists {
 		return state, nil
 	}
+	source := toCoreVersionRef(platformRef("source"))
 	return core.WorkbenchLineageState{
 		RootBundleID: rootID,
-		ActiveBundle: core.WorkbenchBundle{ID: rootID, RootBuildManifestID: rootID},
+		ActiveBundle: core.WorkbenchBundle{
+			ID: rootID, RootBuildManifestID: rootID, PageSpecRevision: source,
+			PrototypeRevision: source, BlueprintRevision: source, RequirementRevisions: []core.VersionRef{source},
+		},
 	}, nil
 }
 
 func TestWorkbenchHookCreatesPerSliceBundlesAndFrozenBuildManifest(t *testing.T) {
-	execution, _ := adapterExecution(t)
+	execution, inputManifest := adapterExecution(t)
+	reviewedScope := json.RawMessage(`{"conversationIntent":{"kind":"start_workflow","proposalId":"reviewed-start","workbenchInstruction":{"objective":"Build the reviewed application"}}}`)
+	execution.Run.Scope = reviewedScope
 	execution.Definition = domain.NodeDefinition{ID: "compile", Name: "Compile", Type: domain.NodeManifestCompiler, InputSchema: engineSchema(), OutputSchema: engineSchema(), ManifestCompiler: &domain.ManifestCompilerNodeConfig{ManifestKind: "application_build", SchemaVersion: 1, Hook: "application-build-manifest/v1"}}
 	prototypeA, prototypeB := platformRef("prototype-a"), platformRef("prototype-b")
 	sliceA := SliceContext{ID: uuid.NewString(), Key: "a", Title: "A", FanOutNodeID: "pages", Blueprint: platformRef("bp-a"), Prototype: &prototypeA}
@@ -783,7 +951,7 @@ func TestWorkbenchHookCreatesPerSliceBundlesAndFrozenBuildManifest(t *testing.T)
 	execution.Run.Context.Slices = map[string]SliceContext{sliceA.ID: sliceA, sliceB.ID: sliceB}
 	execution.Inputs = adapterInputs(t, execution, json.RawMessage(`{}`), sliceA, sliceB)
 	service := &fakeWorkbench{}
-	manifest, err := (CoreWorkbenchManifestHook{Workbench: service}).Compile(context.Background(), execution)
+	manifest, err := (CoreWorkbenchManifestHook{Workbench: service, Proposals: &fakeCoreProposals{manifest: inputManifest}}).Compile(context.Background(), execution)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -799,6 +967,11 @@ func TestWorkbenchHookCreatesPerSliceBundlesAndFrozenBuildManifest(t *testing.T)
 	for ordinal, input := range service.inputs {
 		if input.ManifestGroupKey == nil || *input.ManifestGroupKey != execution.Node.ID || input.RootOrdinal == nil || *input.RootOrdinal != ordinal {
 			t.Fatalf("bundle %d lost stable compiler group/root order: %#v", ordinal, input)
+		}
+		context := input.TrustedWorkflowContext()
+		if context == nil || !reflect.DeepEqual(context.InputManifest, inputManifest) ||
+			!reflect.DeepEqual(context.RunScope, reviewedScope) || context.OutputContract == nil {
+			t.Fatalf("bundle %d lost trusted workflow context: %#v", ordinal, context)
 		}
 	}
 	if manifest.ManifestGroupKey != execution.Node.ID {
@@ -828,6 +1001,18 @@ func TestWorkbenchHookKeepsSelectionGroupsIsolatedAndFailsClosedBeforeWrites(t *
 		compiled, err := (CoreWorkbenchManifestHook{Workbench: service, Proposals: &fakeCoreProposals{manifest: manifest}}).Compile(context.Background(), current)
 		if err != nil {
 			t.Fatalf("compile %s selection: %v", nodeID, err)
+		}
+		trusted := service.inputs[len(service.inputs)-1].TrustedWorkflowContext()
+		nodeSourceFound := false
+		if trusted != nil {
+			for _, source := range trusted.InputManifest.Sources {
+				if source.Purpose == "blueprint_selection_node" && source.Ref.AnchorID == nodeID {
+					nodeSourceFound = true
+				}
+			}
+		}
+		if trusted == nil || !reflect.DeepEqual(trusted.InputManifest, manifest) || !nodeSourceFound {
+			t.Fatalf("selection %s lost exact manifest source purposes/anchors: %#v", nodeID, trusted)
 		}
 		return compiled
 	}
@@ -901,6 +1086,165 @@ func TestValidateBlueprintSelectionSlicesFailsClosed(t *testing.T) {
 	}
 }
 
+func TestBlueprintSelectionStartRequiresCompleteCurrentPageBindings(t *testing.T) {
+	projectID, actorID := uuid.NewString(), uuid.NewString()
+	blueprint, pageSpec, prototype := platformRef("selection-start-blueprint"), platformRef("selection-start-page-spec"), platformRef("selection-start-prototype")
+	valid := workflowSelectionManifest(t, projectID, actorID, blueprint, "page-a", pageSpec, prototype)
+	anchoredBlueprint := blueprint
+	anchoredBlueprint.AnchorID = "page-a"
+	blueprintSnapshot := currentSelectionSnapshot(blueprint, projectID, "blueprint", nil)
+	blueprintSnapshot.Content = json.RawMessage(`{"nodes":[{"id":"feature-a","key":"feature-a","kind":"feature","title":"Feature A"},{"id":"page-a","key":"page-a","kind":"page","title":"Page page-a","route":"/page-a","userGoal":"Use page-a","requirementIds":["REQ-001"]}],"edges":[]}`)
+	snapshots := map[string]workflowSelectionArtifactSnapshot{
+		exactWorkflowArtifactRefKey(blueprint): blueprintSnapshot,
+		exactWorkflowArtifactRefKey(pageSpec):  currentSelectionSnapshot(pageSpec, projectID, "page_spec", []workflowSelectionRevisionSource{{Ref: anchoredBlueprint, Purpose: "blueprint", Required: true}}),
+		exactWorkflowArtifactRefKey(prototype): currentSelectionSnapshot(prototype, projectID, "prototype", []workflowSelectionRevisionSource{{Ref: pageSpec, Purpose: "page_spec", Required: true}}),
+	}
+	resolver := func(_ context.Context, ref domain.ArtifactRef) (workflowSelectionArtifactSnapshot, error) {
+		snapshot, ok := snapshots[exactWorkflowArtifactRefKey(ref)]
+		if !ok {
+			return workflowSelectionArtifactSnapshot{}, domain.ErrNotFound
+		}
+		return snapshot, nil
+	}
+	if err := validateBlueprintSelectionStartWithResolver(context.Background(), valid, resolver); err != nil {
+		t.Fatalf("complete current selection rejected: %v", err)
+	}
+	mixed := workflowSelectionManifestFixture(t, projectID, actorID, blueprint,
+		[]workflowBlueprintSelectionNode{
+			{ID: "feature-a", Key: "feature-a", Kind: "feature", Title: "Feature A"},
+			{ID: "page-a", Key: "page-a", Kind: "page", Title: "Page page-a", Route: "/page-a", UserGoal: "Use page-a", RequirementIDs: []string{"REQ-001"}},
+		},
+		[]workflowBlueprintSelectionPageBinding{{NodeID: "page-a", PageSpec: &pageSpec, Prototype: &prototype}})
+	if err := validateBlueprintSelectionStartWithResolver(context.Background(), mixed, resolver); err != nil {
+		t.Fatalf("mixed contextual-node and Page selection rejected: %v", err)
+	}
+
+	onlyFeature := workflowSelectionManifestFixture(t, projectID, actorID, blueprint,
+		[]workflowBlueprintSelectionNode{{ID: "feature-a", Key: "feature-a", Kind: "feature", Title: "Feature A"}}, nil)
+	missingPageSpec := workflowSelectionManifestFixture(t, projectID, actorID, blueprint,
+		[]workflowBlueprintSelectionNode{{ID: "page-a", Kind: "page"}},
+		[]workflowBlueprintSelectionPageBinding{{NodeID: "page-a", Prototype: &prototype}})
+	missingPrototype := workflowSelectionManifestFixture(t, projectID, actorID, blueprint,
+		[]workflowBlueprintSelectionNode{{ID: "page-a", Kind: "page"}},
+		[]workflowBlueprintSelectionPageBinding{{NodeID: "page-a", PageSpec: &pageSpec}})
+	for name, manifest := range map[string]domain.InputManifest{
+		"feature only": onlyFeature, "missing PageSpec": missingPageSpec, "missing Prototype": missingPrototype,
+	} {
+		if err := validateBlueprintSelectionStartWithResolver(context.Background(), manifest, resolver); err == nil {
+			t.Fatalf("%s selection reached application start", name)
+		}
+	}
+
+	validScope, _, err := blueprintSelectionScope(valid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	extra := platformRef("fabricated-selection-extra")
+	extraSources := append(append([]domain.ManifestSource(nil), valid.Sources...), domain.ManifestSource{Ref: extra, Purpose: "selection_context"})
+	validScope.SelectionID, err = workflowBlueprintSelectionIdentity(validScope, extraSources)
+	if err != nil {
+		t.Fatal(err)
+	}
+	extraConstraints, err := domain.CanonicalJSON(map[string]any{"blueprintSelection": validScope})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fabricatedExtra, err := domain.NewInputManifest(
+		uuid.NewString(), projectID, core.BlueprintSelectionJobType, validScope.SelectionID, nil,
+		extraSources, extraConstraints, "blueprint-selection/v1", actorID, time.Now().UTC(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshots[exactWorkflowArtifactRefKey(extra)] = currentSelectionSnapshot(extra, projectID, "decision_record", nil)
+	if err := validateBlueprintSelectionStartWithResolver(context.Background(), fabricatedExtra, resolver); err == nil {
+		t.Fatal("fabricated non-closure selection_context reached application start")
+	}
+	forgedBlueprint, forgedPageSpec, forgedPrototype := platformRef("forged-kind-blueprint"), platformRef("forged-kind-page-spec"), platformRef("forged-kind-prototype")
+	forgedNode := workflowBlueprintSelectionNode{
+		ID: "feature-a", Key: "FEATURE-A", Kind: "page", Title: "Forged feature",
+		Route: "/forged", UserGoal: "Forge kind", RequirementIDs: []string{"REQ-F"},
+	}
+	forgedManifest := workflowSelectionManifestFixture(t, projectID, actorID, forgedBlueprint,
+		[]workflowBlueprintSelectionNode{forgedNode},
+		[]workflowBlueprintSelectionPageBinding{{NodeID: "feature-a", PageSpec: &forgedPageSpec, Prototype: &forgedPrototype}})
+	forgedRootSnapshot := currentSelectionSnapshot(forgedBlueprint, projectID, "blueprint", nil)
+	forgedRootSnapshot.Content = json.RawMessage(`{"nodes":[{"id":"feature-a","key":"FEATURE-A","kind":"feature","title":"Feature A"},{"id":"page-real","key":"PAGE-REAL","kind":"page","title":"Real page","route":"/real","userGoal":"Use real page","requirementIds":["REQ-R"]}],"edges":[]}`)
+	forgedAnchor := forgedBlueprint
+	forgedAnchor.AnchorID = "feature-a"
+	snapshots[exactWorkflowArtifactRefKey(forgedBlueprint)] = forgedRootSnapshot
+	snapshots[exactWorkflowArtifactRefKey(forgedPageSpec)] = currentSelectionSnapshot(forgedPageSpec, projectID, "page_spec", []workflowSelectionRevisionSource{{Ref: forgedAnchor, Purpose: "blueprint", Required: true}})
+	snapshots[exactWorkflowArtifactRefKey(forgedPrototype)] = currentSelectionSnapshot(forgedPrototype, projectID, "prototype", []workflowSelectionRevisionSource{{Ref: forgedPageSpec, Purpose: "page_spec", Required: true}})
+	if err := validateBlueprintSelectionStartWithResolver(context.Background(), forgedManifest, resolver); err == nil {
+		t.Fatal("manifest-forged Feature-to-Page kind reached application start")
+	}
+
+	stale := snapshots[exactWorkflowArtifactRefKey(pageSpec)]
+	stale.LatestApprovedRevisionID = uuid.NewString()
+	snapshots[exactWorkflowArtifactRefKey(pageSpec)] = stale
+	if err := validateBlueprintSelectionStartWithResolver(context.Background(), valid, resolver); err == nil {
+		t.Fatal("stale PageSpec binding reached application start")
+	}
+}
+
+func currentSelectionSnapshot(
+	ref domain.ArtifactRef,
+	projectID, kind string,
+	sources []workflowSelectionRevisionSource,
+) workflowSelectionArtifactSnapshot {
+	return workflowSelectionArtifactSnapshot{
+		Ref: ref, ProjectID: projectID, Kind: kind, Lifecycle: "active", WorkflowStatus: "approved",
+		SyncStatus: "current", LatestApprovedRevisionID: ref.RevisionID, Sources: sources,
+	}
+}
+
+func workflowSelectionManifestFixture(
+	t *testing.T,
+	projectID, actorID string,
+	blueprint domain.ArtifactRef,
+	nodes []workflowBlueprintSelectionNode,
+	bindings []workflowBlueprintSelectionPageBinding,
+) domain.InputManifest {
+	t.Helper()
+	nodeIDs := make([]string, len(nodes))
+	sources := []domain.ManifestSource{{Ref: blueprint, Purpose: "blueprint_selection_root"}}
+	for index, node := range nodes {
+		nodeIDs[index] = node.ID
+		anchored := blueprint
+		anchored.AnchorID = node.ID
+		sources = append(sources, domain.ManifestSource{Ref: anchored, Purpose: "blueprint_selection_node"})
+	}
+	for _, binding := range bindings {
+		if binding.PageSpec != nil {
+			sources = append(sources, domain.ManifestSource{Ref: *binding.PageSpec, Purpose: "selected_page_spec"})
+		}
+		if binding.Prototype != nil {
+			sources = append(sources, domain.ManifestSource{Ref: *binding.Prototype, Purpose: "selected_prototype"})
+		}
+	}
+	scope := workflowBlueprintSelectionScope{
+		SchemaVersion: 1, Blueprint: blueprint,
+		NodeIDs: nodeIDs, Nodes: nodes, PageBindings: bindings,
+	}
+	selectionID, err := workflowBlueprintSelectionIdentity(scope, sources)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scope.SelectionID = selectionID
+	constraints, err := domain.CanonicalJSON(map[string]any{"blueprintSelection": scope})
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := domain.NewInputManifest(
+		uuid.NewString(), projectID, core.BlueprintSelectionJobType, selectionID, nil,
+		sources, constraints, "blueprint-selection/v1", actorID, time.Now().UTC(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return manifest
+}
+
 func workflowSelectionManifestMissingPrototype(
 	t *testing.T,
 	projectID, actorID string,
@@ -914,6 +1258,7 @@ func workflowSelectionManifestMissingPrototype(
 	anchored.AnchorID = nodeID
 	scope := workflowBlueprintSelectionScope{
 		SchemaVersion: 1, SelectionID: selectionID, Blueprint: blueprint, NodeIDs: []string{nodeID},
+		Nodes:        []workflowBlueprintSelectionNode{{ID: nodeID, Kind: "page"}},
 		PageBindings: []workflowBlueprintSelectionPageBinding{{NodeID: nodeID, PageSpec: &pageSpec}},
 	}
 	constraints, err := domain.CanonicalJSON(map[string]any{"blueprintSelection": scope})
@@ -934,12 +1279,14 @@ func workflowSelectionManifestMissingPrototype(
 type fakeImplementationGenerator struct {
 	calls        int
 	instructions []string
+	constraints  [][]string
 }
 
-func (f *fakeImplementationGenerator) GenerateImplementation(_ context.Context, bundleID, actorID, model, instruction string) (generation.ImplementationGenerationResult, error) {
+func (f *fakeImplementationGenerator) GenerateImplementation(_ context.Context, request generation.ImplementationGenerationRequest) (generation.ImplementationGenerationResult, error) {
 	f.calls++
-	f.instructions = append(f.instructions, instruction)
-	return generation.ImplementationGenerationResult{Proposal: core.ImplementationProposal{ID: uuid.NewString(), BuildManifestID: bundleID, Status: "open", PayloadHash: platformHash(bundleID), CreatedBy: actorID}, Model: model}, nil
+	f.instructions = append(f.instructions, request.Instruction.Objective)
+	f.constraints = append(f.constraints, append([]string(nil), request.Instruction.Constraints...))
+	return generation.ImplementationGenerationResult{Proposal: core.ImplementationProposal{ID: uuid.NewString(), BuildManifestID: request.BundleID, Status: "open", PayloadHash: platformHash(request.BundleID), CreatedBy: request.ActorID}, Model: request.Model}, nil
 }
 func TestWorkbenchRunnerOnlyReturnsImplementationProposalRefs(t *testing.T) {
 	execution, _ := adapterExecution(t)
@@ -993,6 +1340,8 @@ func TestWorkbenchRunnerWaitsForRebaseWithoutCallingAI(t *testing.T) {
 			RootBundleID: rootID,
 			ActiveBundle: core.WorkbenchBundle{
 				ID: rootID, RootBuildManifestID: rootID, CurrentWorkspaceRevision: &oldWorkspace,
+				PageSpecRevision: toCoreVersionRef(platformRef("source")), PrototypeRevision: toCoreVersionRef(platformRef("source")),
+				BlueprintRevision: toCoreVersionRef(platformRef("source")), RequirementRevisions: []core.VersionRef{toCoreVersionRef(platformRef("source"))},
 			},
 			CurrentWorkspaceRevision: &currentWorkspace,
 		},
@@ -1042,6 +1391,8 @@ func TestWorkbenchRunnerRecoversDerivedActiveProposalWithoutCallingAI(t *testing
 			RootBundleID: rootID,
 			ActiveBundle: core.WorkbenchBundle{
 				ID: derivedID, RootBuildManifestID: rootID, CurrentWorkspaceRevision: &workspace,
+				PageSpecRevision: toCoreVersionRef(platformRef("source")), PrototypeRevision: toCoreVersionRef(platformRef("source")),
+				BlueprintRevision: toCoreVersionRef(platformRef("source")), RequirementRevisions: []core.VersionRef{toCoreVersionRef(platformRef("source"))},
 			},
 			CurrentWorkspaceRevision: &workspace, CurrentProposal: &proposal,
 		},
@@ -1117,6 +1468,28 @@ func TestWorkbenchRunnerConsumesReviewedConversationInstructionFromScope(t *test
 	}
 	if len(generator.instructions) != 1 || !strings.Contains(generator.instructions[0], "Build the approved dashboard") || strings.Contains(generator.instructions[0], "fallback") {
 		t.Fatalf("reviewed conversation instruction was not used: %#v", generator.instructions)
+	}
+	if !reflect.DeepEqual(generator.constraints[0], []string{"Use exact API contracts"}) {
+		t.Fatalf("reviewed constraints were not preserved as typed input: %#v", generator.constraints)
+	}
+}
+
+func TestBuildManifestSourceCoverageIncludesTypedBundleContext(t *testing.T) {
+	structural := platformRef("structural")
+	contextRef := platformRef("decision")
+	bundle := core.WorkbenchBundle{
+		ManifestHash: "sha256:verified", PageSpecRevision: toCoreVersionRef(structural),
+		PrototypeRevision: toCoreVersionRef(structural), BlueprintRevision: toCoreVersionRef(structural),
+		RequirementRevisions: []core.VersionRef{toCoreVersionRef(structural)},
+		ContextRevisions:     []core.WorkbenchContextRevision{{Kind: "decision_record", Revision: toCoreVersionRef(contextRef)}},
+	}
+	manifest := BuildManifest{Sources: []domain.ArtifactRef{structural}}
+	if err := validateBuildManifestBundleSourceCoverage(manifest, bundle); err == nil {
+		t.Fatal("BuildManifest accepted a missing typed context revision")
+	}
+	manifest.Sources = append(manifest.Sources, contextRef)
+	if err := validateBuildManifestBundleSourceCoverage(manifest, bundle); err != nil {
+		t.Fatalf("complete bundle source union was rejected: %v", err)
 	}
 }
 

@@ -337,14 +337,24 @@ export class PlatformFlowClient {
     bundleId: string,
     model: string,
     instruction: string,
+    replaceProposal?: Pick<ImplementationProposalDto, 'id' | 'version'>,
     options?: ClientMutationOptions,
   ) {
     return this.http.post<ImplementationGenerationResultDto, {
       readonly model: string
       readonly instruction: string
+      readonly replaceProposalId?: string
+      readonly replaceProposalVersion?: number
     }>(
       `/v1/build-manifests/${segment(bundleId)}/generate`,
-      { model, instruction },
+      {
+        model,
+        instruction,
+        ...(replaceProposal ? {
+          replaceProposalId: replaceProposal.id,
+          replaceProposalVersion: replaceProposal.version,
+        } : {}),
+      },
       mutationOptions(options),
     )
   }

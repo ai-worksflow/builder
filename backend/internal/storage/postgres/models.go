@@ -435,36 +435,40 @@ type WorkflowDefinitionModel struct {
 func (WorkflowDefinitionModel) TableName() string { return "workflow_definitions" }
 
 type WorkflowDefinitionVersionModel struct {
-	ID               uuid.UUID       `gorm:"type:uuid;primaryKey"`
-	DefinitionID     uuid.UUID       `gorm:"type:uuid;not null;index"`
-	Version          int             `gorm:"not null"`
-	SchemaVersion    int             `gorm:"not null"`
-	Content          json.RawMessage `gorm:"type:jsonb;not null"`
-	ContentHash      string          `gorm:"not null"`
-	ValidationReport json.RawMessage `gorm:"type:jsonb;not null"`
-	Published        bool            `gorm:"not null"`
-	CreatedBy        uuid.UUID       `gorm:"type:uuid;not null"`
-	CreatedAt        time.Time
+	ID                      uuid.UUID       `gorm:"type:uuid;primaryKey"`
+	DefinitionID            uuid.UUID       `gorm:"type:uuid;not null;index"`
+	Version                 int             `gorm:"not null"`
+	SchemaVersion           int             `gorm:"not null"`
+	Content                 json.RawMessage `gorm:"type:jsonb;not null"`
+	ContentHash             string          `gorm:"not null"`
+	ExecutionProfileVersion string          `gorm:"not null"`
+	ExecutionProfileHash    string          `gorm:"not null"`
+	ValidationReport        json.RawMessage `gorm:"type:jsonb;not null"`
+	Published               bool            `gorm:"not null"`
+	CreatedBy               uuid.UUID       `gorm:"type:uuid;not null"`
+	CreatedAt               time.Time
 }
 
 func (WorkflowDefinitionVersionModel) TableName() string { return "workflow_definition_versions" }
 
 type WorkflowRunModel struct {
-	ID                  uuid.UUID       `gorm:"type:uuid;primaryKey"`
-	ProjectID           uuid.UUID       `gorm:"type:uuid;not null;index"`
-	DefinitionVersionID uuid.UUID       `gorm:"type:uuid;not null"`
-	Status              string          `gorm:"not null"`
-	InputManifestID     *uuid.UUID      `gorm:"type:uuid"`
-	Scope               json.RawMessage `gorm:"type:jsonb;not null"`
-	Context             json.RawMessage `gorm:"type:jsonb;not null"`
-	EventCursor         uint64          `gorm:"not null"`
-	StartedBy           uuid.UUID       `gorm:"type:uuid;not null"`
-	StartedAt           *time.Time
-	CompletedAt         *time.Time
-	CancelledAt         *time.Time
-	Failure             json.RawMessage `gorm:"type:jsonb"`
-	CreatedAt           time.Time
-	UpdatedAt           time.Time
+	ID                      uuid.UUID       `gorm:"type:uuid;primaryKey"`
+	ProjectID               uuid.UUID       `gorm:"type:uuid;not null;index"`
+	DefinitionVersionID     uuid.UUID       `gorm:"type:uuid;not null"`
+	ExecutionProfileVersion string          `gorm:"not null"`
+	ExecutionProfileHash    string          `gorm:"not null"`
+	Status                  string          `gorm:"not null"`
+	InputManifestID         *uuid.UUID      `gorm:"type:uuid"`
+	Scope                   json.RawMessage `gorm:"type:jsonb;not null"`
+	Context                 json.RawMessage `gorm:"type:jsonb;not null"`
+	EventCursor             uint64          `gorm:"not null"`
+	StartedBy               uuid.UUID       `gorm:"type:uuid;not null"`
+	StartedAt               *time.Time
+	CompletedAt             *time.Time
+	CancelledAt             *time.Time
+	Failure                 json.RawMessage `gorm:"type:jsonb"`
+	CreatedAt               time.Time
+	UpdatedAt               time.Time
 }
 
 func (WorkflowRunModel) TableName() string { return "workflow_runs" }
@@ -505,15 +509,16 @@ type WorkflowRunEventModel struct {
 func (WorkflowRunEventModel) TableName() string { return "workflow_run_events" }
 
 type ConversationModel struct {
-	ID         uuid.UUID `gorm:"type:uuid;primaryKey"`
-	ProjectID  uuid.UUID `gorm:"type:uuid;not null;index"`
-	Title      string    `gorm:"not null"`
-	Status     string    `gorm:"not null"`
-	Version    uint64    `gorm:"not null"`
-	CreatedBy  uuid.UUID `gorm:"type:uuid;not null"`
-	CreatedAt  time.Time
-	UpdatedAt  time.Time
-	ArchivedAt *time.Time
+	ID                      uuid.UUID `gorm:"type:uuid;primaryKey"`
+	ProjectID               uuid.UUID `gorm:"type:uuid;not null;index"`
+	Title                   string    `gorm:"not null"`
+	Status                  string    `gorm:"not null"`
+	Version                 uint64    `gorm:"not null"`
+	CreatedBy               uuid.UUID `gorm:"type:uuid;not null"`
+	CreatedAt               time.Time
+	UpdatedAt               time.Time
+	ArchivedAt              *time.Time
+	SummaryCheckpointHeadID *uuid.UUID `gorm:"type:uuid"`
 }
 
 func (ConversationModel) TableName() string { return "conversations" }
@@ -531,6 +536,32 @@ type ConversationMessageModel struct {
 
 func (ConversationMessageModel) TableName() string { return "conversation_messages" }
 
+type ConversationSummaryCheckpointModel struct {
+	ID                   uuid.UUID  `gorm:"type:uuid;primaryKey"`
+	ProjectID            uuid.UUID  `gorm:"type:uuid;not null;index"`
+	ConversationID       uuid.UUID  `gorm:"type:uuid;not null;index"`
+	PreviousCheckpointID *uuid.UUID `gorm:"type:uuid"`
+	ThroughMessageID     uuid.UUID  `gorm:"type:uuid;not null"`
+	ThroughSequence      uint64     `gorm:"not null"`
+	MessageCount         uint64     `gorm:"not null"`
+	ContentBytes         uint64     `gorm:"not null"`
+	PrefixHash           []byte     `gorm:"type:bytea;not null"`
+	HashAlgorithm        string     `gorm:"not null"`
+	Summary              string     `gorm:"not null"`
+	SummaryHash          []byte     `gorm:"type:bytea;not null"`
+	Status               string     `gorm:"not null"`
+	Version              uint64     `gorm:"not null"`
+	CreatedBy            uuid.UUID  `gorm:"type:uuid;not null"`
+	CreatedAt            time.Time
+	ReviewedBy           *uuid.UUID `gorm:"type:uuid"`
+	ReviewedAt           *time.Time
+	ReviewReason         string `gorm:"not null"`
+}
+
+func (ConversationSummaryCheckpointModel) TableName() string {
+	return "conversation_summary_checkpoints"
+}
+
 type WorkflowIntentProposalModel struct {
 	ID                           uuid.UUID       `gorm:"type:uuid;primaryKey"`
 	ProjectID                    uuid.UUID       `gorm:"type:uuid;not null;index"`
@@ -541,6 +572,7 @@ type WorkflowIntentProposalModel struct {
 	Status                       string          `gorm:"not null"`
 	Version                      uint64          `gorm:"not null"`
 	SuggestedDefinitionVersionID uuid.UUID       `gorm:"type:uuid;not null"`
+	DesiredOutputCapability      string          `gorm:"not null;default:application"`
 	Scope                        json.RawMessage `gorm:"type:jsonb;not null"`
 	SourceRefs                   json.RawMessage `gorm:"type:jsonb;not null"`
 	ManifestIntent               json.RawMessage `gorm:"type:jsonb;not null"`
@@ -549,6 +581,9 @@ type WorkflowIntentProposalModel struct {
 	AIProvider                   *string         `gorm:"column:ai_provider"`
 	AIModel                      *string         `gorm:"column:ai_model"`
 	AIResponseID                 *string         `gorm:"column:ai_response_id"`
+	SummaryCheckpointID          *uuid.UUID      `gorm:"type:uuid"`
+	ConversationContext          json.RawMessage `gorm:"type:jsonb;not null"`
+	ProviderInputHash            []byte          `gorm:"type:bytea"`
 	DecisionReason               string          `gorm:"not null"`
 	ProposedBy                   uuid.UUID       `gorm:"type:uuid;not null"`
 	DecidedBy                    *uuid.UUID      `gorm:"type:uuid"`
@@ -559,27 +594,30 @@ type WorkflowIntentProposalModel struct {
 func (WorkflowIntentProposalModel) TableName() string { return "workflow_intent_proposals" }
 
 type ConversationCommandModel struct {
-	ID               uuid.UUID       `gorm:"type:uuid;primaryKey"`
-	ProjectID        uuid.UUID       `gorm:"type:uuid;not null;index"`
-	ConversationID   uuid.UUID       `gorm:"type:uuid;not null;index"`
-	ProposalID       uuid.UUID       `gorm:"type:uuid;not null;uniqueIndex"`
-	Kind             string          `gorm:"not null"`
-	Status           string          `gorm:"not null"`
-	Version          uint64          `gorm:"not null"`
-	Payload          json.RawMessage `gorm:"type:jsonb;not null"`
-	Result           json.RawMessage `gorm:"type:jsonb"`
-	Failure          json.RawMessage `gorm:"type:jsonb"`
-	AcceptedBy       uuid.UUID       `gorm:"type:uuid;not null"`
-	ExecutionActorID *uuid.UUID      `gorm:"type:uuid"`
-	ExecutionClaim   *uuid.UUID      `gorm:"type:uuid"`
-	ClaimExpiresAt   *time.Time
-	ExecutedBy       *uuid.UUID `gorm:"type:uuid"`
-	RejectedBy       *uuid.UUID `gorm:"type:uuid"`
-	CreatedAt        time.Time
-	UpdatedAt        time.Time
-	ExecutedAt       *time.Time
-	RejectedAt       *time.Time
-	FailedAt         *time.Time
+	ID                  uuid.UUID       `gorm:"type:uuid;primaryKey"`
+	ProjectID           uuid.UUID       `gorm:"type:uuid;not null;index"`
+	ConversationID      uuid.UUID       `gorm:"type:uuid;not null;index"`
+	ProposalID          uuid.UUID       `gorm:"type:uuid;not null;uniqueIndex"`
+	Kind                string          `gorm:"not null"`
+	Status              string          `gorm:"not null"`
+	Version             uint64          `gorm:"not null"`
+	Payload             json.RawMessage `gorm:"type:jsonb;not null"`
+	Result              json.RawMessage `gorm:"type:jsonb"`
+	Failure             json.RawMessage `gorm:"type:jsonb"`
+	SummaryCheckpointID *uuid.UUID      `gorm:"type:uuid"`
+	ConversationContext json.RawMessage `gorm:"type:jsonb;not null"`
+	ProviderInputHash   []byte          `gorm:"type:bytea"`
+	AcceptedBy          uuid.UUID       `gorm:"type:uuid;not null"`
+	ExecutionActorID    *uuid.UUID      `gorm:"type:uuid"`
+	ExecutionClaim      *uuid.UUID      `gorm:"type:uuid"`
+	ClaimExpiresAt      *time.Time
+	ExecutedBy          *uuid.UUID `gorm:"type:uuid"`
+	RejectedBy          *uuid.UUID `gorm:"type:uuid"`
+	CreatedAt           time.Time
+	UpdatedAt           time.Time
+	ExecutedAt          *time.Time
+	RejectedAt          *time.Time
+	FailedAt            *time.Time
 }
 
 func (ConversationCommandModel) TableName() string { return "conversation_commands" }
@@ -593,6 +631,7 @@ type ApplicationBuildManifestModel struct {
 	WorkspaceRevisionID *uuid.UUID `gorm:"type:uuid"`
 	RootOrdinal         *int
 	ManifestGroupKey    *string
+	DeliverySliceID     *string
 	SchemaVersion       int       `gorm:"not null"`
 	ContentStore        string    `gorm:"not null"`
 	ContentRef          string    `gorm:"not null"`
@@ -612,22 +651,64 @@ type ImplementationProposalModel struct {
 	ProjectID               uuid.UUID  `gorm:"type:uuid;not null;index"`
 	BuildManifestID         uuid.UUID  `gorm:"type:uuid;not null"`
 	BaseWorkspaceRevisionID *uuid.UUID `gorm:"type:uuid"`
-	Status                  string     `gorm:"not null"`
-	Version                 uint64     `gorm:"not null"`
-	ContentStore            string     `gorm:"not null"`
-	ContentRef              string     `gorm:"not null"`
-	ContentHash             string     `gorm:"not null"`
-	PayloadHash             string     `gorm:"not null"`
-	OperationCount          int        `gorm:"not null"`
-	AcceptedCount           int        `gorm:"not null"`
-	RejectedCount           int        `gorm:"not null"`
-	CreatedBy               uuid.UUID  `gorm:"type:uuid;not null"`
+	ExecutionSource         string     `gorm:"not null;default:manual_submission"`
+	ConversationCommandID   *uuid.UUID `gorm:"type:uuid"`
+	SupersedesProposalID    *uuid.UUID `gorm:"type:uuid"`
+	InstructionHash         *string
+	AIProvider              *string   `gorm:"column:ai_provider"`
+	AIModel                 *string   `gorm:"column:ai_model"`
+	Status                  string    `gorm:"not null"`
+	Version                 uint64    `gorm:"not null"`
+	ContentStore            string    `gorm:"not null"`
+	ContentRef              string    `gorm:"not null"`
+	ContentHash             string    `gorm:"not null"`
+	PayloadHash             string    `gorm:"not null"`
+	OperationCount          int       `gorm:"not null"`
+	AcceptedCount           int       `gorm:"not null"`
+	RejectedCount           int       `gorm:"not null"`
+	CreatedBy               uuid.UUID `gorm:"type:uuid;not null"`
 	CreatedAt               time.Time
 	AppliedBy               *uuid.UUID `gorm:"type:uuid"`
 	AppliedAt               *time.Time
 }
 
 func (ImplementationProposalModel) TableName() string { return "implementation_proposals" }
+
+type ImplementationGenerationClaimModel struct {
+	ID                            uuid.UUID  `gorm:"type:uuid;primaryKey"`
+	BuildManifestID               uuid.UUID  `gorm:"type:uuid;not null;index"`
+	ProjectID                     uuid.UUID  `gorm:"type:uuid;not null;index"`
+	RootManifestID                uuid.UUID  `gorm:"type:uuid;not null"`
+	RequestKey                    uuid.UUID  `gorm:"type:uuid;not null;uniqueIndex"`
+	ReservedProposalID            uuid.UUID  `gorm:"type:uuid;not null;uniqueIndex"`
+	ExecutionSource               string     `gorm:"not null"`
+	ConversationCommandID         *uuid.UUID `gorm:"type:uuid;uniqueIndex"`
+	GovernanceManifestID          *uuid.UUID `gorm:"type:uuid"`
+	GovernanceManifestHash        *string
+	GovernanceSourceRefs          json.RawMessage `gorm:"type:jsonb"`
+	Instruction                   json.RawMessage `gorm:"type:jsonb;not null"`
+	InstructionHash               string          `gorm:"not null"`
+	RequestedModel                string          `gorm:"not null"`
+	GenerationContractVersion     string          `gorm:"not null"`
+	SystemPromptHash              string          `gorm:"not null"`
+	OutputSchemaHash              string          `gorm:"not null"`
+	ActorID                       uuid.UUID       `gorm:"type:uuid;not null"`
+	ExpectedActiveProposalID      *uuid.UUID      `gorm:"type:uuid"`
+	ExpectedActiveProposalVersion *uint64
+	ClaimToken                    *uuid.UUID `gorm:"type:uuid"`
+	ClaimExpiresAt                *time.Time
+	Status                        string     `gorm:"not null"`
+	AttemptCount                  int        `gorm:"not null"`
+	CompletedProposalID           *uuid.UUID `gorm:"type:uuid"`
+	LastFailure                   *string
+	LastFailedAt                  *time.Time
+	CreatedAt                     time.Time
+	UpdatedAt                     time.Time
+}
+
+func (ImplementationGenerationClaimModel) TableName() string {
+	return "implementation_generation_claims"
+}
 
 type ImplementationOperationDecisionModel struct {
 	ProposalID  uuid.UUID `gorm:"type:uuid;primaryKey"`

@@ -136,25 +136,91 @@ func TestArtifactAndOutputProposalServicesCannotMutateSystemManagedArtifacts(t *
 	}
 }
 
+func TestArtifactServiceAllowsEmptyBlueprintWorkflowTargetButRejectsForgedRequirementIDs(t *testing.T) {
+	database, cleanup := baselinePostgresDatabase(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	store, service, projectID, userID := newArtifactLineageFixture(t, database)
+	baselineRef := seedArtifactLineageRevision(
+		t, database, store, projectID, userID, "requirement_baseline", "approved", "current",
+		json.RawMessage(`{
+			"requirements":[
+				{"type":"requirement","requirementId":"REQ-1","priority":"must","acceptanceCriterionIds":["AC-1"]},
+				{"type":"acceptanceCriterion","acceptanceCriterionId":"AC-1"}
+			]
+		}`),
+	)
+	baselineSource := ArtifactSourceInput{Ref: baselineRef, Purpose: "requirement_baseline", Required: true}
+	empty := json.RawMessage(`{"schemaVersion":1,"nodes":[],"edges":[],"pageSpecs":[]}`)
+	created, err := service.Create(ctx, projectID.String(), userID.String(), CreateArtifactInput{
+		Kind: "blueprint", Title: "Workflow target", Content: empty,
+		SourceVersions: []ArtifactSourceInput{baselineSource},
+	})
+	if err != nil {
+		t.Fatalf("create empty Blueprint workflow target: %v", err)
+	}
+	updated, err := service.UpdateDraft(ctx, created.Draft.ID, userID.String(), created.Draft.ETag, UpdateDraftInput{
+		Content: json.RawMessage(`{"schemaVersion":1,"nodes":[],"edges":[],"pageSpecs":[],"draftNote":"AI pending"}`),
+	})
+	if err != nil {
+		t.Fatalf("update empty Blueprint workflow target: %v", err)
+	}
+	if _, err := service.CreateRevision(ctx, created.Artifact.ID, userID.String(), updated.ETag, CreateRevisionInput{
+		ChangeSummary: "Initialize Blueprint AI target", ChangeSource: "system",
+	}); err != nil {
+		t.Fatalf("checkpoint empty Blueprint workflow target: %v", err)
+	}
+
+	for name, requirementIDs := range map[string][]string{
+		"forged": {"REQ-BOGUS"},
+		"mixed":  {"REQ-1", "REQ-BOGUS"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := service.Create(ctx, projectID.String(), userID.String(), CreateArtifactInput{
+				Kind: "blueprint", Title: "Invalid " + name,
+				Content:        semanticBlueprintFixture(t, requirementIDs),
+				SourceVersions: []ArtifactSourceInput{baselineSource},
+			}); !errors.Is(err, ErrBlockingGate) {
+				t.Fatalf("Blueprint accepted forged Requirement Baseline trace: %v", err)
+			}
+		})
+	}
+}
+
 func TestArtifactServiceEnforcesPageSpecLineageOnCreateUpdateAndRevision(t *testing.T) {
 	database, cleanup := baselinePostgresDatabase(t)
 	defer cleanup()
 
 	ctx := context.Background()
 	store, service, projectID, userID := newArtifactLineageFixture(t, database)
+	baselineRef := seedArtifactLineageRevision(
+		t, database, store, projectID, userID, "requirement_baseline", "approved", "current",
+		json.RawMessage(`{
+			"requirements":[
+				{"type":"requirement","requirementId":"REQ-1","priority":"must","acceptanceCriterionIds":["AC-1"]},
+				{"type":"acceptanceCriterion","acceptanceCriterionId":"AC-1"}
+			]
+		}`),
+	)
 	blueprintPayload := json.RawMessage(`{
 		"nodes":[
-			{"id":"feature-orders","key":"FEATURE-ORDERS","kind":"feature"},
-			{"id":"page-orders","key":"PAGE-ORDERS","kind":"page"}
-		]
+			{"id":"feature-orders","key":"FEATURE-ORDERS","kind":"feature","title":"Orders"},
+			{"id":"page-orders","key":"PAGE-ORDERS","kind":"page","title":"Orders","route":"/orders","userGoal":"Review orders","requirementIds":["REQ-1"]}
+		],
+		"edges":[{"id":"contains-orders","sourceNodeId":"feature-orders","targetNodeId":"page-orders","kind":"contains"}]
 	}`)
 	blueprintRef := seedArtifactLineageRevision(
 		t, database, store, projectID, userID, "blueprint", "approved", "current", blueprintPayload,
 	)
+	seedArtifactLineageRevisionSource(t, database, blueprintRef, baselineRef, "requirement_baseline", true, nil, userID)
 	pageAnchor := "page-orders"
 	blueprintRef.AnchorID = &pageAnchor
 	validSource := ArtifactSourceInput{Ref: blueprintRef, Purpose: "blueprint", Required: true}
-	pageSpecPayload := json.RawMessage(`{"blueprintPageNodeId":"page-orders","title":"Orders"}`)
+	pageSpecPayload := json.RawMessage(`{
+		"blueprintPageNodeId":"page-orders","title":"Orders","route":"/orders","userGoal":"Review orders",
+		"acceptanceCriterionIds":["AC-1"],"states":[],"dataBindings":[],"interactions":[]
+	}`)
 
 	missingAnchor := blueprintRef
 	missingAnchor.AnchorID = nil
@@ -185,6 +251,21 @@ func TestArtifactServiceEnforcesPageSpecLineageOnCreateUpdateAndRevision(t *test
 		"missing_blueprint_source": {
 			Kind: "page_spec", Title: "Missing source", Content: pageSpecPayload,
 		},
+		"wrong_blueprint_route": {
+			Kind: "page_spec", Title: "Wrong route",
+			Content:        json.RawMessage(`{"blueprintPageNodeId":"page-orders","route":"/wrong","userGoal":"Review orders"}`),
+			SourceVersions: []ArtifactSourceInput{validSource},
+		},
+		"forged_acceptance_id": {
+			Kind: "page_spec", Title: "Forged acceptance",
+			Content:        json.RawMessage(`{"blueprintPageNodeId":"page-orders","route":"/orders","userGoal":"Review orders","acceptanceCriterionIds":["AC-BOGUS"]}`),
+			SourceVersions: []ArtifactSourceInput{validSource},
+		},
+		"forged_api_operation": {
+			Kind: "page_spec", Title: "Forged operation",
+			Content:        json.RawMessage(`{"blueprintPageNodeId":"page-orders","route":"/orders","userGoal":"Review orders","dataBindings":[{"source":"api","operationId":"api-bogus"}]}`),
+			SourceVersions: []ArtifactSourceInput{validSource},
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			if _, err := service.Create(ctx, projectID.String(), userID.String(), input); !errors.Is(err, ErrBlockingGate) {
@@ -205,7 +286,10 @@ func TestArtifactServiceEnforcesPageSpecLineageOnCreateUpdateAndRevision(t *test
 	}
 
 	updated, err := service.UpdateDraft(ctx, created.Draft.ID, userID.String(), created.Draft.ETag, UpdateDraftInput{
-		Content: json.RawMessage(`{"blueprintPageNodeId":"page-orders","title":"Orders updated"}`),
+		Content: json.RawMessage(`{
+			"blueprintPageNodeId":"page-orders","title":"Orders updated","route":"/orders","userGoal":"Review orders",
+			"acceptanceCriterionIds":["AC-1"],"states":[],"dataBindings":[],"interactions":[]
+		}`),
 		// SourceVersions deliberately omitted: the service must validate and retain the existing source.
 	})
 	if err != nil {
@@ -225,6 +309,11 @@ func TestArtifactServiceEnforcesPageSpecLineageOnCreateUpdateAndRevision(t *test
 		Content: json.RawMessage(`{"blueprintPageNodeId":"page-other","title":"Drifted"}`),
 	}); !errors.Is(err, ErrBlockingGate) {
 		t.Fatalf("content/source anchor drift bypassed lineage gate: %v", err)
+	}
+	if _, err := service.UpdateDraft(ctx, updated.ID, userID.String(), updated.ETag, UpdateDraftInput{
+		Content: json.RawMessage(`{"blueprintPageNodeId":"page-orders","route":"/orders","userGoal":"Review orders","acceptanceCriterionIds":["AC-1","AC-BOGUS"]}`),
+	}); !errors.Is(err, ErrBlockingGate) {
+		t.Fatalf("mixed valid/forged PageSpec acceptance trace bypassed update gate: %v", err)
 	}
 
 	corruptAnchor := "page-missing"
@@ -247,15 +336,102 @@ func TestArtifactServiceEnforcesPageSpecLineageOnCreateUpdateAndRevision(t *test
 	}
 }
 
+func TestPageSpecFormalReviewRequiresCurrentBlueprintSourcePostgres(t *testing.T) {
+	database, cleanup := baselinePostgresDatabase(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	store, service, projectID, userID := newArtifactLineageFixture(t, database)
+	baselineRef := seedArtifactLineageRevision(
+		t, database, store, projectID, userID, "requirement_baseline", "approved", "current",
+		json.RawMessage(`{
+  "requirements":[
+    {"type":"requirement","requirementId":"REQ-1","priority":"must","acceptanceCriterionIds":["AC-1"]},
+    {"type":"acceptanceCriterion","acceptanceCriterionId":"AC-1"}
+  ]
+}`),
+	)
+	blueprintPayload := json.RawMessage(`{
+  "nodes":[
+    {"id":"feature-orders","key":"FEATURE-ORDERS","kind":"feature","requirementIds":["REQ-1"]},
+    {"id":"page-orders","key":"PAGE-ORDERS","kind":"page","title":"Orders","route":"/orders","userGoal":"Review orders","requirementIds":["REQ-1"]}
+  ],
+  "edges":[{"id":"contains-orders","sourceNodeId":"feature-orders","targetNodeId":"page-orders","kind":"contains"}]
+}`)
+	blueprintRef := seedArtifactLineageRevision(
+		t, database, store, projectID, userID, "blueprint", "approved", "current", blueprintPayload,
+	)
+	seedArtifactLineageRevisionSource(t, database, blueprintRef, baselineRef, "requirement_baseline", true, nil, userID)
+	anchor := "page-orders"
+	blueprintRef.AnchorID = &anchor
+	sources := []ArtifactSourceInput{{Ref: blueprintRef, Purpose: "blueprint", Required: true}}
+	pageSpecPayload := json.RawMessage(`{
+  "blueprintPageNodeId":"page-orders","title":"Orders","route":"/orders","userGoal":"Review orders",
+  "acceptanceCriterionIds":["AC-1"],"requiredRoles":[],"states":[],"dataBindings":[],"interactions":[]
+}`)
+	if err := service.validateArtifactLineageForReview(ctx, database, projectID, "page_spec", pageSpecPayload, sources); err != nil {
+		t.Fatalf("current Blueprint source was rejected at formal review: %v", err)
+	}
+	if err := database.Model(&storage.ArtifactHealthModel{}).
+		Where("artifact_id = ?", blueprintRef.ArtifactID).Update("sync_status", "needs_sync").Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := service.validateArtifactLineageForReview(ctx, database, projectID, "page_spec", pageSpecPayload, sources); !errors.Is(err, ErrBlockingGate) {
+		t.Fatalf("formal PageSpec accepted a stale Blueprint source: %v", err)
+	}
+	if err := service.validateArtifactLineage(ctx, database, projectID, "page_spec", pageSpecPayload, sources); err != nil {
+		t.Fatalf("draft PageSpec could not retain a stale exact Blueprint source for conflict handling: %v", err)
+	}
+	if err := database.Model(&storage.ArtifactHealthModel{}).
+		Where("artifact_id = ?", blueprintRef.ArtifactID).Update("sync_status", "current").Error; err != nil {
+		t.Fatal(err)
+	}
+
+	newRevisionID := uuid.New()
+	now := time.Now().UTC()
+	newerBlueprintPayload := append(append(json.RawMessage(nil), blueprintPayload...), '\n')
+	contentRef := store.addFinalized("newer-blueprint-"+newRevisionID.String(), newerBlueprintPayload)
+	if err := database.Create(&storage.ArtifactRevisionModel{
+		ID: newRevisionID, ArtifactID: uuid.MustParse(blueprintRef.ArtifactID), RevisionNumber: 2, SchemaVersion: 1,
+		ContentStore: "mongo", ContentRef: contentRef.ID, ContentHash: contentRef.ContentHash, ByteSize: contentRef.ByteSize,
+		WorkflowStatus: "approved", ChangeSource: "human", ChangeSummary: "Newer Blueprint",
+		CreatedBy: userID, CreatedAt: now, ApprovedAt: &now,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Model(&storage.ArtifactModel{}).Where("id = ?", blueprintRef.ArtifactID).Updates(map[string]any{
+		"latest_revision_id": newRevisionID, "latest_approved_revision_id": newRevisionID,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := service.validateArtifactLineageForReview(ctx, database, projectID, "page_spec", pageSpecPayload, sources); !errors.Is(err, ErrBlockingGate) {
+		t.Fatalf("formal PageSpec accepted an older approved Blueprint source: %v", err)
+	}
+	if err := service.validateArtifactLineage(ctx, database, projectID, "page_spec", pageSpecPayload, sources); err != nil {
+		t.Fatalf("draft PageSpec could not retain an older approved Blueprint source: %v", err)
+	}
+}
+
 func TestArtifactServicePrototypeLineageFormalAndExploratory(t *testing.T) {
 	database, cleanup := baselinePostgresDatabase(t)
 	defer cleanup()
 
 	ctx := context.Background()
 	store, service, projectID, userID := newArtifactLineageFixture(t, database)
-	pageSpecRef := seedArtifactLineageRevision(
-		t, database, store, projectID, userID, "page_spec", "approved", "current",
-		json.RawMessage(`{"blueprintPageNodeId":"page-orders","title":"Orders"}`),
+	pageSpecRef := seedArtifactSemanticPageSpecRevision(
+		t, database, store, projectID, userID, "approved", "current",
+		json.RawMessage(`{
+			"blueprintPageNodeId":"page-orders","title":"Orders","route":"/orders","userGoal":"Review orders",
+			"acceptanceCriterionIds":["AC-1"],"requiredRoles":["orders-reader"],
+			"states":[
+				{"id":"state-ready","key":"ready","title":"Ready","required":true,"fixtureIds":["fixture-ready"]},
+				{"id":"state-loading","key":"loading","title":"Loading","required":true,"fixtureIds":[]},
+				{"id":"state-empty","key":"empty","title":"Empty","required":true,"fixtureIds":[]},
+				{"id":"state-error","key":"error","title":"Error","required":true,"fixtureIds":[]}
+			],
+			"interactions":[{"id":"interaction-open","trigger":"click","outcome":"Open details"}],
+			"dataBindings":[{"id":"binding-orders","name":"Orders","source":"api","operationId":"api-orders","required":true}]
+		}`),
 	)
 	pageSpecSource := ArtifactSourceInput{Ref: pageSpecRef, Purpose: "page_spec", Required: true}
 	formalPayload := prototypeLineagePayload(t, pageSpecRef, false)
@@ -269,6 +445,46 @@ func TestArtifactServicePrototypeLineageFormalAndExploratory(t *testing.T) {
 	}
 	if created.Draft == nil {
 		t.Fatal("valid formal Prototype has no draft")
+	}
+	designSystemRef := seedArtifactLineageRevision(
+		t, database, store, projectID, userID, "design_system", "approved", "current",
+		json.RawMessage(`{"tokens":[]}`),
+	)
+	componentPayload, err := json.Marshal(map[string]any{
+		"pageSpecRevision": pageSpecRef, "exploratory": false,
+		"layers": map[string]any{"component-layer": map[string]any{
+			"id": "component-layer", "kind": "componentInstance", "childIds": []any{},
+			"componentRef": designSystemRef,
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Create(ctx, projectID.String(), userID.String(), CreateArtifactInput{
+		Kind: "prototype", Title: "Unfrozen component ref", Content: componentPayload,
+		SourceVersions: []ArtifactSourceInput{pageSpecSource},
+	}); !errors.Is(err, ErrBlockingGate) {
+		t.Fatalf("Prototype accepted a componentRef outside its immutable sources: %v", err)
+	}
+	if _, err := service.Create(ctx, projectID.String(), userID.String(), CreateArtifactInput{
+		Kind: "prototype", Title: "Frozen component ref", Content: componentPayload,
+		SourceVersions: []ArtifactSourceInput{
+			pageSpecSource,
+			{Ref: designSystemRef, Purpose: "design_system", Required: true},
+		},
+	}); err != nil {
+		t.Fatalf("Prototype rejected an exact immutable design-system componentRef: %v", err)
+	}
+	if err := service.validateArtifactLineageForReview(
+		ctx, database, projectID, "prototype", formalPayload, []ArtifactSourceInput{pageSpecSource},
+	); !errors.Is(err, ErrBlockingGate) {
+		t.Fatalf("strict review accepted missing PageSpec semantic coverage: %v", err)
+	}
+	if err := service.validateArtifactLineageForReview(
+		ctx, database, projectID, "prototype", prototypeLineageCoveragePayload(t, pageSpecRef),
+		[]ArtifactSourceInput{pageSpecSource},
+	); err != nil {
+		t.Fatalf("strict review rejected complete PageSpec semantic coverage: %v", err)
 	}
 	if _, err := service.Create(ctx, projectID.String(), userID.String(), CreateArtifactInput{
 		Kind: "prototype", Title: "Duplicate PageSpec source", Content: formalPayload,
@@ -300,9 +516,9 @@ func TestArtifactServicePrototypeLineageFormalAndExploratory(t *testing.T) {
 		t.Fatalf("formal Prototype accepted a stale PageSpec: %v", err)
 	}
 
-	unapprovedRef := seedArtifactLineageRevision(
-		t, database, store, projectID, userID, "page_spec", "draft", "needs_sync",
-		json.RawMessage(`{"blueprintPageNodeId":"page-experiment","title":"Experiment"}`),
+	unapprovedRef := seedArtifactSemanticPageSpecRevision(
+		t, database, store, projectID, userID, "draft", "needs_sync",
+		json.RawMessage(`{"blueprintPageNodeId":"page-orders","title":"Experiment"}`),
 	)
 	unapprovedSource := ArtifactSourceInput{Ref: unapprovedRef, Purpose: "page_spec", Required: true}
 	if _, err := service.Create(ctx, projectID.String(), userID.String(), CreateArtifactInput{
@@ -317,6 +533,12 @@ func TestArtifactServicePrototypeLineageFormalAndExploratory(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("exact exploratory Prototype should allow an unapproved PageSpec: %v", err)
 	}
+	if err := service.validateArtifactLineageForReview(
+		ctx, database, projectID, "prototype", prototypeLineagePayload(t, unapprovedRef, true),
+		[]ArtifactSourceInput{unapprovedSource},
+	); !errors.Is(err, ErrBlockingGate) || !strings.Contains(err.Error(), "exploratory") {
+		t.Fatalf("formal review accepted an exploratory Prototype: %v", err)
+	}
 
 	if err := database.Model(&storage.ArtifactDraftSourceModel{}).
 		Where("draft_id = ?", created.Draft.ID).Update("source_content_hash", "sha256:corrupt").Error; err != nil {
@@ -327,6 +549,78 @@ func TestArtifactServicePrototypeLineageFormalAndExploratory(t *testing.T) {
 		CreateRevisionInput{ChangeSummary: "Freeze invalid Prototype lineage"},
 	); !errors.Is(err, ErrBlockingGate) {
 		t.Fatalf("CreateRevision froze corrupted Prototype lineage: %v", err)
+	}
+}
+
+func TestPrototypeApprovalRejectsSemanticallyIncompletePageSpecCoverage(t *testing.T) {
+	database, cleanup := baselinePostgresDatabase(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	store, artifacts, projectID, ownerID := newArtifactLineageFixture(t, database)
+	now := time.Now().UTC()
+	reviewerID := uuid.New()
+	if err := database.Create(&storage.UserModel{
+		ID: reviewerID, Email: "semantic-reviewer-" + uuid.NewString() + "@example.com",
+		DisplayName: "Semantic Reviewer", PasswordHash: "not-used", CreatedAt: now, UpdatedAt: now,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Create(&storage.ProjectMemberModel{
+		ProjectID: projectID, UserID: reviewerID, Role: "editor", JoinedAt: now, UpdatedAt: now,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	pageSpecRef := seedArtifactSemanticPageSpecRevision(
+		t, database, store, projectID, ownerID, "approved", "current",
+		json.RawMessage(`{
+			"blueprintPageNodeId":"page-orders","title":"Orders","route":"/orders","userGoal":"Review orders",
+			"acceptanceCriterionIds":["AC-1"],"requiredRoles":["orders-reader"],
+			"states":[
+				{"id":"state-ready","key":"ready","title":"Ready","required":true,"fixtureIds":["fixture-ready"]},
+				{"id":"state-loading","key":"loading","title":"Loading","required":true,"fixtureIds":[]},
+				{"id":"state-empty","key":"empty","title":"Empty","required":true,"fixtureIds":[]},
+				{"id":"state-error","key":"error","title":"Error","required":true,"fixtureIds":[]}
+			],
+			"interactions":[{"id":"interaction-open","trigger":"click","outcome":"Open details"}],
+			"dataBindings":[{"id":"binding-orders","name":"Orders","source":"api","operationId":"api-orders","required":true}]
+		}`),
+	)
+	incomplete := prototypeLineageReviewIncompletePayload(t, pageSpecRef)
+	if report := ValidateArtifactContent("prototype", incomplete); !report.Valid {
+		t.Fatalf("test fixture must pass standalone Prototype validation so only cross-artifact semantics block approval: %#v", report.Findings)
+	}
+	pageSpecSource := ArtifactSourceInput{Ref: pageSpecRef, Purpose: "page_spec", Required: true}
+	created, err := artifacts.Create(ctx, projectID.String(), ownerID.String(), CreateArtifactInput{
+		Kind: "prototype", Title: "Semantically incomplete", Content: incomplete,
+		SourceVersions: []ArtifactSourceInput{pageSpecSource},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	revision, err := artifacts.CreateRevision(
+		ctx, created.Artifact.ID, ownerID.String(), created.Draft.ETag,
+		CreateRevisionInput{ChangeSummary: "Submit incomplete semantic coverage"},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	access, err := NewAccessControl(database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reviews, err := NewReviewService(database, store, access)
+	if err != nil {
+		t.Fatal(err)
+	}
+	review, err := reviews.Submit(ctx, projectID.String(), created.Artifact.ID, ownerID.String(), SubmitReviewInput{
+		RevisionID: revision.ID, ReviewerIDs: []string{reviewerID.String()}, MinimumApprovals: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reviews.Decide(ctx, review.ID, reviewerID.String(), DecideReviewInput{Decision: "approve"}); !errors.Is(err, ErrBlockingGate) || !strings.Contains(err.Error(), "PageSpec state") {
+		t.Fatalf("approval did not fail on authoritative PageSpec semantic coverage: %v", err)
 	}
 }
 
@@ -487,11 +781,164 @@ func seedArtifactLineageRevision(
 	return VersionRef{ArtifactID: artifactID.String(), RevisionID: revisionID.String(), ContentHash: contentRef.ContentHash}
 }
 
+func seedArtifactLineageRevisionSource(
+	t *testing.T,
+	database *gorm.DB,
+	target VersionRef,
+	source VersionRef,
+	purpose string,
+	required bool,
+	anchorID *string,
+	addedBy uuid.UUID,
+) {
+	t.Helper()
+	if err := database.Create(&storage.ArtifactRevisionSourceModel{
+		RevisionID: uuid.MustParse(target.RevisionID), Ordinal: 0,
+		SourceArtifactID: uuid.MustParse(source.ArtifactID), SourceRevisionID: uuid.MustParse(source.RevisionID),
+		SourceContentHash: source.ContentHash, SourceAnchorID: cloneStringPointer(anchorID),
+		Purpose: purpose, Required: required, AddedBy: addedBy, AddedAt: time.Now().UTC(),
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func seedArtifactSemanticPageSpecRevision(
+	t *testing.T,
+	database *gorm.DB,
+	store *baselineContentStoreSpy,
+	projectID uuid.UUID,
+	userID uuid.UUID,
+	workflowStatus string,
+	syncStatus string,
+	pageSpecPayload json.RawMessage,
+) VersionRef {
+	t.Helper()
+	baselineRef := seedArtifactLineageRevision(
+		t, database, store, projectID, userID, "requirement_baseline", "approved", "current",
+		json.RawMessage(`{
+  "requirements":[
+    {"type":"requirement","requirementId":"REQ-1","priority":"must","acceptanceCriterionIds":["AC-1"]},
+    {"type":"acceptanceCriterion","acceptanceCriterionId":"AC-1"}
+  ]
+}`),
+	)
+	blueprintRef := seedArtifactLineageRevision(
+		t, database, store, projectID, userID, "blueprint", "approved", "current",
+		json.RawMessage(`{
+  "nodes":[
+    {"id":"feature-orders","key":"FEATURE-ORDERS","kind":"feature","requirementIds":["REQ-1"]},
+    {"id":"page-orders","key":"PAGE-ORDERS","kind":"page","title":"Orders","route":"/orders","userGoal":"Review orders","requirementIds":["REQ-1"]},
+    {"id":"api-orders","key":"API-ORDERS","kind":"apiOperation","method":"GET","path":"/api/orders","requirementIds":["REQ-1"]},
+    {"id":"permission-orders","key":"PERMISSION-ORDERS","kind":"permission","roles":["orders-reader"],"requirementIds":["REQ-1"]}
+  ],
+  "edges":[
+    {"id":"contains-orders","sourceNodeId":"feature-orders","targetNodeId":"page-orders","kind":"contains","required":true},
+    {"id":"calls-orders","sourceNodeId":"page-orders","targetNodeId":"api-orders","kind":"calls","required":true},
+    {"id":"protect-orders","sourceNodeId":"api-orders","targetNodeId":"permission-orders","kind":"requires","required":true}
+  ]
+}`),
+	)
+	seedArtifactLineageRevisionSource(
+		t, database, blueprintRef, baselineRef, "requirement_baseline", true, nil, userID,
+	)
+	pageSpecRef := seedArtifactLineageRevision(
+		t, database, store, projectID, userID, "page_spec", workflowStatus, syncStatus, pageSpecPayload,
+	)
+	anchor := "page-orders"
+	seedArtifactLineageRevisionSource(
+		t, database, pageSpecRef, blueprintRef, "blueprint", true, &anchor, userID,
+	)
+	return pageSpecRef
+}
+
 func prototypeLineagePayload(t *testing.T, pageSpec VersionRef, exploratory bool) json.RawMessage {
 	t.Helper()
 	payload, err := json.Marshal(map[string]any{
 		"pageSpecRevision": pageSpec,
 		"exploratory":      exploratory,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return payload
+}
+
+func prototypeLineageCoveragePayload(t *testing.T, pageSpec VersionRef) json.RawMessage {
+	t.Helper()
+	payload, err := json.Marshal(map[string]any{
+		"pageSpecRevision": pageSpec,
+		"exploratory":      false,
+		"states": []any{
+			map[string]any{"id": "state-ready", "key": "ready", "title": "Ready", "required": true, "fixtureIds": []any{"fixture-ready"}, "pageStateId": "state-ready"},
+			map[string]any{"id": "state-loading", "key": "loading", "title": "Loading", "required": true, "fixtureIds": []any{}},
+			map[string]any{"id": "state-empty", "key": "empty", "title": "Empty", "required": true, "fixtureIds": []any{}},
+			map[string]any{"id": "state-error", "key": "error", "title": "Error", "required": true, "fixtureIds": []any{}},
+		},
+		"breakpoints": []any{
+			map[string]any{"id": "breakpoint-desktop", "name": "desktop"},
+			map[string]any{"id": "breakpoint-tablet", "name": "tablet"},
+			map[string]any{"id": "breakpoint-mobile", "name": "mobile"},
+		},
+		"frames": prototypeLineageFrames(),
+		"fixtures": []any{map[string]any{
+			"id": "fixture-ready", "name": "Ready orders", "stateId": "state-ready",
+			"response": map[string]any{"orders": []any{}}, "statusCode": 200, "latencyMs": 0,
+			"sanitized": true, "contentHash": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		}},
+		"interactions": []any{
+			map[string]any{
+				"id": "interaction-open", "sourceLayerId": "layer-orders", "trigger": "click",
+				"actions": []any{
+					map[string]any{"type": "updateBinding", "bindingId": "binding-orders", "value": map[string]any{}},
+				},
+			},
+		},
+		"layers": map[string]any{"layer-orders": map[string]any{
+			"id": "layer-orders", "kind": "frame", "childIds": []any{}, "dataBindingId": "binding-orders",
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return payload
+}
+
+func prototypeLineageFrames() []any {
+	frames := make([]any, 0, 12)
+	for _, stateID := range []string{"state-ready", "state-loading", "state-empty", "state-error"} {
+		for _, breakpointID := range []string{"breakpoint-desktop", "breakpoint-tablet", "breakpoint-mobile"} {
+			frames = append(frames, map[string]any{
+				"id": stateID + "-" + breakpointID, "stateId": stateID,
+				"breakpointId": breakpointID, "rootLayerId": "layer-orders",
+			})
+		}
+	}
+	return frames
+}
+
+func prototypeLineageReviewIncompletePayload(t *testing.T, pageSpec VersionRef) json.RawMessage {
+	t.Helper()
+	payload, err := json.Marshal(map[string]any{
+		"pageSpecRevision": pageSpec,
+		"exploratory":      false,
+		"states": []any{
+			map[string]any{"id": "state-ready", "key": "ready", "title": "Ready", "required": true, "fixtureIds": []any{}},
+		},
+		"breakpoints": []any{
+			map[string]any{"id": "breakpoint-desktop", "name": "desktop"},
+			map[string]any{"id": "breakpoint-tablet", "name": "tablet"},
+			map[string]any{"id": "breakpoint-mobile", "name": "mobile"},
+		},
+		"layers": map[string]any{
+			"layer-root": map[string]any{"id": "layer-root", "childIds": []any{}},
+		},
+		"frames": []any{
+			map[string]any{"id": "frame-desktop", "stateId": "state-ready", "breakpointId": "breakpoint-desktop", "rootLayerId": "layer-root"},
+			map[string]any{"id": "frame-tablet", "stateId": "state-ready", "breakpointId": "breakpoint-tablet", "rootLayerId": "layer-root"},
+			map[string]any{"id": "frame-mobile", "stateId": "state-ready", "breakpointId": "breakpoint-mobile", "rootLayerId": "layer-root"},
+		},
+		"fixtures":     []any{},
+		"interactions": []any{},
 	})
 	if err != nil {
 		t.Fatal(err)

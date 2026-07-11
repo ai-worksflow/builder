@@ -295,6 +295,7 @@ export function BlueprintEditor() {
         description: '',
         ...(kind === 'page' ? { route: `/${slug(key)}`, userGoal: '' } : {}),
         ...(kind === 'apiOperation' ? { method: 'GET', path: '' } : {}),
+        ...(kind === 'permission' ? { roles: [] } : {}),
         requirementIds: [],
         assignedMemberIds: [],
       }],
@@ -772,6 +773,7 @@ function NodeInspector({ node, position, readOnly, onChange, onMove, onDelete }:
         <label className="block text-[10px] text-muted-foreground">HTTP method<select value={node.method?.toUpperCase() ?? ''} disabled={readOnly} onChange={(event) => onChange({ method: event.target.value })} className="mt-1 h-8 w-full rounded border border-border bg-background px-2 font-mono text-[10px] text-foreground"><option value="">Select method</option>{HTTP_METHODS.map((method) => <option key={method} value={method}>{method}</option>)}</select></label>
         <label className="block text-[10px] text-muted-foreground">API path<input value={node.path ?? ''} readOnly={readOnly} onChange={(event) => onChange({ path: event.target.value })} placeholder="/orders" className="mt-1 h-8 w-full rounded border border-border bg-background px-2 font-mono text-[10px] text-foreground" /></label>
       </>}
+      {node.kind === 'permission' && <label className="block text-[10px] text-muted-foreground">Roles<input value={(node.roles ?? []).join(', ')} readOnly={readOnly} onChange={(event) => onChange({ roles: commaList(event.target.value) })} placeholder="admin, editor" className="mt-1 h-8 w-full rounded border border-border bg-background px-2 text-[10px] text-foreground" /></label>}
       <label className="block text-[10px] text-muted-foreground">Stable requirement IDs<input value={node.requirementIds.join(', ')} readOnly={readOnly} onChange={(event) => onChange({ requirementIds: commaList(event.target.value) })} className="mt-1 h-8 w-full rounded border border-border bg-background px-2 text-[10px] text-foreground" /></label>
       <label className="block text-[10px] text-muted-foreground">Assigned member IDs<input value={node.assignedMemberIds.join(', ')} readOnly={readOnly} onChange={(event) => onChange({ assignedMemberIds: commaList(event.target.value) })} className="mt-1 h-8 w-full rounded border border-border bg-background px-2 text-[10px] text-foreground" /></label>
       <div className="rounded border border-border bg-background p-2">

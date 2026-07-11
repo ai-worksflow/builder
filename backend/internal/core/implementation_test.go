@@ -2,6 +2,8 @@ package core
 
 import (
 	"testing"
+
+	"github.com/worksflow/builder/backend/internal/domain"
 )
 
 func TestImplementationRevisionLineageSourcesFreezeEveryInput(t *testing.T) {
@@ -13,11 +15,22 @@ func TestImplementationRevisionLineageSourcesFreezeEveryInput(t *testing.T) {
 	requirement := implementationTestVersionRef("requirement")
 	contract := implementationTestVersionRef("contract")
 	designSystem := implementationTestVersionRef("design-system")
+	decision := implementationTestVersionRef("decision")
+	workflowBase := implementationTestVersionRef("workflow-base")
+	workflowAnchor := "page.orders"
+	workflowSource := VersionRef{ArtifactID: "selection-artifact", RevisionID: "selection-revision", ContentHash: "sha256:selection", AnchorID: &workflowAnchor}
 	workspace := implementationTestVersionRef("workspace")
+	workflowBaseRef := domain.ArtifactRef{ArtifactID: workflowBase.ArtifactID, RevisionID: workflowBase.RevisionID, ContentHash: workflowBase.ContentHash}
+	workflowSourceRef := domain.ArtifactRef{ArtifactID: workflowSource.ArtifactID, RevisionID: workflowSource.RevisionID, ContentHash: workflowSource.ContentHash, AnchorID: workflowAnchor}
 	bundle := WorkbenchBundle{
 		BlueprintRevision: blueprint, PageSpecRevision: pageSpec, PrototypeRevision: prototype,
 		RequirementRevisions: []VersionRef{requirement}, ContractRevisions: []VersionRef{contract},
-		DesignSystemRevisions: []VersionRef{designSystem}, CurrentWorkspaceRevision: &workspace,
+		DesignSystemRevisions: []VersionRef{designSystem}, ContextRevisions: []WorkbenchContextRevision{{Kind: "decision_record", Revision: decision}},
+		WorkflowContext: &ApplicationBuildContext{InputManifest: domain.InputManifest{
+			BaseRevision: &workflowBaseRef,
+			Sources:      []domain.ManifestSource{{Ref: workflowSourceRef, Purpose: "blueprint_selection_node"}},
+		}},
+		CurrentWorkspaceRevision: &workspace,
 	}
 
 	sources := implementationRevisionLineageSources(bundle)
@@ -32,6 +45,9 @@ func TestImplementationRevisionLineageSourcesFreezeEveryInput(t *testing.T) {
 		{requirement, "requirement", "implemented_by"},
 		{contract, "contract", "implemented_by"},
 		{designSystem, "design_system", "implemented_by"},
+		{decision, "context_decision_record", "implemented_by"},
+		{workflowBase, "workflow_input_base", "implemented_by"},
+		{workflowSource, "workflow_input:blueprint_selection_node", "implemented_by"},
 		{workspace, "workspace_base", "derives_from"},
 	}
 	if len(sources) != len(want) {
@@ -39,9 +55,22 @@ func TestImplementationRevisionLineageSourcesFreezeEveryInput(t *testing.T) {
 	}
 	for index, expected := range want {
 		actual := sources[index]
-		if actual.Ref != expected.ref || actual.Purpose != expected.purpose ||
+		if !exactWorkbenchVersionRef(actual.Ref, expected.ref) || actual.Purpose != expected.purpose ||
 			actual.Relation != expected.relation || !actual.Required {
 			t.Fatalf("source %d lost exact lineage: got=%+v want=%+v", index, actual, expected)
+		}
+	}
+	manifestSources := buildManifestSources(bundle)
+	for _, expected := range []VersionRef{decision, workflowBase, workflowSource} {
+		found := false
+		for _, actual := range manifestSources {
+			if exactWorkbenchVersionRef(actual, expected) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("build manifest source set lost contextual evidence: %+v", expected)
 		}
 	}
 }

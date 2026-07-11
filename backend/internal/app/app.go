@@ -262,7 +262,10 @@ func Run(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 	if err != nil {
 		return fmt.Errorf("create AI provider: %w", err)
 	}
-	generationService, err := generation.NewService(dependencies.Postgres, contentStore, aiProvider, proposalService, workbenchService, implementationService)
+	generationService, err := generation.NewService(
+		dependencies.Postgres, contentStore, aiProvider, proposalService, workbenchService, implementationService,
+		generation.ServiceConfig{ClaimLease: cfg.AI.Timeout + 5*time.Minute},
+	)
 	if err != nil {
 		return fmt.Errorf("create generation service: %w", err)
 	}
@@ -284,7 +287,7 @@ func Run(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 	}
 	workflowEngine, err := workflowruntime.NewPlatformEngine(workflowruntime.PlatformDependencies{
 		Store: workflowStore, CoreProposals: proposalService, Generation: generationService,
-		Workbench: workbenchService, ArtifactInputs: workflowruntime.CoreArtifactInputValidator{Database: dependencies.Postgres},
+		Workbench: workbenchService, ArtifactInputs: workflowruntime.CoreArtifactInputValidator{Database: dependencies.Postgres, Contents: contentStore},
 		HumanEditOutput:     workflowruntime.CoreHumanEditOutputValidator{Artifacts: artifactService, Proposals: proposalService},
 		TargetArtifacts:     workflowruntime.CoreTargetArtifactInitializer{Artifacts: artifactService},
 		RequirementBaseline: baselineService,
@@ -308,6 +311,9 @@ func Run(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 	}
 	conversationService, err := conversation.NewService(conversation.ServiceDependencies{
 		Database: dependencies.Postgres, Access: accessControl, Workflow: workflowFacade, Manifests: workflowStore, AIProvider: aiProvider,
+		Generation: generationService, DefaultImplementationModel: cfg.AI.DefaultModel,
+		Workbench:         workbenchService,
+		CommandClaimLease: cfg.AI.Timeout + 5*time.Minute,
 	})
 	if err != nil {
 		return fmt.Errorf("create conversation control-plane service: %w", err)
@@ -433,6 +439,7 @@ func Run(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 		return checkErr
 	}
 	readinessChecks["realtime_fanout"] = fanoutSupervisor.Readiness
+	readinessChecks["workflow_execution_profiles"] = workflowEngine.Readiness
 	readiness := health.NewReadiness(cfg.Dependencies.ReadinessTimeout, readinessChecks)
 	router, err := httpapi.NewRouter(cfg, logger, httpapi.RouterOptions{
 		Readiness: readiness, WebSocket: websocketHandler,

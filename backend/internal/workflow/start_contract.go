@@ -15,20 +15,23 @@ var ErrStartManifestIncompatible = errors.New("workflow definition is incompatib
 // discovery can use the same matcher after resolving exact kinds, while the
 // workflow engine can use it before any run is created.
 type StartManifestDescriptor struct {
-	JobType             string
-	OutputSchemaVersion string
-	SourcePurposes      []string
-	ArtifactKinds       []string
+	JobType              string
+	OutputSchemaVersion  string
+	SourcePurposes       []string
+	ArtifactKinds        []string
+	ArtifactCount        int
+	AllArtifactsApproved bool
 }
 
-func DescribeStartManifest(manifest domain.InputManifest, artifactKinds []string) StartManifestDescriptor {
+func DescribeStartManifest(manifest domain.InputManifest, metadata StartArtifactMetadata) StartManifestDescriptor {
 	purposes := make([]string, 0, len(manifest.Sources))
 	for _, source := range manifest.Sources {
 		purposes = append(purposes, source.Purpose)
 	}
 	return StartManifestDescriptor{
 		JobType: manifest.JobType, OutputSchemaVersion: manifest.OutputSchemaVersion,
-		SourcePurposes: purposes, ArtifactKinds: append([]string(nil), artifactKinds...),
+		SourcePurposes: purposes, ArtifactKinds: append([]string(nil), metadata.Kinds...),
+		ArtifactCount: metadata.Count, AllArtifactsApproved: metadata.AllApproved,
 	}
 }
 
@@ -59,6 +62,15 @@ func CompatibleStart(
 	}
 	if !sameStrings(manifest.ArtifactKinds, definition.InputContract.ArtifactKinds) {
 		return fmt.Errorf("%w: exact artifact kinds do not match", ErrStartManifestIncompatible)
+	}
+	if manifest.ArtifactCount < definition.InputContract.MinimumArtifacts {
+		return fmt.Errorf("%w: artifact count is below the entry minimum", ErrStartManifestIncompatible)
+	}
+	if definition.InputContract.MaximumArtifacts > 0 && manifest.ArtifactCount > definition.InputContract.MaximumArtifacts {
+		return fmt.Errorf("%w: artifact count exceeds the entry maximum", ErrStartManifestIncompatible)
+	}
+	if definition.InputContract.RequireApproved && !manifest.AllArtifactsApproved {
+		return fmt.Errorf("%w: entry policy requires approved artifact revisions", ErrStartManifestIncompatible)
 	}
 	desiredOutputCapability = strings.TrimSpace(desiredOutputCapability)
 	if desiredOutputCapability != "" && desiredOutputCapability != definition.OutputContract.Capability {

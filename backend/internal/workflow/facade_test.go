@@ -23,30 +23,13 @@ func (k fixedStartArtifactKinds) ResolveStartArtifactKinds(context.Context, doma
 	return append([]string(nil), k...), nil
 }
 
-func authoredWorkflowFixture() ([]domain.NodeDefinition, []domain.WorkflowEdge) {
-	schema := json.RawMessage(`{"type":"object","additionalProperties":true}`)
-	nodes := []domain.NodeDefinition{
-		{
-			ID: "source", Name: "Project brief input", Type: domain.NodeArtifactInput,
-			InputSchema: schema, OutputSchema: schema,
-			ArtifactInput: &domain.ArtifactInputNodeConfig{AllowedTypes: []domain.ArtifactType{domain.ArtifactDocument}, AllowedKinds: []string{"project_brief"}, MinimumArtifacts: 1},
-		},
-		{
-			ID: "workbench", Name: "Build in Workbench", Type: domain.NodeWorkbenchBuild,
-			InputSchema: schema, OutputSchema: schema,
-			WorkbenchBuild: &domain.WorkbenchBuildNodeConfig{BuildManifestSchemaVersion: 1, MaxAttempts: 1, Timeout: time.Minute},
-		},
-		{
-			ID: "publish", Name: "Publish", Type: domain.NodePublish,
-			InputSchema: schema, OutputSchema: schema,
-			Publish: &domain.PublishNodeConfig{Environment: "production", RequiredRole: "admin"},
-		},
+func authoredWorkflowFixture(t *testing.T) ([]domain.NodeDefinition, []domain.WorkflowEdge) {
+	t.Helper()
+	definition, err := MinimumLoopDefinition(uuid.NewString(), uuid.NewString(), time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
 	}
-	edges := []domain.WorkflowEdge{
-		{ID: "source-workbench", From: "source", To: "workbench"},
-		{ID: "workbench-publish", From: "workbench", To: "publish"},
-	}
-	return nodes, edges
+	return definition.Nodes, definition.Edges
 }
 
 func TestWorkflowDefinitionAuthoringVersionsAndPublishesImmutableGraphs(t *testing.T) {
@@ -59,9 +42,10 @@ func TestWorkflowDefinitionAuthoringVersionsAndPublishesImmutableGraphs(t *testi
 	engine.StartArtifactKinds = startArtifactKindResolverFunc(func(context.Context, domain.InputManifest) ([]string, error) {
 		return []string{"project_brief"}, nil
 	})
+	installCompleteTestExecutionProfileRuntime(t, engine, nil)
 	facade := Facade{Engine: engine, Store: store, Access: fixedWorkflowAccess{role: core.RoleOwner}}
 	projectID, ownerID := uuid.NewString(), uuid.NewString()
-	nodes, edges := authoredWorkflowFixture()
+	nodes, edges := authoredWorkflowFixture(t)
 	created, err := facade.CreateDefinition(context.Background(), projectID, ownerID, CreateDefinitionInput{
 		Key: "custom-delivery", Title: "Custom delivery", Nodes: nodes, Edges: edges,
 		InputContract: ProjectBriefInputContract(), OutputContract: ApplicationOutputContract(),
@@ -102,6 +86,7 @@ func TestWorkflowDefinitionAuthoringRejectsUnknownRoles(t *testing.T) {
 	engine.StartArtifactKinds = startArtifactKindResolverFunc(func(context.Context, domain.InputManifest) ([]string, error) {
 		return []string{"project_brief"}, nil
 	})
+	installCompleteTestExecutionProfileRuntime(t, engine, nil)
 	facade := Facade{Engine: engine, Store: store, Access: fixedWorkflowAccess{role: core.RoleOwner}}
 	schema := json.RawMessage(`{"type":"object","additionalProperties":true}`)
 	_, err := facade.CreateDefinition(context.Background(), uuid.NewString(), uuid.NewString(), CreateDefinitionInput{
@@ -128,6 +113,7 @@ func TestListingAndDefaultStartAreSideEffectFreeUntilExplicitProvisioning(t *tes
 	engine.StartArtifactKinds = startArtifactKindResolverFunc(func(context.Context, domain.InputManifest) ([]string, error) {
 		return []string{"project_brief"}, nil
 	})
+	installCompleteTestExecutionProfileRuntime(t, engine, nil)
 	facade := Facade{Engine: engine, Store: store, Access: fixedWorkflowAccess{role: core.RoleOwner}}
 	projectID, ownerID := uuid.NewString(), uuid.NewString()
 	first, err := facade.ListDefinitions(context.Background(), projectID, ownerID)
@@ -209,6 +195,7 @@ func TestDefinitionListKeepsLatestDraftVisibleWhileDefaultStartUsesPublishedVers
 	engine.StartArtifactKinds = startArtifactKindResolverFunc(func(context.Context, domain.InputManifest) ([]string, error) {
 		return []string{"project_brief"}, nil
 	})
+	installCompleteTestExecutionProfileRuntime(t, engine, nil)
 	facade := Facade{Engine: engine, Store: store, Access: fixedWorkflowAccess{role: core.RoleOwner}}
 	projectID, actorID := uuid.NewString(), uuid.NewString()
 	if _, err := SeedMinimumLoop(context.Background(), store, MinimumLoopSeed{

@@ -401,6 +401,10 @@ export interface BlueprintNodeDto {
   readonly userGoal?: string
   readonly method?: string
   readonly path?: string
+  readonly roles?: readonly string[]
+  // Read compatibility for drafts created before Permission roles were canonicalized.
+  readonly requiredRoles?: readonly string[]
+  readonly role?: string
   readonly position: { readonly x: number; readonly y: number }
   readonly requirementIds: readonly EntityId[]
   readonly pageSpecArtifactId?: EntityId
@@ -494,6 +498,9 @@ export interface PageInteractionSpecDto {
   readonly id: EntityId
   readonly trigger: string
   readonly outcome: string
+  readonly targetPageNodeId?: EntityId
+  // Read compatibility for PageSpecs that stored a PageSpec artifact ID instead
+  // of the stable Blueprint page node ID.
   readonly targetPageSpecId?: EntityId
   readonly acceptanceCriterionIds: readonly EntityId[]
 }
@@ -789,7 +796,7 @@ export interface PresenceDto {
 
 export interface ProjectAuthorizationDto {
   readonly projectId: EntityId
-  readonly action: 'view' | 'comment' | 'edit' | 'publish' | 'admin'
+  readonly action: 'view' | 'comment' | 'edit' | 'review' | 'publish' | 'admin'
   readonly allowed: boolean
   readonly role: ProjectRole
 }
@@ -1003,6 +1010,36 @@ export interface WorkbenchBundleDto {
   readonly pageSpecRevision: VersionRefDto
   readonly prototypeRevision: VersionRefDto
   readonly requirementRevisions: readonly VersionRefDto[]
+  readonly contextRevisions?: readonly {
+    readonly kind: string
+    readonly revision: VersionRefDto
+  }[]
+  readonly workflowContext?: {
+    readonly definition: {
+      readonly id: EntityId
+      readonly version: number
+      readonly hash: ContentHash
+    }
+    readonly inputManifest: {
+      readonly id: EntityId
+      readonly projectId: EntityId
+      readonly jobType: string
+      readonly deliverySliceId?: EntityId
+      readonly baseRevision?: VersionRefDto
+      readonly sources: readonly {
+        readonly ref: VersionRefDto
+        readonly purpose: string
+      }[]
+      readonly constraints: JsonValue
+      readonly outputSchemaVersion: string
+      readonly createdBy: EntityId
+      readonly createdAt: IsoDateTime
+      readonly hash: ContentHash
+    }
+    readonly deliverySliceId?: EntityId
+    readonly runScope?: JsonValue
+    readonly outputContract?: JsonValue
+  }
   readonly blueprintRevision: VersionRefDto
   readonly sceneGraph: AssetRefDto
   readonly renderedFrames: readonly RenderedFrameRefDto[]

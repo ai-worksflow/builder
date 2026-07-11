@@ -397,6 +397,25 @@ func TestGenerationProviderErrorsHaveStableProblemStatus(t *testing.T) {
 	}
 }
 
+func TestDirectImplementationGenerationCannotReplaceConversationOwnedProposal(t *testing.T) {
+	generator := &fakeGenerationService{implementationErr: generation.ErrActiveImplementationProposal}
+	router := newBusinessRouter(t, transport.Services{Generation: generator})
+	headers := authenticatedHeaders(true)
+	headers.Set("Content-Type", "application/json")
+	headers.Set("Idempotency-Key", "manual-generation-conversation-owned")
+	proposalID := uuid.NewString()
+	response := performRequest(router, http.MethodPost, "/v1/build-manifests/"+uuid.NewString()+"/generate", []byte(`{
+		"model":"gpt-5","instruction":"replace reviewed command",
+		"replaceProposalId":"`+proposalID+`","replaceProposalVersion":1
+	}`), headers)
+	assertProblem(t, response, http.StatusConflict, "active_implementation_proposal")
+	if generator.implementationRequest.ExecutionSource != core.ImplementationSourceManualGeneration ||
+		generator.implementationRequest.ExpectedActiveProposalID != proposalID ||
+		generator.implementationRequest.ExpectedActiveProposalVersion != 1 {
+		t.Fatalf("direct generation did not preserve explicit manual CAS: %#v", generator.implementationRequest)
+	}
+}
+
 func newBusinessRouter(t *testing.T, services transport.Services, persistence ...gin.HandlerFunc) *gin.Engine {
 	t.Helper()
 	if services.Auth == nil {
@@ -545,10 +564,12 @@ func (*fakeProposalService) Apply(context.Context, string, string, core.ApplyPro
 }
 
 type fakeGenerationService struct {
-	artifactErr error
-	actor       string
-	manifestID  string
-	model       string
+	artifactErr           error
+	implementationErr     error
+	implementationRequest generation.ImplementationGenerationRequest
+	actor                 string
+	manifestID            string
+	model                 string
 }
 
 func (f *fakeGenerationService) GenerateArtifactProposal(_ context.Context, manifestID, actor, model string) (generation.ArtifactGenerationResult, error) {
@@ -558,6 +579,7 @@ func (f *fakeGenerationService) GenerateArtifactProposal(_ context.Context, mani
 	return generation.ArtifactGenerationResult{}, f.artifactErr
 }
 
-func (*fakeGenerationService) GenerateImplementation(context.Context, string, string, string, string) (generation.ImplementationGenerationResult, error) {
-	return generation.ImplementationGenerationResult{}, nil
+func (f *fakeGenerationService) GenerateImplementation(_ context.Context, request generation.ImplementationGenerationRequest) (generation.ImplementationGenerationResult, error) {
+	f.implementationRequest = request
+	return generation.ImplementationGenerationResult{}, f.implementationErr
 }

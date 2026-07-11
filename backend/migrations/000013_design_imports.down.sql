@@ -1,3 +1,7 @@
+DROP TRIGGER IF EXISTS design_import_proposal_independent_apply ON output_proposals;
+DROP FUNCTION IF EXISTS prohibit_design_import_creator_proposal_apply();
+DROP TRIGGER IF EXISTS design_import_proposal_independent_decision ON proposal_operation_decisions;
+DROP FUNCTION IF EXISTS prohibit_design_import_creator_proposal_decision();
 DROP TRIGGER IF EXISTS design_import_snapshot_immutable ON design_imports;
 DROP FUNCTION IF EXISTS prevent_design_import_snapshot_mutation();
 DROP TRIGGER IF EXISTS design_import_state_transition ON design_imports;

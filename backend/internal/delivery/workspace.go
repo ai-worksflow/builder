@@ -136,6 +136,9 @@ func (l *RevisionLoader) LoadBuildManifest(ctx context.Context, projectID, actor
 		}
 		return core.WorkbenchBundle{}, wrapInternal("load build manifest", err)
 	}
+	if err := core.EnsureWorkflowManifestGroupActivated(ctx, l.database, model); err != nil {
+		return core.WorkbenchBundle{}, err
+	}
 	stored, err := l.contents.Get(ctx, model.ContentRef, model.ContentHash)
 	if err != nil {
 		return core.WorkbenchBundle{}, wrapInternal("load frozen build manifest", err)

@@ -22,7 +22,7 @@ func TestMinimumLoopSeedIsPublishedOnlyByInstallerAndValid(t *testing.T) {
 	if record.Definition.CreatedBy != seed.InstallerUserID {
 		t.Fatal("seed must preserve installer user")
 	}
-	if record.Definition.Version != MinimumLoopCurrentVersion || record.Definition.SchemaVersion != "3" {
+	if record.Definition.Version != MinimumLoopCurrentVersion || record.Definition.SchemaVersion != "5" {
 		t.Fatalf("current seed version = %d schema = %s", record.Definition.Version, record.Definition.SchemaVersion)
 	}
 	if len(record.Definition.Nodes) != 22 || len(record.Definition.Edges) != 21 {
@@ -43,7 +43,7 @@ func TestMinimumLoopSeedIsPublishedOnlyByInstallerAndValid(t *testing.T) {
 			required[node.Type] = true
 		}
 		if node.ID == "pages" {
-			if node.FanOut == nil || node.FanOut.ItemKind != "blueprint_page" || node.FanOut.ItemsPath != "/blueprintPages" || node.FanOut.SliceKeyPath != "/key" {
+			if node.FanOut == nil || node.FanOut.ItemKind != "blueprint_page" || node.FanOut.ItemsPath != "/blueprintPages" || node.FanOut.SliceKeyPath != "/key" || node.FanOut.MaxItems != domain.MaximumWorkflowFanOutItems {
 				t.Fatalf("minimum loop page fan-out is not an exact Blueprint-page mode: %+v", node.FanOut)
 			}
 		}
@@ -82,13 +82,15 @@ func TestMinimumLoopSeedIsPublishedOnlyByInstallerAndValid(t *testing.T) {
 		t.Fatalf("expected canonical seed JSON: %v", err)
 	}
 	versions, err := store.ListDefinitionVersions(context.Background(), seed.DefinitionID)
-	if err != nil || len(versions) != 3 {
+	if err != nil || len(versions) != 5 {
 		t.Fatalf("seed versions = %+v, error = %v", versions, err)
 	}
 	if versions[0].Definition.Version != 1 || versions[0].Published ||
 		versions[1].Definition.Version != 2 || versions[1].Published ||
-		versions[2].VersionID != seed.VersionID || !versions[2].Published {
-		t.Fatalf("seed version publication is not v1/v2 drafts -> v3 published: %+v", versions)
+		versions[2].Definition.Version != 3 || versions[2].Published ||
+		versions[3].Definition.Version != 4 || versions[3].Published || versions[3].ExecutionProfile != WorkflowExecutionProfileV1Ref() || versions[3].Definition.ExecutionProfile != WorkflowExecutionProfileV1Ref() ||
+		versions[4].VersionID != seed.VersionID || !versions[4].Published || versions[4].ExecutionProfile != CurrentWorkflowExecutionProfileRef() {
+		t.Fatalf("seed version publication is not v1/v2/v3/v4 history -> v5 published with frozen profiles: %+v", versions)
 	}
 	second, err := SeedMinimumLoop(context.Background(), store, seed, time.Now())
 	if err != nil || second.VersionID != record.VersionID {
@@ -124,6 +126,14 @@ func TestBlueprintSelectionFlowSeedIsExecutableAndIdempotent(t *testing.T) {
 	if err != nil || second.VersionID != record.VersionID {
 		t.Fatalf("idempotent selection seed = %#v, err=%v", second, err)
 	}
+	versions, err := store.ListDefinitionVersions(context.Background(), seed.DefinitionID)
+	if err != nil || len(versions) != 4 {
+		t.Fatalf("selection seed versions = %+v, err=%v", versions, err)
+	}
+	if versions[2].Definition.Version != 3 || versions[2].ExecutionProfile != WorkflowExecutionProfileV1Ref() || versions[2].Definition.ExecutionProfile != WorkflowExecutionProfileV1Ref() || versions[2].Published ||
+		versions[3].Definition.Version != BlueprintSelectionFlowVersion || versions[3].ExecutionProfile != CurrentWorkflowExecutionProfileRef() || !versions[3].Published {
+		t.Fatalf("selection v3/v4 execution profiles drifted: %+v", versions)
+	}
 }
 
 func TestSeedMinimumLoopUpgradesExistingProjectFromV1(t *testing.T) {
@@ -153,15 +163,17 @@ func TestSeedMinimumLoopUpgradesExistingProjectFromV1(t *testing.T) {
 		t.Fatal(err)
 	}
 	versions, err := store.ListDefinitionVersions(context.Background(), definitionID)
-	if err != nil || len(versions) != 3 {
+	if err != nil || len(versions) != 5 {
 		t.Fatalf("upgraded versions = %+v, error = %v", versions, err)
 	}
 	if versions[0].VersionID != legacyVersionID || versions[0].Published ||
 		versions[1].Definition.Version != 2 || versions[1].Published ||
+		versions[2].Definition.Version != 3 || versions[2].Published ||
+		versions[3].Definition.Version != 4 || versions[3].Published || versions[3].ExecutionProfile != WorkflowExecutionProfileV1Ref() ||
 		upgraded.Definition.Version != MinimumLoopCurrentVersion || upgraded.VersionID != v2ID || !upgraded.Published {
 		t.Fatalf("existing v1 history was not preserved while publishing current version: %+v / %+v", versions, upgraded)
 	}
-	if versions[2].Definition.SchemaVersion != "3" || len(versions[2].Definition.Nodes) != 22 {
-		t.Fatalf("existing project did not receive current topology: %+v", versions[2].Definition)
+	if versions[4].Definition.SchemaVersion != "5" || len(versions[4].Definition.Nodes) != 22 || versions[4].ExecutionProfile != CurrentWorkflowExecutionProfileRef() {
+		t.Fatalf("existing project did not receive current topology: %+v", versions[4].Definition)
 	}
 }

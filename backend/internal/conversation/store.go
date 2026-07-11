@@ -12,6 +12,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/worksflow/builder/backend/internal/core"
 	platformdomain "github.com/worksflow/builder/backend/internal/domain"
+	"github.com/worksflow/builder/backend/internal/generation"
 	storage "github.com/worksflow/builder/backend/internal/storage/postgres"
 	runtime "github.com/worksflow/builder/backend/internal/workflow"
 	"gorm.io/gorm"
@@ -29,24 +30,37 @@ type GORMStore struct {
 }
 
 type intentDefinitionContext struct {
-	VersionID    string          `json:"versionId"`
-	DefinitionID string          `json:"definitionId"`
-	Key          string          `json:"key"`
-	Title        string          `json:"title"`
-	Description  string          `json:"description"`
-	Content      json.RawMessage `json:"content"`
+	VersionID        string                                     `json:"versionId"`
+	DefinitionID     string                                     `json:"definitionId"`
+	Key              string                                     `json:"key"`
+	Title            string                                     `json:"title"`
+	Description      string                                     `json:"description"`
+	DefinitionHash   string                                     `json:"definitionHash"`
+	ExecutionProfile platformdomain.WorkflowExecutionProfileRef `json:"executionProfile"`
+	Content          json.RawMessage                            `json:"content"`
 }
 
 type intentWorkbenchTargetContext struct {
 	DefinitionVersionID string `json:"definitionVersionId"`
-	RunID               string `json:"runId"`
-	RootBundleID        string `json:"rootBundleId"`
-	ActiveBundleID      string `json:"activeBundleId"`
-	ManifestGroup       string `json:"manifestGroup"`
-	Ordinal             int    `json:"ordinal"`
+	// Definition authoring text is useful to operators and store-side diagnostics,
+	// but is never part of the provider view. Exact version/run/bundle identities
+	// and the reviewed slice labels below are sufficient for model selection.
+	DefinitionKey         string `json:"-"`
+	DefinitionTitle       string `json:"-"`
+	DefinitionDescription string `json:"-"`
+	RunID                 string `json:"runId"`
+	RootBundleID          string `json:"rootBundleId"`
+	ActiveBundleID        string `json:"activeBundleId"`
+	ManifestGroup         string `json:"manifestGroup"`
+	Ordinal               int    `json:"ordinal"`
+	SliceID               string `json:"sliceId"`
+	SliceKey              string `json:"sliceKey"`
+	SliceTitle            string `json:"sliceTitle"`
 }
 
 type intentGenerationContext struct {
+	Conversation     ProviderConversationContext    `json:"conversation"`
+	Provenance       ConversationContextProvenance  `json:"provenance"`
 	Messages         []Message                      `json:"messages"`
 	Definitions      []intentDefinitionContext      `json:"definitions"`
 	WorkbenchTargets []intentWorkbenchTargetContext `json:"workbenchTargets"`
@@ -56,7 +70,13 @@ var activeWorkbenchRunStatuses = []string{"running", "waiting_input", "waiting_r
 
 var executableImplementationProposalStatuses = []string{"open", "reviewing", "ready"}
 
-const maxIntentWorkbenchTargets = 100
+const (
+	maxIntentWorkbenchTargets          = 100
+	maxIntentWorkbenchTargetCandidates = 1000
+	intentCandidateQueryBatchSize      = 256
+	maxIntentConversationMessages      = 200
+	maxIntentConversationMessageBytes  = 128 << 10
+)
 
 func NewGORMStore(database *gorm.DB) (*GORMStore, error) {
 	if database == nil {
@@ -238,6 +258,9 @@ func (s *GORMStore) ListMessages(ctx context.Context, projectID, conversationID 
 }
 
 func (s *GORMStore) CreateIntentProposal(ctx context.Context, projectID, conversationID, actorID uuid.UUID, input CreateIntentProposalInput, provenance ProposalProvenance, manifestJobType string) (WorkflowIntentProposal, Message, error) {
+	if provenance.Origin == ProposalOriginSubmitted && hasWorkbenchSliceMetadata(input.WorkbenchInstruction) {
+		return WorkflowIntentProposal{}, Message{}, fmt.Errorf("%w: workbench slice identity is server managed", core.ErrInvalidInput)
+	}
 	var proposal storage.WorkflowIntentProposalModel
 	var assistant storage.ConversationMessageModel
 	err := s.database.WithContext(ctx).Transaction(func(transaction *gorm.DB) error {
@@ -262,10 +285,20 @@ func (s *GORMStore) CreateIntentProposal(ctx context.Context, projectID, convers
 		if err := validateExactSourceRefs(transaction, projectID, input.SourceRefs); err != nil {
 			return err
 		}
+		conversationContext, summaryCheckpointID, providerInputHash, err := validateAndEncodeProposalConversationContext(
+			transaction, projectID, conversationID, trigger, input.ConversationContext, provenance,
+		)
+		if err != nil {
+			return err
+		}
 		if input.Kind == IntentWorkbenchInstruction {
-			if err := validateExpectedWorkbenchTarget(transaction, projectID, input); err != nil {
+			slice, err := validateExpectedWorkbenchTarget(transaction, projectID, input)
+			if err != nil {
 				return err
 			}
+			input.WorkbenchInstruction.SliceID = slice.ID
+			input.WorkbenchInstruction.SliceKey = slice.Key
+			input.WorkbenchInstruction.SliceTitle = slice.Title
 		}
 		sourceRefs, err := platformdomain.CanonicalJSON(input.SourceRefs)
 		if err != nil {
@@ -305,9 +338,12 @@ func (s *GORMStore) CreateIntentProposal(ctx context.Context, projectID, convers
 			TriggerMessageID: trigger.ID, AssistantMessageID: assistantMessageID,
 			Kind: string(input.Kind), Status: string(ProposalPending), Version: 1,
 			SuggestedDefinitionVersionID: definitionVersionID, Scope: reviewedScope,
-			SourceRefs: sourceRefs, ManifestIntent: manifestIntent, WorkbenchInstruction: instruction,
+			DesiredOutputCapability: platformdomain.WorkflowOutputApplication,
+			SourceRefs:              sourceRefs, ManifestIntent: manifestIntent, WorkbenchInstruction: instruction,
 			Origin: string(provenance.Origin), AIProvider: aiProvider, AIModel: aiModel, AIResponseID: aiResponseID,
-			DecisionReason: "", ProposedBy: actorID, CreatedAt: now,
+			SummaryCheckpointID: summaryCheckpointID, ConversationContext: conversationContext,
+			ProviderInputHash: providerInputHash,
+			DecisionReason:    "", ProposedBy: actorID, CreatedAt: now,
 		}
 		if err := transaction.Create(&proposal).Error; err != nil {
 			return err
@@ -323,11 +359,16 @@ func (s *GORMStore) CreateIntentProposal(ctx context.Context, projectID, convers
 		if err := transaction.Create(&assistant).Error; err != nil {
 			return err
 		}
-		auditMetadata := map[string]any{"conversationId": conversationID.String(), "kind": input.Kind, "origin": provenance.Origin}
+		auditMetadata := map[string]any{"conversationId": conversationID.String(), "kind": input.Kind, "origin": provenance.Origin, "desiredOutputCapability": platformdomain.WorkflowOutputApplication}
 		if provenance.AI != nil {
 			auditMetadata["aiProvider"] = provenance.AI.Provider
 			auditMetadata["aiModel"] = provenance.AI.Model
 			auditMetadata["aiResponseId"] = provenance.AI.ResponseID
+			auditMetadata["conversationContextMode"] = input.ConversationContext.Mode
+			auditMetadata["providerInputHash"] = input.ConversationContext.ProviderInputHash
+			if summaryCheckpointID != nil {
+				auditMetadata["summaryCheckpointId"] = summaryCheckpointID.String()
+			}
 		}
 		if err := conversationAudit(transaction, projectID, actorID, "conversation.intent_proposed", "workflow_intent_proposal", proposal.ID.String(), auditMetadata); err != nil {
 			return err
@@ -365,7 +406,8 @@ func reviewedConversationIntentScope(
 		ConversationID: conversationID.String(), TriggerMessageID: triggerMessageID.String(),
 		ProposalID: proposalID.String(), AssistantMessageID: assistantMessageID.String(),
 		Kind: input.Kind, DefinitionVersionID: input.SuggestedDefinitionVersionID,
-		WorkbenchInstruction: input.WorkbenchInstruction, ManifestIntent: input.ManifestIntent,
+		DesiredOutputCapability: platformdomain.WorkflowOutputApplication,
+		WorkbenchInstruction:    input.WorkbenchInstruction, ManifestIntent: input.ManifestIntent,
 		SourceRefs: append([]platformdomain.ArtifactRef(nil), input.SourceRefs...),
 	}
 	canonical, err := platformdomain.CanonicalJSON(scope)
@@ -385,9 +427,12 @@ func (s *GORMStore) IntentGenerationContext(
 	sourceRefs []platformdomain.ArtifactRef,
 	manifestIntent ManifestIntent,
 	manifestJobType string,
+	targetHint *WorkbenchTargetHint,
 ) (intentGenerationContext, error) {
-	if len(candidateVersionIDs) == 0 || len(candidateVersionIDs) > 20 {
-		return intentGenerationContext{}, fmt.Errorf("%w: candidate definition versions", core.ErrInvalidInput)
+	var err error
+	targetHint, err = normalizeWorkbenchTargetHint(targetHint)
+	if err != nil {
+		return intentGenerationContext{}, err
 	}
 	if err := s.ensureActiveConversation(ctx, projectID, conversationID); err != nil {
 		return intentGenerationContext{}, err
@@ -404,39 +449,37 @@ func (s *GORMStore) IntentGenerationContext(
 	if err := validateExactSourceRefs(s.database.WithContext(ctx), projectID, sourceRefs); err != nil {
 		return intentGenerationContext{}, err
 	}
-	var messageModels []storage.ConversationMessageModel
-	if err := s.database.WithContext(ctx).Where("conversation_id = ? AND sequence <= ?", conversationID, trigger.Sequence).
-		Order("sequence DESC").Limit(50).Find(&messageModels).Error; err != nil {
-		return intentGenerationContext{}, fmt.Errorf("load conversation generation context: %w", err)
-	}
-	selectedMessages := make([]storage.ConversationMessageModel, 0, len(messageModels))
-	bytesUsed := 0
-	for _, model := range messageModels {
-		if bytesUsed+len(model.Content) > 128<<10 && model.ID != triggerMessageID {
-			continue
-		}
-		bytesUsed += len(model.Content)
-		selectedMessages = append(selectedMessages, model)
-	}
-	messages := make([]Message, 0, len(selectedMessages))
-	for index := len(selectedMessages) - 1; index >= 0; index-- {
-		messages = append(messages, messageFromModel(selectedMessages[index]))
+	providerConversation, contextProvenance, err := s.loadIntentConversationContext(ctx, conversationID, trigger)
+	if err != nil {
+		return intentGenerationContext{}, err
 	}
 	type definitionRow struct {
-		ID           uuid.UUID
-		DefinitionID uuid.UUID
-		WorkflowKey  string
-		Title        string
-		Description  string
-		Content      json.RawMessage
+		ID                      uuid.UUID
+		DefinitionID            uuid.UUID
+		WorkflowKey             string
+		Title                   string
+		Description             string
+		DefinitionHash          string
+		ExecutionProfileVersion string
+		ExecutionProfileHash    string
+		Content                 json.RawMessage
 	}
 	var rows []definitionRow
-	if err := s.database.WithContext(ctx).Table("workflow_definition_versions AS version").
-		Select("version.id, version.definition_id, definition.workflow_key, definition.title, definition.description, version.content").
-		Joins("JOIN workflow_definitions AS definition ON definition.id = version.definition_id").
-		Where("version.id IN ? AND version.published = TRUE AND (definition.project_id IS NULL OR definition.project_id = ?)", candidateVersionIDs, projectID).
-		Order("version.id ASC").Scan(&rows).Error; err != nil {
-		return intentGenerationContext{}, fmt.Errorf("load candidate workflow versions: %w", err)
+	for start := 0; start < len(candidateVersionIDs); start += intentCandidateQueryBatchSize {
+		end := min(start+intentCandidateQueryBatchSize, len(candidateVersionIDs))
+		var batch []definitionRow
+		if err := s.database.WithContext(ctx).Table("workflow_definition_versions AS version").
+			Select(`version.id, version.definition_id, definition.workflow_key, definition.title, definition.description,
+				version.content_hash AS definition_hash,
+				version.execution_profile_version,
+				version.execution_profile_hash,
+				version.content`).
+			Joins("JOIN workflow_definitions AS definition ON definition.id = version.definition_id").
+			Where("version.id IN ? AND version.published = TRUE AND (definition.project_id IS NULL OR definition.project_id = ?)", candidateVersionIDs[start:end], projectID).
+			Order("version.id ASC").Scan(&batch).Error; err != nil {
+			return intentGenerationContext{}, fmt.Errorf("load candidate workflow versions: %w", err)
+		}
+		rows = append(rows, batch...)
 	}
 	if len(rows) != len(candidateVersionIDs) {
 		return intentGenerationContext{}, core.ErrNotFound
@@ -451,29 +494,62 @@ func (s *GORMStore) IntentGenerationContext(
 		definitionRows[row.ID] = row
 	}
 	type workbenchTargetRow struct {
-		DefinitionVersionID uuid.UUID
-		RunID               uuid.UUID
-		RootBundleID        uuid.UUID
-		ActiveBundleID      uuid.UUID
-		ManifestGroup       string
-		Ordinal             int
+		DefinitionVersionID   uuid.UUID
+		DefinitionKey         string
+		DefinitionTitle       string
+		DefinitionDescription string
+		RunID                 uuid.UUID
+		RootBundleID          uuid.UUID
+		ActiveBundleID        uuid.UUID
+		ManifestGroup         string
+		Ordinal               int
+		RunContext            json.RawMessage
+		CompilerNodeKey       *string
+		CompilerNodeType      *string
+		CompilerNodeStatus    *string
+		PersistedSliceID      *string
+	}
+	linkedRunIDs, err := executedConversationRunIDs(s.database.WithContext(ctx), projectID, conversationID)
+	if err != nil {
+		return intentGenerationContext{}, err
+	}
+	if targetHint != nil && len(linkedRunIDs) != 0 {
+		linked := false
+		for _, runID := range linkedRunIDs {
+			if runID.String() == targetHint.RunID {
+				linked = true
+				break
+			}
+		}
+		if !linked {
+			return intentGenerationContext{}, fmt.Errorf("%w: Workbench target hint is outside this conversation's executed workflow commands", core.ErrConflict)
+		}
 	}
 	var targetRows []workbenchTargetRow
 	// Continuation targets are project runtime state, not start candidates.
 	// Enumerate every authoritative active Workbench leaf in the tenant even
 	// when its historical definition is incompatible with the current M1
 	// governance manifest. Compatibility still applies to rows above only.
-	if err := s.database.WithContext(ctx).Table("application_build_manifests AS leaf").
+	targetQuery := s.database.WithContext(ctx).Table("application_build_manifests AS leaf").
 		Select(`run.definition_version_id AS definition_version_id,
+			definition.workflow_key AS definition_key,
+			definition.title AS definition_title,
+			definition.description AS definition_description,
 			run.id AS run_id,
 			root.id AS root_bundle_id,
 			leaf.id AS active_bundle_id,
 			leaf.manifest_group_key AS manifest_group,
-			leaf.root_ordinal AS ordinal`).
+			leaf.root_ordinal AS ordinal,
+			run.context AS run_context,
+			compiler.node_key AS compiler_node_key,
+			compiler.node_type AS compiler_node_type,
+			compiler.status AS compiler_node_status,
+			root.delivery_slice_id AS persisted_slice_id`).
 		Joins("JOIN application_build_manifests AS root ON root.id = leaf.root_manifest_id AND root.project_id = leaf.project_id").
 		Joins("JOIN workflow_runs AS run ON run.id = leaf.workflow_run_id AND run.project_id = leaf.project_id").
 		Joins("JOIN workflow_definition_versions AS run_version ON run_version.id = run.definition_version_id").
 		Joins("JOIN workflow_definitions AS definition ON definition.id = run_version.definition_id").
+		Joins("LEFT JOIN workflow_node_runs AS compiler ON compiler.id::text = leaf.manifest_group_key AND compiler.run_id = run.id").
 		Where("leaf.project_id = ? AND run.status IN ?", projectID, activeWorkbenchRunStatuses).
 		Where("definition.project_id IS NULL OR definition.project_id = ?", projectID).
 		Where("leaf.status = ? AND leaf.invalidated_at IS NULL", "frozen").
@@ -481,40 +557,41 @@ func (s *GORMStore) IntentGenerationContext(
 		Where("root.root_manifest_id = root.id AND root.derived_from_id IS NULL").
 		Where("root.workflow_run_id = leaf.workflow_run_id AND root.manifest_group_key = leaf.manifest_group_key AND root.root_ordinal = leaf.root_ordinal").
 		Where("NOT EXISTS (?)", s.database.Table("application_build_manifests AS child").Select("1").Where("child.derived_from_id = leaf.id")).
-		Order("run.id ASC, leaf.manifest_group_key ASC, leaf.root_ordinal ASC, root.id ASC, leaf.id ASC").
-		Limit(maxIntentWorkbenchTargets).
+		Where(`NOT EXISTS (
+			SELECT 1 FROM implementation_proposals AS ineligible
+			WHERE ineligible.build_manifest_id = leaf.id
+			  AND ineligible.status IN ('open', 'reviewing', 'ready')
+			  AND (
+			    ineligible.status <> 'open'
+			    OR ineligible.accepted_count <> 0
+			    OR ineligible.rejected_count <> 0
+			    OR ineligible.applied_at IS NOT NULL
+			    OR ineligible.execution_source = 'conversation_command'
+			    OR EXISTS (SELECT 1 FROM implementation_operation_decisions decision WHERE decision.proposal_id = ineligible.id)
+			  )
+		)`).
+		Order("run.id ASC, leaf.manifest_group_key ASC, leaf.root_ordinal ASC, root.id ASC, leaf.id ASC")
+	if len(linkedRunIDs) != 0 {
+		targetQuery = targetQuery.Where("run.id IN ?", linkedRunIDs)
+	}
+	if targetHint != nil {
+		runID, _ := uuid.Parse(targetHint.RunID)
+		rootID, _ := uuid.Parse(targetHint.RootBundleID)
+		targetQuery = targetQuery.Where("run.id = ? AND root.id = ?", runID, rootID)
+	}
+	if err := targetQuery.
+		Limit(maxIntentWorkbenchTargetCandidates + 1).
 		Scan(&targetRows).Error; err != nil {
 		return intentGenerationContext{}, fmt.Errorf("load active workflow workbench targets: %w", err)
 	}
-
-	missingVersionIDs := make([]uuid.UUID, 0)
-	seenMissingVersionIDs := make(map[uuid.UUID]struct{})
-	for _, target := range targetRows {
-		if _, exists := definitionRows[target.DefinitionVersionID]; exists {
-			continue
-		}
-		if _, exists := seenMissingVersionIDs[target.DefinitionVersionID]; exists {
-			continue
-		}
-		seenMissingVersionIDs[target.DefinitionVersionID] = struct{}{}
-		missingVersionIDs = append(missingVersionIDs, target.DefinitionVersionID)
+	if len(targetRows) > maxIntentWorkbenchTargetCandidates {
+		return intentGenerationContext{}, fmt.Errorf(
+			"%w: more than %d authoritative Workbench target candidates; narrow or complete existing runs",
+			core.ErrConflict, maxIntentWorkbenchTargetCandidates,
+		)
 	}
-	if len(missingVersionIDs) != 0 {
-		var targetDefinitionRows []definitionRow
-		if err := s.database.WithContext(ctx).Table("workflow_definition_versions AS version").
-			Select("version.id, version.definition_id, definition.workflow_key, definition.title, definition.description, version.content").
-			Joins("JOIN workflow_definitions AS definition ON definition.id = version.definition_id").
-			Where("version.id IN ?", missingVersionIDs).
-			Where("definition.project_id IS NULL OR definition.project_id = ?", projectID).
-			Order("version.id ASC").Scan(&targetDefinitionRows).Error; err != nil {
-			return intentGenerationContext{}, fmt.Errorf("load active target workflow versions: %w", err)
-		}
-		if len(targetDefinitionRows) != len(missingVersionIDs) {
-			return intentGenerationContext{}, core.ErrConflict
-		}
-		for _, row := range targetDefinitionRows {
-			definitionRows[row.ID] = row
-		}
+	if targetHint != nil && len(targetRows) != 1 {
+		return intentGenerationContext{}, fmt.Errorf("%w: Workbench target hint does not identify one authoritative target in this project and conversation", core.ErrConflict)
 	}
 
 	versionIDs := make([]uuid.UUID, 0, len(definitionRows))
@@ -527,18 +604,145 @@ func (s *GORMStore) IntentGenerationContext(
 		row := definitionRows[versionID]
 		definitions = append(definitions, intentDefinitionContext{
 			VersionID: row.ID.String(), DefinitionID: row.DefinitionID.String(), Key: row.WorkflowKey,
-			Title: row.Title, Description: row.Description, Content: append(json.RawMessage(nil), row.Content...),
+			Title: row.Title, Description: row.Description, DefinitionHash: row.DefinitionHash,
+			ExecutionProfile: platformdomain.WorkflowExecutionProfileRef{
+				Version: row.ExecutionProfileVersion, Hash: row.ExecutionProfileHash,
+			},
+			Content: append(json.RawMessage(nil), row.Content...),
 		})
 	}
 	targets := make([]intentWorkbenchTargetContext, 0, len(targetRows))
 	for _, row := range targetRows {
+		slice, sliceErr := workbenchTargetSliceFromRuntime(
+			projectID,
+			row.RunID,
+			row.RootBundleID,
+			row.ManifestGroup,
+			row.Ordinal,
+			row.RunContext,
+			row.CompilerNodeKey,
+			row.CompilerNodeType,
+			row.CompilerNodeStatus,
+			row.PersistedSliceID,
+		)
+		if sliceErr != nil {
+			if targetHint != nil {
+				return intentGenerationContext{}, sliceErr
+			}
+			continue
+		}
 		targets = append(targets, intentWorkbenchTargetContext{
-			DefinitionVersionID: row.DefinitionVersionID.String(), RunID: row.RunID.String(),
+			DefinitionVersionID: row.DefinitionVersionID.String(), DefinitionKey: row.DefinitionKey,
+			DefinitionTitle: row.DefinitionTitle, DefinitionDescription: row.DefinitionDescription,
+			RunID:        row.RunID.String(),
 			RootBundleID: row.RootBundleID.String(), ActiveBundleID: row.ActiveBundleID.String(),
 			ManifestGroup: row.ManifestGroup, Ordinal: row.Ordinal,
+			SliceID: slice.ID, SliceKey: slice.Key, SliceTitle: slice.Title,
 		})
 	}
-	return intentGenerationContext{Messages: messages, Definitions: definitions, WorkbenchTargets: targets}, nil
+	if targetHint != nil && len(targets) != 1 {
+		return intentGenerationContext{}, fmt.Errorf("%w: Workbench target hint does not resolve to immutable page semantics", core.ErrConflict)
+	}
+	return intentGenerationContext{
+		Conversation: providerConversation, Provenance: contextProvenance,
+		Messages: providerConversation.TailMessages, Definitions: definitions, WorkbenchTargets: targets,
+	}, nil
+}
+
+func (s *GORMStore) loadIntentMessages(
+	ctx context.Context,
+	conversationID uuid.UUID,
+	trigger storage.ConversationMessageModel,
+) ([]Message, error) {
+	providerContext, _, err := s.loadIntentConversationContext(ctx, conversationID, trigger)
+	if err != nil {
+		return nil, err
+	}
+	return providerContext.TailMessages, nil
+}
+
+type workbenchTargetSlice struct {
+	ID    string
+	Key   string
+	Title string
+}
+
+func workbenchTargetSliceFromRuntime(
+	projectID, runID, rootBundleID uuid.UUID,
+	manifestGroup string,
+	ordinal int,
+	rawContext json.RawMessage,
+	compilerNodeKey, compilerNodeType, compilerNodeStatus, persistedSliceID *string,
+) (workbenchTargetSlice, error) {
+	groupID, err := uuid.Parse(strings.TrimSpace(manifestGroup))
+	if err != nil || groupID.String() != manifestGroup || ordinal < 0 || compilerNodeKey == nil || compilerNodeType == nil ||
+		compilerNodeStatus == nil || strings.TrimSpace(*compilerNodeType) != string(platformdomain.NodeManifestCompiler) ||
+		strings.TrimSpace(*compilerNodeStatus) != string(runtime.NodeCompleted) {
+		return workbenchTargetSlice{}, fmt.Errorf("%w: Workbench target has no authoritative manifest compiler identity", core.ErrConflict)
+	}
+	var runContext runtime.RunContext
+	if err := json.Unmarshal(rawContext, &runContext); err != nil {
+		return workbenchTargetSlice{}, fmt.Errorf("%w: decode Workbench run context", core.ErrConflict)
+	}
+	nodeKey := strings.TrimSpace(*compilerNodeKey)
+	metadata, exists := runContext.Nodes[nodeKey]
+	if !exists || nodeKey == "" || len(metadata.Output) == 0 {
+		return workbenchTargetSlice{}, fmt.Errorf("%w: Workbench compiler output is missing", core.ErrConflict)
+	}
+	var manifest runtime.BuildManifest
+	if err := json.Unmarshal(metadata.Output, &manifest); err != nil || manifest.Validate() != nil ||
+		manifest.ProjectID != projectID.String() || manifest.RunID != runID.String() || manifest.ManifestGroupKey != groupID.String() ||
+		ordinal >= len(manifest.BundleIDs) || ordinal >= len(manifest.SliceIDs) || manifest.BundleIDs[ordinal] != rootBundleID.String() {
+		return workbenchTargetSlice{}, fmt.Errorf("%w: Workbench compiler output does not map the exact root ordinal", core.ErrConflict)
+	}
+	sliceID := strings.TrimSpace(manifest.SliceIDs[ordinal])
+	if persistedSliceID == nil || strings.TrimSpace(*persistedSliceID) != sliceID {
+		return workbenchTargetSlice{}, fmt.Errorf("%w: Workbench root delivery slice identity drifted", core.ErrConflict)
+	}
+	slice, exists := runContext.Slices[sliceID]
+	if !exists || strings.TrimSpace(slice.ID) != sliceID || strings.TrimSpace(slice.Key) == "" || strings.TrimSpace(slice.Title) == "" {
+		return workbenchTargetSlice{}, fmt.Errorf("%w: Workbench target has no immutable page slice metadata", core.ErrConflict)
+	}
+	return workbenchTargetSlice{ID: sliceID, Key: strings.TrimSpace(slice.Key), Title: strings.TrimSpace(slice.Title)}, nil
+}
+
+func executedConversationRunIDs(transaction *gorm.DB, projectID, conversationID uuid.UUID) ([]uuid.UUID, error) {
+	var models []storage.ConversationCommandModel
+	if err := transaction.
+		Select("id", "kind", "payload").
+		Where("project_id = ? AND conversation_id = ? AND status = ?", projectID, conversationID, CommandExecuted).
+		Order("created_at ASC, id ASC").
+		Find(&models).Error; err != nil {
+		return nil, fmt.Errorf("load executed conversation workflow commands: %w", err)
+	}
+	seen := make(map[uuid.UUID]struct{}, len(models))
+	result := make([]uuid.UUID, 0, len(models))
+	for _, model := range models {
+		var runID uuid.UUID
+		switch IntentKind(model.Kind) {
+		case IntentStartWorkflow:
+			runID = model.ID
+		case IntentWorkbenchInstruction:
+			var payload CommandPayload
+			if err := json.Unmarshal(model.Payload, &payload); err != nil {
+				return nil, fmt.Errorf("%w: executed Workbench command payload is invalid", core.ErrConflict)
+			}
+			parsed, err := uuid.Parse(strings.TrimSpace(payload.Workbench.ExpectedRunID))
+			if err != nil || parsed.String() != payload.Workbench.ExpectedRunID {
+				return nil, fmt.Errorf("%w: executed Workbench command run identity is invalid", core.ErrConflict)
+			}
+			runID = parsed
+		default:
+			return nil, fmt.Errorf("%w: executed conversation command kind is invalid", core.ErrConflict)
+		}
+		if _, duplicate := seen[runID]; duplicate {
+			continue
+		}
+		seen[runID] = struct{}{}
+		result = append(result, runID)
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].String() < result[j].String() })
+	return result, nil
 }
 
 func (s *GORMStore) GetProposal(ctx context.Context, projectID, conversationID, proposalID uuid.UUID) (WorkflowIntentProposal, error) {
@@ -599,6 +803,11 @@ func (s *GORMStore) DecideProposal(ctx context.Context, projectID, conversationI
 		if proposal.Status != string(ProposalPending) {
 			return core.ErrConflict
 		}
+		if input.Decision == DecisionAccept && proposal.Kind == string(IntentWorkbenchInstruction) {
+			if err := validateAcceptedWorkbenchTarget(transaction, projectID, proposal); err != nil {
+				return err
+			}
+		}
 		now := s.now().UTC()
 		status := ProposalRejected
 		if input.Decision == DecisionAccept {
@@ -633,7 +842,10 @@ func (s *GORMStore) DecideProposal(ctx context.Context, projectID, conversationI
 			model := storage.ConversationCommandModel{
 				ID: uuid.New(), ProjectID: projectID, ConversationID: conversationID, ProposalID: proposal.ID,
 				Kind: proposal.Kind, Status: string(CommandPending), Version: 1, Payload: encoded,
-				AcceptedBy: actorID, CreatedAt: now, UpdatedAt: now,
+				SummaryCheckpointID: proposal.SummaryCheckpointID,
+				ConversationContext: append(json.RawMessage(nil), proposal.ConversationContext...),
+				ProviderInputHash:   append([]byte(nil), proposal.ProviderInputHash...),
+				AcceptedBy:          actorID, CreatedAt: now, UpdatedAt: now,
 			}
 			if err := transaction.Create(&model).Error; err != nil {
 				if uniqueViolation(err) {
@@ -720,6 +932,9 @@ func (s *GORMStore) ListCommands(ctx context.Context, projectID, conversationID 
 }
 
 func (s *GORMStore) ClaimCommand(ctx context.Context, projectID, conversationID, commandID, actorID uuid.UUID, expectedETag string, lease time.Duration) (commandClaim, error) {
+	if lease <= 0 {
+		return commandClaim{}, fmt.Errorf("%w: command claim lease", core.ErrInvalidInput)
+	}
 	var model storage.ConversationCommandModel
 	token := uuid.New()
 	err := s.database.WithContext(ctx).Transaction(func(transaction *gorm.DB) error {
@@ -743,15 +958,12 @@ func (s *GORMStore) ClaimCommand(ctx context.Context, projectID, conversationID,
 		if model.ExecutionClaim != nil && model.ClaimExpiresAt != nil && model.ClaimExpiresAt.After(now) {
 			return core.ErrConflict
 		}
-		if model.ExecutionActorID != nil && *model.ExecutionActorID != actorID {
-			return core.ErrForbidden
-		}
 		expiresAt := now.Add(lease)
 		result := transaction.Model(&storage.ConversationCommandModel{}).
 			Where("id = ? AND version = ? AND status = ?", model.ID, model.Version, CommandPending).
 			Updates(map[string]any{
 				"execution_actor_id": actorID, "execution_claim": token, "claim_expires_at": expiresAt,
-				"version": model.Version + 1, "updated_at": now,
+				"failure": nil, "version": model.Version + 1, "updated_at": now,
 			})
 		if result.Error != nil {
 			return result.Error
@@ -788,6 +1000,9 @@ func (s *GORMStore) CompleteCommand(ctx context.Context, claim commandClaim, act
 			return core.ErrConflict
 		}
 		now := s.now().UTC()
+		if model.ClaimExpiresAt == nil || model.ClaimExpiresAt.Before(now) {
+			return core.ErrConflict
+		}
 		updates := map[string]any{
 			"status": status, "version": model.Version + 1, "result": nullableJSON(result),
 			"failure": nil, "execution_claim": nil, "claim_expires_at": nil, "updated_at": now,
@@ -842,39 +1057,46 @@ func (s *GORMStore) CompleteCommand(ctx context.Context, claim commandClaim, act
 
 func (s *GORMStore) CompleteWorkbenchCommand(
 	ctx context.Context,
-	projectID, conversationID, commandID, actorID uuid.UUID,
-	expectedETag string,
-	lease time.Duration,
-	result WorkbenchExecutionResult,
+	claim commandClaim,
+	actorID uuid.UUID,
+	receipt WorkbenchExecutionReceipt,
 ) (ConversationCommand, error) {
-	if lease <= 0 {
-		return ConversationCommand{}, fmt.Errorf("%w: command claim lease", core.ErrInvalidInput)
+	commandID, err := uuid.Parse(claim.Command.ID)
+	if err != nil {
+		return ConversationCommand{}, core.ErrInvalidInput
 	}
-	encodedResult, err := platformdomain.CanonicalJSON(result)
+	projectID, err := uuid.Parse(claim.Command.ProjectID)
+	if err != nil {
+		return ConversationCommand{}, core.ErrInvalidInput
+	}
+	encodedResult, err := platformdomain.CanonicalJSON(map[string]any{
+		"runId": receipt.RunID, "rootBundleId": receipt.RootBundleID,
+		"bundleId": receipt.ActiveBundleID, "implementationProposalId": receipt.ImplementationProposalID,
+		"instructionHash":         receipt.InstructionHash,
+		"desiredOutputCapability": claim.Command.Payload.DesiredOutputCapability,
+	})
 	if err != nil {
 		return ConversationCommand{}, fmt.Errorf("canonicalize workbench result: %w", err)
 	}
 	var model storage.ConversationCommandModel
 	err = s.database.WithContext(ctx).Transaction(func(transaction *gorm.DB) error {
 		if err := transaction.Clauses(clause.Locking{Strength: "UPDATE"}).
-			Where("id = ? AND project_id = ? AND conversation_id = ?", commandID, projectID, conversationID).
+			Where("id = ? AND project_id = ?", commandID, projectID).
 			Take(&model).Error; err != nil {
 			return mapNotFound(err)
 		}
 		if model.Kind != string(IntentWorkbenchInstruction) || model.Status != string(CommandPending) ||
-			CommandETag(model.ID.String(), model.Version) != expectedETag {
+			model.ExecutionClaim == nil || *model.ExecutionClaim != claim.Token ||
+			model.ExecutionActorID == nil || *model.ExecutionActorID != actorID {
 			return core.ErrConflict
 		}
 		now := s.now().UTC()
-		if model.ExecutionClaim != nil && model.ClaimExpiresAt != nil && model.ClaimExpiresAt.After(now) {
+		if model.ClaimExpiresAt == nil || model.ClaimExpiresAt.Before(now) {
 			return core.ErrConflict
-		}
-		if model.ExecutionActorID != nil && *model.ExecutionActorID != actorID {
-			return core.ErrForbidden
 		}
 		var reviewedProposal storage.WorkflowIntentProposalModel
 		if err := transaction.Clauses(clause.Locking{Strength: "UPDATE"}).Where(
-			"id = ? AND project_id = ? AND conversation_id = ?", model.ProposalID, projectID, conversationID,
+			"id = ? AND project_id = ? AND conversation_id = ?", model.ProposalID, projectID, model.ConversationID,
 		).Take(&reviewedProposal).Error; err != nil {
 			return mapNotFound(err)
 		}
@@ -886,30 +1108,12 @@ func (s *GORMStore) CompleteWorkbenchCommand(
 		if err != nil {
 			return err
 		}
-		claimToken := uuid.New()
-		claimExpiresAt := now.Add(lease)
-		claim := transaction.Model(&storage.ConversationCommandModel{}).Where(
-			"id = ? AND version = ? AND status = ?", model.ID, model.Version, CommandPending,
-		).Updates(map[string]any{
-			"execution_actor_id": actorID, "execution_claim": claimToken, "claim_expires_at": claimExpiresAt,
-			"version": model.Version + 1, "updated_at": now,
-		})
-		if claim.Error != nil {
-			return claim.Error
-		}
-		if claim.RowsAffected != 1 {
-			return core.ErrConflict
-		}
-		model.ExecutionActorID = &actorID
-		model.ExecutionClaim = &claimToken
-		model.ClaimExpiresAt = &claimExpiresAt
-		model.Version++
-		if err := validateWorkbenchResultOnDatabase(transaction, projectID, command.Payload, result, true); err != nil {
+		if err := validateWorkbenchReceiptOnDatabase(transaction, projectID, command, receipt, actorID, now); err != nil {
 			return err
 		}
 		update := transaction.Model(&storage.ConversationCommandModel{}).Where(
 			"id = ? AND version = ? AND status = ? AND execution_claim = ?",
-			model.ID, model.Version, CommandPending, claimToken,
+			model.ID, model.Version, CommandPending, claim.Token,
 		).Updates(map[string]any{
 			"status": CommandExecuted, "version": model.Version + 1, "result": encodedResult, "failure": nil,
 			"execution_actor_id": actorID, "execution_claim": nil, "claim_expires_at": nil,
@@ -926,12 +1130,79 @@ func (s *GORMStore) CompleteWorkbenchCommand(
 		}
 		if err := conversationAudit(transaction, projectID, actorID, "conversation.command.executed", "conversation_command", model.ID.String(), map[string]any{
 			"conversationId": model.ConversationID.String(), "proposalId": model.ProposalID.String(), "kind": model.Kind,
+			"runId": receipt.RunID, "rootBundleId": receipt.RootBundleID, "activeBundleId": receipt.ActiveBundleID,
+			"implementationProposalId": receipt.ImplementationProposalID, "instructionHash": receipt.InstructionHash,
+			"desiredOutputCapability": command.Payload.DesiredOutputCapability,
 		}); err != nil {
 			return err
 		}
 		return conversationOutbox(transaction, "conversation_command", model.ID.String(), "conversation.command.executed", map[string]any{
 			"projectId": projectID.String(), "conversationId": model.ConversationID.String(),
 			"commandId": model.ID.String(), "status": CommandExecuted,
+		})
+	})
+	if err != nil {
+		return ConversationCommand{}, err
+	}
+	return commandFromModel(model)
+}
+
+func (s *GORMStore) FailCommandAttempt(
+	ctx context.Context,
+	claim commandClaim,
+	actorID uuid.UUID,
+	failure *CommandFailure,
+) (ConversationCommand, error) {
+	if failure == nil || strings.TrimSpace(failure.Code) == "" || strings.TrimSpace(failure.Message) == "" {
+		return ConversationCommand{}, core.ErrInvalidInput
+	}
+	commandID, err := uuid.Parse(claim.Command.ID)
+	if err != nil {
+		return ConversationCommand{}, core.ErrInvalidInput
+	}
+	projectID, err := uuid.Parse(claim.Command.ProjectID)
+	if err != nil {
+		return ConversationCommand{}, core.ErrInvalidInput
+	}
+	encoded, err := platformdomain.CanonicalJSON(failure)
+	if err != nil {
+		return ConversationCommand{}, err
+	}
+	var model storage.ConversationCommandModel
+	err = s.database.WithContext(ctx).Transaction(func(transaction *gorm.DB) error {
+		if err := transaction.Clauses(clause.Locking{Strength: "UPDATE"}).Where(
+			"id = ? AND project_id = ?", commandID, projectID,
+		).Take(&model).Error; err != nil {
+			return mapNotFound(err)
+		}
+		if model.Status != string(CommandPending) || model.ExecutionClaim == nil || *model.ExecutionClaim != claim.Token ||
+			model.ExecutionActorID == nil || *model.ExecutionActorID != actorID {
+			return core.ErrConflict
+		}
+		now := s.now().UTC()
+		result := transaction.Model(&storage.ConversationCommandModel{}).Where(
+			"id = ? AND version = ? AND status = ? AND execution_claim = ?", model.ID, model.Version, CommandPending, claim.Token,
+		).Updates(map[string]any{
+			"version": model.Version + 1, "failure": encoded,
+			"execution_claim": nil, "claim_expires_at": nil, "updated_at": now,
+		})
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return core.ErrConflict
+		}
+		if err := transaction.Where("id = ?", model.ID).Take(&model).Error; err != nil {
+			return err
+		}
+		if err := conversationAudit(transaction, projectID, actorID, "conversation.command_attempt_failed", "conversation_command", model.ID.String(), map[string]any{
+			"conversationId": model.ConversationID.String(), "failureClass": failure.Code,
+		}); err != nil {
+			return err
+		}
+		return conversationOutbox(transaction, "conversation_command", model.ID.String(), "conversation.command_attempt_failed", map[string]any{
+			"projectId": projectID.String(), "conversationId": model.ConversationID.String(),
+			"commandId": model.ID.String(), "failureClass": failure.Code, "status": CommandPending,
 		})
 	})
 	if err != nil {
@@ -953,6 +1224,34 @@ func (s *GORMStore) RejectCommand(ctx context.Context, projectID, conversationID
 		now := s.now().UTC()
 		if model.ExecutionClaim != nil && model.ClaimExpiresAt != nil && model.ClaimExpiresAt.After(now) {
 			return core.ErrConflict
+		}
+		if model.Kind == string(IntentWorkbenchInstruction) {
+			var liveGeneration storage.ImplementationGenerationClaimModel
+			err := transaction.Clauses(clause.Locking{Strength: "SHARE"}).Select("id").Where(
+				"conversation_command_id = ? AND status = 'processing' AND claim_expires_at >= ?",
+				model.ID, now,
+			).Take(&liveGeneration).Error
+			if err == nil {
+				// The command lease may expire a few milliseconds before the
+				// generation lease. Keep rejection fenced until that authoritative
+				// generation attempt either commits a product or loses its lease.
+				return core.ErrConflict
+			}
+			if !errors.Is(err, gorm.ErrRecordNotFound) {
+				return err
+			}
+			var generated storage.ImplementationProposalModel
+			err = transaction.Clauses(clause.Locking{Strength: "SHARE"}).Select("id").Where(
+				"conversation_command_id = ?", model.ID,
+			).Take(&generated).Error
+			if err == nil {
+				// Generation already produced the deterministic result. The command
+				// must recover and commit its receipt; it can no longer be rejected.
+				return core.ErrConflict
+			}
+			if !errors.Is(err, gorm.ErrRecordNotFound) {
+				return err
+			}
 		}
 		resultPayload, _ := platformdomain.CanonicalJSON(map[string]any{"reason": reason})
 		result := transaction.Model(&storage.ConversationCommandModel{}).
@@ -986,28 +1285,34 @@ func (s *GORMStore) RejectCommand(ctx context.Context, projectID, conversationID
 	return commandFromModel(model)
 }
 
-func (s *GORMStore) ValidateWorkbenchResult(ctx context.Context, projectID uuid.UUID, payload CommandPayload, result WorkbenchExecutionResult) error {
-	return validateWorkbenchResultOnDatabase(s.database.WithContext(ctx), projectID, payload, result, false)
-}
-
-func validateWorkbenchResultOnDatabase(
+func validateWorkbenchReceiptOnDatabase(
 	database *gorm.DB,
 	projectID uuid.UUID,
-	payload CommandPayload,
-	result WorkbenchExecutionResult,
-	lock bool,
+	command ConversationCommand,
+	receipt WorkbenchExecutionReceipt,
+	actorID uuid.UUID,
+	now time.Time,
 ) error {
-	runID, err := uuid.Parse(result.RunID)
+	payload := command.Payload
+	runID, err := uuid.Parse(receipt.RunID)
 	if err != nil {
 		return fmt.Errorf("%w: workbench run id", core.ErrInvalidInput)
 	}
-	bundleID, err := uuid.Parse(result.BundleID)
+	rootBundleID, err := uuid.Parse(receipt.RootBundleID)
+	if err != nil {
+		return fmt.Errorf("%w: workbench root bundle id", core.ErrInvalidInput)
+	}
+	bundleID, err := uuid.Parse(receipt.ActiveBundleID)
 	if err != nil {
 		return fmt.Errorf("%w: workbench bundle id", core.ErrInvalidInput)
 	}
-	implementationProposalID, err := uuid.Parse(result.ImplementationProposalID)
+	implementationProposalID, err := uuid.Parse(receipt.ImplementationProposalID)
 	if err != nil {
 		return fmt.Errorf("%w: implementation proposal id", core.ErrInvalidInput)
+	}
+	commandID, err := uuid.Parse(command.ID)
+	if err != nil || commandID != implementationProposalID {
+		return core.ErrConflict
 	}
 	definitionVersionID, err := uuid.Parse(payload.DefinitionVersionID)
 	if err != nil {
@@ -1018,73 +1323,89 @@ func validateWorkbenchResultOnDatabase(
 		return core.ErrConflict
 	}
 	expectedBundleID, err := uuid.Parse(payload.Workbench.ExpectedBundleID)
-	if err != nil {
+	if err != nil || expectedBundleID != rootBundleID {
 		return fmt.Errorf("%w: expected workbench bundle id", core.ErrInvalidInput)
 	}
-	if lock {
-		var project storage.ProjectModel
-		if err := database.Clauses(clause.Locking{Strength: "UPDATE"}).Select("id").
-			Where("id = ?", projectID).Take(&project).Error; err != nil {
-			return mapNotFound(err)
-		}
+	if payload.DesiredOutputCapability != platformdomain.WorkflowOutputApplication || !validConversationInstructionHash(receipt.InstructionHash) {
+		return core.ErrConflict
 	}
-	if err := validateManifestIntentWithLock(database, projectID, payload.ManifestIntent, lock); err != nil {
+	var project storage.ProjectModel
+	if err := database.Clauses(clause.Locking{Strength: "UPDATE"}).Select("id").
+		Where("id = ?", projectID).Take(&project).Error; err != nil {
+		return mapNotFound(err)
+	}
+	if err := validateManifestIntentWithLock(database, projectID, payload.ManifestIntent, true); err != nil {
 		return err
 	}
 	var run storage.WorkflowRunModel
-	runQuery := database.Where(
+	runQuery := database.Clauses(clause.Locking{Strength: "UPDATE"}).Where(
 		"id = ? AND project_id = ? AND definition_version_id = ? AND status IN ?",
 		runID, projectID, definitionVersionID, activeWorkbenchRunStatuses,
 	)
-	if lock {
-		runQuery = runQuery.Clauses(clause.Locking{Strength: "UPDATE"})
-	}
 	if err := runQuery.Take(&run).Error; err != nil {
 		return mapNotFound(err)
 	}
-	currentWorkspaceRevisionID, err := currentApprovedWorkspaceRevisionID(database, projectID, lock)
+	currentWorkspaceRevisionID, err := currentApprovedWorkspaceRevisionID(database, projectID, true)
 	if err != nil {
 		return err
 	}
-	var activeLeaf storage.ApplicationBuildManifestModel
-	if lock {
-		_, activeLeaf, err = loadLockedAuthoritativeWorkbenchLeaf(
-			database, projectID, runID, expectedBundleID, bundleID,
-		)
-		if err != nil {
-			return err
-		}
-	} else {
-		expectedRoot, _, targetErr := loadAuthoritativeWorkbenchLeaf(database, projectID, runID, expectedBundleID)
-		if targetErr != nil {
-			return targetErr
-		}
-		resultRoot, resultLeaf, resultErr := loadAuthoritativeWorkbenchLeaf(database, projectID, runID, bundleID)
-		if resultErr != nil {
-			return resultErr
-		}
-		if resultRoot.ID != expectedRoot.ID || resultLeaf.ID != bundleID {
-			return core.ErrConflict
-		}
-		activeLeaf = resultLeaf
+	root, activeLeaf, err := loadLockedAuthoritativeWorkbenchLeaf(
+		database, projectID, runID, expectedBundleID, bundleID,
+	)
+	if err != nil {
+		return err
+	}
+	if root.ID != rootBundleID || activeLeaf.ID != bundleID {
+		return core.ErrConflict
 	}
 	if !sameOptionalUUID(activeLeaf.WorkspaceRevisionID, currentWorkspaceRevisionID) {
 		return core.ErrConflict
 	}
 	var implementationProposal storage.ImplementationProposalModel
-	proposalQuery := database.Where("id = ? AND project_id = ?", implementationProposalID, projectID)
-	if lock {
-		proposalQuery = proposalQuery.Clauses(clause.Locking{Strength: "UPDATE"})
-	}
+	proposalQuery := database.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id = ? AND project_id = ?", implementationProposalID, projectID)
 	if err := proposalQuery.Take(&implementationProposal).Error; err != nil {
 		return mapNotFound(err)
 	}
 	if implementationProposal.BuildManifestID != activeLeaf.ID ||
 		!containsString(executableImplementationProposalStatuses, implementationProposal.Status) ||
-		implementationProposal.AppliedAt != nil || implementationProposal.AppliedBy != nil {
+		implementationProposal.AppliedAt != nil || implementationProposal.AppliedBy != nil ||
+		implementationProposal.ExecutionSource != string(core.ImplementationSourceConversationCommand) ||
+		implementationProposal.ConversationCommandID == nil || *implementationProposal.ConversationCommandID != commandID ||
+		implementationProposal.InstructionHash == nil || *implementationProposal.InstructionHash != receipt.InstructionHash ||
+		implementationProposal.CreatedAt.Before(command.CreatedAt) ||
+		implementationProposal.CreatedAt.After(now) {
 		return core.ErrConflict
 	}
+	var generationClaim storage.ImplementationGenerationClaimModel
+	governanceManifestID, err := uuid.Parse(payload.ManifestIntent.InputManifest.ID)
+	if err != nil {
+		return core.ErrConflict
+	}
+	governanceSources, err := platformdomain.CanonicalJSON(payload.SourceRefs)
+	if err != nil {
+		return core.ErrConflict
+	}
+	if err := database.Clauses(clause.Locking{Strength: "SHARE"}).Where(
+		"request_key = ? AND reserved_proposal_id = ? AND completed_proposal_id = ? AND project_id = ? AND build_manifest_id = ? AND execution_source = ? AND conversation_command_id = ? AND instruction_hash = ? AND actor_id = ? AND governance_manifest_id = ? AND governance_manifest_hash = ? AND governance_source_refs = CAST(? AS jsonb) AND status = 'completed'",
+		commandID, implementationProposalID, implementationProposalID, projectID, activeLeaf.ID,
+		core.ImplementationSourceConversationCommand, commandID, receipt.InstructionHash, implementationProposal.CreatedBy,
+		governanceManifestID, payload.ManifestIntent.InputManifest.Hash, string(governanceSources),
+	).Take(&generationClaim).Error; err != nil {
+		return mapNotFound(err)
+	}
 	return nil
+}
+
+func validConversationInstructionHash(value string) bool {
+	if len(value) != len("sha256:")+64 || !strings.HasPrefix(value, "sha256:") {
+		return false
+	}
+	for _, character := range strings.TrimPrefix(value, "sha256:") {
+		if character < '0' || character > '9' && (character < 'a' || character > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 func currentApprovedWorkspaceRevisionID(database *gorm.DB, projectID uuid.UUID, lock bool) (*uuid.UUID, error) {
@@ -1262,31 +1583,152 @@ func validateExactSourceRefs(transaction *gorm.DB, projectID uuid.UUID, refs []p
 	return nil
 }
 
-func validateExpectedWorkbenchTarget(transaction *gorm.DB, projectID uuid.UUID, input CreateIntentProposalInput) error {
+func validateExpectedWorkbenchTarget(transaction *gorm.DB, projectID uuid.UUID, input CreateIntentProposalInput) (workbenchTargetSlice, error) {
 	runID, err := uuid.Parse(input.WorkbenchInstruction.ExpectedRunID)
 	if err != nil {
-		return core.ErrInvalidInput
+		return workbenchTargetSlice{}, core.ErrInvalidInput
 	}
 	definitionVersionID, err := uuid.Parse(input.SuggestedDefinitionVersionID)
 	if err != nil {
-		return core.ErrInvalidInput
+		return workbenchTargetSlice{}, core.ErrInvalidInput
 	}
 	bundleID, err := uuid.Parse(input.WorkbenchInstruction.ExpectedBundleID)
 	if err != nil {
-		return core.ErrInvalidInput
+		return workbenchTargetSlice{}, core.ErrInvalidInput
 	}
 	if err := validateManifestIntent(transaction, projectID, input.ManifestIntent); err != nil {
-		return err
+		return workbenchTargetSlice{}, err
 	}
 	var run storage.WorkflowRunModel
 	if err := transaction.Where(
 		"id = ? AND project_id = ? AND definition_version_id = ? AND status IN ?",
 		runID, projectID, definitionVersionID, activeWorkbenchRunStatuses,
 	).Take(&run).Error; err != nil {
+		return workbenchTargetSlice{}, mapNotFound(err)
+	}
+	root, _, err := loadAuthoritativeWorkbenchLeaf(transaction, projectID, runID, bundleID)
+	if err != nil {
+		return workbenchTargetSlice{}, err
+	}
+	return workbenchTargetSliceForRoot(transaction, projectID, run, root)
+}
+
+func workbenchTargetSliceForRoot(
+	transaction *gorm.DB,
+	projectID uuid.UUID,
+	run storage.WorkflowRunModel,
+	root storage.ApplicationBuildManifestModel,
+) (workbenchTargetSlice, error) {
+	if root.WorkflowRunID == nil || *root.WorkflowRunID != run.ID || root.ManifestGroupKey == nil || root.RootOrdinal == nil {
+		return workbenchTargetSlice{}, fmt.Errorf("%w: Workbench root has no exact runtime lineage", core.ErrConflict)
+	}
+	groupID, err := uuid.Parse(strings.TrimSpace(*root.ManifestGroupKey))
+	if err != nil || groupID.String() != *root.ManifestGroupKey {
+		return workbenchTargetSlice{}, fmt.Errorf("%w: Workbench root has no exact compiler identity", core.ErrConflict)
+	}
+	var compiler storage.WorkflowNodeRunModel
+	if err := transaction.Where("id = ? AND run_id = ?", groupID, run.ID).Take(&compiler).Error; err != nil {
+		return workbenchTargetSlice{}, mapNotFound(err)
+	}
+	return workbenchTargetSliceFromRuntime(
+		projectID,
+		run.ID,
+		root.ID,
+		*root.ManifestGroupKey,
+		*root.RootOrdinal,
+		run.Context,
+		&compiler.NodeKey,
+		&compiler.NodeType,
+		&compiler.Status,
+		root.DeliverySliceID,
+	)
+}
+
+func validateAcceptedWorkbenchTarget(
+	transaction *gorm.DB,
+	projectID uuid.UUID,
+	proposal storage.WorkflowIntentProposalModel,
+) error {
+	payload, err := commandPayloadFromProposal(proposal)
+	if err != nil {
+		return err
+	}
+	runID, runErr := uuid.Parse(payload.Workbench.ExpectedRunID)
+	definitionVersionID, definitionErr := uuid.Parse(payload.DefinitionVersionID)
+	rootID, rootErr := uuid.Parse(payload.Workbench.ExpectedBundleID)
+	if runErr != nil || definitionErr != nil || rootErr != nil || payload.DesiredOutputCapability != platformdomain.WorkflowOutputApplication {
+		return core.ErrInvalidInput
+	}
+	workspaceRevisionID, err := currentApprovedWorkspaceRevisionID(transaction, projectID, true)
+	if err != nil {
+		return err
+	}
+	var run storage.WorkflowRunModel
+	if err := transaction.Clauses(clause.Locking{Strength: "UPDATE"}).Where(
+		"id = ? AND project_id = ? AND definition_version_id = ? AND status IN ?",
+		runID, projectID, definitionVersionID, activeWorkbenchRunStatuses,
+	).Take(&run).Error; err != nil {
 		return mapNotFound(err)
 	}
-	_, _, err = loadAuthoritativeWorkbenchLeaf(transaction, projectID, runID, bundleID)
-	return err
+	_, leaf, err := loadAuthoritativeWorkbenchLeaf(transaction, projectID, runID, rootID)
+	if err != nil {
+		return err
+	}
+	root, leaf, err := loadLockedAuthoritativeWorkbenchLeaf(transaction, projectID, runID, rootID, leaf.ID)
+	if err != nil || root.ID != rootID {
+		return core.ErrConflict
+	}
+	slice, err := workbenchTargetSliceForRoot(transaction, projectID, run, root)
+	if err != nil || payload.Workbench.SliceID != slice.ID || payload.Workbench.SliceKey != slice.Key || payload.Workbench.SliceTitle != slice.Title {
+		return core.ErrConflict
+	}
+	if !sameOptionalUUID(leaf.WorkspaceRevisionID, workspaceRevisionID) {
+		return core.ErrConflict
+	}
+	var appliedCount int64
+	if err := transaction.Table("implementation_proposals AS implementation").
+		Joins("JOIN application_build_manifests AS manifest ON manifest.id = implementation.build_manifest_id").
+		Where("manifest.root_manifest_id = ? AND implementation.status IN ?", root.ID, []string{"applied", "partially_applied"}).
+		Count(&appliedCount).Error; err != nil {
+		return err
+	}
+	if appliedCount != 0 {
+		return core.ErrConflict
+	}
+	var active []storage.ImplementationProposalModel
+	if err := transaction.Clauses(clause.Locking{Strength: "UPDATE"}).Where(
+		"build_manifest_id = ? AND status IN ?", leaf.ID, []string{"open", "reviewing", "ready"},
+	).Limit(2).Find(&active).Error; err != nil {
+		return err
+	}
+	if len(active) > 1 {
+		return core.ErrConflict
+	}
+	if len(active) == 1 {
+		candidate := active[0]
+		if candidate.Status != "open" || candidate.AcceptedCount != 0 || candidate.RejectedCount != 0 ||
+			candidate.AppliedAt != nil || candidate.ExecutionSource == string(core.ImplementationSourceConversationCommand) {
+			return generation.ErrActiveImplementationProposal
+		}
+		var decisions int64
+		if err := transaction.Model(&storage.ImplementationOperationDecisionModel{}).
+			Where("proposal_id = ?", candidate.ID).Count(&decisions).Error; err != nil {
+			return err
+		}
+		if decisions != 0 {
+			return generation.ErrActiveImplementationProposal
+		}
+	}
+	var liveClaims []storage.ImplementationGenerationClaimModel
+	if err := transaction.Clauses(clause.Locking{Strength: "UPDATE"}).Where(
+		"build_manifest_id = ? AND status = 'processing' AND claim_expires_at >= ?", leaf.ID, time.Now().UTC(),
+	).Limit(2).Find(&liveClaims).Error; err != nil {
+		return err
+	}
+	if len(liveClaims) != 0 {
+		return generation.ErrImplementationGenerationProcessing
+	}
+	return nil
 }
 
 func loadAuthoritativeWorkbenchLeaf(
@@ -1409,7 +1851,15 @@ func sameWorkbenchManifestCoordinate(left, right storage.ApplicationBuildManifes
 		left.ManifestGroupKey == nil || right.ManifestGroupKey == nil {
 		return false
 	}
-	return strings.TrimSpace(*left.ManifestGroupKey) != "" && *left.ManifestGroupKey == *right.ManifestGroupKey
+	return strings.TrimSpace(*left.ManifestGroupKey) != "" && *left.ManifestGroupKey == *right.ManifestGroupKey &&
+		optionalStringPointersEqual(left.DeliverySliceID, right.DeliverySliceID)
+}
+
+func optionalStringPointersEqual(left, right *string) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	return *left == *right
 }
 
 func commandPayloadFromProposal(model storage.WorkflowIntentProposalModel) (CommandPayload, error) {
@@ -1425,9 +1875,17 @@ func commandPayloadFromProposal(model storage.WorkflowIntentProposalModel) (Comm
 	if err := json.Unmarshal(model.WorkbenchInstruction, &instruction); err != nil {
 		return CommandPayload{}, fmt.Errorf("decode proposal workbench instruction: %w", err)
 	}
+	conversationContext, err := decodeStoredConversationContext(
+		model.ConversationContext, model.SummaryCheckpointID, model.ProviderInputHash,
+	)
+	if err != nil {
+		return CommandPayload{}, err
+	}
 	return CommandPayload{
-		DefinitionVersionID: model.SuggestedDefinitionVersionID.String(), Scope: append(json.RawMessage(nil), model.Scope...),
+		DefinitionVersionID: model.SuggestedDefinitionVersionID.String(), DesiredOutputCapability: model.DesiredOutputCapability,
+		Scope:      append(json.RawMessage(nil), model.Scope...),
 		SourceRefs: sources, ManifestIntent: manifest, Workbench: instruction,
+		ConversationContext: conversationContext,
 	}, nil
 }
 
@@ -1436,6 +1894,7 @@ func conversationFromModel(model storage.ConversationModel) Conversation {
 		ID: model.ID.String(), ProjectID: model.ProjectID.String(), Title: model.Title,
 		Status: ConversationStatus(model.Status), Version: model.Version, ETag: ConversationETag(model.ID.String(), model.Version),
 		CreatedBy: model.CreatedBy.String(), CreatedAt: model.CreatedAt, UpdatedAt: model.UpdatedAt, ArchivedAt: model.ArchivedAt,
+		SummaryCheckpointHeadID: uuidString(model.SummaryCheckpointHeadID),
 	}
 }
 
@@ -1448,6 +1907,9 @@ func messageFromModel(model storage.ConversationMessageModel) Message {
 }
 
 func proposalFromModel(model storage.WorkflowIntentProposalModel) (WorkflowIntentProposal, error) {
+	if model.DesiredOutputCapability == "" {
+		model.DesiredOutputCapability = platformdomain.WorkflowOutputApplication
+	}
 	payload, err := commandPayloadFromProposal(model)
 	if err != nil {
 		return WorkflowIntentProposal{}, err
@@ -1457,9 +1919,11 @@ func proposalFromModel(model storage.WorkflowIntentProposalModel) (WorkflowInten
 		TriggerMessageID: model.TriggerMessageID.String(), AssistantMessageID: model.AssistantMessageID.String(),
 		Kind: IntentKind(model.Kind), Status: ProposalStatus(model.Status), Version: model.Version,
 		ETag: ProposalETag(model.ID.String(), model.Version), SuggestedDefinitionVersionID: model.SuggestedDefinitionVersionID.String(),
-		Scope: payload.Scope, SourceRefs: payload.SourceRefs, ManifestIntent: payload.ManifestIntent,
+		DesiredOutputCapability: model.DesiredOutputCapability,
+		Scope:                   payload.Scope, SourceRefs: payload.SourceRefs, ManifestIntent: payload.ManifestIntent,
 		WorkbenchInstruction: payload.Workbench, Origin: ProposalOrigin(model.Origin), AI: aiProvenanceFromModel(model),
-		DecisionReason: model.DecisionReason, ProposedBy: model.ProposedBy.String(),
+		ConversationContext: payload.ConversationContext,
+		DecisionReason:      model.DecisionReason, ProposedBy: model.ProposedBy.String(),
 		DecidedBy: uuidString(model.DecidedBy), CreatedAt: model.CreatedAt, DecidedAt: model.DecidedAt,
 	}, nil
 }
@@ -1468,6 +1932,20 @@ func commandFromModel(model storage.ConversationCommandModel) (ConversationComma
 	var payload CommandPayload
 	if err := json.Unmarshal(model.Payload, &payload); err != nil {
 		return ConversationCommand{}, fmt.Errorf("decode conversation command payload: %w", err)
+	}
+	if payload.DesiredOutputCapability == "" {
+		payload.DesiredOutputCapability = platformdomain.WorkflowOutputApplication
+	}
+	storedContext, err := decodeStoredConversationContext(
+		model.ConversationContext, model.SummaryCheckpointID, model.ProviderInputHash,
+	)
+	if err != nil {
+		return ConversationCommand{}, fmt.Errorf("decode command conversation context: %w", err)
+	}
+	if payload.ConversationContext == nil && storedContext.Mode == "legacy_unrecorded" {
+		payload.ConversationContext = storedContext
+	} else if !sameConversationContext(payload.ConversationContext, storedContext) {
+		return ConversationCommand{}, fmt.Errorf("command payload conversation context does not match stored provenance")
 	}
 	var failure *CommandFailure
 	if len(model.Failure) > 0 && string(model.Failure) != "null" {

@@ -13,7 +13,7 @@ import (
 
 const (
 	BlueprintSelectionFlowKey     = "blueprint-selection-app"
-	BlueprintSelectionFlowVersion = 2
+	BlueprintSelectionFlowVersion = 4
 )
 
 type BlueprintSelectionFlowSeed struct {
@@ -64,6 +64,28 @@ func SeedBlueprintSelectionFlow(
 	} else if err != nil {
 		return DefinitionRecord{}, err
 	}
+	for version := 2; version < BlueprintSelectionFlowVersion; version++ {
+		if _, err := store.GetDefinition(ctx, seed.DefinitionID, version); err == nil {
+			continue
+		} else if !errors.Is(err, domain.ErrNotFound) {
+			return DefinitionRecord{}, err
+		}
+		definition, err := blueprintSelectionFlowDefinitionForVersion(seed.DefinitionID, version, seed.InstallerUserID, now)
+		if err != nil {
+			return DefinitionRecord{}, err
+		}
+		versionID, err := blueprintSelectionFlowVersionID(seed.ProjectID, version)
+		if err != nil {
+			return DefinitionRecord{}, err
+		}
+		record := DefinitionRecord{VersionID: versionID, ProjectID: seed.ProjectID, Key: BlueprintSelectionFlowKey,
+			Title: "Build application from Blueprint selection", Description: "Fan out only the approved pages frozen by a Blueprint selection, compile an isolated application manifest, build in Workbench, verify, and publish.", Definition: definition}
+		if err := store.SaveDefinition(ctx, record); err != nil {
+			if _, reloadErr := store.GetDefinition(ctx, seed.DefinitionID, version); reloadErr != nil {
+				return DefinitionRecord{}, err
+			}
+		}
+	}
 	definition, err := BlueprintSelectionFlowDefinition(seed.DefinitionID, seed.InstallerUserID, now)
 	if err != nil {
 		return DefinitionRecord{}, err
@@ -73,6 +95,9 @@ func SeedBlueprintSelectionFlow(
 		Title:       "Build application from Blueprint selection",
 		Description: "Fan out only the approved pages frozen by a Blueprint selection, compile an isolated application manifest, build in Workbench, verify, and publish.",
 		Published:   seed.Published, Definition: definition,
+	}
+	if err := normalizeDefinitionRecordProfile(&record); err != nil {
+		return DefinitionRecord{}, err
 	}
 	if err := store.SaveDefinition(ctx, record); err != nil {
 		if existing, reloadErr := store.GetDefinition(ctx, seed.DefinitionID, BlueprintSelectionFlowVersion); reloadErr == nil {
@@ -89,6 +114,9 @@ func ensureBlueprintSelectionPublication(
 	seed BlueprintSelectionFlowSeed,
 	record DefinitionRecord,
 ) (DefinitionRecord, error) {
+	if record.Definition.Version == BlueprintSelectionFlowVersion && (record.ExecutionProfile != CurrentWorkflowExecutionProfileRef() || record.Definition.ExecutionProfile != record.ExecutionProfile) {
+		return DefinitionRecord{}, ErrCASConflict
+	}
 	if seed.Published && !record.Published {
 		published, err := store.PublishDefinitionVersion(ctx, seed.ProjectID, seed.DefinitionID, record.VersionID, seed.InstallerUserID)
 		if err != nil {
@@ -135,8 +163,8 @@ func blueprintSelectionFlowDefinitionForVersion(id string, version int, createdB
 	schemaVersion := fmt.Sprintf("%d", version)
 	envelope := json.RawMessage(`{"type":"object","additionalProperties":true}`)
 	nodes := []domain.NodeDefinition{
-		{ID: "selection", Name: "Frozen Blueprint selection", Type: domain.NodeArtifactInput, InputSchema: envelope, OutputSchema: envelope, ArtifactInput: &domain.ArtifactInputNodeConfig{AllowedTypes: []domain.ArtifactType{domain.ArtifactBlueprint}, AllowedKinds: []string{"blueprint"}, RequireApproved: true, MinimumArtifacts: 1}},
-		{ID: "pages", Name: "Selected approved pages", Type: domain.NodeFanOut, InputSchema: envelope, OutputSchema: envelope, FanOut: &domain.FanOutNodeConfig{ItemsPath: "/blueprintPages", SliceKeyPath: "/key", MergeNodeID: "pages-merged", MaxParallel: 4, ItemKind: "blueprint_selection_page"}},
+		{ID: "selection", Name: "Frozen Blueprint selection", Type: domain.NodeArtifactInput, InputSchema: envelope, OutputSchema: envelope, ArtifactInput: &domain.ArtifactInputNodeConfig{AllowedTypes: []domain.ArtifactType{domain.ArtifactBlueprint}, AllowedKinds: []string{"blueprint"}, RequireApproved: true, MinimumArtifacts: 2, MaximumArtifacts: 101}},
+		{ID: "pages", Name: "Selected approved pages", Type: domain.NodeFanOut, InputSchema: envelope, OutputSchema: envelope, FanOut: &domain.FanOutNodeConfig{ItemsPath: "/blueprintPages", SliceKeyPath: "/key", MergeNodeID: "pages-merged", MaxParallel: 4, MaxItems: domain.MaximumWorkflowFanOutItems, ItemKind: "blueprint_selection_page"}},
 		{ID: "page-ready", Name: "Use frozen PageSpec and Prototype", Type: domain.NodeTransform, InputSchema: envelope, OutputSchema: envelope, Transform: &domain.TransformNodeConfig{Transform: "selection_passthrough"}},
 		{ID: "pages-merged", Name: "Merge selected page branches", Type: domain.NodeMerge, InputSchema: envelope, OutputSchema: envelope, Merge: &domain.MergeNodeConfig{FanOutNodeID: "pages", Policy: domain.MergeAll, AllowWaiver: false}},
 		{ID: "compile-manifest", Name: "Compile isolated selection manifest", Type: domain.NodeManifestCompiler, InputSchema: envelope, OutputSchema: envelope, ManifestCompiler: &domain.ManifestCompilerNodeConfig{ManifestKind: "application_build", SchemaVersion: 1, Hook: "application-build-manifest/v1"}},
@@ -149,8 +177,19 @@ func blueprintSelectionFlowDefinitionForVersion(id string, version int, createdB
 	for index, pair := range pairs {
 		edges[index] = domain.WorkflowEdge{ID: fmt.Sprintf("edge-%02d", index+1), From: pair[0], To: pair[1]}
 	}
-	return domain.NewWorkflowDefinitionWithContracts(
-		id, version, "Build application from Blueprint selection", schemaVersion, nodes, edges,
-		BlueprintSelectionInputContract(), ApplicationOutputContract(), createdBy, now,
-	)
+	profile := domain.WorkflowExecutionProfileRef{}
+	switch version {
+	case 3:
+		profile = WorkflowExecutionProfileV1Ref()
+	case BlueprintSelectionFlowVersion:
+		profile = CurrentWorkflowExecutionProfileRef()
+	}
+	if !profile.IsZero() {
+		return domain.NewWorkflowDefinitionWithExecutionProfile(
+			id, version, "Build application from Blueprint selection", schemaVersion, nodes, edges,
+			BlueprintSelectionInputContract(), ApplicationOutputContract(), profile, createdBy, now,
+		)
+	}
+	return domain.NewWorkflowDefinitionWithContracts(id, version, "Build application from Blueprint selection", schemaVersion, nodes, edges,
+		BlueprintSelectionInputContract(), ApplicationOutputContract(), createdBy, now)
 }

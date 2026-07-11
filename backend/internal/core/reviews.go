@@ -257,14 +257,32 @@ func (s *ReviewService) DecideIfMatch(ctx context.Context, reviewID, actorID, ex
 			return ErrForbidden
 		}
 		var artifact storage.ArtifactModel
-		if err := transaction.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id = ?", request.ArtifactID).Take(&artifact).Error; err != nil {
-			return err
+		var revision storage.ArtifactRevisionModel
+		if input.Decision == "approve" {
+			locks, err := lockArtifactApprovalSourceClosure(
+				ctx, transaction, request.ProjectID, request.ArtifactID, request.RevisionID,
+			)
+			if err != nil {
+				return err
+			}
+			var ok bool
+			artifact, ok = locks.artifacts[request.ArtifactID]
+			if !ok {
+				return fmt.Errorf("%w: review artifact is missing from approval lock set", ErrBlockingGate)
+			}
+			revision, ok = locks.revisions[request.RevisionID]
+			if !ok {
+				return fmt.Errorf("%w: review revision is missing from approval lock set", ErrBlockingGate)
+			}
+		} else {
+			if err := transaction.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id = ?", request.ArtifactID).Take(&artifact).Error; err != nil {
+				return err
+			}
+			if err := transaction.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id = ?", request.RevisionID).Take(&revision).Error; err != nil {
+				return err
+			}
 		}
 		if err := ensureGenericArtifactMutationAllowed(artifact.Kind); err != nil {
-			return err
-		}
-		var revision storage.ArtifactRevisionModel
-		if err := transaction.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id = ?", request.RevisionID).Take(&revision).Error; err != nil {
 			return err
 		}
 		if revision.ContentHash != request.ContentHash || revision.WorkflowStatus != "in_review" {
@@ -420,6 +438,24 @@ WHERE dependencies.project_id = ?
 	stored, err := s.contents.Get(ctx, revision.ContentRef, revision.ContentHash)
 	if err != nil {
 		return err
+	}
+	if artifact.Kind == "blueprint" || artifact.Kind == "page_spec" || artifact.Kind == "prototype" {
+		var sourceModels []storage.ArtifactRevisionSourceModel
+		if err := transaction.Where("revision_id = ?", revision.ID).
+			Order("ordinal ASC").Find(&sourceModels).Error; err != nil {
+			return err
+		}
+		artifacts := &ArtifactService{contents: s.contents}
+		if err := artifacts.validateArtifactLineageForReview(
+			ctx,
+			transaction,
+			artifact.ProjectID,
+			artifact.Kind,
+			stored.Payload,
+			sourceInputsFromRevisionModels(sourceModels),
+		); err != nil {
+			return err
+		}
 	}
 	report := ValidateArtifactContent(artifact.Kind, stored.Payload)
 	if !report.Valid {

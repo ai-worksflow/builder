@@ -156,9 +156,21 @@ BEGIN
     END IF;
 
     IF NEW.base_revision_id IS NOT NULL AND NOT EXISTS (
-        SELECT 1 FROM artifact_revisions
-        WHERE id = NEW.base_revision_id
-          AND artifact_id = NEW.prototype_artifact_id
+        SELECT 1
+        FROM artifact_revisions AS revision
+        WHERE revision.id = NEW.base_revision_id
+          AND revision.artifact_id = NEW.prototype_artifact_id
+          AND EXISTS (
+              SELECT 1
+              FROM artifact_revision_sources AS source
+              WHERE source.revision_id = revision.id
+                AND source.source_artifact_id = NEW.page_spec_artifact_id
+                AND source.source_revision_id = NEW.page_spec_revision_id
+                AND source.source_content_hash = NEW.page_spec_content_hash
+                AND source.source_anchor_id IS NULL
+                AND source.purpose = 'page_spec'
+                AND source.required = true
+          )
     ) THEN
         RAISE EXCEPTION 'design import base revision does not belong to its Prototype'
             USING ERRCODE = '23503';
@@ -237,12 +249,18 @@ BEGIN
         RAISE EXCEPTION 'design import pipeline stages cannot move backwards' USING ERRCODE = '55000';
     END IF;
 
+    IF OLD.status IN ('applied', 'rejected') AND NEW.status <> OLD.status THEN
+        RAISE EXCEPTION 'terminal design import decisions are immutable' USING ERRCODE = '55000';
+    END IF;
+
     IF (OLD.prototype_artifact_id IS NOT NULL AND NEW.prototype_artifact_id IS DISTINCT FROM OLD.prototype_artifact_id)
        OR (OLD.base_revision_id IS NOT NULL AND NEW.base_revision_id IS DISTINCT FROM OLD.base_revision_id)
        OR (OLD.input_manifest_id IS NOT NULL AND NEW.input_manifest_id IS DISTINCT FROM OLD.input_manifest_id)
        OR (OLD.output_proposal_id IS NOT NULL AND NEW.output_proposal_id IS DISTINCT FROM OLD.output_proposal_id)
        OR (OLD.operation_id IS NOT NULL AND NEW.operation_id IS DISTINCT FROM OLD.operation_id)
-       OR (OLD.applied_revision_id IS NOT NULL AND NEW.applied_revision_id IS DISTINCT FROM OLD.applied_revision_id) THEN
+       OR (OLD.applied_revision_id IS NOT NULL AND NEW.applied_revision_id IS DISTINCT FROM OLD.applied_revision_id)
+       OR (OLD.decided_by IS NOT NULL AND NEW.decided_by IS DISTINCT FROM OLD.decided_by)
+       OR (OLD.decided_at IS NOT NULL AND NEW.decided_at IS DISTINCT FROM OLD.decided_at) THEN
         RAISE EXCEPTION 'design import checkpoint identities are immutable once recorded' USING ERRCODE = '55000';
     END IF;
 
@@ -261,6 +279,56 @@ CREATE TRIGGER design_import_state_transition
 BEFORE UPDATE ON design_imports
 FOR EACH ROW
 EXECUTE FUNCTION validate_design_import_state_transition();
+
+CREATE OR REPLACE FUNCTION prohibit_design_import_creator_proposal_decision()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    IF EXISTS (
+        SELECT 1
+        FROM design_imports AS design_import
+        WHERE design_import.project_id = (
+            SELECT proposal.project_id FROM output_proposals AS proposal WHERE proposal.id = NEW.proposal_id
+        )
+          AND (design_import.output_proposal_id = NEW.proposal_id OR design_import.expected_output_proposal_id = NEW.proposal_id)
+          AND design_import.created_by = NEW.decided_by
+    ) THEN
+        RAISE EXCEPTION 'design import creator cannot decide its conversion proposal' USING ERRCODE = '42501';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER design_import_proposal_independent_decision
+BEFORE INSERT OR UPDATE ON proposal_operation_decisions
+FOR EACH ROW
+EXECUTE FUNCTION prohibit_design_import_creator_proposal_decision();
+
+CREATE OR REPLACE FUNCTION prohibit_design_import_creator_proposal_apply()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    IF NEW.kind = 'design_import_to_prototype'
+       AND NEW.status IN ('applied', 'partially_applied')
+       AND EXISTS (
+           SELECT 1
+           FROM design_imports AS design_import
+           WHERE design_import.project_id = NEW.project_id
+             AND (design_import.output_proposal_id = NEW.id OR design_import.expected_output_proposal_id = NEW.id)
+             AND (NEW.applied_by IS NULL OR design_import.created_by = NEW.applied_by)
+       ) THEN
+        RAISE EXCEPTION 'design import creator cannot apply its conversion proposal' USING ERRCODE = '42501';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER design_import_proposal_independent_apply
+BEFORE UPDATE ON output_proposals
+FOR EACH ROW
+EXECUTE FUNCTION prohibit_design_import_creator_proposal_apply();
 
 CREATE OR REPLACE FUNCTION prevent_design_import_snapshot_mutation()
 RETURNS trigger

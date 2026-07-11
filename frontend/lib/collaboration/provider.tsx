@@ -35,9 +35,9 @@ import type {
 } from './types'
 
 const ROLE_ACTIONS: Record<ProjectRole, ReadonlySet<ProjectAction>> = {
-  owner: new Set(['view', 'comment', 'edit', 'publish', 'admin']),
-  admin: new Set(['view', 'comment', 'edit', 'publish', 'admin']),
-  editor: new Set(['view', 'comment', 'edit']),
+  owner: new Set(['view', 'comment', 'edit', 'review', 'publish', 'admin']),
+  admin: new Set(['view', 'comment', 'edit', 'review', 'publish', 'admin']),
+  editor: new Set(['view', 'comment', 'edit', 'review']),
   commenter: new Set(['view', 'comment']),
   viewer: new Set(['view']),
 }

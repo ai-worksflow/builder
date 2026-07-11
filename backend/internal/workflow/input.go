@@ -49,6 +49,7 @@ func buildNodeInputEnvelope(run *RunRecord, definition domain.WorkflowDefinition
 			if err != nil {
 				return domain.NodeInputEnvelope{}, fmt.Errorf("edge %s from %s: %w", edge.ID, source.Key, err)
 			}
+			reference = pruneReferenceForSemanticTarget(run, definition, targetDefinition, reference)
 			value, err := applyEdgeMapping(output, edge.Mapping)
 			if err != nil {
 				return domain.NodeInputEnvelope{}, fmt.Errorf("edge %s mapping: %w", edge.ID, err)
@@ -165,11 +166,20 @@ func nodeOutputReference(run *RunRecord, definition domain.NodeDefinition, sourc
 	if source.OutputProposal != nil {
 		value := *source.OutputProposal
 		reference.OutputProposal = &value
+		if reference.InputManifest != nil {
+			reference.ProposalPins = appendUniqueProposalPin(reference.ProposalPins, domain.ProposalLineagePin{
+				Proposal: value, Manifest: *reference.InputManifest,
+				ProducerNodeKey: source.Key, ProducerDefinitionNodeID: source.DefinitionNodeID,
+			})
+		}
 	}
 	producedArtifactIDs := map[string]bool{}
 	if refs, err := artifactRefsFromNodeOutput(output); err == nil {
 		for _, ref := range refs {
 			reference.ArtifactRevisions = appendUniqueArtifactRef(reference.ArtifactRevisions, ref)
+			if definition.Type == domain.NodeHumanEdit {
+				reference.MaterializedArtifactRevisions = appendUniqueArtifactRef(reference.MaterializedArtifactRevisions, ref)
+			}
 			producedArtifactIDs[ref.ArtifactID] = true
 		}
 	}
@@ -185,6 +195,16 @@ func nodeOutputReference(run *RunRecord, definition domain.NodeDefinition, sourc
 		}
 	}
 	if hasStoredInputs {
+		if source.OutputProposal == nil && propagatesProposalLineage(definition.Type) {
+			for _, pin := range storedInputs.ProposalPins() {
+				reference.ProposalPins = appendUniqueProposalPin(reference.ProposalPins, pin)
+			}
+		}
+		if propagatesMaterializedLineage(definition.Type) {
+			for _, ref := range storedInputs.MaterializedArtifactRefs() {
+				reference.MaterializedArtifactRevisions = appendUniqueArtifactRef(reference.MaterializedArtifactRevisions, ref)
+			}
+		}
 		for _, ref := range storedInputs.ArtifactRefs() {
 			if producedArtifactIDs[ref.ArtifactID] {
 				continue
@@ -194,6 +214,9 @@ func nodeOutputReference(run *RunRecord, definition domain.NodeDefinition, sourc
 		for _, ref := range storedInputs.SliceRefs() {
 			reference.DeliverySliceRefs = appendUniqueSliceRef(reference.DeliverySliceRefs, ref)
 		}
+	}
+	if invalidatesPriorDeliverySlices(definition) {
+		reference = withoutPriorDeliverySliceEpoch(reference)
 	}
 	sliceID := source.SliceID
 	if definition.Type == domain.NodeFanOut && targetSliceID != "" {
@@ -210,6 +233,224 @@ func nodeOutputReference(run *RunRecord, definition domain.NodeDefinition, sourc
 		}
 	}
 	return reference
+}
+
+// A new upstream semantic epoch cannot inherit page delivery evidence from an
+// earlier epoch. The exact refs embedded by those slices are removed together
+// with the slice refs; global refs that are not part of the old slice snapshot
+// remain available as generation context.
+func withoutPriorDeliverySliceEpoch(reference domain.NodeOutputReference) domain.NodeOutputReference {
+	stale := make([]domain.ArtifactRef, 0)
+	for _, slice := range reference.DeliverySliceRefs {
+		for _, ref := range []*domain.ArtifactRef{slice.Blueprint, slice.PageSpec, slice.Prototype} {
+			if ref != nil && ref.Validate() == nil {
+				stale = appendUniqueArtifactRef(stale, *ref)
+			}
+		}
+	}
+	reference.ArtifactRevisions = filterArtifactRefs(reference.ArtifactRevisions, stale)
+	reference.MaterializedArtifactRevisions = filterArtifactRefs(reference.MaterializedArtifactRevisions, stale)
+	reference.DeliverySliceRefs = nil
+	return reference
+}
+
+func filterArtifactRefs(refs, excluded []domain.ArtifactRef) []domain.ArtifactRef {
+	filtered := make([]domain.ArtifactRef, 0, len(refs))
+	for _, ref := range refs {
+		drop := false
+		for _, candidate := range excluded {
+			if sameArtifactRevision(ref, candidate) {
+				drop = true
+				break
+			}
+		}
+		if !drop {
+			filtered = append(filtered, ref)
+		}
+	}
+	return filtered
+}
+
+func sameArtifactRevision(left, right domain.ArtifactRef) bool {
+	return left.ArtifactID == right.ArtifactID && left.RevisionID == right.RevisionID && left.ContentHash == right.ContentHash
+}
+
+func pruneReferenceForSemanticTarget(run *RunRecord, workflow domain.WorkflowDefinition, target domain.NodeDefinition, reference domain.NodeOutputReference) domain.NodeOutputReference {
+	producedKind := semanticProducedArtifactKind(target)
+	if invalidatesPriorDeliverySlices(target) {
+		reference = withoutPriorDeliverySliceEpoch(reference)
+	}
+	if producedKind == "" {
+		return reference
+	}
+	obsoleteKinds := map[string]bool{}
+	for _, kind := range semanticDownstreamArtifactKinds(producedKind) {
+		obsoleteKinds[kind] = true
+	}
+	kinds := runtimeArtifactKinds(run, workflow)
+	filter := func(refs []domain.ArtifactRef) []domain.ArtifactRef {
+		filtered := make([]domain.ArtifactRef, 0, len(refs))
+		for _, ref := range refs {
+			if obsoleteKinds[kinds[ref.ArtifactID]] {
+				continue
+			}
+			filtered = append(filtered, ref)
+		}
+		return filtered
+	}
+	reference.ArtifactRevisions = filter(reference.ArtifactRevisions)
+	reference.MaterializedArtifactRevisions = filter(reference.MaterializedArtifactRevisions)
+	for index := range reference.DeliverySliceRefs {
+		slice := &reference.DeliverySliceRefs[index]
+		if obsoleteKinds["blueprint"] {
+			slice.Blueprint, slice.PageSpec, slice.Prototype = nil, nil, nil
+			continue
+		}
+		if obsoleteKinds["page_spec"] {
+			slice.PageSpec, slice.Prototype = nil, nil
+			continue
+		}
+		if obsoleteKinds["prototype"] {
+			slice.Prototype = nil
+		}
+	}
+	return reference
+}
+
+func semanticProducedArtifactKind(definition domain.NodeDefinition) string {
+	if definition.Type == domain.NodeHumanEdit && definition.HumanEdit != nil {
+		return definition.HumanEdit.ArtifactKind
+	}
+	if definition.Type != domain.NodeAITransform || definition.AITransform == nil {
+		return ""
+	}
+	switch definition.AITransform.JobType {
+	case "refine_project_brief":
+		return "project_brief"
+	case "derive_requirements":
+		return "product_requirements"
+	case "decompose_pages":
+		return "blueprint"
+	case "generate_page_spec":
+		return "page_spec"
+	case "generate_prototype":
+		return "prototype"
+	default:
+		return ""
+	}
+}
+
+func semanticDownstreamArtifactKinds(kind string) []string {
+	return map[string][]string{
+		"project_brief":        {"product_requirements", "requirement_baseline", "blueprint", "page_spec", "prototype"},
+		"product_requirements": {"requirement_baseline", "blueprint", "page_spec", "prototype"},
+		"requirement_baseline": {"blueprint", "page_spec", "prototype"},
+		"blueprint":            {"page_spec", "prototype"},
+		"page_spec":            {"prototype"},
+	}[kind]
+}
+
+func runtimeArtifactKinds(run *RunRecord, workflow domain.WorkflowDefinition) map[string]string {
+	kinds := map[string]string{}
+	ambiguous := map[string]bool{}
+	record := func(ref domain.ArtifactRef, kind string) {
+		if ref.Validate() != nil || strings.TrimSpace(kind) == "" {
+			return
+		}
+		if ambiguous[ref.ArtifactID] {
+			return
+		}
+		if existing, exists := kinds[ref.ArtifactID]; !exists || existing == kind {
+			kinds[ref.ArtifactID] = kind
+		} else {
+			// A stable artifact cannot change semantic kind. Leave an ambiguous
+			// history unclassified so pruning never silently deletes evidence.
+			delete(kinds, ref.ArtifactID)
+			ambiguous[ref.ArtifactID] = true
+		}
+	}
+	for _, node := range run.Nodes {
+		definition, exists := workflow.FindNode(node.DefinitionNodeID)
+		if !exists {
+			continue
+		}
+		kind := ""
+		if definition.HumanEdit != nil {
+			kind = definition.HumanEdit.ArtifactKind
+		} else if definition.ArtifactInput != nil && len(definition.ArtifactInput.AllowedKinds) == 1 {
+			kind = definition.ArtifactInput.AllowedKinds[0]
+		}
+		if kind == "" {
+			continue
+		}
+		metadata := run.Context.Nodes[node.Key]
+		refs, err := artifactRefsFromNodeOutput(metadata.Output)
+		if err != nil {
+			continue
+		}
+		for _, ref := range refs {
+			record(ref, kind)
+		}
+	}
+	for _, slice := range run.Context.Slices {
+		record(slice.Blueprint, "blueprint")
+		if slice.PageSpec != nil {
+			record(*slice.PageSpec, "page_spec")
+		}
+		if slice.Prototype != nil {
+			record(*slice.Prototype, "prototype")
+		}
+	}
+	return kinds
+}
+
+func invalidatesPriorDeliverySlices(definition domain.NodeDefinition) bool {
+	if definition.Type == domain.NodeFanOut {
+		return true
+	}
+	if definition.Type == domain.NodeHumanEdit && definition.HumanEdit != nil {
+		switch definition.HumanEdit.ArtifactKind {
+		case "project_brief", "product_requirements", "requirement_baseline", "blueprint":
+			return true
+		}
+	}
+	if definition.Type == domain.NodeAITransform && definition.AITransform != nil {
+		switch definition.AITransform.JobType {
+		case "refine_project_brief", "derive_requirements", "decompose_pages":
+			return true
+		}
+	}
+	return false
+}
+
+func propagatesProposalLineage(nodeType domain.WorkflowNodeType) bool {
+	switch nodeType {
+	case domain.NodeCondition, domain.NodeFanOut, domain.NodeMerge, domain.NodeReviewGate,
+		domain.NodeQualityGate, domain.NodeTransform:
+		return true
+	default:
+		return false
+	}
+}
+
+func propagatesMaterializedLineage(nodeType domain.WorkflowNodeType) bool {
+	switch nodeType {
+	case domain.NodeCondition, domain.NodeFanOut, domain.NodeMerge, domain.NodeTransform:
+		return true
+	default:
+		return false
+	}
+}
+
+func appendUniqueProposalPin(pins []domain.ProposalLineagePin, candidate domain.ProposalLineagePin) []domain.ProposalLineagePin {
+	for _, pin := range pins {
+		if pin.ProducerNodeKey == candidate.ProducerNodeKey &&
+			pin.ProducerDefinitionNodeID == candidate.ProducerDefinitionNodeID &&
+			pin.Proposal == candidate.Proposal && pin.Manifest == candidate.Manifest {
+			return pins
+		}
+	}
+	return append(pins, candidate)
 }
 
 func workflowSliceRef(slice SliceContext) domain.WorkflowSliceRef {

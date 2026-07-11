@@ -48,7 +48,7 @@ type PlatformDependencies struct {
 // NewPlatformEngine exposes a single bootstrap seam without coupling app.go or
 // the HTTP router to concrete runner implementations.
 func NewPlatformEngine(dependencies PlatformDependencies) (*Engine, error) {
-	if dependencies.Store == nil || dependencies.CoreProposals == nil || dependencies.Generation == nil || dependencies.Workbench == nil || dependencies.ArtifactInputs == nil || dependencies.HumanEditOutput == nil || dependencies.TargetArtifacts == nil || dependencies.WorkbenchCompletion == nil || dependencies.ReviewGate == nil || dependencies.Access == nil || dependencies.BlueprintPages == nil || dependencies.DefaultModel == "" {
+	if dependencies.Store == nil || dependencies.CoreProposals == nil || dependencies.Generation == nil || dependencies.Workbench == nil || dependencies.ArtifactInputs == nil || dependencies.HumanEditOutput == nil || dependencies.TargetArtifacts == nil || dependencies.WorkbenchCompletion == nil || dependencies.ReviewGate == nil || dependencies.Access == nil || dependencies.BlueprintPages == nil || dependencies.Quality == nil || dependencies.QualityManifest == nil || dependencies.Publisher == nil || dependencies.DefaultModel == "" {
 		return nil, fmt.Errorf("workflow store, artifact input/target, proposal, generation, workbench and access dependencies are required")
 	}
 	engine, err := NewEngine(dependencies.Store)
@@ -61,6 +61,7 @@ func NewPlatformEngine(dependencies PlatformDependencies) (*Engine, error) {
 	if dependencies.IDs != nil {
 		engine.IDs = dependencies.IDs
 	}
+	engine.RequireGovernedStarts = true
 	engine.ManifestFreezer = CoreManifestFreezer{
 		Proposals: dependencies.CoreProposals, Targets: dependencies.TargetArtifacts,
 		RequirementBaseline: dependencies.RequirementBaseline,
@@ -85,11 +86,13 @@ func NewPlatformEngine(dependencies PlatformDependencies) (*Engine, error) {
 	}
 	engine.ConditionEvaluator = DeclarativeConditionEvaluator{}
 	registry := NewMapRegistry()
-	_ = registry.Register(domain.NodeFanOut, FanOutRunner{Resolver: DefinitionFanOutResolver{
+	if err := registry.Register(domain.NodeFanOut, FanOutRunner{Resolver: DefinitionFanOutResolver{
 		DeliverySlices: dependencies.FanOut,
 		BlueprintPages: dependencies.BlueprintPages,
-	}})
-	_ = registry.Register(domain.NodeTransform, RunnerFunc(func(_ context.Context, execution Execution) (WorkerResult, error) {
+	}}); err != nil {
+		return nil, err
+	}
+	if err := registry.Register(domain.NodeTransform, RunnerFunc(func(_ context.Context, execution Execution) (WorkerResult, error) {
 		if execution.Definition.Transform == nil || execution.Definition.Transform.Transform != "selection_passthrough" {
 			return WorkerResult{}, fmt.Errorf("unsupported platform transform")
 		}
@@ -98,56 +101,75 @@ func NewPlatformEngine(dependencies PlatformDependencies) (*Engine, error) {
 			value = json.RawMessage(`{}`)
 		}
 		return WorkerResult{Disposition: ResultComplete, Output: append(json.RawMessage(nil), value...)}, nil
-	}))
-	_ = registry.Register(domain.NodeWorkbenchBuild, GenerationWorkbenchRunner{Generation: dependencies.Generation, Workbench: dependencies.Workbench, DefaultModel: dependencies.DefaultModel, Instruction: dependencies.BuildInstruction})
-	if dependencies.Quality != nil {
-		if dependencies.QualityManifest == nil {
-			return nil, fmt.Errorf("workflow quality manifest resolver is required")
-		}
-		_ = registry.Register(domain.NodeQualityGate, QualityGateRunner{
-			Evaluator: dependencies.Quality, ManifestResolver: dependencies.QualityManifest, Access: dependencies.Access,
-		})
+	})); err != nil {
+		return nil, err
 	}
-	if dependencies.Publisher != nil {
-		_ = registry.Register(domain.NodePublish, PublishRunner{Publisher: dependencies.Publisher, Access: dependencies.Access})
+	if err := registry.Register(domain.NodeWorkbenchBuild, GenerationWorkbenchRunner{Generation: dependencies.Generation, Workbench: dependencies.Workbench, DefaultModel: dependencies.DefaultModel, Instruction: dependencies.BuildInstruction}); err != nil {
+		return nil, err
+	}
+	if err := registry.Register(domain.NodeQualityGate, QualityGateRunner{
+		Evaluator: dependencies.Quality, ManifestResolver: dependencies.QualityManifest, Access: dependencies.Access,
+	}); err != nil {
+		return nil, err
+	}
+	if err := registry.Register(domain.NodePublish, PublishRunner{Publisher: dependencies.Publisher, Access: dependencies.Access}); err != nil {
+		return nil, err
 	}
 	engine.Runners = registry
-	engine.Capabilities = PlatformWorkflowCapabilities(dependencies.Quality != nil, dependencies.Publisher != nil)
+	engine.Capabilities = CurrentWorkflowExecutionProfileDescriptor().Capabilities
+	if err := engine.SealProductionExecutionProfiles(); err != nil {
+		return nil, err
+	}
 	return engine, nil
 }
 
 // CoreArtifactInputValidator enforces the declarative input gate against the
 // exact artifact revisions referenced by the run manifest.
-type CoreArtifactInputValidator struct{ Database *gorm.DB }
+type CoreArtifactInputValidator struct {
+	Database *gorm.DB
+	Contents content.Store
+}
 
 func (v CoreArtifactInputValidator) ResolveStartArtifactKinds(ctx context.Context, manifest domain.InputManifest) ([]string, error) {
+	metadata, err := v.ResolveStartArtifactMetadata(ctx, manifest)
+	return metadata.Kinds, err
+}
+
+func (v CoreArtifactInputValidator) ResolveStartArtifactMetadata(ctx context.Context, manifest domain.InputManifest) (StartArtifactMetadata, error) {
 	if v.Database == nil {
-		return nil, fmt.Errorf("artifact input database is required")
+		return StartArtifactMetadata{}, fmt.Errorf("artifact input database is required")
+	}
+	if err := validateBlueprintSelectionStart(ctx, v.Database, v.Contents, manifest); err != nil {
+		return StartArtifactMetadata{}, err
 	}
 	kinds := map[string]struct{}{}
-	for _, ref := range artifactInputRefs(manifest) {
+	refs := artifactInputRefs(manifest)
+	allApproved := true
+	for _, ref := range refs {
 		var row struct {
-			Kind      string `gorm:"column:artifact_kind"`
-			ProjectID string `gorm:"column:artifact_project_id"`
+			Kind           string `gorm:"column:artifact_kind"`
+			ProjectID      string `gorm:"column:artifact_project_id"`
+			WorkflowStatus string `gorm:"column:workflow_status"`
 		}
 		if err := v.Database.WithContext(ctx).Table("artifact_revisions").
-			Select("artifacts.kind AS artifact_kind, artifacts.project_id::text AS artifact_project_id").
+			Select("artifacts.kind AS artifact_kind, artifacts.project_id::text AS artifact_project_id, artifact_revisions.workflow_status").
 			Joins("JOIN artifacts ON artifacts.id = artifact_revisions.artifact_id").
 			Where("artifact_revisions.id = ? AND artifact_revisions.artifact_id = ? AND artifact_revisions.content_hash = ?", ref.RevisionID, ref.ArtifactID, ref.ContentHash).
 			Take(&row).Error; err != nil {
-			return nil, err
+			return StartArtifactMetadata{}, err
 		}
 		if row.ProjectID != manifest.ProjectID {
-			return nil, fmt.Errorf("artifact input revision is outside the manifest project")
+			return StartArtifactMetadata{}, fmt.Errorf("artifact input revision is outside the manifest project")
 		}
 		kinds[strings.TrimSpace(row.Kind)] = struct{}{}
+		allApproved = allApproved && row.WorkflowStatus == "approved"
 	}
 	resolved := make([]string, 0, len(kinds))
 	for kind := range kinds {
 		resolved = append(resolved, kind)
 	}
 	sort.Strings(resolved)
-	return resolved, nil
+	return StartArtifactMetadata{Kinds: resolved, Count: len(refs), AllApproved: allApproved && len(refs) > 0}, nil
 }
 
 func (v CoreArtifactInputValidator) Validate(ctx context.Context, execution Execution, manifest domain.InputManifest) (json.RawMessage, error) {
@@ -155,9 +177,15 @@ func (v CoreArtifactInputValidator) Validate(ctx context.Context, execution Exec
 		return nil, fmt.Errorf("artifact input database and node config are required")
 	}
 	config := execution.Definition.ArtifactInput
+	if err := validateBlueprintSelectionStart(ctx, v.Database, v.Contents, manifest); err != nil {
+		return nil, err
+	}
 	refs := artifactInputRefs(manifest)
 	if len(refs) < config.MinimumArtifacts {
 		return nil, fmt.Errorf("artifact input requires at least %d exact revisions", config.MinimumArtifacts)
+	}
+	if config.MaximumArtifacts > 0 && len(refs) > config.MaximumArtifacts {
+		return nil, fmt.Errorf("artifact input accepts at most %d exact revisions", config.MaximumArtifacts)
 	}
 	accepted := make([]map[string]any, 0, len(refs))
 	for _, ref := range refs {
@@ -215,11 +243,22 @@ type workflowBlueprintSelectionPageBinding struct {
 	Prototype *domain.ArtifactRef `json:"prototype,omitempty"`
 }
 
+type workflowBlueprintSelectionNode struct {
+	ID             string   `json:"id"`
+	Key            string   `json:"key"`
+	Kind           string   `json:"kind"`
+	Title          string   `json:"title"`
+	Route          string   `json:"route,omitempty"`
+	UserGoal       string   `json:"userGoal,omitempty"`
+	RequirementIDs []string `json:"requirementIds,omitempty"`
+}
+
 type workflowBlueprintSelectionScope struct {
 	SchemaVersion int                                     `json:"schemaVersion"`
 	SelectionID   string                                  `json:"selectionId"`
 	Blueprint     domain.ArtifactRef                      `json:"blueprint"`
 	NodeIDs       []string                                `json:"nodeIds"`
+	Nodes         []workflowBlueprintSelectionNode        `json:"nodes"`
 	PageBindings  []workflowBlueprintSelectionPageBinding `json:"pageBindings"`
 }
 
@@ -242,7 +281,7 @@ func blueprintSelectionScope(manifest domain.InputManifest) (workflowBlueprintSe
 	scope := constraints.BlueprintSelection
 	if scope.SchemaVersion != 1 || strings.TrimSpace(scope.SelectionID) == "" ||
 		manifest.DeliverySliceID != scope.SelectionID || scope.Blueprint.Validate() != nil ||
-		scope.Blueprint.AnchorID != "" || len(scope.NodeIDs) == 0 {
+		scope.Blueprint.AnchorID != "" || len(scope.NodeIDs) == 0 || len(scope.NodeIDs) > 100 {
 		return workflowBlueprintSelectionScope{}, true, fmt.Errorf("Blueprint selection scope identity is invalid")
 	}
 	rootCount := 0
@@ -276,9 +315,27 @@ func blueprintSelectionScope(manifest domain.InputManifest) (workflowBlueprintSe
 		}
 		seenNodes[nodeID] = true
 	}
+	if len(scope.Nodes) != len(scope.NodeIDs) {
+		return workflowBlueprintSelectionScope{}, true, fmt.Errorf("Blueprint selection semantic node snapshots are incomplete")
+	}
+	pageNodes := map[string]bool{}
+	seenSnapshots := map[string]bool{}
+	for _, node := range scope.Nodes {
+		nodeID, kind := strings.TrimSpace(node.ID), strings.TrimSpace(node.Kind)
+		if nodeID == "" || kind == "" || !seenNodes[nodeID] || seenSnapshots[nodeID] {
+			return workflowBlueprintSelectionScope{}, true, fmt.Errorf("Blueprint selection semantic node snapshot is invalid")
+		}
+		seenSnapshots[nodeID] = true
+		if kind == "page" {
+			pageNodes[nodeID] = true
+		}
+	}
+	if len(pageNodes) == 0 {
+		return workflowBlueprintSelectionScope{}, true, fmt.Errorf("application Blueprint selection requires at least one selected Page")
+	}
 	seenBindings := map[string]bool{}
 	for _, binding := range scope.PageBindings {
-		if !seenNodes[binding.NodeID] || seenBindings[binding.NodeID] {
+		if !pageNodes[binding.NodeID] || seenBindings[binding.NodeID] {
 			return workflowBlueprintSelectionScope{}, true, fmt.Errorf("Blueprint selection page binding is outside the node scope")
 		}
 		seenBindings[binding.NodeID] = true
@@ -287,15 +344,308 @@ func blueprintSelectionScope(manifest domain.InputManifest) (workflowBlueprintSe
 				return workflowBlueprintSelectionScope{}, true, fmt.Errorf("Blueprint selection page binding is not frozen in manifest sources")
 			}
 		}
-		if binding.Prototype != nil && binding.PageSpec == nil {
-			return workflowBlueprintSelectionScope{}, true, fmt.Errorf("Blueprint selection Prototype has no PageSpec binding")
+		if binding.PageSpec == nil || binding.Prototype == nil {
+			return workflowBlueprintSelectionScope{}, true, fmt.Errorf("every selected Page requires exact PageSpec and Prototype bindings")
 		}
+	}
+	if len(seenBindings) != len(pageNodes) {
+		return workflowBlueprintSelectionScope{}, true, fmt.Errorf("Blueprint selection page bindings are incomplete")
 	}
 	return scope, true, nil
 }
 
 func exactWorkflowArtifactRefKey(ref domain.ArtifactRef) string {
 	return ref.ArtifactID + "\x00" + ref.RevisionID + "\x00" + ref.ContentHash + "\x00" + ref.AnchorID
+}
+
+type workflowSelectionRevisionSource struct {
+	Ref      domain.ArtifactRef
+	Purpose  string
+	Required bool
+}
+
+type workflowSelectionArtifactSnapshot struct {
+	Ref                      domain.ArtifactRef
+	ProjectID                string
+	Kind                     string
+	Lifecycle                string
+	WorkflowStatus           string
+	SyncStatus               string
+	LatestApprovedRevisionID string
+	Sources                  []workflowSelectionRevisionSource
+	Content                  json.RawMessage
+}
+
+type workflowSelectionArtifactResolver func(context.Context, domain.ArtifactRef) (workflowSelectionArtifactSnapshot, error)
+
+func validateBlueprintSelectionStart(ctx context.Context, database *gorm.DB, contents content.Store, manifest domain.InputManifest) error {
+	if manifest.JobType != core.BlueprintSelectionJobType {
+		return nil
+	}
+	if database == nil || contents == nil {
+		return fmt.Errorf("Blueprint selection validation database and content store are required")
+	}
+	return validateBlueprintSelectionStartWithResolver(ctx, manifest, func(ctx context.Context, ref domain.ArtifactRef) (workflowSelectionArtifactSnapshot, error) {
+		return loadWorkflowSelectionArtifactSnapshot(ctx, database, contents, ref)
+	})
+}
+
+func validateBlueprintSelectionStartWithResolver(
+	ctx context.Context,
+	manifest domain.InputManifest,
+	resolve workflowSelectionArtifactResolver,
+) error {
+	scope, selection, err := blueprintSelectionScope(manifest)
+	if err != nil || !selection {
+		return err
+	}
+	if resolve == nil {
+		return fmt.Errorf("Blueprint selection artifact resolver is required")
+	}
+	blueprint, err := resolve(ctx, scope.Blueprint)
+	if err != nil {
+		return err
+	}
+	if err := requireCurrentSelectionArtifact(blueprint, manifest.ProjectID, "blueprint", scope.Blueprint); err != nil {
+		return fmt.Errorf("Blueprint selection root: %w", err)
+	}
+	actualNodes, _, err := core.DecodeBlueprintSemanticGraph(blueprint.Content)
+	if err != nil {
+		return fmt.Errorf("Blueprint selection root content: %w", err)
+	}
+	actualByID := make(map[string]core.BlueprintSemanticNode, len(actualNodes))
+	for _, node := range actualNodes {
+		actualByID[node.ID] = node
+	}
+	pageNodes := map[string]bool{}
+	for _, node := range scope.Nodes {
+		actual, exists := actualByID[strings.TrimSpace(node.ID)]
+		if !exists || actual.Kind != strings.TrimSpace(node.Kind) || actual.Key != strings.TrimSpace(node.Key) ||
+			actual.Title != strings.TrimSpace(node.Title) || actual.Route != strings.TrimSpace(node.Route) ||
+			actual.UserGoal != strings.TrimSpace(node.UserGoal) || !sameStrings(actual.RequirementIDs, node.RequirementIDs) {
+			return fmt.Errorf("Blueprint selection semantic node %q differs from the pinned Blueprint content", node.ID)
+		}
+		if strings.TrimSpace(node.Kind) == "page" {
+			pageNodes[strings.TrimSpace(node.ID)] = true
+		}
+	}
+	expectedSources := make([]domain.ManifestSource, 0, len(manifest.Sources))
+	seenExpectedRefs := map[string]bool{}
+	appendExpectedSource := func(ref domain.ArtifactRef, purpose string) {
+		key := exactWorkflowArtifactRefKey(ref)
+		if seenExpectedRefs[key] {
+			return
+		}
+		seenExpectedRefs[key] = true
+		expectedSources = append(expectedSources, domain.ManifestSource{Ref: ref, Purpose: purpose})
+	}
+	appendExpectedSource(scope.Blueprint, "blueprint_selection_root")
+	for _, nodeID := range scope.NodeIDs {
+		anchored := scope.Blueprint
+		anchored.AnchorID = nodeID
+		appendExpectedSource(anchored, "blueprint_selection_node")
+	}
+	bindings := make(map[string]workflowBlueprintSelectionPageBinding, len(scope.PageBindings))
+	for _, binding := range scope.PageBindings {
+		if !pageNodes[binding.NodeID] {
+			return fmt.Errorf("Blueprint selection contains a binding for non-selected Page %q", binding.NodeID)
+		}
+		if _, duplicate := bindings[binding.NodeID]; duplicate {
+			return fmt.Errorf("Blueprint selection contains duplicate Page binding %q", binding.NodeID)
+		}
+		bindings[binding.NodeID] = binding
+		if binding.PageSpec != nil {
+			appendExpectedSource(*binding.PageSpec, "selected_page_spec")
+		}
+		if binding.Prototype != nil {
+			appendExpectedSource(*binding.Prototype, "selected_prototype")
+		}
+	}
+	if len(bindings) != len(pageNodes) {
+		return fmt.Errorf("Blueprint selection Page bindings do not exactly match selected Pages")
+	}
+	for nodeID := range pageNodes {
+		binding, exists := bindings[nodeID]
+		if !exists || binding.PageSpec == nil || binding.Prototype == nil {
+			return fmt.Errorf("selected Page %q is missing an exact PageSpec or Prototype binding", nodeID)
+		}
+		pageSpec, err := resolve(ctx, *binding.PageSpec)
+		if err != nil {
+			return err
+		}
+		if err := requireCurrentSelectionArtifact(pageSpec, manifest.ProjectID, "page_spec", *binding.PageSpec); err != nil {
+			return fmt.Errorf("selected Page %q PageSpec: %w", nodeID, err)
+		}
+		expectedBlueprint := scope.Blueprint
+		expectedBlueprint.AnchorID = nodeID
+		if !hasOnlyExactRequiredSelectionSource(pageSpec.Sources, "blueprint", expectedBlueprint) {
+			return fmt.Errorf("selected Page %q PageSpec does not derive from the exact Blueprint page anchor", nodeID)
+		}
+		prototype, err := resolve(ctx, *binding.Prototype)
+		if err != nil {
+			return err
+		}
+		if err := requireCurrentSelectionArtifact(prototype, manifest.ProjectID, "prototype", *binding.Prototype); err != nil {
+			return fmt.Errorf("selected Page %q Prototype: %w", nodeID, err)
+		}
+		if !hasOnlyExactRequiredSelectionSource(prototype.Sources, "page_spec", *binding.PageSpec) {
+			return fmt.Errorf("selected Page %q Prototype does not derive from the exact PageSpec", nodeID)
+		}
+	}
+	for _, source := range blueprint.Sources {
+		contextArtifact, err := resolve(ctx, source.Ref)
+		if err != nil {
+			return fmt.Errorf("resolve Blueprint selection context: %w", err)
+		}
+		if !contextArtifact.Ref.Equal(source.Ref) || contextArtifact.ProjectID != manifest.ProjectID || contextArtifact.WorkflowStatus != "approved" {
+			return fmt.Errorf("Blueprint selection context is no longer an approved same-project revision")
+		}
+		appendExpectedSource(source.Ref, "selection_context")
+	}
+	if !sameExactManifestSources(manifest.Sources, expectedSources) {
+		return fmt.Errorf("Blueprint selection manifest sources differ from the server-resolved frozen selection")
+	}
+	selectionID, err := workflowBlueprintSelectionIdentity(scope, manifest.Sources)
+	if err != nil {
+		return err
+	}
+	if selectionID != scope.SelectionID {
+		return fmt.Errorf("Blueprint selection identity does not match its canonical frozen inputs")
+	}
+	return nil
+}
+
+func sameExactManifestSources(left, right []domain.ManifestSource) bool {
+	counts := func(values []domain.ManifestSource) map[string]int {
+		result := make(map[string]int, len(values))
+		for _, source := range values {
+			result[source.Purpose+"\x00"+exactWorkflowArtifactRefKey(source.Ref)]++
+		}
+		return result
+	}
+	leftCounts, rightCounts := counts(left), counts(right)
+	if len(leftCounts) != len(rightCounts) || len(left) != len(right) {
+		return false
+	}
+	for key, count := range leftCounts {
+		if rightCounts[key] != count {
+			return false
+		}
+	}
+	return true
+}
+
+func workflowBlueprintSelectionIdentity(scope workflowBlueprintSelectionScope, sources []domain.ManifestSource) (string, error) {
+	toVersionRef := func(ref domain.ArtifactRef) core.VersionRef {
+		value := core.VersionRef{ArtifactID: ref.ArtifactID, RevisionID: ref.RevisionID, ContentHash: ref.ContentHash}
+		if ref.AnchorID != "" {
+			anchor := ref.AnchorID
+			value.AnchorID = &anchor
+		}
+		return value
+	}
+	bindings := make([]core.BlueprintSelectionPageBinding, 0, len(scope.PageBindings))
+	for _, binding := range scope.PageBindings {
+		converted := core.BlueprintSelectionPageBinding{NodeID: binding.NodeID}
+		if binding.PageSpec != nil {
+			value := toVersionRef(*binding.PageSpec)
+			converted.PageSpec = &value
+		}
+		if binding.Prototype != nil {
+			value := toVersionRef(*binding.Prototype)
+			converted.Prototype = &value
+		}
+		bindings = append(bindings, converted)
+	}
+	convertedSources := make([]core.ManifestSourceInput, 0, len(sources))
+	for _, source := range sources {
+		convertedSources = append(convertedSources, core.ManifestSourceInput{Ref: toVersionRef(source.Ref), Purpose: source.Purpose})
+	}
+	return core.BlueprintSelectionIdentity(toVersionRef(scope.Blueprint), scope.NodeIDs, bindings, convertedSources)
+}
+
+func requireCurrentSelectionArtifact(snapshot workflowSelectionArtifactSnapshot, projectID, kind string, expected domain.ArtifactRef) error {
+	if !snapshot.Ref.Equal(expected) || snapshot.ProjectID != projectID || snapshot.Kind != kind || snapshot.Lifecycle != "active" {
+		return fmt.Errorf("artifact identity, project, kind, or lifecycle drifted")
+	}
+	if snapshot.WorkflowStatus != "approved" || snapshot.LatestApprovedRevisionID != expected.RevisionID || snapshot.SyncStatus != "current" {
+		return fmt.Errorf("artifact is not its current latest-approved revision")
+	}
+	return nil
+}
+
+func hasOnlyExactRequiredSelectionSource(sources []workflowSelectionRevisionSource, purpose string, expected domain.ArtifactRef) bool {
+	count := 0
+	for _, source := range sources {
+		if strings.TrimSpace(source.Purpose) != purpose || !source.Required {
+			continue
+		}
+		count++
+		if !source.Ref.Equal(expected) {
+			return false
+		}
+	}
+	return count == 1
+}
+
+func loadWorkflowSelectionArtifactSnapshot(
+	ctx context.Context,
+	database *gorm.DB,
+	contents content.Store,
+	ref domain.ArtifactRef,
+) (workflowSelectionArtifactSnapshot, error) {
+	var row struct {
+		ProjectID                string `gorm:"column:project_id"`
+		Kind                     string `gorm:"column:kind"`
+		Lifecycle                string `gorm:"column:lifecycle"`
+		WorkflowStatus           string `gorm:"column:workflow_status"`
+		SyncStatus               string `gorm:"column:sync_status"`
+		LatestApprovedRevisionID string `gorm:"column:latest_approved_revision_id"`
+		ContentRef               string `gorm:"column:content_ref"`
+		ContentHash              string `gorm:"column:content_hash"`
+	}
+	if err := database.WithContext(ctx).Table("artifact_revisions AS revision").
+		Select("artifact.project_id::text AS project_id, artifact.kind, artifact.lifecycle, revision.workflow_status, COALESCE(health.sync_status, '') AS sync_status, COALESCE(artifact.latest_approved_revision_id::text, '') AS latest_approved_revision_id, revision.content_ref, revision.content_hash").
+		Joins("JOIN artifacts AS artifact ON artifact.id = revision.artifact_id").
+		Joins("LEFT JOIN artifact_health AS health ON health.artifact_id = artifact.id").
+		Where("revision.id = ? AND revision.artifact_id = ? AND revision.content_hash = ?", ref.RevisionID, ref.ArtifactID, ref.ContentHash).
+		Take(&row).Error; err != nil {
+		return workflowSelectionArtifactSnapshot{}, err
+	}
+	stored, err := contents.Get(ctx, row.ContentRef, row.ContentHash)
+	if err != nil {
+		return workflowSelectionArtifactSnapshot{}, err
+	}
+	var sourceRows []struct {
+		ArtifactID  string  `gorm:"column:artifact_id"`
+		RevisionID  string  `gorm:"column:revision_id"`
+		ContentHash string  `gorm:"column:content_hash"`
+		AnchorID    *string `gorm:"column:anchor_id"`
+		Purpose     string  `gorm:"column:purpose"`
+		Required    bool    `gorm:"column:required"`
+	}
+	if err := database.WithContext(ctx).Table("artifact_revision_sources AS source").
+		Select("source.source_artifact_id::text AS artifact_id, source.source_revision_id::text AS revision_id, source.source_content_hash AS content_hash, source.source_anchor_id AS anchor_id, source.purpose, source.required").
+		Where("source.revision_id = ?", ref.RevisionID).
+		Order("source.ordinal ASC, source.source_artifact_id ASC").Scan(&sourceRows).Error; err != nil {
+		return workflowSelectionArtifactSnapshot{}, err
+	}
+	snapshot := workflowSelectionArtifactSnapshot{
+		Ref: ref, ProjectID: row.ProjectID, Kind: row.Kind, Lifecycle: row.Lifecycle,
+		WorkflowStatus: row.WorkflowStatus, SyncStatus: row.SyncStatus,
+		LatestApprovedRevisionID: row.LatestApprovedRevisionID, Content: stored.Payload,
+	}
+	for _, source := range sourceRows {
+		anchor := ""
+		if source.AnchorID != nil {
+			anchor = *source.AnchorID
+		}
+		snapshot.Sources = append(snapshot.Sources, workflowSelectionRevisionSource{
+			Ref:     domain.ArtifactRef{ArtifactID: source.ArtifactID, RevisionID: source.RevisionID, ContentHash: source.ContentHash, AnchorID: anchor},
+			Purpose: source.Purpose, Required: source.Required,
+		})
+	}
+	return snapshot, nil
 }
 
 func loadRunBlueprintSelection(
@@ -534,20 +884,22 @@ func (v CoreHumanEditOutputValidator) validateProposalLineage(
 ) error {
 	pins := make(map[string]humanEditProposalPin)
 	for _, binding := range execution.Inputs.Bindings() {
-		if binding.Source.OutputProposal == nil {
-			continue
-		}
-		if binding.Source.InputManifest == nil {
+		if binding.Source.OutputProposal != nil && binding.Source.InputManifest == nil {
 			return humanEditValidationError("input.outputProposal", "proposal input is missing its immutable manifest ref")
 		}
-		pin := humanEditProposalPin{proposal: *binding.Source.OutputProposal, manifest: *binding.Source.InputManifest}
-		key := pin.proposal.ID + "\x00" + pin.proposal.PayloadHash
+	}
+	for _, lineage := range execution.Inputs.ProposalPins() {
+		pin := humanEditProposalPin{proposal: lineage.Proposal, manifest: lineage.Manifest}
+		key := lineage.ProducerNodeKey + "\x00" + lineage.ProducerDefinitionNodeID + "\x00" + pin.proposal.ID + "\x00" + pin.proposal.PayloadHash
 		if existing, duplicate := pins[key]; duplicate && existing.manifest != pin.manifest {
 			return humanEditValidationError("input.outputProposal", "proposal is bound to conflicting manifests")
 		}
 		pins[key] = pin
 	}
 	if len(pins) == 0 {
+		if execution.Workflow.InputContract != nil {
+			return humanEditValidationError("input.outputProposal", "governed human edit requires exactly one proposal input")
+		}
 		return nil
 	}
 	if len(pins) != 1 || v.Proposals == nil {
@@ -757,6 +1109,10 @@ func (v CoreWorkbenchCompletionValidator) ValidateCompletion(ctx context.Context
 		if manifest.RootOrdinal == nil || *manifest.RootOrdinal != rootOrdinal {
 			return "", fmt.Errorf("frozen build manifest root ordinal does not match bundle order")
 		}
+		if manifestGroupKey != "legacy" &&
+			(manifest.DeliverySliceID == nil || *manifest.DeliverySliceID != buildManifest.SliceIDs[rootOrdinal]) {
+			return "", fmt.Errorf("frozen build manifest delivery slice does not match bundle order")
+		}
 		rootID := manifest.RootManifestID
 		if rootID == uuid.Nil {
 			rootID = manifest.ID
@@ -803,6 +1159,10 @@ func (v CoreWorkbenchCompletionValidator) ValidateCompletion(ctx context.Context
 		}
 		if proposalManifest.RootOrdinal == nil || *proposalManifest.RootOrdinal != proposalIndex {
 			return "", fmt.Errorf("implementation proposal %s has the wrong frozen root ordinal", proposalID)
+		}
+		if manifestGroupKey != "legacy" &&
+			(proposalManifest.DeliverySliceID == nil || *proposalManifest.DeliverySliceID != buildManifest.SliceIDs[proposalIndex]) {
+			return "", fmt.Errorf("implementation proposal %s has the wrong frozen delivery slice", proposalID)
 		}
 		rootID := proposalManifest.RootManifestID
 		if rootID == uuid.Nil {
@@ -902,12 +1262,14 @@ func validateBuildManifestRootLineage(
 	visited := map[uuid.UUID]bool{}
 	current := manifest
 	expectedManifestGroup := manifest.ManifestGroupKey
+	expectedDeliverySliceID := manifest.DeliverySliceID
 	if expectedManifestGroup == nil || strings.TrimSpace(*expectedManifestGroup) == "" {
 		return fmt.Errorf("build manifest lineage has no manifest compiler group")
 	}
 	for {
 		if current.ID == uuid.Nil || current.ProjectID != projectID || current.WorkflowRunID == nil ||
 			*current.WorkflowRunID != workflowRunID || !optionalWorkflowStringEqual(current.ManifestGroupKey, expectedManifestGroup) ||
+			!optionalWorkflowStringEqual(current.DeliverySliceID, expectedDeliverySliceID) ||
 			visited[current.ID] {
 			return fmt.Errorf("build manifest lineage is invalid or cyclic")
 		}
@@ -1494,11 +1856,21 @@ func (a CoreManifestFreezer) Freeze(ctx context.Context, execution Execution) (d
 		}
 	}
 	if currentSliceID != "" {
-		if slice, exists := execution.Run.Context.Slices[currentSliceID]; exists {
-			for purpose, ref := range map[string]*domain.ArtifactRef{"delivery_slice_blueprint": &slice.Blueprint, "delivery_slice_page_spec": slice.PageSpec, "delivery_slice_prototype": slice.Prototype} {
-				if ref != nil && ref.Validate() == nil {
-					sourceByArtifact[ref.ArtifactID] = core.ManifestSourceInput{Ref: toCoreVersionRef(*ref), Purpose: purpose}
-				}
+		if _, exists := execution.Run.Context.Slices[currentSliceID]; !exists {
+			return domain.InputManifest{}, fmt.Errorf("current delivery slice %q is missing", currentSliceID)
+		}
+		pinned := make([]domain.WorkflowSliceRef, 0, 1)
+		for _, ref := range execution.Inputs.SliceRefs() {
+			if ref.ID == currentSliceID {
+				pinned = append(pinned, ref)
+			}
+		}
+		if len(pinned) != 1 {
+			return domain.InputManifest{}, fmt.Errorf("current delivery slice %q requires exactly one immutable input pin, got %d", currentSliceID, len(pinned))
+		}
+		for purpose, ref := range map[string]*domain.ArtifactRef{"delivery_slice_blueprint": pinned[0].Blueprint, "delivery_slice_page_spec": pinned[0].PageSpec, "delivery_slice_prototype": pinned[0].Prototype} {
+			if ref != nil && ref.Validate() == nil {
+				sourceByArtifact[ref.ArtifactID] = core.ManifestSourceInput{Ref: toCoreVersionRef(*ref), Purpose: purpose}
 			}
 		}
 	}
@@ -1537,7 +1909,32 @@ func (a CoreManifestFreezer) Freeze(ctx context.Context, execution Execution) (d
 		}}
 	}
 	var base *core.VersionRef
-	if a.Targets != nil {
+	if jobType == "refine_project_brief" {
+		if upstream.BaseRevision == nil {
+			return domain.InputManifest{}, fmt.Errorf("refine_project_brief requires the stable entry Project Brief base")
+		}
+		current := make([]domain.ArtifactRef, 0, 1)
+		for _, ref := range execution.Inputs.ArtifactRefs() {
+			if ref.ArtifactID != upstream.BaseRevision.ArtifactID || ref.AnchorID != "" {
+				continue
+			}
+			duplicate := false
+			for _, existing := range current {
+				if sameArtifactRevision(existing, ref) {
+					duplicate = true
+					break
+				}
+			}
+			if !duplicate {
+				current = append(current, ref)
+			}
+		}
+		if len(current) != 1 {
+			return domain.InputManifest{}, fmt.Errorf("refine_project_brief requires exactly one current whole Project Brief revision, got %d", len(current))
+		}
+		converted := toCoreVersionRef(current[0])
+		base = &converted
+	} else if a.Targets != nil {
 		base, err = a.Targets.EnsureTarget(ctx, execution, jobType, sources)
 		if err != nil {
 			return domain.InputManifest{}, err
@@ -1609,8 +2006,8 @@ type CoreWorkbenchManifestHook struct {
 }
 
 func (h CoreWorkbenchManifestHook) Compile(ctx context.Context, execution Execution) (BuildManifest, error) {
-	if h.Workbench == nil {
-		return BuildManifest{}, fmt.Errorf("workbench service is required")
+	if h.Workbench == nil || h.Proposals == nil || execution.Run.InputManifest == nil {
+		return BuildManifest{}, fmt.Errorf("workbench, proposal service and run input manifest are required")
 	}
 	if execution.Definition.ManifestCompiler == nil {
 		return BuildManifest{}, fmt.Errorf("manifest compiler node config is required")
@@ -1619,7 +2016,35 @@ func (h CoreWorkbenchManifestHook) Compile(ctx context.Context, execution Execut
 	if config.ManifestKind != "application_build" || config.SchemaVersion != 1 || config.Hook != "application-build-manifest/v1" {
 		return BuildManifest{}, fmt.Errorf("unsupported manifest compiler %s/%d/%s", config.ManifestKind, config.SchemaVersion, config.Hook)
 	}
+	upstream, err := h.Proposals.GetManifest(ctx, execution.Run.InputManifest.ID, execution.Run.StartedBy)
+	if err != nil {
+		return BuildManifest{}, err
+	}
+	if upstream.Ref() != *execution.Run.InputManifest || upstream.ProjectID != execution.Run.ProjectID {
+		return BuildManifest{}, fmt.Errorf("workflow run input manifest drifted")
+	}
+	if execution.Workflow.OutputContract == nil || execution.Workflow.OutputContract.Validate() != nil {
+		return BuildManifest{}, fmt.Errorf("application build requires a valid workflow output contract")
+	}
+	runScope := execution.Run.Scope
+	if len(runScope) == 0 {
+		runScope = json.RawMessage(`{}`)
+	}
+	runScope, err = domain.CanonicalJSON(runScope)
+	if err != nil {
+		return BuildManifest{}, fmt.Errorf("canonicalize workflow run scope: %w", err)
+	}
 	sliceRefs := execution.Inputs.SliceRefs()
+	mergedFanOutID := ""
+	for _, ref := range sliceRefs {
+		if mergedFanOutID == "" {
+			mergedFanOutID = ref.FanOutNodeID
+			continue
+		}
+		if ref.FanOutNodeID != mergedFanOutID {
+			return BuildManifest{}, fmt.Errorf("build manifest input combines multiple delivery fan-out epochs")
+		}
+	}
 	slices := make([]SliceContext, 0, len(sliceRefs))
 	for _, ref := range sliceRefs {
 		current, exists := execution.Run.Context.Slices[ref.ID]
@@ -1644,7 +2069,7 @@ func (h CoreWorkbenchManifestHook) Compile(ctx context.Context, execution Execut
 	if len(slices) == 0 {
 		return BuildManifest{}, fmt.Errorf("build manifest requires delivery slices")
 	}
-	selection, selected, err := loadRunBlueprintSelection(ctx, h.Proposals, execution)
+	selection, selected, err := blueprintSelectionScope(upstream)
 	if err != nil {
 		return BuildManifest{}, err
 	}
@@ -1669,10 +2094,21 @@ func (h CoreWorkbenchManifestHook) Compile(ctx context.Context, execution Execut
 		}
 		runID, sliceID := execution.Run.ID, slice.ID
 		ordinal := rootOrdinal
-		bundle, err := h.Workbench.CreateBundle(ctx, execution.Run.ProjectID, execution.Run.StartedBy, core.CreateWorkbenchBundleInput{
+		outputContract := *execution.Workflow.OutputContract
+		outputContract.ProducedArtifactKinds = append([]string(nil), execution.Workflow.OutputContract.ProducedArtifactKinds...)
+		createInput := core.CreateWorkbenchBundleInput{
 			PrototypeRevision: toCoreVersionRef(*slice.Prototype), WorkflowRunID: &runID,
 			ManifestGroupKey: &manifestGroupKey, RootOrdinal: &ordinal, DeliverySliceID: &sliceID,
-		})
+		}
+		buildContext := core.ApplicationBuildContext{
+			Definition: execution.Run.Definition, ExecutionProfile: execution.Run.ExecutionProfile, InputManifest: upstream, DeliverySliceID: slice.ID,
+			RunScope: runScope, OutputContract: &outputContract,
+		}
+		bundleInput := core.NewWorkflowWorkbenchBundleInput(createInput, buildContext)
+		if execution.legacyProfileView {
+			bundleInput = core.NewLegacyWorkflowWorkbenchBundleInput(createInput, buildContext)
+		}
+		bundle, err := h.Workbench.CreateBundle(ctx, execution.Run.ProjectID, execution.Run.StartedBy, bundleInput)
 		if err != nil {
 			return BuildManifest{}, err
 		}
@@ -1682,14 +2118,11 @@ func (h CoreWorkbenchManifestHook) Compile(ctx context.Context, execution Execut
 			sources = appendUniqueArtifactRef(sources, ref)
 		}
 	}
-	if h.Proposals != nil && execution.Run.InputManifest != nil {
-		upstream, err := h.Proposals.GetManifest(ctx, execution.Run.InputManifest.ID, execution.Run.StartedBy)
-		if err != nil {
-			return BuildManifest{}, err
-		}
-		for _, source := range upstream.Sources {
-			sources = appendUniqueArtifactRef(sources, source.Ref)
-		}
+	for _, source := range upstream.Sources {
+		sources = appendUniqueArtifactRef(sources, source.Ref)
+	}
+	if upstream.BaseRevision != nil {
+		sources = appendUniqueArtifactRef(sources, *upstream.BaseRevision)
 	}
 	now := time.Now().UTC()
 	if h.Now != nil {
@@ -1730,7 +2163,7 @@ func validateBlueprintSelectionSlices(selection workflowBlueprintSelectionScope,
 }
 
 type ImplementationGenerator interface {
-	GenerateImplementation(context.Context, string, string, string, string) (generation.ImplementationGenerationResult, error)
+	GenerateImplementation(context.Context, generation.ImplementationGenerationRequest) (generation.ImplementationGenerationResult, error)
 }
 
 type GenerationWorkbenchRunner struct {
@@ -1765,6 +2198,9 @@ func (r GenerationWorkbenchRunner) Run(ctx context.Context, execution Execution)
 			(state.ActiveBundle.RootBuildManifestID != "" && state.ActiveBundle.RootBuildManifestID != rootBundleID) {
 			return WorkerResult{}, fmt.Errorf("workbench lineage state does not match frozen root %s", rootBundleID)
 		}
+		if err := validateBuildManifestBundleSourceCoverage(manifest, state.ActiveBundle); err != nil {
+			return WorkerResult{}, err
+		}
 		if state.CurrentProposal != nil &&
 			(state.CurrentProposal.Status == "applied" || state.CurrentProposal.Status == "partially_applied") {
 			results = append(results, workbenchProposalResult(rootBundleID, state.ActiveBundle.ID, *state.CurrentProposal))
@@ -1777,9 +2213,12 @@ func (r GenerationWorkbenchRunner) Run(ctx context.Context, execution Execution)
 			results = append(results, workbenchProposalResult(rootBundleID, state.ActiveBundle.ID, *state.CurrentProposal))
 			return workbenchWaitInputResult(results, manifest.BundleIDs[rootIndex+1:]), nil
 		}
-		generated, err := r.Generation.GenerateImplementation(
-			ctx, state.ActiveBundle.ID, execution.Run.StartedBy, r.DefaultModel, instruction,
-		)
+		generated, err := r.Generation.GenerateImplementation(ctx, generation.ImplementationGenerationRequest{
+			BundleID: state.ActiveBundle.ID, ActorID: execution.Run.StartedBy, Model: r.DefaultModel,
+			Instruction:     instruction,
+			ExecutionSource: core.ImplementationSourceWorkflowRunner,
+			ExpectedRunID:   execution.Run.ID, ExpectedRootBundleID: rootBundleID,
+		})
 		if err != nil {
 			return WorkerResult{}, err
 		}
@@ -1821,9 +2260,9 @@ func sameOptionalWorkflowVersionRef(left, right *core.VersionRef) bool {
 		left.ContentHash == right.ContentHash && leftAnchor == rightAnchor
 }
 
-func workbenchInstruction(scope json.RawMessage, fallback string) (string, error) {
+func workbenchInstruction(scope json.RawMessage, fallback string) (generation.ImplementationInstruction, error) {
 	if len(scope) == 0 {
-		return strings.TrimSpace(fallback), nil
+		return generation.ImplementationInstruction{Objective: strings.TrimSpace(fallback)}, nil
 	}
 	var envelope struct {
 		ConversationIntent struct {
@@ -1831,26 +2270,26 @@ func workbenchInstruction(scope json.RawMessage, fallback string) (string, error
 		} `json:"conversationIntent"`
 	}
 	if err := json.Unmarshal(scope, &envelope); err != nil {
-		return "", fmt.Errorf("decode workbench instruction from run scope: %w", err)
+		return generation.ImplementationInstruction{}, fmt.Errorf("decode workbench instruction from run scope: %w", err)
 	}
 	if len(envelope.ConversationIntent.WorkbenchInstruction) == 0 || string(envelope.ConversationIntent.WorkbenchInstruction) == "null" {
-		return strings.TrimSpace(fallback), nil
+		return generation.ImplementationInstruction{Objective: strings.TrimSpace(fallback)}, nil
 	}
 	var instruction struct {
 		Objective   string   `json:"objective"`
 		Constraints []string `json:"constraints,omitempty"`
 	}
 	if err := json.Unmarshal(envelope.ConversationIntent.WorkbenchInstruction, &instruction); err != nil {
-		return "", fmt.Errorf("decode structured workbench instruction: %w", err)
+		return generation.ImplementationInstruction{}, fmt.Errorf("decode structured workbench instruction: %w", err)
 	}
 	if strings.TrimSpace(instruction.Objective) == "" {
-		return "", fmt.Errorf("conversation workbench instruction objective is required")
+		return generation.ImplementationInstruction{}, fmt.Errorf("conversation workbench instruction objective is required")
 	}
-	canonical, err := domain.CanonicalJSON(envelope.ConversationIntent.WorkbenchInstruction)
+	normalized, _, _, err := generation.CanonicalImplementationInstruction(instruction.Objective, instruction.Constraints)
 	if err != nil {
-		return "", err
+		return generation.ImplementationInstruction{}, err
 	}
-	return string(canonical), nil
+	return normalized, nil
 }
 
 type FanOutResolver interface {
@@ -1872,16 +2311,29 @@ func (r DefinitionFanOutResolver) Resolve(ctx context.Context, execution Executi
 	if config == nil {
 		return nil, fmt.Errorf("fan-out node config is required")
 	}
+	var items []FanOutItem
+	var err error
 	if config.ItemKind == "delivery_slice" && r.DeliverySlices != nil {
-		return r.DeliverySlices.Resolve(ctx, execution)
-	}
-	if config.ItemKind == "blueprint_page" || config.ItemKind == "blueprint_selection_page" {
+		items, err = r.DeliverySlices.Resolve(ctx, execution)
+	} else if config.ItemKind == "blueprint_page" || config.ItemKind == "blueprint_selection_page" {
 		if r.BlueprintPages == nil {
 			return nil, fmt.Errorf("blueprint_page fan-out resolver is required")
 		}
-		return r.BlueprintPages.Resolve(ctx, execution)
+		items, err = r.BlueprintPages.Resolve(ctx, execution)
+	} else {
+		items, err = (InputEnvelopeFanOutResolver{}).Resolve(ctx, execution)
 	}
-	return InputEnvelopeFanOutResolver{}.Resolve(ctx, execution)
+	if err != nil {
+		return nil, err
+	}
+	limit, err := effectiveFanOutMaxItems(config)
+	if err != nil {
+		return nil, err
+	}
+	if len(items) > limit {
+		return nil, fmt.Errorf("fan-out resolver produced %d items, exceeding maxItems %d", len(items), limit)
+	}
+	return items, nil
 }
 
 // CoreBlueprintPageFanOutResolver derives branches only from the immutable
@@ -2031,57 +2483,17 @@ type semanticBlueprintPage struct {
 }
 
 func semanticBlueprintPages(content json.RawMessage) ([]semanticBlueprintPage, error) {
-	type node struct {
-		ID             string   `json:"id"`
-		Key            string   `json:"key"`
-		Kind           string   `json:"kind"`
-		Type           string   `json:"type"`
-		Title          string   `json:"title"`
-		Description    string   `json:"description"`
-		Route          string   `json:"route"`
-		UserGoal       string   `json:"userGoal"`
-		RequirementIDs []string `json:"requirementIds"`
+	decoded, err := core.DecodeBlueprintPages(content)
+	if err != nil {
+		return nil, err
 	}
-	var blueprint struct {
-		Nodes    []node `json:"nodes"`
-		Semantic *struct {
-			Nodes []node `json:"nodes"`
-		} `json:"semantic"`
-	}
-	if err := json.Unmarshal(content, &blueprint); err != nil {
-		return nil, fmt.Errorf("decode Blueprint semantic graph: %w", err)
-	}
-	nodes := blueprint.Nodes
-	if blueprint.Semantic != nil {
-		nodes = blueprint.Semantic.Nodes
-	}
-	pages := make([]semanticBlueprintPage, 0)
-	seenIDs := map[string]struct{}{}
-	for _, candidate := range nodes {
-		kind := strings.TrimSpace(candidate.Kind)
-		if kind == "" {
-			kind = strings.TrimSpace(candidate.Type)
-		}
-		if !strings.EqualFold(kind, "page") {
-			continue
-		}
-		page := semanticBlueprintPage{
-			ID: strings.TrimSpace(candidate.ID), Key: strings.TrimSpace(candidate.Key),
-			Title: strings.TrimSpace(candidate.Title), Description: strings.TrimSpace(candidate.Description),
-			Route: strings.TrimSpace(candidate.Route), UserGoal: strings.TrimSpace(candidate.UserGoal),
-			RequirementIDs: append([]string(nil), candidate.RequirementIDs...),
-		}
-		if page.ID == "" || page.Key == "" || page.Title == "" || !strings.HasPrefix(page.Route, "/") || page.UserGoal == "" {
-			return nil, fmt.Errorf("every semantic Blueprint Page requires id, key, title, absolute route, and userGoal")
-		}
-		if _, duplicate := seenIDs[page.ID]; duplicate {
-			return nil, fmt.Errorf("Blueprint Page ids must be unique")
-		}
-		seenIDs[page.ID] = struct{}{}
-		pages = append(pages, page)
-	}
-	if len(pages) == 0 {
-		return nil, fmt.Errorf("current approved Blueprint contains no semantic Page nodes")
+	pages := make([]semanticBlueprintPage, 0, len(decoded))
+	for _, page := range decoded {
+		pages = append(pages, semanticBlueprintPage{
+			ID: page.ID, Key: page.Key, Title: page.Title, Description: page.Description,
+			Route: page.Route, UserGoal: page.UserGoal,
+			RequirementIDs: append([]string(nil), page.RequirementIDs...),
+		})
 	}
 	return pages, nil
 }
@@ -2220,6 +2632,13 @@ func (r FanOutRunner) Run(ctx context.Context, e Execution) (WorkerResult, error
 	if err != nil {
 		return WorkerResult{}, err
 	}
+	limit, err := effectiveFanOutMaxItems(e.Definition.FanOut)
+	if err != nil {
+		return WorkerResult{}, err
+	}
+	if len(items) > limit {
+		return WorkerResult{}, fmt.Errorf("fan-out resolver produced %d items, exceeding maxItems %d", len(items), limit)
+	}
 	return WorkerResult{Disposition: ResultComplete, FanOutItems: items}, nil
 }
 
@@ -2334,7 +2753,9 @@ func (r CoreQualityManifestResolver) Resolve(
 			continue
 		}
 		for ordinal, bundleID := range manifest.BundleIDs {
-			if bundleID == rootID.String() && ordinal == *producer.RootOrdinal && ordinal == len(manifest.BundleIDs)-1 {
+			if bundleID == rootID.String() && ordinal == *producer.RootOrdinal && ordinal == len(manifest.BundleIDs)-1 &&
+				(producer.ManifestGroupKey != nil && *producer.ManifestGroupKey == "legacy" ||
+					producer.DeliverySliceID != nil && *producer.DeliverySliceID == manifest.SliceIDs[ordinal]) {
 				matches = append(matches, manifest)
 				break
 			}
@@ -2520,7 +2941,40 @@ func refsFromBundle(bundle core.WorkbenchBundle) []domain.ArtifactRef {
 	for _, ref := range bundle.DesignSystemRevisions {
 		refs = append(refs, fromCoreVersionRef(ref))
 	}
+	for _, contextRevision := range bundle.ContextRevisions {
+		refs = append(refs, fromCoreVersionRef(contextRevision.Revision))
+	}
+	if bundle.WorkflowContext != nil {
+		if bundle.WorkflowContext.InputManifest.BaseRevision != nil {
+			refs = append(refs, *bundle.WorkflowContext.InputManifest.BaseRevision)
+		}
+		for _, source := range bundle.WorkflowContext.InputManifest.Sources {
+			refs = append(refs, source.Ref)
+		}
+	}
 	return refs
+}
+
+func validateBuildManifestBundleSourceCoverage(manifest BuildManifest, bundle core.WorkbenchBundle) error {
+	if bundle.ManifestHash == "" {
+		// Runner unit adapters may provide only lineage coordinates. Production
+		// CoreWorkbenchAPI always returns a hash-verified frozen bundle.
+		return nil
+	}
+	available := make(map[string]struct{}, len(manifest.Sources))
+	for _, ref := range manifest.Sources {
+		available[artifactRefIdentity(ref)] = struct{}{}
+	}
+	for _, required := range refsFromBundle(bundle) {
+		if _, exists := available[artifactRefIdentity(required)]; !exists {
+			return fmt.Errorf("build manifest sources omit frozen Workbench bundle revision %s/%s", required.ArtifactID, required.RevisionID)
+		}
+	}
+	return nil
+}
+
+func artifactRefIdentity(ref domain.ArtifactRef) string {
+	return ref.ArtifactID + "\x00" + ref.RevisionID + "\x00" + ref.ContentHash + "\x00" + ref.AnchorID
 }
 func appendUniqueArtifactRef(refs []domain.ArtifactRef, candidate domain.ArtifactRef) []domain.ArtifactRef {
 	for _, ref := range refs {

@@ -41,16 +41,111 @@ type Engine struct {
 	ManifestCompilers        *BuildManifestRegistry
 	ConditionEvaluator       ConditionEvaluator
 	Capabilities             WorkflowCapabilities
+	ExecutionProfiles        *WorkflowExecutionProfileRegistry
+	// RequireGovernedStarts is enabled by the production platform bootstrap.
+	// Generic engines retain legacy start support for replay/unit fixtures.
+	RequireGovernedStarts bool
 }
 
 func NewEngine(store Store) (*Engine, error) {
 	if store == nil {
 		return nil, fmt.Errorf("workflow store is required")
 	}
+	profiles, err := NewBuiltinWorkflowExecutionProfileRegistry()
+	if err != nil {
+		return nil, err
+	}
 	return &Engine{
 		Store: store, IDs: UUIDGenerator{}, Clock: realClock{}, LeaseDuration: 2 * time.Minute,
-		RetryBackoff: defaultRetryBackoff, Capabilities: PlatformWorkflowCapabilities(true, true),
+		RetryBackoff: defaultRetryBackoff, Capabilities: PlatformWorkflowCapabilities(true, true), ExecutionProfiles: profiles,
 	}, nil
+}
+
+func (e *Engine) executionProfile(ref domain.WorkflowExecutionProfileRef) (WorkflowExecutionProfileBundle, error) {
+	if e == nil || e.ExecutionProfiles == nil {
+		return WorkflowExecutionProfileBundle{}, fmt.Errorf("workflow execution profile registry is required")
+	}
+	if err := e.SealExecutionProfiles(); err != nil {
+		return WorkflowExecutionProfileBundle{}, err
+	}
+	return e.ExecutionProfiles.Resolve(ref)
+}
+
+func (e *Engine) supportedExecutionProfiles() []domain.WorkflowExecutionProfileRef {
+	if e == nil || e.ExecutionProfiles == nil || !e.ExecutionProfiles.IsSealed() {
+		return nil
+	}
+	return e.ExecutionProfiles.SupportedRefs()
+}
+
+// SealExecutionProfiles captures bootstrap dispatch exactly once. It is safe to
+// call repeatedly; the first call wins and later Engine registry replacement
+// cannot affect an existing profile bundle.
+func (e *Engine) SealExecutionProfiles() error {
+	if e == nil || e.ExecutionProfiles == nil {
+		return fmt.Errorf("workflow execution profile registry is required")
+	}
+	if e.ExecutionProfiles.IsSealed() {
+		return nil
+	}
+	return e.ExecutionProfiles.Seal(e.captureExecutionRuntime())
+}
+
+// SealProductionExecutionProfiles additionally proves that the runtime
+// bootstrap implements the complete current v2 descriptor. Production never
+// advertises a descriptor with condition/compiler/runner dispatch missing.
+func (e *Engine) SealProductionExecutionProfiles() error {
+	if e == nil {
+		return fmt.Errorf("workflow execution engine is required")
+	}
+	descriptor := CurrentWorkflowExecutionProfileDescriptor()
+	expectedCapabilities, err := domain.CanonicalHash(descriptor.Capabilities)
+	if err != nil {
+		return err
+	}
+	actualCapabilities, err := domain.CanonicalHash(e.Capabilities)
+	if err != nil {
+		return err
+	}
+	if expectedCapabilities != actualCapabilities {
+		return fmt.Errorf("production workflow capabilities do not match the current execution profile descriptor")
+	}
+	runtime := e.captureExecutionRuntime()
+	if runtime.conditionEvaluator == nil || runtime.manifestFreezer == nil || runtime.artifactInputs == nil || runtime.startArtifactKinds == nil || runtime.proposalDispatcher == nil || runtime.humanEditOutput == nil || runtime.workbenchCompletion == nil || runtime.reviewGate == nil {
+		return fmt.Errorf("production workflow condition, manifest, artifact, proposal and human control-plane dispatch are incomplete")
+	}
+	if err := e.ExecutionProfiles.Seal(runtime); err != nil {
+		return err
+	}
+	_, err = e.ExecutionProfiles.Resolve(CurrentWorkflowExecutionProfileRef())
+	return err
+}
+
+// Readiness reports active nonterminal runs that this process cannot execute.
+// Profile-aware claiming still permits mixed-version rolling deployments, but
+// an unsupported profile with no local bundle must be observable rather than
+// leaving a permanently ready node that no worker can claim.
+func (e *Engine) Readiness(ctx context.Context) error {
+	if e == nil || e.Store == nil || e.ExecutionProfiles == nil {
+		return fmt.Errorf("workflow execution engine is not initialized")
+	}
+	if err := e.SealExecutionProfiles(); err != nil {
+		return err
+	}
+	active, err := e.Store.ListActiveExecutionProfiles(ctx)
+	if err != nil {
+		return err
+	}
+	supported := make(map[domain.WorkflowExecutionProfileRef]bool)
+	for _, ref := range e.supportedExecutionProfiles() {
+		supported[ref] = true
+	}
+	for _, ref := range active {
+		if !supported[ref] {
+			return fmt.Errorf("active workflow run requires unsupported execution profile %s/%s", ref.Version, ref.Hash)
+		}
+	}
+	return nil
 }
 
 type StartRequest struct {
@@ -60,9 +155,84 @@ type StartRequest struct {
 	InputManifest       domain.ManifestRef
 	Scope               json.RawMessage
 	StartedBy           string
+	provenance          startRequestProvenance
+}
+
+type startRequestProvenance struct {
+	acceptedConversationCommandID string
+	definitionVersionID           string
+	inputManifest                 domain.ManifestRef
+	scopeHash                     string
+}
+
+// NewAcceptedConversationCommandStartRequest is the only constructor that can
+// mint the private provenance required for a reviewed conversation command.
+// Transport callers can still build ordinary StartRequest values, but cannot
+// authorize the reserved scope.conversationIntent control-plane envelope.
+func NewAcceptedConversationCommandStartRequest(
+	commandID, definitionVersionID string,
+	inputManifest domain.ManifestRef,
+	scope json.RawMessage,
+) (StartRequest, error) {
+	scopeHash, err := domain.CanonicalHash(scope)
+	if err != nil {
+		return StartRequest{}, &domain.DomainError{Kind: domain.ErrInvalidArgument, Field: "scope", Message: "accepted conversation command scope must be canonicalizable JSON"}
+	}
+	return StartRequest{
+		RunID: commandID, DefinitionVersionID: definitionVersionID,
+		InputManifest: inputManifest, Scope: cloneRaw(scope),
+		provenance: startRequestProvenance{
+			acceptedConversationCommandID: commandID,
+			definitionVersionID:           definitionVersionID, inputManifest: inputManifest, scopeHash: scopeHash,
+		},
+	}, nil
+}
+
+// AcceptedConversationCommandID exposes immutable provenance for diagnostics
+// and contract tests without allowing callers to manufacture it.
+func (r StartRequest) AcceptedConversationCommandID() (string, bool) {
+	commandID := strings.TrimSpace(r.provenance.acceptedConversationCommandID)
+	return commandID, commandID != ""
+}
+
+func validateStartRequestScope(request StartRequest) error {
+	if len(request.Scope) == 0 {
+		if _, trusted := request.AcceptedConversationCommandID(); trusted {
+			return &domain.DomainError{Kind: domain.ErrInvalidArgument, Field: "scope.conversationIntent", Message: "accepted conversation command provenance requires its reviewed intent envelope"}
+		}
+		return nil
+	}
+	var scope map[string]json.RawMessage
+	if err := json.Unmarshal(request.Scope, &scope); err != nil || scope == nil {
+		return &domain.DomainError{Kind: domain.ErrInvalidArgument, Field: "scope", Message: "workflow scope must be a JSON object"}
+	}
+	_, reserved := scope["conversationIntent"]
+	commandID, trusted := request.AcceptedConversationCommandID()
+	if !reserved {
+		if trusted {
+			return &domain.DomainError{Kind: domain.ErrInvalidArgument, Field: "scope.conversationIntent", Message: "accepted conversation command provenance requires its reviewed intent envelope"}
+		}
+		return nil
+	}
+	if !trusted || commandID != strings.TrimSpace(request.RunID) {
+		return &domain.DomainError{Kind: domain.ErrInvalidArgument, Field: "scope.conversationIntent", Message: "reserved conversation intent scope requires an accepted server command"}
+	}
+	scopeHash, err := domain.CanonicalHash(request.Scope)
+	if err != nil || request.provenance.definitionVersionID != request.DefinitionVersionID ||
+		request.provenance.inputManifest != request.InputManifest || request.provenance.scopeHash != scopeHash {
+		return &domain.DomainError{Kind: domain.ErrInvalidArgument, Field: "scope.conversationIntent", Message: "accepted conversation command provenance does not match the exact start request"}
+	}
+	var intent map[string]json.RawMessage
+	if err := json.Unmarshal(scope["conversationIntent"], &intent); err != nil || intent == nil {
+		return &domain.DomainError{Kind: domain.ErrInvalidArgument, Field: "scope.conversationIntent", Message: "reviewed conversation intent envelope must be a JSON object"}
+	}
+	return nil
 }
 
 func (e *Engine) Start(ctx context.Context, request StartRequest) (*RunRecord, error) {
+	if err := validateStartRequestScope(request); err != nil {
+		return nil, err
+	}
 	definitionRecord, err := e.Store.GetDefinitionVersion(ctx, request.DefinitionVersionID)
 	if err != nil {
 		return nil, err
@@ -70,16 +240,28 @@ func (e *Engine) Start(ctx context.Context, request StartRequest) (*RunRecord, e
 	if !definitionRecord.Published {
 		return nil, fmt.Errorf("workflow definition version is not published")
 	}
+	selectedProfile := definitionRecord.ExecutionProfile
+	currentProfile := CurrentWorkflowExecutionProfileRef()
+	legacyProfile := LegacyWorkflowExecutionProfileRef()
+	currentDefinition := selectedProfile == currentProfile && definitionRecord.Definition.ExecutionProfile == currentProfile
+	isolatedLegacyDefinition := !e.RequireGovernedStarts && selectedProfile == legacyProfile &&
+		definitionRecord.Definition.ExecutionProfile == legacyProfile
+	if !currentDefinition && !isolatedLegacyDefinition {
+		return nil, &domain.DomainError{Kind: domain.ErrInvalidArgument, Field: "workflow.executionProfile", Message: "new production runs require the current exact execution profile"}
+	}
+	profile, err := e.executionProfile(selectedProfile)
+	if err != nil {
+		return nil, err
+	}
+	runtime := profile.executionRuntime(e)
 	if definitionRecord.ProjectID != "" && definitionRecord.ProjectID != request.ProjectID {
 		return nil, fmt.Errorf("workflow definition belongs to another project")
 	}
-	if err := definitionRecord.Definition.Validate(); err != nil {
+	if err := ValidateDefinitionForExecutionProfile(definitionRecord.Definition, definitionRecord.ExecutionProfile); err != nil {
 		return nil, err
 	}
-	if definitionRecord.Definition.InputContract != nil {
-		if err := e.Capabilities.ValidateDefinition(definitionRecord.Definition); err != nil {
-			return nil, err
-		}
+	if e.RequireGovernedStarts && definitionRecord.Definition.InputContract == nil {
+		return nil, &domain.DomainError{Kind: domain.ErrInvalidArgument, Field: "workflow.inputContract", Message: "production workflow starts require a governed input contract"}
 	}
 	manifest, err := e.Store.GetManifest(ctx, request.InputManifest.ID)
 	if err != nil {
@@ -91,17 +273,31 @@ func (e *Engine) Start(ctx context.Context, request StartRequest) (*RunRecord, e
 	if manifest.Ref() != request.InputManifest || manifest.ProjectID != request.ProjectID {
 		return nil, domain.ErrManifestUnpinned
 	}
-	var artifactKinds []string
+	if err := ValidateStartManifestJobType(definitionRecord.Definition, manifest.JobType); err != nil {
+		return nil, &domain.DomainError{Kind: domain.ErrInvalidArgument, Field: "inputManifest.jobType", Message: "the input manifest job type is incompatible with the selected workflow definition"}
+	}
+	metadata := StartArtifactMetadata{}
 	if definitionRecord.Definition.InputContract != nil {
-		if e.StartArtifactKinds == nil {
+		if runtime.startArtifactKinds == nil {
 			return nil, fmt.Errorf("workflow start artifact-kind resolver is required")
 		}
-		artifactKinds, err = e.StartArtifactKinds.ResolveStartArtifactKinds(ctx, manifest)
-		if err != nil {
-			return nil, err
+		if resolver, ok := runtime.startArtifactKinds.(StartArtifactMetadataResolver); ok {
+			metadata, err = resolver.ResolveStartArtifactMetadata(ctx, manifest)
+			if err != nil {
+				return nil, err
+			}
+		} else {
+			metadata.Kinds, err = runtime.startArtifactKinds.ResolveStartArtifactKinds(ctx, manifest)
+			if err != nil {
+				return nil, err
+			}
+			metadata.Count = len(artifactInputRefs(manifest))
+			if definitionRecord.Definition.InputContract.RequireApproved {
+				return nil, fmt.Errorf("workflow start approval metadata resolver is required")
+			}
 		}
 	}
-	if err := CompatibleStart(definitionRecord.Definition, DescribeStartManifest(manifest, artifactKinds), ""); err != nil {
+	if err := CompatibleStart(definitionRecord.Definition, DescribeStartManifest(manifest, metadata), ""); err != nil {
 		return nil, &domain.DomainError{
 			Kind: domain.ErrInvalidArgument, Field: "inputManifest",
 			Message: "the input manifest contract is incompatible with the selected workflow definition",
@@ -121,7 +317,7 @@ func (e *Engine) Start(ctx context.Context, request StartRequest) (*RunRecord, e
 	if err != nil {
 		return nil, err
 	}
-	run := &RunRecord{ID: runID, ProjectID: request.ProjectID, DefinitionVersionID: request.DefinitionVersionID, Definition: definitionRecord.Definition.Ref(), InputManifest: &request.InputManifest, Status: RunRunning, Scope: cloneRaw(request.Scope), Context: contextState, StartedBy: request.StartedBy, StartedAt: timePointer(now), CreatedAt: now, UpdatedAt: now, Nodes: map[string]*NodeRecord{}}
+	run := &RunRecord{ID: runID, ProjectID: request.ProjectID, DefinitionVersionID: request.DefinitionVersionID, Definition: definitionRecord.Definition.RefForExecutionProfile(selectedProfile), ExecutionProfile: selectedProfile, InputManifest: &request.InputManifest, Status: RunRunning, Scope: cloneRaw(request.Scope), Context: contextState, StartedBy: request.StartedBy, StartedAt: timePointer(now), CreatedAt: now, UpdatedAt: now, Nodes: map[string]*NodeRecord{}}
 	if len(run.Scope) == 0 {
 		run.Scope = json.RawMessage(`{}`)
 	}
@@ -146,7 +342,7 @@ func (e *Engine) Start(ctx context.Context, request StartRequest) (*RunRecord, e
 	if err := run.Validate(); err != nil {
 		return nil, err
 	}
-	events := []Event{{ID: e.id(), RunID: run.ID, Type: "run.started", Payload: mustJSON(map[string]any{"definitionVersionId": request.DefinitionVersionID, "manifestId": request.InputManifest.ID}), ActorID: request.StartedBy, CreatedAt: now}}
+	events := []Event{{ID: e.id(), RunID: run.ID, Type: "run.started", Payload: mustJSON(map[string]any{"definitionVersionId": request.DefinitionVersionID, "manifestId": request.InputManifest.ID, "executionProfile": selectedProfile}), ActorID: request.StartedBy, CreatedAt: now}}
 	if entryNode := run.Nodes[entry]; entryNode != nil && entryNode.Status == NodeWaitingInput {
 		events = append(events, Event{ID: e.id(), RunID: run.ID, Type: "node.execution_authorization_required", NodeKey: entry, Payload: json.RawMessage(`{}`), CreatedAt: now})
 	}
@@ -157,7 +353,10 @@ func (e *Engine) Start(ctx context.Context, request StartRequest) (*RunRecord, e
 }
 
 func (e *Engine) ClaimAndExecute(ctx context.Context, workerID string) error {
-	lease, err := e.Store.ClaimRunnable(ctx, workerID, e.now(), e.leaseDuration())
+	if err := e.SealExecutionProfiles(); err != nil {
+		return err
+	}
+	lease, err := e.Store.ClaimRunnable(ctx, workerID, e.now(), e.leaseDuration(), e.supportedExecutionProfiles()...)
 	if err != nil {
 		return err
 	}
@@ -172,22 +371,29 @@ func (e *Engine) ExecuteLease(ctx context.Context, lease Lease) error {
 	if node.Status != NodeRunning || node.LeaseOwner != lease.WorkerID || node.ID != lease.NodeID || node.Attempt != lease.Attempt {
 		return ErrLeaseLost
 	}
-	inputs, err := buildNodeInputEnvelope(run, definitionRecord.Definition, node)
+	profile, err := e.executionProfile(run.ExecutionProfile)
+	if err != nil {
+		return err
+	}
+	inputs, err := profile.buildInputs(run, definitionRecord.Definition, node)
 	if err != nil {
 		return e.handleFailure(ctx, run, definitionRecord.Definition, node, lease, err)
 	}
 	execution := Execution{Run: *run, Node: *node, Definition: definition, Workflow: definitionRecord.Definition, Lease: lease, Inputs: inputs}
 	if _, _, required := nodeExecutionPolicy(definition); required && run.Context.Nodes[node.Key].ExecutionActor == nil {
-		return e.applyResult(ctx, run, definitionRecord.Definition, node, lease, execution, WorkerResult{Disposition: ResultWaitInput})
+		return profile.applyResult(ctx, e, run, definitionRecord.Definition, node, lease, execution, WorkerResult{Disposition: ResultWaitInput})
 	}
-	result, runErr := e.executeNode(ctx, execution)
+	result, runErr := profile.executeNode(ctx, e, execution)
 	if runErr != nil {
 		return e.handleFailure(ctx, run, definitionRecord.Definition, node, lease, runErr)
 	}
-	return e.applyResult(ctx, run, definitionRecord.Definition, node, lease, execution, result)
+	return profile.applyResult(ctx, e, run, definitionRecord.Definition, node, lease, execution, result)
 }
 
-func (e *Engine) executeNode(ctx context.Context, execution Execution) (WorkerResult, error) {
+// executeNodeV0V1Frozen is the migration-cut interpreter shared by the two
+// already-issued profile descriptors. Never change its semantics for a future
+// engine revision; add executeNodeV2 and a new profile bundle instead.
+func (e *Engine) executeNodeV0V1Frozen(ctx context.Context, runtime workflowExecutionRuntime, execution Execution) (WorkerResult, error) {
 	node := execution.Definition
 	switch node.Type {
 	case domain.NodeArtifactInput:
@@ -199,8 +405,8 @@ func (e *Engine) executeNode(ctx context.Context, execution Execution) (WorkerRe
 			return WorkerResult{}, err
 		}
 		output := mustJSON(map[string]any{"payload": map[string]any{"manifestId": manifest.ID, "manifestHash": manifest.Hash}})
-		if e.ArtifactInputs != nil {
-			output, err = e.ArtifactInputs.Validate(ctx, execution, manifest)
+		if runtime.artifactInputs != nil {
+			output, err = runtime.artifactInputs.Validate(ctx, execution, manifest)
 			if err != nil {
 				return WorkerResult{}, err
 			}
@@ -213,14 +419,14 @@ func (e *Engine) executeNode(ctx context.Context, execution Execution) (WorkerRe
 	case domain.NodeMerge:
 		return WorkerResult{Disposition: ResultComplete}, nil
 	case domain.NodeAITransform, domain.NodeAI:
-		if e.ManifestFreezer != nil {
-			manifest, err := e.ManifestFreezer.Freeze(ctx, execution)
+		if runtime.manifestFreezer != nil {
+			manifest, err := runtime.manifestFreezer.Freeze(ctx, execution)
 			if err != nil {
 				return WorkerResult{}, err
 			}
 			var proposal *domain.ProposalRef
-			if e.ProposalDispatcher != nil {
-				proposal, err = e.ProposalDispatcher.Dispatch(ctx, execution, manifest)
+			if runtime.proposalDispatcher != nil {
+				proposal, err = runtime.proposalDispatcher.Dispatch(ctx, execution, manifest)
 				if err != nil {
 					return WorkerResult{}, err
 				}
@@ -232,8 +438,13 @@ func (e *Engine) executeNode(ctx context.Context, execution Execution) (WorkerRe
 			return WorkerResult{Disposition: disposition, Manifest: &manifest, Proposal: proposal}, nil
 		}
 	case domain.NodeManifestCompiler:
-		if e.ManifestCompilers != nil {
-			manifest, err := e.ManifestCompilers.Compile(ctx, execution)
+		if execution.Definition.ManifestCompiler != nil && len(runtime.manifestCompilers) > 0 {
+			config := execution.Definition.ManifestCompiler
+			compiler := runtime.manifestCompilers[manifestCompilerKey(config.ManifestKind, config.SchemaVersion, config.Hook)]
+			if compiler == nil {
+				return WorkerResult{}, fmt.Errorf("%w for manifest compiler %s/%d/%s", ErrRunnerNotFound, config.ManifestKind, config.SchemaVersion, config.Hook)
+			}
+			manifest, err := compiler.Compile(ctx, execution)
 			if err != nil {
 				return WorkerResult{}, err
 			}
@@ -244,8 +455,8 @@ func (e *Engine) executeNode(ctx context.Context, execution Execution) (WorkerRe
 		}
 		// Legacy definitions and isolated engine tests retain their injected hook;
 		// governed platform definitions always use the exact dispatcher above.
-		if execution.Workflow.InputContract == nil && e.BuildManifestHook != nil && execution.Definition.ManifestCompiler != nil {
-			manifest, err := e.BuildManifestHook.Compile(ctx, execution)
+		if execution.Workflow.InputContract == nil && runtime.buildManifestHook != nil && execution.Definition.ManifestCompiler != nil {
+			manifest, err := runtime.buildManifestHook.Compile(ctx, execution)
 			if err != nil {
 				return WorkerResult{}, err
 			}
@@ -255,18 +466,15 @@ func (e *Engine) executeNode(ctx context.Context, execution Execution) (WorkerRe
 			return WorkerResult{Disposition: ResultComplete, BuildManifest: &manifest}, nil
 		}
 	case domain.NodeCondition:
-		if e.ConditionEvaluator != nil {
-			branch, err := e.ConditionEvaluator.Evaluate(ctx, execution, node.Condition.Branches)
+		if runtime.conditionEvaluator != nil {
+			branch, err := runtime.conditionEvaluator.Evaluate(ctx, execution, node.Condition.Branches)
 			if err != nil {
 				return WorkerResult{}, err
 			}
 			return WorkerResult{Disposition: ResultComplete, Branch: branch}, nil
 		}
 	}
-	if e.Runners == nil {
-		return WorkerResult{}, fmt.Errorf("%w for %s", ErrRunnerNotFound, node.Type)
-	}
-	runner, exists := e.Runners.RunnerFor(node.Type)
+	runner, exists := runtime.runners[node.Type]
 	if !exists {
 		return WorkerResult{}, fmt.Errorf("%w for %s", ErrRunnerNotFound, node.Type)
 	}
@@ -279,11 +487,13 @@ func (e *Engine) executeNode(ctx context.Context, execution Execution) (WorkerRe
 	return runner.Run(runContext, execution)
 }
 
-func (e *Engine) applyResult(ctx context.Context, run *RunRecord, definition domain.WorkflowDefinition, node *NodeRecord, lease Lease, execution Execution, result WorkerResult) error {
+// applyResultV0V1Frozen is immutable historical interpreter code. New profiles
+// must add a new apply function rather than editing this migration-cut helper.
+func (e *Engine) applyResultV0V1Frozen(ctx context.Context, runtime workflowExecutionRuntime, run *RunRecord, definition domain.WorkflowDefinition, node *NodeRecord, lease Lease, execution Execution, result WorkerResult, validate profileValidateResultFunc, reconcile profileReconcileFunc) error {
 	if result.Disposition == "" {
 		result.Disposition = ResultComplete
 	}
-	if err := e.validateResult(ctx, run, definition, node, execution, &result); err != nil {
+	if err := validate(ctx, e, runtime, run, definition, node, execution, &result); err != nil {
 		return e.handleFailure(ctx, run, definition, node, lease, err)
 	}
 	now := e.now()
@@ -349,7 +559,7 @@ func (e *Engine) applyResult(ctx context.Context, run *RunRecord, definition dom
 			e.cancelUnneededMergeBranches(run, definition, definitionNode, builder)
 		}
 	}
-	e.reconcile(run, definition, builder)
+	reconcile(e, runtime, run, definition, builder)
 	e.refreshRunStatus(run, definition, now)
 	return e.Store.Commit(ctx, builder.build())
 }
@@ -379,7 +589,9 @@ func (e *Engine) cancelUnneededMergeBranches(run *RunRecord, definition domain.W
 	}
 }
 
-func (e *Engine) validateResult(ctx context.Context, run *RunRecord, definition domain.WorkflowDefinition, node *NodeRecord, execution Execution, result *WorkerResult) error {
+// validateResultV0V1Frozen is immutable historical interpreter code. New
+// validation behavior belongs in a new execution-profile implementation.
+func (e *Engine) validateResultV0V1Frozen(ctx context.Context, run *RunRecord, definition domain.WorkflowDefinition, node *NodeRecord, execution Execution, result *WorkerResult) error {
 	definitionNode, _ := definition.FindNode(node.DefinitionNodeID)
 	if len(result.Output) > 0 {
 		canonical, err := domain.CanonicalJSON(result.Output)
@@ -450,6 +662,13 @@ func (e *Engine) validateResult(ctx context.Context, run *RunRecord, definition 
 	case domain.NodeFanOut:
 		if len(result.FanOutItems) == 0 {
 			return fmt.Errorf("fan-out produced no items")
+		}
+		limit, err := effectiveFanOutMaxItems(definitionNode.FanOut)
+		if err != nil {
+			return err
+		}
+		if len(result.FanOutItems) > limit {
+			return fmt.Errorf("fan-out produced %d items, exceeding maxItems %d", len(result.FanOutItems), limit)
 		}
 	case domain.NodeManifestCompiler:
 		if result.BuildManifest == nil {
@@ -584,6 +803,11 @@ func (e *Engine) SubmitHumanInput(ctx context.Context, runID, nodeKey string, ou
 	if err != nil {
 		return err
 	}
+	profile, err := e.executionProfile(run.ExecutionProfile)
+	if err != nil {
+		return err
+	}
+	runtime := profile.executionRuntime(e)
 	if node.Status != NodeWaitingInput || (definitionNode.Type != domain.NodeHumanEdit && definitionNode.Type != domain.NodeHumanTask && definitionNode.Type != domain.NodeArtifactInput && definitionNode.Type != domain.NodeWorkbenchBuild) {
 		return &domain.DomainError{Kind: domain.ErrInvalidTransition, Field: "node", Message: "node is not waiting for human input"}
 	}
@@ -604,23 +828,23 @@ func (e *Engine) SubmitHumanInput(ctx context.Context, runID, nodeKey string, ou
 		}
 	}
 	if definitionNode.Type == domain.NodeWorkbenchBuild {
-		if e.WorkbenchCompletion == nil {
+		if runtime.workbenchCompletion == nil {
 			return fmt.Errorf("workbench completion validator is required")
 		}
-		outputRevisionID, err = e.WorkbenchCompletion.ValidateCompletion(ctx, Execution{Run: *run, Node: *node, Definition: definitionNode, Inputs: storedInputs}, canonical)
+		outputRevisionID, err = runtime.workbenchCompletion.ValidateCompletion(ctx, Execution{Run: *run, Node: *node, Definition: definitionNode, Inputs: storedInputs}, canonical)
 		if err != nil {
 			return err
 		}
 	}
 	var humanEdit HumanEditValidation
 	if definitionNode.Type == domain.NodeHumanEdit {
-		if e.HumanEditOutput == nil {
+		if runtime.humanEditOutput == nil {
 			return fmt.Errorf("human edit output validator is required")
 		}
 		if !hasStoredInputs && len(record.Definition.Incoming(definitionNode.ID)) > 0 {
 			return &domain.DomainError{Kind: domain.ErrValidation, Field: "input", Message: "human edit input lineage is missing"}
 		}
-		humanEdit, err = e.HumanEditOutput.ValidateHumanEdit(
+		humanEdit, err = runtime.humanEditOutput.ValidateHumanEdit(
 			ctx,
 			Execution{Run: *run, Node: *node, Definition: definitionNode, Inputs: storedInputs},
 			canonical,
@@ -633,7 +857,7 @@ func (e *Engine) SubmitHumanInput(ctx context.Context, runID, nodeKey string, ou
 			return &domain.DomainError{Kind: domain.ErrValidation, Field: "artifactRevision", Message: "human edit validator returned no exact artifact revision"}
 		}
 	}
-	workflowContext, err := e.validatedHumanWorkflowContext(definitionNode, canonical)
+	workflowContext, err := validatedHumanWorkflowContextWithKeys(definitionNode, canonical, runtime.humanContextKeys)
 	if err != nil {
 		return err
 	}
@@ -676,10 +900,13 @@ func applyHumanEditSliceLineage(run *RunRecord, sliceID string, edit HumanEditVa
 	switch edit.ArtifactKind {
 	case "page_spec":
 		slice.PageSpec = &primary
+		slice.Prototype = nil
 	case "prototype":
 		slice.Prototype = &primary
 	case "blueprint":
 		slice.Blueprint = primary
+		slice.PageSpec = nil
+		slice.Prototype = nil
 	}
 	run.Context.Slices[sliceID] = slice
 	return nil
@@ -688,6 +915,14 @@ func applyHumanEditSliceLineage(run *RunRecord, sliceID string, edit HumanEditVa
 func (e *Engine) validatedHumanWorkflowContext(
 	definition domain.NodeDefinition,
 	output json.RawMessage,
+) (map[string]json.RawMessage, error) {
+	return validatedHumanWorkflowContextWithKeys(definition, output, e.HumanWorkflowContextKeys)
+}
+
+func validatedHumanWorkflowContextWithKeys(
+	definition domain.NodeDefinition,
+	output json.RawMessage,
+	allowedKeys map[string]struct{},
 ) (map[string]json.RawMessage, error) {
 	var envelope map[string]json.RawMessage
 	if err := json.Unmarshal(output, &envelope); err != nil {
@@ -711,7 +946,7 @@ func (e *Engine) validatedHumanWorkflowContext(
 			return nil, &domain.DomainError{Kind: domain.ErrValidation, Field: "workflowContext." + key, Message: "workflow context key is reserved for a trusted runner"}
 		}
 		_, schemaDeclared := declared[key]
-		_, serverAllowed := e.HumanWorkflowContextKeys[key]
+		_, serverAllowed := allowedKeys[key]
 		if !schemaDeclared && !serverAllowed {
 			return nil, &domain.DomainError{Kind: domain.ErrValidation, Field: "workflowContext." + key, Message: "workflow context key is not declared by the node schema or server allowlist"}
 		}
@@ -790,24 +1025,56 @@ func (e *Engine) ResolveReview(ctx context.Context, runID, nodeKey string, decis
 	if node.Status != NodeWaitingReview {
 		return &domain.DomainError{Kind: domain.ErrInvalidTransition, Field: "node", Message: "node is not waiting for review"}
 	}
+	profile, err := e.executionProfile(run.ExecutionProfile)
+	if err != nil {
+		return err
+	}
+	runtime := profile.executionRuntime(e)
 	prohibitSelf, allowWaiver := false, false
 	if definitionNode.ReviewGate != nil {
 		prohibitSelf = definitionNode.ReviewGate.ProhibitSelfReview
 		allowWaiver = definitionNode.ReviewGate.AllowWaiver
+		if governedApplicationWorkflow(record.Definition) {
+			allowWaiver = false
+		}
 	}
 	if definitionNode.Approval != nil {
 		prohibitSelf = definitionNode.Approval.ProhibitSelfReview
 	}
 	canonicalReviewVerified := false
-	if resolution == ReviewApprove && definitionNode.Type == domain.NodeReviewGate && e.ReviewGate != nil {
+	if resolution == ReviewApprove && definitionNode.Type == domain.NodeReviewGate && runtime.reviewGate != nil {
 		inputs, hasInputs, inputErr := decodeStoredInputs(run.Context.Nodes[node.Key].Input)
 		if inputErr != nil {
 			return inputErr
 		}
 		refs := make([]domain.ArtifactRef, 0)
 		if hasInputs {
-			refs = append(refs, inputs.ArtifactRefs()...)
+			if governedApplicationWorkflow(record.Definition) {
+				refs = append(refs, inputs.MaterializedArtifactRefs()...)
+				// Compatibility for already-running governed nodes whose direct
+				// HumanEdit predecessor predates the explicit materialized marker.
+				if len(refs) == 0 {
+					for _, binding := range inputs.Bindings() {
+						if binding.Source.OutputRevisionID == "" {
+							continue
+						}
+						for _, ref := range binding.Source.ArtifactRevisions {
+							if ref.RevisionID == binding.Source.OutputRevisionID {
+								refs = appendUniqueArtifactRef(refs, ref)
+							}
+						}
+					}
+				}
+				if len(refs) != 1 {
+					return &domain.DomainError{Kind: domain.ErrInvalidTransition, Field: "review", Message: "governed review requires exactly one current HumanEdit materialization"}
+				}
+			} else {
+				refs = append(refs, inputs.ArtifactRefs()...)
+			}
 		} else {
+			if governedApplicationWorkflow(record.Definition) {
+				return &domain.DomainError{Kind: domain.ErrInvalidTransition, Field: "review", Message: "governed review requires a typed materialized input envelope"}
+			}
 			// Compatibility for runs that entered review before input envelopes
 			// were introduced. New executions always use the pinned envelope.
 			for _, predecessor := range effectiveIncoming(run, record.Definition, node) {
@@ -821,7 +1088,7 @@ func (e *Engine) ResolveReview(ctx context.Context, runID, nodeKey string, decis
 				refs = append(refs, found...)
 			}
 		}
-		if err := e.ReviewGate.VerifyApproval(ctx, run.ProjectID, refs, *definitionNode.ReviewGate); err != nil {
+		if err := runtime.reviewGate.VerifyApproval(ctx, run.ProjectID, refs, *definitionNode.ReviewGate); err != nil {
 			return err
 		}
 		canonicalReviewVerified = true
@@ -956,7 +1223,12 @@ func (e *Engine) WaiveNode(ctx context.Context, runID, nodeKey string, actor Act
 	if err != nil {
 		return err
 	}
-	allowed := definitionNode.Type == domain.NodeQualityGate || (definitionNode.Merge != nil && definitionNode.Merge.AllowWaiver) || (definitionNode.ReviewGate != nil && definitionNode.ReviewGate.AllowWaiver)
+	governedReleaseGate := definitionNode.Type == domain.NodeQualityGate && definitionNode.QualityGate != nil &&
+		definitionNode.QualityGate.Blocking && definitionNode.QualityGate.GateName == "release" &&
+		governedApplicationWorkflow(record.Definition)
+	allowed := (definitionNode.Type == domain.NodeQualityGate && !governedReleaseGate) ||
+		(definitionNode.Merge != nil && definitionNode.Merge.AllowWaiver) ||
+		(definitionNode.ReviewGate != nil && definitionNode.ReviewGate.AllowWaiver)
 	if !allowed {
 		return fmt.Errorf("node does not allow waiver")
 	}
@@ -986,6 +1258,11 @@ func (e *Engine) WaiveNode(ctx context.Context, runID, nodeKey string, actor Act
 	e.reconcile(run, record.Definition, builder)
 	e.refreshRunStatus(run, record.Definition, now)
 	return e.Store.Commit(ctx, builder.build())
+}
+
+func governedApplicationWorkflow(definition domain.WorkflowDefinition) bool {
+	return definition.InputContract != nil && definition.OutputContract != nil &&
+		definition.OutputContract.Capability == domain.WorkflowOutputApplication
 }
 
 func (e *Engine) RetryNode(ctx context.Context, runID, nodeKey, actorID, reason string) error {
@@ -1073,7 +1350,16 @@ func (e *Engine) loadRun(ctx context.Context, runID string) (*RunRecord, Definit
 	if err != nil {
 		return nil, DefinitionRecord{}, err
 	}
-	if record.Definition.Ref() != run.Definition {
+	if err := run.ExecutionProfile.Validate(); err != nil || record.ExecutionProfile != run.ExecutionProfile || run.Definition.ExecutionProfile != run.ExecutionProfile {
+		return nil, DefinitionRecord{}, fmt.Errorf("run execution profile pin mismatch")
+	}
+	if err := ValidateDefinitionForExecutionProfile(record.Definition, record.ExecutionProfile); err != nil {
+		return nil, DefinitionRecord{}, err
+	}
+	if _, err := e.executionProfile(run.ExecutionProfile); err != nil {
+		return nil, DefinitionRecord{}, err
+	}
+	if record.Definition.RefForExecutionProfile(record.ExecutionProfile) != run.Definition {
 		return nil, DefinitionRecord{}, fmt.Errorf("run definition pin mismatch")
 	}
 	return run, record, nil
@@ -1097,6 +1383,13 @@ func (e *Engine) loadExecution(ctx context.Context, runID, nodeKey string) (*Run
 
 func (e *Engine) instantiateFanOut(run *RunRecord, definition domain.WorkflowDefinition, fanOut *NodeRecord, items []FanOutItem, builder *mutationBuilder) error {
 	definitionNode, _ := definition.FindNode(fanOut.DefinitionNodeID)
+	limit, err := effectiveFanOutMaxItems(definitionNode.FanOut)
+	if err != nil {
+		return err
+	}
+	if len(items) > limit {
+		return fmt.Errorf("fan-out produced %d items, exceeding maxItems %d", len(items), limit)
+	}
 	region, err := definition.FanOutRegion(definitionNode.ID)
 	if err != nil {
 		return err
@@ -1178,6 +1471,16 @@ func (e *Engine) instantiateFanOut(run *RunRecord, definition domain.WorkflowDef
 }
 
 func (e *Engine) reconcile(run *RunRecord, definition domain.WorkflowDefinition, builder *mutationBuilder) {
+	profile, err := e.executionProfile(run.ExecutionProfile)
+	if err != nil {
+		return
+	}
+	profile.reconcile(e, run, definition, builder)
+}
+
+// reconcileV0V1Frozen is immutable historical interpreter code. New scheduler
+// semantics require a new profile and a new reconcile entry point.
+func (e *Engine) reconcileV0V1Frozen(run *RunRecord, definition domain.WorkflowDefinition, builder *mutationBuilder) {
 	for changed := true; changed; {
 		changed = false
 		if e.reconcileFanOutConcurrency(run, definition, builder) {
@@ -1254,6 +1557,116 @@ func (e *Engine) reconcile(run *RunRecord, definition domain.WorkflowDefinition,
 		}
 	}
 	e.updateSliceStates(run, definition, builder)
+}
+
+// reconcileV2 preserves the frozen v0/v1 scheduler except for Condition-aware
+// cancellation of a Merge whose paired FanOut can no longer be reached. Keep
+// this entry point separate: persisted v0/v1 runs must retain their exact
+// historical interpreter semantics.
+func (e *Engine) reconcileV2(run *RunRecord, definition domain.WorkflowDefinition, builder *mutationBuilder) {
+	for changed := true; changed; {
+		changed = false
+		if e.reconcileFanOutConcurrency(run, definition, builder) {
+			changed = true
+		}
+		for _, node := range sortedNodes(run.Nodes) {
+			if node.Status != NodePending {
+				continue
+			}
+			definitionNode, exists := definition.FindNode(node.DefinitionNodeID)
+			if !exists {
+				continue
+			}
+			if node.SliceID != "" && dynamicRegionRoot(definition, definitionNode.ID) {
+				// Root instances are activated only by the fan-out concurrency limiter.
+				continue
+			}
+			if definitionNode.Type == domain.NodeMerge {
+				if mergeFanOutRouteDisabled(run, definition, definitionNode) {
+					expected := node.Status
+					node.Status = NodeCancelled
+					node.CompletedAt = timePointer(builder.now)
+					node.UpdatedAt = builder.now
+					builder.mark(node, expected, "")
+					changed = true
+					continue
+				}
+				ready, impossible := mergeOutcome(run, definition, definitionNode)
+				if ready {
+					expected := node.Status
+					node.Status = NodeReady
+					node.UpdatedAt = builder.now
+					builder.mark(node, expected, "")
+					builder.event("node.ready", node.Key, nil, "")
+					changed = true
+				}
+				if impossible {
+					expected := node.Status
+					if definitionNode.Merge.AllowWaiver {
+						node.Status = NodeWaitingReview
+					} else {
+						node.Status = NodeFailed
+						node.CompletedAt = timePointer(builder.now)
+					}
+					node.UpdatedAt = builder.now
+					builder.mark(node, expected, "")
+					builder.event("merge.unsatisfied", node.Key, nil, "")
+					changed = true
+				}
+				continue
+			}
+			incoming := effectiveIncoming(run, definition, node)
+			if len(incoming) == 0 && len(definition.Incoming(node.DefinitionNodeID)) > 0 {
+				expected := node.Status
+				node.Status = NodeCancelled
+				node.CompletedAt = timePointer(builder.now)
+				node.UpdatedAt = builder.now
+				builder.mark(node, expected, "")
+				changed = true
+				continue
+			}
+			allComplete := true
+			for _, predecessor := range incoming {
+				if predecessor == nil || predecessor.Status != NodeCompleted {
+					allComplete = false
+					break
+				}
+			}
+			if allComplete {
+				expected := node.Status
+				metadata := run.Context.Nodes[node.Key]
+				if _, _, required := nodeExecutionPolicy(definitionNode); required && metadata.ExecutionActor == nil {
+					node.Status = NodeWaitingInput
+					builder.event("node.execution_authorization_required", node.Key, nil, "")
+				} else {
+					node.Status = NodeReady
+					builder.event("node.ready", node.Key, nil, "")
+				}
+				node.UpdatedAt = builder.now
+				builder.mark(node, expected, "")
+				changed = true
+			}
+		}
+	}
+	e.updateSliceStates(run, definition, builder)
+}
+
+// mergeFanOutRouteDisabled is deliberately based on the FanOut's effective
+// predecessors, not merely its current status. A Pending FanOut with any
+// still-effective predecessor may become runnable later and must keep its Merge
+// alive. Conversely, Condition cancellation removes or cancels every effective
+// predecessor, so a zero-slice Merge on that route can safely be cancelled and
+// allow cancellation to propagate through downstream AND joins.
+func mergeFanOutRouteDisabled(run *RunRecord, definition domain.WorkflowDefinition, merge domain.NodeDefinition) bool {
+	if merge.Merge == nil || len(slicesForFanOut(run.Context, merge.Merge.FanOutNodeID)) != 0 {
+		return false
+	}
+	fanOutDefinition, exists := definition.FindNode(merge.Merge.FanOutNodeID)
+	if !exists || fanOutDefinition.Type != domain.NodeFanOut || len(definition.Incoming(fanOutDefinition.ID)) == 0 {
+		return false
+	}
+	fanOut := run.Nodes[fanOutDefinition.ID]
+	return fanOut != nil && len(effectiveIncoming(run, definition, fanOut)) == 0
 }
 
 func (e *Engine) reconcileFanOutConcurrency(run *RunRecord, definition domain.WorkflowDefinition, builder *mutationBuilder) bool {

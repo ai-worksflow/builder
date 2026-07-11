@@ -32,4 +32,20 @@ func TestFanOutItemKindIsExplicitAndClosed(t *testing.T) {
 	); err != nil {
 		t.Fatalf("blueprint_page fan-out contract was rejected: %v", err)
 	}
+	nodes[1].FanOut.MaxItems = MaximumWorkflowFanOutItems
+	if _, err := NewWorkflowDefinition(
+		uuid.NewString(), 1, "Bounded Blueprint page fan-out", "2", nodes,
+		[]WorkflowEdge{{ID: "a", From: "source", To: "fan"}, {ID: "b", From: "fan", To: "work"}, {ID: "c", From: "work", To: "merge"}},
+		uuid.NewString(), time.Now().UTC(),
+	); err != nil {
+		t.Fatalf("legal maxItems was rejected: %v", err)
+	}
+	nodes[1].FanOut.MaxItems = MaximumWorkflowFanOutItems + 1
+	if _, err := NewWorkflowDefinition(
+		uuid.NewString(), 1, "Oversized fan-out", "2", nodes,
+		[]WorkflowEdge{{ID: "a", From: "source", To: "fan"}, {ID: "b", From: "fan", To: "work"}, {ID: "c", From: "work", To: "merge"}},
+		uuid.NewString(), time.Now().UTC(),
+	); err == nil {
+		t.Fatal("fan-out maxItems above the platform hard limit was accepted")
+	}
 }

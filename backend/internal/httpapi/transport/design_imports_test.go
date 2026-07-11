@@ -21,6 +21,7 @@ type designImportAPIStub struct {
 	commandKey    string
 	expectedETag  string
 	createError   error
+	createErrors  []error
 }
 
 func (s *designImportAPIStub) Capabilities(context.Context, string, string) (designimport.Capabilities, error) {
@@ -30,6 +31,13 @@ func (s *designImportAPIStub) Capabilities(context.Context, string, string) (des
 func (s *designImportAPIStub) Create(_ context.Context, projectID, actorID, commandKey string, _ designimport.CreateInput) (designimport.Import, error) {
 	s.createCalls++
 	s.commandKey = commandKey
+	if len(s.createErrors) > 0 {
+		err := s.createErrors[0]
+		s.createErrors = s.createErrors[1:]
+		if err != nil {
+			return designimport.Import{}, err
+		}
+	}
 	if s.createError != nil {
 		return designimport.Import{}, s.createError
 	}
@@ -59,6 +67,10 @@ func designImportDTO(projectID, actorID string) designimport.Import {
 }
 
 func designImportRouter(t *testing.T, api DesignImportAPI) *gin.Engine {
+	return designImportRouterWithMutation(t, api, worksmiddleware.CaptureIdempotencyKey(true))
+}
+
+func designImportRouterWithMutation(t *testing.T, api DesignImportAPI, mutation ...gin.HandlerFunc) *gin.Engine {
 	t.Helper()
 	gin.SetMode(gin.TestMode)
 	handler, err := NewDesignImportHandler(DesignImportDependencies{Service: api, MaxJSONBodyBytes: designimport.MaxRequestBytes})
@@ -73,7 +85,7 @@ func designImportRouter(t *testing.T, api DesignImportAPI) *gin.Engine {
 		})
 		c.Next()
 	})
-	if err := RegisterDesignImportRoutes(group, handler, worksmiddleware.CaptureIdempotencyKey(true)); err != nil {
+	if err := RegisterDesignImportRoutes(group, handler, mutation...); err != nil {
 		t.Fatal(err)
 	}
 	return router
@@ -155,12 +167,36 @@ func TestDesignImportProcessingConflictIsRetryable(t *testing.T) {
   "file":{"name":"design.json","mediaType":"application/json","contentBase64":"e30="}
 }`
 	response := designImportRequest(router, http.MethodPost, "/v1/projects/project-1/design-imports", body, map[string]string{"Idempotency-Key": "design-import-processing-1"})
-	if response.Code != http.StatusConflict || response.Header().Get("Retry-After") != "1" {
+	if response.Code != http.StatusServiceUnavailable || response.Header().Get("Retry-After") != "1" {
 		t.Fatalf("processing status=%d retry=%q body=%s", response.Code, response.Header().Get("Retry-After"), response.Body.String())
 	}
 	var details map[string]any
 	if err := json.Unmarshal(response.Body.Bytes(), &details); err != nil || details["code"] != "design_import_processing" {
 		t.Fatalf("unexpected processing problem: %#v err=%v", details, err)
+	}
+}
+
+func TestDesignImportProcessingResponseReleasesHTTPIdempotencyClaim(t *testing.T) {
+	api := &designImportAPIStub{createErrors: []error{designimport.ErrProcessing, nil}}
+	store := &memoryIdempotencyStore{}
+	router := designImportRouterWithMutation(
+		t, api,
+		worksmiddleware.CaptureIdempotencyKey(true),
+		worksmiddleware.PersistIdempotency(store),
+	)
+	body := `{
+  "sourceKind":"upload","mode":"upload",
+  "pageSpecRevision":{"artifactId":"a","revisionId":"r","contentHash":"sha256:h"},
+  "file":{"name":"design.json","mediaType":"application/json","contentBase64":"e30="}
+}`
+	headers := map[string]string{"Idempotency-Key": "design-import-recover-same-command"}
+	first := designImportRequest(router, http.MethodPost, "/v1/projects/project-1/design-imports", body, headers)
+	second := designImportRequest(router, http.MethodPost, "/v1/projects/project-1/design-imports", body, headers)
+	if first.Code != http.StatusServiceUnavailable || second.Code != http.StatusCreated || api.createCalls != 2 {
+		t.Fatalf("first=%d second=%d calls=%d firstBody=%s secondBody=%s", first.Code, second.Code, api.createCalls, first.Body.String(), second.Body.String())
+	}
+	if second.Header().Get("Idempotency-Replayed") != "" {
+		t.Fatalf("retry unexpectedly replayed the processing response: %#v", second.Header())
 	}
 }
 

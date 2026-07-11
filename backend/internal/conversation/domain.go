@@ -65,17 +65,24 @@ const (
 	CommandFailed   CommandStatus = "failed"
 )
 
+// ErrIntentSummaryCheckpointRequired is returned before any AI call when the
+// complete ordered message history through the trigger cannot fit the explicit
+// generation budget. Callers must create a reviewed summary checkpoint rather
+// than silently dropping messages or inventing an uncontrolled summary.
+var ErrIntentSummaryCheckpointRequired = fmt.Errorf("%w: controlled conversation summary checkpoint required", core.ErrConflict)
+
 type Conversation struct {
-	ID         string             `json:"id"`
-	ProjectID  string             `json:"projectId"`
-	Title      string             `json:"title"`
-	Status     ConversationStatus `json:"status"`
-	Version    uint64             `json:"version"`
-	ETag       string             `json:"etag"`
-	CreatedBy  string             `json:"createdBy"`
-	CreatedAt  time.Time          `json:"createdAt"`
-	UpdatedAt  time.Time          `json:"updatedAt"`
-	ArchivedAt *time.Time         `json:"archivedAt,omitempty"`
+	ID                      string             `json:"id"`
+	ProjectID               string             `json:"projectId"`
+	Title                   string             `json:"title"`
+	Status                  ConversationStatus `json:"status"`
+	Version                 uint64             `json:"version"`
+	ETag                    string             `json:"etag"`
+	CreatedBy               string             `json:"createdBy"`
+	CreatedAt               time.Time          `json:"createdAt"`
+	UpdatedAt               time.Time          `json:"updatedAt"`
+	ArchivedAt              *time.Time         `json:"archivedAt,omitempty"`
+	SummaryCheckpointHeadID *string            `json:"summaryCheckpointHeadId,omitempty"`
 }
 
 type Message struct {
@@ -100,6 +107,17 @@ type WorkbenchInstruction struct {
 	Constraints      []string `json:"constraints,omitempty"`
 	ExpectedRunID    string   `json:"expectedRunId,omitempty"`
 	ExpectedBundleID string   `json:"expectedBundleId,omitempty"`
+	SliceID          string   `json:"sliceId,omitempty"`
+	SliceKey         string   `json:"sliceKey,omitempty"`
+	SliceTitle       string   `json:"sliceTitle,omitempty"`
+}
+
+// WorkbenchTargetHint is an optional browser navigation hint. It is never an
+// execution result: the server resolves it against the current project's
+// authoritative, executable Workbench lineage before exposing it to AI.
+type WorkbenchTargetHint struct {
+	RunID        string `json:"runId"`
+	RootBundleID string `json:"rootBundleId"`
 }
 
 // ReviewedConversationIntent is the immutable, server-identified intent that
@@ -107,15 +125,16 @@ type WorkbenchInstruction struct {
 // IDs are minted by the proposal transaction and cannot be supplied by the
 // client or model.
 type ReviewedConversationIntent struct {
-	ConversationID       string                       `json:"conversationId"`
-	TriggerMessageID     string                       `json:"triggerMessageId"`
-	ProposalID           string                       `json:"proposalId"`
-	AssistantMessageID   string                       `json:"assistantMessageId"`
-	Kind                 IntentKind                   `json:"kind"`
-	DefinitionVersionID  string                       `json:"definitionVersionId"`
-	WorkbenchInstruction WorkbenchInstruction         `json:"workbenchInstruction"`
-	ManifestIntent       ManifestIntent               `json:"manifestIntent"`
-	SourceRefs           []platformdomain.ArtifactRef `json:"sourceRefs"`
+	ConversationID          string                       `json:"conversationId"`
+	TriggerMessageID        string                       `json:"triggerMessageId"`
+	ProposalID              string                       `json:"proposalId"`
+	AssistantMessageID      string                       `json:"assistantMessageId"`
+	Kind                    IntentKind                   `json:"kind"`
+	DefinitionVersionID     string                       `json:"definitionVersionId"`
+	DesiredOutputCapability string                       `json:"desiredOutputCapability"`
+	WorkbenchInstruction    WorkbenchInstruction         `json:"workbenchInstruction"`
+	ManifestIntent          ManifestIntent               `json:"manifestIntent"`
+	SourceRefs              []platformdomain.ArtifactRef `json:"sourceRefs"`
 }
 
 type AIProvenance struct {
@@ -125,42 +144,47 @@ type AIProvenance struct {
 }
 
 type ProposalProvenance struct {
-	Origin ProposalOrigin
-	AI     *AIProvenance
+	Origin            ProposalOrigin
+	AI                *AIProvenance
+	providerInputHash string
 }
 
 type WorkflowIntentProposal struct {
-	ID                           string                       `json:"id"`
-	ProjectID                    string                       `json:"projectId"`
-	ConversationID               string                       `json:"conversationId"`
-	TriggerMessageID             string                       `json:"triggerMessageId"`
-	AssistantMessageID           string                       `json:"assistantMessageId"`
-	Kind                         IntentKind                   `json:"kind"`
-	Status                       ProposalStatus               `json:"status"`
-	Version                      uint64                       `json:"version"`
-	ETag                         string                       `json:"etag"`
-	SuggestedDefinitionVersionID string                       `json:"suggestedDefinitionVersionId"`
-	Scope                        json.RawMessage              `json:"scope"`
-	SourceRefs                   []platformdomain.ArtifactRef `json:"sourceRefs"`
-	ManifestIntent               ManifestIntent               `json:"manifestIntent"`
-	WorkbenchInstruction         WorkbenchInstruction         `json:"workbenchInstruction"`
-	Origin                       ProposalOrigin               `json:"origin"`
-	AI                           *AIProvenance                `json:"ai,omitempty"`
-	DecisionReason               string                       `json:"decisionReason,omitempty"`
-	ProposedBy                   string                       `json:"proposedBy"`
-	DecidedBy                    *string                      `json:"decidedBy,omitempty"`
-	CreatedAt                    time.Time                    `json:"createdAt"`
-	DecidedAt                    *time.Time                   `json:"decidedAt,omitempty"`
+	ID                           string                         `json:"id"`
+	ProjectID                    string                         `json:"projectId"`
+	ConversationID               string                         `json:"conversationId"`
+	TriggerMessageID             string                         `json:"triggerMessageId"`
+	AssistantMessageID           string                         `json:"assistantMessageId"`
+	Kind                         IntentKind                     `json:"kind"`
+	Status                       ProposalStatus                 `json:"status"`
+	Version                      uint64                         `json:"version"`
+	ETag                         string                         `json:"etag"`
+	SuggestedDefinitionVersionID string                         `json:"suggestedDefinitionVersionId"`
+	DesiredOutputCapability      string                         `json:"desiredOutputCapability"`
+	Scope                        json.RawMessage                `json:"scope"`
+	SourceRefs                   []platformdomain.ArtifactRef   `json:"sourceRefs"`
+	ManifestIntent               ManifestIntent                 `json:"manifestIntent"`
+	WorkbenchInstruction         WorkbenchInstruction           `json:"workbenchInstruction"`
+	Origin                       ProposalOrigin                 `json:"origin"`
+	AI                           *AIProvenance                  `json:"ai,omitempty"`
+	ConversationContext          *ConversationContextProvenance `json:"conversationContext,omitempty"`
+	DecisionReason               string                         `json:"decisionReason,omitempty"`
+	ProposedBy                   string                         `json:"proposedBy"`
+	DecidedBy                    *string                        `json:"decidedBy,omitempty"`
+	CreatedAt                    time.Time                      `json:"createdAt"`
+	DecidedAt                    *time.Time                     `json:"decidedAt,omitempty"`
 }
 
 // CommandPayload is the immutable snapshot made when a human accepts an
 // intent proposal. Executors never re-read mutable conversation text.
 type CommandPayload struct {
-	DefinitionVersionID string                       `json:"definitionVersionId"`
-	Scope               json.RawMessage              `json:"scope"`
-	SourceRefs          []platformdomain.ArtifactRef `json:"sourceRefs"`
-	ManifestIntent      ManifestIntent               `json:"manifestIntent"`
-	Workbench           WorkbenchInstruction         `json:"workbench"`
+	DefinitionVersionID     string                         `json:"definitionVersionId"`
+	DesiredOutputCapability string                         `json:"desiredOutputCapability"`
+	Scope                   json.RawMessage                `json:"scope"`
+	SourceRefs              []platformdomain.ArtifactRef   `json:"sourceRefs"`
+	ManifestIntent          ManifestIntent                 `json:"manifestIntent"`
+	Workbench               WorkbenchInstruction           `json:"workbench"`
+	ConversationContext     *ConversationContextProvenance `json:"conversationContext,omitempty"`
 }
 
 type CommandFailure struct {
@@ -205,22 +229,24 @@ type AppendMessageInput struct {
 }
 
 type CreateIntentProposalInput struct {
-	TriggerMessageID             string                       `json:"triggerMessageId"`
-	AssistantContent             string                       `json:"assistantContent"`
-	Kind                         IntentKind                   `json:"kind"`
-	SuggestedDefinitionVersionID string                       `json:"suggestedDefinitionVersionId"`
-	Scope                        json.RawMessage              `json:"scope"`
-	SourceRefs                   []platformdomain.ArtifactRef `json:"sourceRefs"`
-	ManifestIntent               ManifestIntent               `json:"manifestIntent"`
-	WorkbenchInstruction         WorkbenchInstruction         `json:"workbenchInstruction"`
+	TriggerMessageID             string                         `json:"triggerMessageId"`
+	AssistantContent             string                         `json:"assistantContent"`
+	Kind                         IntentKind                     `json:"kind"`
+	SuggestedDefinitionVersionID string                         `json:"suggestedDefinitionVersionId"`
+	Scope                        json.RawMessage                `json:"scope"`
+	SourceRefs                   []platformdomain.ArtifactRef   `json:"sourceRefs"`
+	ManifestIntent               ManifestIntent                 `json:"manifestIntent"`
+	WorkbenchInstruction         WorkbenchInstruction           `json:"workbenchInstruction"`
+	ConversationContext          *ConversationContextProvenance `json:"-"`
 }
 
 type GenerateIntentProposalInput struct {
-	TriggerMessageID              string                       `json:"triggerMessageId"`
-	CandidateDefinitionVersionIDs []string                     `json:"candidateDefinitionVersionIds"`
-	SourceRefs                    []platformdomain.ArtifactRef `json:"sourceRefs"`
-	ManifestIntent                ManifestIntent               `json:"manifestIntent"`
-	Model                         string                       `json:"model,omitempty"`
+	TriggerMessageID        string                       `json:"triggerMessageId"`
+	DesiredOutputCapability string                       `json:"desiredOutputCapability"`
+	SourceRefs              []platformdomain.ArtifactRef `json:"sourceRefs"`
+	ManifestIntent          ManifestIntent               `json:"manifestIntent"`
+	WorkbenchTargetHint     *WorkbenchTargetHint         `json:"workbenchTargetHint,omitempty"`
+	Model                   string                       `json:"model,omitempty"`
 }
 
 type GeneratedIntentProposal struct {
@@ -235,14 +261,17 @@ type DecideProposalInput struct {
 	Reason   string           `json:"reason,omitempty"`
 }
 
-type WorkbenchExecutionResult struct {
-	RunID                    string `json:"runId"`
-	BundleID                 string `json:"bundleId"`
-	ImplementationProposalID string `json:"implementationProposalId"`
-}
+type ExecuteCommandInput struct{}
 
-type ExecuteCommandInput struct {
-	WorkbenchResult *WorkbenchExecutionResult `json:"workbenchResult,omitempty"`
+// WorkbenchExecutionReceipt is minted by the server-side generation path. It
+// is deliberately not part of ExecuteCommandInput and cannot be uploaded by a
+// browser.
+type WorkbenchExecutionReceipt struct {
+	RunID                    string
+	RootBundleID             string
+	ActiveBundleID           string
+	ImplementationProposalID string
+	InstructionHash          string
 }
 
 type RejectCommandInput struct {
@@ -442,6 +471,15 @@ func normalizeProposalInput(input CreateIntentProposalInput) (CreateIntentPropos
 			}
 		}
 	}
+	input.WorkbenchInstruction.SliceID = strings.TrimSpace(input.WorkbenchInstruction.SliceID)
+	input.WorkbenchInstruction.SliceKey = strings.TrimSpace(input.WorkbenchInstruction.SliceKey)
+	input.WorkbenchInstruction.SliceTitle = strings.TrimSpace(input.WorkbenchInstruction.SliceTitle)
+	if len(input.WorkbenchInstruction.SliceID) > 128 || len(input.WorkbenchInstruction.SliceKey) > 256 || len(input.WorkbenchInstruction.SliceTitle) > 512 {
+		return input, fmt.Errorf("%w: workbench slice identity", core.ErrInvalidInput)
+	}
+	if input.Kind == IntentStartWorkflow && (input.WorkbenchInstruction.SliceID != "" || input.WorkbenchInstruction.SliceKey != "" || input.WorkbenchInstruction.SliceTitle != "") {
+		return input, fmt.Errorf("%w: start workflow cannot select a workbench slice", core.ErrInvalidInput)
+	}
 	if input.Kind == IntentWorkbenchInstruction && (input.WorkbenchInstruction.ExpectedRunID == "" || input.WorkbenchInstruction.ExpectedBundleID == "") {
 		return input, fmt.Errorf("%w: workbench instruction requires expectedRunId and expectedBundleId", core.ErrInvalidInput)
 	}
@@ -450,4 +488,18 @@ func normalizeProposalInput(input CreateIntentProposalInput) (CreateIntentPropos
 	// it impossible for a client or model to preselect those server identities.
 	input.Scope = canonicalScope
 	return input, nil
+}
+
+func normalizeWorkbenchTargetHint(hint *WorkbenchTargetHint) (*WorkbenchTargetHint, error) {
+	if hint == nil {
+		return nil, nil
+	}
+	runID := strings.TrimSpace(hint.RunID)
+	rootBundleID := strings.TrimSpace(hint.RootBundleID)
+	parsedRunID, runErr := uuid.Parse(runID)
+	parsedRootID, rootErr := uuid.Parse(rootBundleID)
+	if runErr != nil || rootErr != nil || parsedRunID.String() != runID || parsedRootID.String() != rootBundleID {
+		return nil, fmt.Errorf("%w: workbenchTargetHint requires canonical runId and rootBundleId", core.ErrInvalidInput)
+	}
+	return &WorkbenchTargetHint{RunID: runID, RootBundleID: rootBundleID}, nil
 }

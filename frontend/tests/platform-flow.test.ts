@@ -1,20 +1,17 @@
 import assert from 'node:assert/strict'
 import {
   deliverySliceContext,
+  estimateWorkflowSemanticStates,
   parseEditableDefinition,
-  resolveCandidateSelection,
   revisionCandidates,
   starterWorkflowDefinition as starterDefinition,
   workflowRoleSatisfies,
 } from '../lib/platform/workflow-ui-contract'
 import {
-  highestPublishedWorkflowVersionIds,
-  projectBriefIntentCandidateVersionIds,
   projectBriefEntryAction,
 } from '../lib/platform/workflow-entry'
 import { PlatformClient } from '../lib/platform/client'
 import type { FetchLike } from '../lib/platform/http'
-import type { WorkflowDefinitionRecordDto, WorkflowNodeDefinitionDto } from '../lib/platform/flow-contract'
 
 type TestCase = {
   readonly name: string
@@ -57,6 +54,7 @@ test('workflow definitions and immutable versions use the Go workflow routes', a
   })
 
   await client.listDefinitions('project-1')
+  await client.capabilities('project-1')
   await client.createDefinition('project-1', {
     key: 'custom-flow',
     title: 'Custom flow',
@@ -64,6 +62,7 @@ test('workflow definitions and immutable versions use the Go workflow routes', a
     schemaVersion: 'workflow/v2',
     inputContract: {
       capability: 'project_brief', manifestJobTypes: ['workflow_start'], artifactKinds: ['project_brief'],
+      minimumArtifacts: 1, maximumArtifacts: 1, requireApproved: false,
       requiredSourcePurposes: ['project_brief'], manifestSchemaContracts: { workflow_start: 'workflow-input/v1' },
     },
     outputContract: {
@@ -77,16 +76,25 @@ test('workflow definitions and immutable versions use the Go workflow routes', a
 
   assert.deepEqual(calls.map((call) => call.path), [
     '/v1/projects/project-1/workflow-definitions',
+    '/v1/projects/project-1/workflow-capabilities',
     '/v1/projects/project-1/workflow-definitions',
     '/v1/projects/project-1/workflow-definitions/definition-1/versions',
     '/v1/projects/project-1/workflow-runs',
   ])
-  assert.equal(calls[1].method, 'POST')
-  assert.deepEqual(calls[1].body, {
+  assert.equal(calls[2].method, 'POST')
+  assert.deepEqual(calls[2].body, {
     key: 'custom-flow',
     title: 'Custom flow',
     name: 'Custom flow',
     schemaVersion: 'workflow/v2',
+    inputContract: {
+      capability: 'project_brief', manifestJobTypes: ['workflow_start'], artifactKinds: ['project_brief'],
+      minimumArtifacts: 1, maximumArtifacts: 1, requireApproved: false,
+      requiredSourcePurposes: ['project_brief'], manifestSchemaContracts: { workflow_start: 'workflow-input/v1' },
+    },
+    outputContract: {
+      capability: 'application', producedArtifactKinds: ['workspace'], terminalOutcome: 'deployment', terminalNodeType: 'publish',
+    },
     nodes: [],
     edges: [],
   })
@@ -199,30 +207,6 @@ test('Project Brief entry checkpoints newer drafts and fails closed for approved
   }), 'use_existing_revision')
 })
 
-test('conversation candidates include only the highest published version per definition', () => {
-  assert.deepEqual(highestPublishedWorkflowVersionIds([
-    { id: 'minimum', versionId: 'minimum-v1', version: 1, published: true },
-    { id: 'minimum', versionId: 'minimum-v2', version: 2, published: true },
-    { id: 'custom', versionId: 'custom-v1', version: 1, published: true },
-    { id: 'custom', versionId: 'custom-v2-draft', version: 2, published: false },
-  ]), ['minimum-v2', 'custom-v1'])
-})
-
-test('Project Brief intent candidates exclude Blueprint-selection-only workflows', () => {
-  const ordinary = workflowRecord({
-    id: 'ordinary', versionId: 'ordinary-v1', key: 'minimum-product-loop',
-    nodes: [{ id: 'input', name: 'Brief', type: 'artifact_input', artifactInput: { allowedTypes: ['document'], requireApproved: true, minimumArtifacts: 1 } }],
-  })
-  const selection = workflowRecord({
-    id: 'selection', versionId: 'selection-v1', key: 'blueprint-selection-app',
-    nodes: [
-      { id: 'input', name: 'Selection', type: 'artifact_input', artifactInput: { allowedTypes: ['blueprint'], requireApproved: true, minimumArtifacts: 1 } },
-      { id: 'pages', name: 'Pages', type: 'fan_out', fanOut: { itemsPath: '/blueprintPages', sliceKeyPath: '/key', mergeNodeId: 'merge', maxParallel: 4, itemKind: 'blueprint_selection_page' } },
-    ],
-  })
-  assert.deepEqual(projectBriefIntentCandidateVersionIds([selection, ordinary]), ['ordinary-v1'])
-})
-
 test('review role ranking does not treat admin as owner', () => {
   assert.equal(workflowRoleSatisfies('owner', 'owner'), true)
   assert.equal(workflowRoleSatisfies('admin', 'owner'), false)
@@ -327,6 +311,26 @@ test('build generation is pinned to a build manifest and has no browser fallback
   })
 })
 
+test('Workbench regeneration sends an exact proposal CAS instead of silently coexisting', async () => {
+  let body: unknown
+  const client = flowClient((_path, init) => {
+    body = typeof init?.body === 'string' ? JSON.parse(init.body) as unknown : undefined
+    return json({ proposal: { id: 'replacement' }, provider: 'openai', model: 'gpt-5' }, 201)
+  })
+  await client.generateImplementation(
+    'build-manifest-1',
+    'gpt-5',
+    'Regenerate from reviewed feedback.',
+    { id: 'active-proposal-1', version: 7 },
+  )
+  assert.deepEqual(body, {
+    model: 'gpt-5',
+    instruction: 'Regenerate from reviewed feedback.',
+    replaceProposalId: 'active-proposal-1',
+    replaceProposalVersion: 7,
+  })
+})
+
 test('Workbench lineage hydration and exact workspace rebase use root-scoped routes', async () => {
   const calls: Array<{ path: string; method: string; body: unknown }> = []
   const client = flowClient((path, init) => {
@@ -378,7 +382,10 @@ test('Workbench lineage hydration and exact workspace rebase use root-scoped rou
 
 test('new workflow definitions start as the complete executable product delivery loop', () => {
   const definition = starterDefinition()
-  assert.equal(definition.schemaVersion, '2')
+  assert.equal(definition.schemaVersion, '4')
+  assert.equal(definition.inputContract.capability, 'project_brief')
+  assert.deepEqual([definition.inputContract.minimumArtifacts, definition.inputContract.maximumArtifacts], [1, 1])
+  assert.equal(definition.outputContract.capability, 'application')
   assert.equal(definition.nodes.length, 22)
   assert.equal(definition.edges.length, 21)
   assert.deepEqual(definition.nodes.map((node) => node.type), [
@@ -409,7 +416,7 @@ test('new workflow definitions start as the complete executable product delivery
   assert.deepEqual(definition.edges.at(-1), { id: 'edge-21', from: 'quality', to: 'publish' })
   assert.deepEqual(definition.nodes.find((node) => node.id === 'pages')?.fanOut, {
     itemsPath: '/blueprintPages', sliceKeyPath: '/key', mergeNodeId: 'pages-merged',
-    maxParallel: 4, itemKind: 'blueprint_page',
+    maxParallel: 4, maxItems: 100, itemKind: 'blueprint_page',
   })
   assert.equal(definition.nodes.find((node) => node.id === 'project-brief-ai')?.aiTransform?.jobType, 'refine_project_brief')
   assert.equal(definition.nodes.find((node) => node.id === 'page-spec-ai')?.aiTransform?.jobType, 'generate_page_spec')
@@ -449,7 +456,40 @@ test('workflow JSON parsing rejects null and malformed node and edge entries', (
   )
 })
 
-test('Human Edit candidates are narrowed to proposal targets and ambiguous lineage requires selection', () => {
+test('workflow authoring estimates Condition state growth before server validation', () => {
+  const schema = { type: 'object' as const }
+  const nodes = [{
+    id: 'entry', name: 'entry', type: 'transform' as const,
+    inputSchema: schema, outputSchema: schema, transform: { transform: 'selection_passthrough' },
+  }]
+  const edges: Array<{ id: string; from: string; to: string; fromPort?: string }> = []
+  let previous = 'entry'
+  for (let index = 1; index <= 4; index += 1) {
+    const condition = `condition-${index}`
+    const join = `join-${index}`
+    nodes.push({
+      id: condition, name: condition, type: 'condition', inputSchema: schema, outputSchema: schema,
+      condition: { branches: [{ name: 'yes', expression: '{"==":[1,1]}' }, { name: 'no', default: true }] },
+    } as unknown as typeof nodes[number])
+    nodes.push({
+      id: join, name: join, type: 'transform', inputSchema: schema, outputSchema: schema,
+      transform: { transform: 'selection_passthrough' },
+    })
+    edges.push({ id: `edge-${index}-in`, from: previous, to: condition })
+    edges.push({ id: `edge-${index}-yes`, from: condition, fromPort: 'yes', to: join })
+    edges.push({ id: `edge-${index}-no`, from: condition, fromPort: 'no', to: join })
+    previous = join
+  }
+  const definition = { nodes, edges } as Parameters<typeof estimateWorkflowSemanticStates>[0]
+  assert.deepEqual(estimateWorkflowSemanticStates(definition, 8), {
+    peakStates: 9, maximumStates: 8, exceeded: true,
+  })
+  assert.deepEqual(estimateWorkflowSemanticStates(definition, 32), {
+    peakStates: 16, maximumStates: 32, exceeded: false,
+  })
+})
+
+test('Human Edit rejects ambiguous multi-producer lineage', () => {
   const brief = versionedResource('brief', 'brief-r1', 'Project brief', { kind: 'requirement' })
   const requirementsA = versionedResource('requirements-a', 'requirements-a-r2', 'Requirements A', { kind: 'requirement' })
   const requirementsB = versionedResource('requirements-b', 'requirements-b-r3', 'Requirements B', { kind: 'requirement' })
@@ -481,15 +521,40 @@ test('Human Edit candidates are narrowed to proposal targets and ambiguous linea
     proposals,
   })
   const resolution = revisionCandidates(definitionNode as never, node as never, run as never, artifacts as never)
-  assert.deepEqual(resolution.candidates.map((candidate) => candidate.artifactId), [
-    'requirements-a',
-    'requirements-b',
-  ])
-  assert.equal(resolveCandidateSelection(resolution.candidates, ''), undefined)
-  assert.equal(
-    resolveCandidateSelection(resolution.candidates, resolution.candidates.at(1)?.key ?? '')?.artifactId,
-    'requirements-b',
+  assert.equal(resolution.candidates.length, 0)
+  assert.match(resolution.error ?? '', /exactly one proposal producer/i)
+})
+
+test('Human Edit resolves one proposal pin propagated through a Condition and rejects malformed pins', () => {
+  const target = versionedResource('requirements-pin', 'requirements-pin-r2', 'Pinned requirements', { kind: 'requirement' })
+  Object.assign(target.artifact, { kind: 'product_requirements' })
+  const linkedProposal = proposal('proposal-pin', 'payload-pin', target.artifact.id, target.latestRevision)
+  const node = {
+    id: 'requirements-pin-node', runId: 'run-1', key: 'requirements-edit',
+    definitionNodeId: 'requirements-edit', type: 'human_edit', status: 'waiting_input', attempt: 1,
+  }
+  const definitionNode = {
+    id: 'requirements-edit', name: 'Edit requirements', type: 'human_edit',
+    humanEdit: { artifactType: 'document', artifactKind: 'product_requirements', requiredRole: 'editor' },
+  }
+  const pin = {
+    proposal: { id: linkedProposal.id, payloadHash: linkedProposal.payloadHash },
+    manifest: { id: 'manifest-pin', hash: 'sha256:manifest-pin' },
+    producerNodeKey: 'requirements-ai', producerDefinitionNodeId: 'requirements-ai',
+  }
+  const run = workflowRun(node, [lineageBinding([], undefined, [], [pin])])
+  const resolution = revisionCandidates(
+    definitionNode as never,
+    node as never,
+    run as never,
+    artifactSnapshot({ documents: [target], proposals: [linkedProposal] }) as never,
   )
+  assert.deepEqual(resolution.candidates.map((candidate) => candidate.artifactId), ['requirements-pin'])
+
+  const multi = workflowRun(node, [lineageBinding([], undefined, [], [pin, { ...pin, producerNodeKey: 'requirements-ai-2' }])])
+  assert.match(revisionCandidates(definitionNode as never, node as never, multi as never, artifactSnapshot({ documents: [target], proposals: [linkedProposal] }) as never).error ?? '', /exactly one proposal producer/i)
+  const malformed = workflowRun(node, [lineageBinding([], undefined, [], [{ ...pin, manifest: {} }])])
+  assert.match(revisionCandidates(definitionNode as never, node as never, malformed as never, artifactSnapshot({ documents: [target], proposals: [linkedProposal] }) as never).error ?? '', /malformed proposal lineage pin/i)
 })
 
 test('slice Human Edit candidates cannot cross into another delivery-slice proposal', () => {
@@ -732,6 +797,7 @@ function lineageBinding(
   artifactRevisions: readonly ReturnType<typeof revisionRefFixture>[],
   outputProposal?: { readonly id: string; readonly payloadHash: string },
   deliverySliceRefs: readonly unknown[] = [],
+  proposalPins: readonly unknown[] = [],
 ) {
   return {
     edgeId: `edge-${outputProposal?.id ?? 'lineage'}`,
@@ -743,6 +809,7 @@ function lineageBinding(
       definitionNodeId: 'predecessor',
       artifactRevisions,
       deliverySliceRefs,
+      proposalPins,
       ...(outputProposal ? { outputProposal } : {}),
     },
     output: {},
@@ -789,22 +856,6 @@ function artifactSnapshot(overrides: Record<string, unknown> = {}) {
     proposals: [],
     traces: [],
     ...overrides,
-  }
-}
-
-function workflowRecord(input: {
-  readonly id: string
-  readonly versionId: string
-  readonly key: string
-  readonly nodes: readonly WorkflowNodeDefinitionDto[]
-}): WorkflowDefinitionRecordDto {
-  return {
-    id: input.id, versionId: input.versionId, projectId: 'project-1', key: input.key,
-    title: input.key, published: true, version: 1, contentHash: 'sha256:definition',
-    definition: {
-      id: input.id, version: 1, name: input.key, schemaVersion: '1', nodes: input.nodes,
-      edges: [], hash: 'sha256:definition', createdBy: 'user-1', createdAt: new Date(0).toISOString(),
-    },
   }
 }
 

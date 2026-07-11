@@ -97,6 +97,11 @@ export function materializeBlueprintContent(
 
 function semanticNode(node: Omit<BlueprintNodeDto, 'position'> | BlueprintNodeDto): SemanticBlueprintNode {
   const kind = canonicalNodeKind(node.kind)
+  const roles = uniqueStrings([
+    ...(node.roles ?? []),
+    ...(node.requiredRoles ?? []),
+    ...(node.role ? [node.role] : []),
+  ])
   return {
     id: node.id,
     key: node.key?.trim() || node.id,
@@ -107,6 +112,7 @@ function semanticNode(node: Omit<BlueprintNodeDto, 'position'> | BlueprintNodeDt
     userGoal: node.userGoal,
     method: node.method,
     path: node.path,
+    ...(kind === 'permission' || roles.length > 0 ? { roles } : {}),
     requirementIds: node.requirementIds,
     pageSpecArtifactId: node.pageSpecArtifactId,
     assignedMemberIds: node.assignedMemberIds,
@@ -114,6 +120,10 @@ function semanticNode(node: Omit<BlueprintNodeDto, 'position'> | BlueprintNodeDt
       ? { ...(node.metadata ?? {}), legacyKind: 'workbenchTarget' }
       : node.metadata,
   }
+}
+
+function uniqueStrings(values: readonly string[]) {
+  return [...new Set(values.map((value) => value.trim()).filter(Boolean))]
 }
 
 function semanticEdge(edge: BlueprintEdgeDto): BlueprintEdgeDto {

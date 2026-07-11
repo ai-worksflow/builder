@@ -124,7 +124,20 @@ func TestTwoFanOutRegionsKeepManifestInputsIsolated(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	definition.OutputContract = &domain.WorkflowOutputContract{
+		Capability: domain.WorkflowOutputApplication, ProducedArtifactKinds: []string{"workspace"},
+		TerminalOutcome: domain.WorkflowOutcomeApplication, TerminalNodeType: domain.NodeWorkbenchBuild,
+	}
 	run := syntheticRun(definition, userID)
+	inputManifest, err := domain.NewInputManifest(
+		uuid.NewString(), run.ProjectID, "workflow-test", "", nil,
+		[]domain.ManifestSource{{Ref: platformRef("workflow-test-source"), Purpose: "workflow_input"}},
+		json.RawMessage(`{"test":"fanout-isolation"}`), "workflow-test/v1", userID, now,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run.InputManifest = ptrManifest(inputManifest.Ref())
 	sliceA := syntheticSlice("a", "fan-a")
 	sliceB := syntheticSlice("b", "fan-b")
 	run.Context.Slices[sliceA.ID], run.Context.Slices[sliceB.ID] = sliceA, sliceB
@@ -164,12 +177,13 @@ func TestTwoFanOutRegionsKeepManifestInputsIsolated(t *testing.T) {
 
 	service := &fakeWorkbench{}
 	definitionA, _ := definition.FindNode("compile-a")
-	manifestA, err := (CoreWorkbenchManifestHook{Workbench: service}).Compile(context.Background(), Execution{Run: *run, Node: *compileA, Definition: definitionA, Inputs: inputsA})
+	proposals := &fakeCoreProposals{manifest: inputManifest}
+	manifestA, err := (CoreWorkbenchManifestHook{Workbench: service, Proposals: proposals}).Compile(context.Background(), Execution{Run: *run, Node: *compileA, Definition: definitionA, Workflow: definition, Inputs: inputsA})
 	if err != nil {
 		t.Fatal(err)
 	}
 	definitionB, _ := definition.FindNode("compile-b")
-	manifestB, err := (CoreWorkbenchManifestHook{Workbench: service}).Compile(context.Background(), Execution{Run: *run, Node: *compileB, Definition: definitionB, Inputs: inputsB})
+	manifestB, err := (CoreWorkbenchManifestHook{Workbench: service, Proposals: proposals}).Compile(context.Background(), Execution{Run: *run, Node: *compileB, Definition: definitionB, Workflow: definition, Inputs: inputsB})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -179,6 +193,219 @@ func TestTwoFanOutRegionsKeepManifestInputsIsolated(t *testing.T) {
 	if len(service.prototypes) != 2 || service.prototypes[0].RevisionID != sliceA.Prototype.RevisionID {
 		t.Fatalf("manifest compiler did not use the immutable incoming prototype pin: %+v", service.prototypes)
 	}
+}
+
+func TestSerialFanOutEpochReplacesPriorSliceLineage(t *testing.T) {
+	now := time.Now().UTC()
+	userID := uuid.NewString()
+	schema := json.RawMessage(`{"type":"object","additionalProperties":true}`)
+	transform := func(id string) domain.NodeDefinition {
+		return domain.NodeDefinition{ID: id, Name: id, Type: domain.NodeTransform, InputSchema: schema, OutputSchema: schema, Transform: &domain.TransformNodeConfig{Transform: id}}
+	}
+	// Explicit anchors prove epoch pruning removes every anchor variant of the
+	// same immutable revision, including the whole Blueprint inherited before
+	// the first fan-out and the page-anchored ref emitted by its slice.
+	fan := func(id, merge string) domain.NodeDefinition {
+		return domain.NodeDefinition{ID: id, Name: id, Type: domain.NodeFanOut, InputSchema: schema, OutputSchema: schema, FanOut: &domain.FanOutNodeConfig{ItemsPath: "/items", SliceKeyPath: "/key", MergeNodeID: merge, MaxParallel: 2}}
+	}
+	merge := func(id, fanOut string) domain.NodeDefinition {
+		return domain.NodeDefinition{ID: id, Name: id, Type: domain.NodeMerge, InputSchema: schema, OutputSchema: schema, Merge: &domain.MergeNodeConfig{FanOutNodeID: fanOut, Policy: domain.MergeAll}}
+	}
+	nodes := []domain.NodeDefinition{
+		transform("entry"), fan("fan-a", "merge-a"), transform("work-a"), merge("merge-a", "fan-a"),
+		fan("fan-b", "merge-b"), transform("work-b"), merge("merge-b", "fan-b"),
+		{ID: "compiler", Name: "compiler", Type: domain.NodeManifestCompiler, InputSchema: schema, OutputSchema: schema, ManifestCompiler: &domain.ManifestCompilerNodeConfig{ManifestKind: "application_build", SchemaVersion: 1, Hook: "application-build-manifest/v1"}},
+	}
+	edges := []domain.WorkflowEdge{
+		{ID: "entry-a", From: "entry", To: "fan-a"}, {ID: "fan-a-work", From: "fan-a", To: "work-a"},
+		{ID: "work-a-merge", From: "work-a", To: "merge-a"}, {ID: "merge-a-fan-b", From: "merge-a", To: "fan-b"},
+		{ID: "fan-b-work", From: "fan-b", To: "work-b"}, {ID: "work-b-merge", From: "work-b", To: "merge-b"},
+		{ID: "merge-b-compiler", From: "merge-b", To: "compiler"},
+	}
+	definition, err := domain.NewWorkflowDefinition(uuid.NewString(), 1, "Serial fan-outs", "2", nodes, edges, userID, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := syntheticRun(definition, userID)
+	entry := addSyntheticNode(run, "entry", "entry", "", NodeCompleted)
+	run.Context.Nodes[entry.Key] = NodeMetadata{DefinitionNodeID: "entry", Output: json.RawMessage(`{"items":[]}`)}
+
+	sliceA := syntheticSlice("old", "fan-a")
+	wholeBlueprint := sliceA.Blueprint
+	anchoredBlueprint := sliceA.Blueprint
+	anchorID := "page-old"
+	anchoredBlueprint.AnchorID = anchorID
+	sliceA.Blueprint = anchoredBlueprint
+	run.Context.Slices[sliceA.ID] = sliceA
+	prepareFanOutRegion(t, run, definition, "fan-a", "work-a", "merge-a", sliceA)
+	mergeAMetadata := run.Context.Nodes["merge-a"]
+	var mergeAInputs domain.NodeInputEnvelope
+	if err := json.Unmarshal(mergeAMetadata.Input, &mergeAInputs); err != nil {
+		t.Fatal(err)
+	}
+	mergeABindings := mergeAInputs.Bindings()
+	mergeABindings[0].Source.ArtifactRevisions = appendUniqueArtifactRef(mergeABindings[0].Source.ArtifactRevisions, wholeBlueprint)
+	mergeAInputs, err = domain.NewNodeInputEnvelope(mergeABindings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mergeAMetadata.Input = mergeAInputs.Canonical()
+	run.Context.Nodes["merge-a"] = mergeAMetadata
+
+	sliceB := syntheticSlice("current", "fan-b")
+	run.Context.Slices[sliceB.ID] = sliceB
+	fanB := addSyntheticNode(run, "fan-b", "fan-b", "", NodeRunning)
+	fanBInputs, err := buildNodeInputEnvelope(run, definition, fanB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fanB.Status = NodeCompleted
+	run.Context.Nodes[fanB.Key] = NodeMetadata{
+		DefinitionNodeID: "fan-b", Input: fanBInputs.Canonical(),
+		FanOutOutputs: map[string]json.RawMessage{sliceB.ID: mustJSON(FanOutItem{Key: sliceB.Key, Title: sliceB.Title, Blueprint: sliceB.Blueprint, PageSpec: sliceB.PageSpec, Prototype: sliceB.Prototype})},
+	}
+	workB := addSyntheticNode(run, instanceKey("work-b", sliceB.ID), "work-b", sliceB.ID, NodeRunning)
+	workBInputs, err := buildNodeInputEnvelope(run, definition, workB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	workB.Status = NodeCompleted
+	run.Context.Nodes[workB.Key] = NodeMetadata{DefinitionNodeID: "work-b", SliceID: sliceB.ID, Input: workBInputs.Canonical(), Output: json.RawMessage(`{"ok":true}`)}
+	mergeB := addSyntheticNode(run, "merge-b", "merge-b", "", NodeRunning)
+	mergeBInputs, err := buildNodeInputEnvelope(run, definition, mergeB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mergeB.Status = NodeCompleted
+	run.Context.Nodes[mergeB.Key] = NodeMetadata{DefinitionNodeID: "merge-b", Input: mergeBInputs.Canonical()}
+	compiler := addSyntheticNode(run, "compiler", "compiler", "", NodeRunning)
+	compilerInputs, err := buildNodeInputEnvelope(run, definition, compiler)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertOnlySlice(t, compilerInputs.SliceRefs(), sliceB)
+	for _, stale := range []domain.ArtifactRef{wholeBlueprint, anchoredBlueprint, *sliceA.PageSpec, *sliceA.Prototype} {
+		for _, ref := range compilerInputs.ArtifactRefs() {
+			if sameArtifactRevision(ref, stale) {
+				t.Fatalf("second fan-out compiler retained stale first-epoch artifact: %+v", ref)
+			}
+		}
+	}
+}
+
+func TestHumanEditMaterializationPreventsReviewQuorumFromRevalidatingUpstreamArtifacts(t *testing.T) {
+	upstream, current := platformRef("review-upstream-brief"), platformRef("review-current-requirements")
+	stored, err := domain.NewNodeInputEnvelope([]domain.NodeInputBinding{{
+		EdgeID: "ai-human", FromPort: "default", ToPort: "default",
+		Source: domain.NodeOutputReference{
+			RunID: uuid.NewString(), NodeKey: "requirements-ai", DefinitionNodeID: "requirements-ai",
+			ArtifactRevisions: []domain.ArtifactRef{upstream},
+		},
+		Output: json.RawMessage(`{}`), Value: json.RawMessage(`{}`),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	output, err := domain.CanonicalJSON(map[string]any{"artifactRevision": current})
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := &RunRecord{ID: uuid.NewString(), Context: NewRunContext()}
+	run.Context.Slices["slice-review"] = SliceContext{ID: "slice-review", Key: "review", FanOutNodeID: "pages", Blueprint: upstream}
+	source := &NodeRecord{Key: "requirements-edit:slice-review", DefinitionNodeID: "requirements-edit", SliceID: "slice-review", Type: domain.NodeHumanEdit, Status: NodeCompleted}
+	definition := domain.NodeDefinition{ID: "requirements-edit", Type: domain.NodeHumanEdit, HumanEdit: &domain.HumanEditNodeConfig{ArtifactKind: "product_requirements"}}
+	reference := nodeOutputReference(run, definition, source, output, stored, true, "")
+	if len(reference.ArtifactRevisions) != 2 {
+		t.Fatalf("HumanEdit materialization lost complete generation lineage: %#v", reference.ArtifactRevisions)
+	}
+	if len(reference.MaterializedArtifactRevisions) != 1 || !reference.MaterializedArtifactRevisions[0].Equal(current) {
+		t.Fatalf("HumanEdit did not isolate its current review materialization: %#v", reference.MaterializedArtifactRevisions)
+	}
+	if len(reference.DeliverySliceRefs) != 1 || reference.DeliverySliceRefs[0].ID != "slice-review" {
+		t.Fatalf("HumanEdit materialization lost its non-reviewable slice lineage: %#v", reference.DeliverySliceRefs)
+	}
+	conditionInput, err := domain.NewNodeInputEnvelope([]domain.NodeInputBinding{{
+		EdgeID: "human-condition", FromPort: "default", ToPort: "default", Source: reference,
+		Output: output, Value: output,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	conditionDefinition := domain.NodeDefinition{ID: "review-condition", Type: domain.NodeCondition, Condition: &domain.ConditionNodeConfig{Branches: []domain.ConditionBranch{{Name: "yes"}, {Name: "no"}}}}
+	conditionNode := &NodeRecord{Key: "review-condition:slice-review", DefinitionNodeID: conditionDefinition.ID, SliceID: "slice-review", Type: domain.NodeCondition, Status: NodeCompleted}
+	conditionReference := nodeOutputReference(run, conditionDefinition, conditionNode, output, conditionInput, true, "")
+	if len(conditionReference.MaterializedArtifactRevisions) != 1 || !conditionReference.MaterializedArtifactRevisions[0].Equal(current) || len(conditionReference.ArtifactRevisions) != 2 {
+		t.Fatalf("transparent control node did not preserve review marker and full generation context: %+v", conditionReference)
+	}
+}
+
+func TestHumanEditSameArtifactRevisionReplacesPriorGenerationBaseline(t *testing.T) {
+	b0 := platformRef("brief-b0")
+	b1 := platformRef("brief-b1")
+	b1.ArtifactID = b0.ArtifactID
+	r1 := platformRef("requirements-r1")
+	run := &RunRecord{ID: uuid.NewString(), Context: NewRunContext()}
+
+	briefInput, err := domain.NewNodeInputEnvelope([]domain.NodeInputBinding{{
+		EdgeID: "brief-ai-edit", FromPort: "default", ToPort: "default",
+		Source: domain.NodeOutputReference{
+			RunID: run.ID, NodeKey: "brief-ai", DefinitionNodeID: "brief-ai",
+			ArtifactRevisions: []domain.ArtifactRef{b0},
+		},
+		Output: json.RawMessage(`{}`), Value: json.RawMessage(`{}`),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	briefOutput := mustJSON(map[string]any{"artifactRevision": b1})
+	briefReference := nodeOutputReference(
+		run,
+		domain.NodeDefinition{ID: "brief-edit", Type: domain.NodeHumanEdit, HumanEdit: &domain.HumanEditNodeConfig{ArtifactKind: "project_brief"}},
+		&NodeRecord{Key: "brief-edit", DefinitionNodeID: "brief-edit", Type: domain.NodeHumanEdit, Status: NodeCompleted},
+		briefOutput, briefInput, true, "",
+	)
+	if len(briefReference.ArtifactRevisions) != 1 || !briefReference.ArtifactRevisions[0].Equal(b1) {
+		t.Fatalf("B1 did not replace B0 on the same stable artifact: %+v", briefReference.ArtifactRevisions)
+	}
+
+	requirementsAIInput, err := domain.NewNodeInputEnvelope([]domain.NodeInputBinding{{
+		EdgeID: "brief-review-requirements-ai", FromPort: "default", ToPort: "default", Source: briefReference,
+		Output: briefOutput, Value: briefOutput,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	requirementsAIReference := nodeOutputReference(
+		run,
+		domain.NodeDefinition{ID: "requirements-ai", Type: domain.NodeAITransform, AITransform: &domain.AITransformNodeConfig{JobType: "derive_requirements"}},
+		&NodeRecord{Key: "requirements-ai", DefinitionNodeID: "requirements-ai", Type: domain.NodeAITransform, Status: NodeCompleted},
+		json.RawMessage(`{}`), requirementsAIInput, true, "",
+	)
+	requirementsEditInput, err := domain.NewNodeInputEnvelope([]domain.NodeInputBinding{{
+		EdgeID: "requirements-ai-edit", FromPort: "default", ToPort: "default", Source: requirementsAIReference,
+		Output: json.RawMessage(`{}`), Value: json.RawMessage(`{}`),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	requirementsReference := nodeOutputReference(
+		run,
+		domain.NodeDefinition{ID: "requirements-edit", Type: domain.NodeHumanEdit, HumanEdit: &domain.HumanEditNodeConfig{ArtifactKind: "product_requirements"}},
+		&NodeRecord{Key: "requirements-edit", DefinitionNodeID: "requirements-edit", Type: domain.NodeHumanEdit, Status: NodeCompleted},
+		mustJSON(map[string]any{"artifactRevision": r1}), requirementsEditInput, true, "",
+	)
+	if len(requirementsReference.ArtifactRevisions) != 2 || !containsArtifactRef(requirementsReference.ArtifactRevisions, b1) || !containsArtifactRef(requirementsReference.ArtifactRevisions, r1) || containsArtifactRef(requirementsReference.ArtifactRevisions, b0) {
+		t.Fatalf("requirements baseline must be exactly B1+R1, never B0+R1: %+v", requirementsReference.ArtifactRevisions)
+	}
+}
+
+func containsArtifactRef(refs []domain.ArtifactRef, candidate domain.ArtifactRef) bool {
+	for _, ref := range refs {
+		if ref.Equal(candidate) {
+			return true
+		}
+	}
+	return false
 }
 
 func TestMinimumLoopRuntimeInputsConnectArtifactToPublish(t *testing.T) {

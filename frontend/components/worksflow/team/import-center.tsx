@@ -67,6 +67,7 @@ const COPY = {
     approve: '批准并应用', retryApprove: '重试应用', reject: '拒绝', openStudio: '打开原型工作室',
     mapping: '提案映射', layers: '图层', components: '组件', states: '状态', interactions: '交互',
     createMode: '新建', updateMode: '更新', failure: '导入失败', trust: '外部来源不是事实源；只有批准后形成的内部 Prototype revision 才能进入下游。',
+    independentReview: '创建者不能评审自己的设计导入。请由另一位具有评审权限的项目成员批准或拒绝。',
     navigationTitle: '继续工作流', graph: '文档依赖图', blueprint: '蓝图编辑器', prototypeStudio: '原型工作室', workbench: '应用工作台',
   },
   'en-US': {
@@ -87,6 +88,7 @@ const COPY = {
     approve: 'Approve and apply', retryApprove: 'Retry apply', reject: 'Reject', openStudio: 'Open Prototype Studio',
     mapping: 'Proposal mapping', layers: 'Layers', components: 'Components', states: 'States', interactions: 'Interactions',
     createMode: 'Create', updateMode: 'Update', failure: 'Import failed', trust: 'External sources are not facts. Only the internal Prototype revision created after approval can flow downstream.',
+    independentReview: 'Creators cannot review their own design imports. Another project member with review permission must approve or reject it.',
     navigationTitle: 'Continue the workflow', graph: 'Document Graph', blueprint: 'Blueprint Editor', prototypeStudio: 'Prototype Studio', workbench: 'Application Workbench',
   },
 } as const
@@ -114,6 +116,7 @@ export function ImportCenter() {
   const [submitting, setSubmitting] = useState(false)
   const [decisionBusy, setDecisionBusy] = useState('')
   const fileInputRef = useRef<HTMLInputElement>(null)
+  const createCommandRef = useRef<{ readonly fingerprint: string; readonly key: string } | null>(null)
 
   const pageSpecs = useMemo(() => workspace.pageSpecs.filter((resource) =>
     resource.approvedRevision
@@ -134,6 +137,8 @@ export function ImportCenter() {
   }), [selectedPageSpecRevision, workspace.prototypes])
   const selectedCapability = capabilities?.sources.find((item) => item.sourceKind === selectedSource)
   const canEdit = collaboration.can('edit')
+  const currentUserId = collaboration.session.signedIn ? collaboration.session.user.id : ''
+  const canReview = Boolean(collaboration.project && ['owner', 'admin', 'editor'].includes(collaboration.project.role))
 
   useEffect(() => {
     if (pageSpecId && pageSpecs.some((resource) => resource.artifact.id === pageSpecId)) return
@@ -211,7 +216,7 @@ export function ImportCenter() {
       const mediaType = normalizedMediaType(file)
       const contentBase64 = await fileBase64(file)
       const selectedFrameIds = selectedFrameText.split(',').map((item) => item.trim()).filter(Boolean)
-      const result = await client.create(projectId, {
+      const createInput = {
         sourceKind: selectedSource,
         mode: 'upload',
         title: title.trim() || undefined,
@@ -223,8 +228,16 @@ export function ImportCenter() {
           contentHash: revision.contentHash,
         },
         targetPrototypeArtifactId: targetPrototypeId || undefined,
-      }, { idempotencyKey: commandKey('design-import-create') })
+      } as const
+      const fingerprint = JSON.stringify(createInput)
+      if (!createCommandRef.current || createCommandRef.current.fingerprint !== fingerprint) {
+        createCommandRef.current = { fingerprint, key: commandKey('design-import-create') }
+      }
+      const result = await client.create(projectId, createInput, {
+        idempotencyKey: createCommandRef.current.key,
+      })
       setImports((current) => [result.data, ...current.filter((item) => item.id !== result.data.id)])
+      createCommandRef.current = null
       setFile(null)
       setTitle('')
       setSelectedFrameText('')
@@ -238,7 +251,7 @@ export function ImportCenter() {
   }
 
   async function decide(item: DesignImportDto, decision: 'approve' | 'reject') {
-    if (!canEdit) return
+    if (!canReview || !currentUserId || item.createdBy === currentUserId) return
     setDecisionBusy(item.id)
     setError(null)
     try {
@@ -407,7 +420,8 @@ export function ImportCenter() {
                         item={item}
                         locale={locale}
                         busy={decisionBusy === item.id}
-                        canEdit={canEdit}
+                        canReview={canReview}
+                        currentUserId={currentUserId}
                         copy={copy}
                         onApprove={() => void decide(item, 'approve')}
                         onReject={() => void decide(item, 'reject')}
@@ -442,11 +456,12 @@ export function ImportCenter() {
   )
 }
 
-function ImportRecord({ item, locale, busy, canEdit, copy, onApprove, onReject, onOpenPrototype }: {
+function ImportRecord({ item, locale, busy, canReview, currentUserId, copy, onApprove, onReject, onOpenPrototype }: {
   item: DesignImportDto
   locale: 'zh-CN' | 'en-US'
   busy: boolean
-  canEdit: boolean
+  canReview: boolean
+  currentUserId: string
   copy: typeof COPY['zh-CN'] | typeof COPY['en-US']
   onApprove: () => void
   onReject: () => void
@@ -455,6 +470,8 @@ function ImportRecord({ item, locale, busy, canEdit, copy, onApprove, onReject, 
   const sourceIcon = SOURCE_ICONS[item.snapshot.sourceKind]
   const Icon = sourceIcon
   const reviewable = item.status === 'open' || (item.status === 'failed' && Boolean(item.proposal))
+  const isCreator = Boolean(currentUserId) && item.createdBy === currentUserId
+  const independentReviewAllowed = canReview && !isCreator
   const statusTone = item.status === 'applied' ? 'success' : item.status === 'failed' || item.status === 'rejected' ? 'danger' : item.status === 'applying' ? 'warning' : 'primary'
   const mapping = proposalMapping(item)
   return (
@@ -491,6 +508,12 @@ function ImportRecord({ item, locale, busy, canEdit, copy, onApprove, onReject, 
           <span><strong>{copy.failure}:</strong> {item.failureDetail}</span>
         </div>
       )}
+      {reviewable && isCreator && (
+        <div className="mt-3 flex items-start gap-1.5 rounded-lg border border-warning/30 bg-warning/10 px-3 py-2 text-[10px] leading-relaxed text-warning" data-testid={`design-import-independent-review-${item.id}`}>
+          <ShieldCheck className="mt-0.5 size-3 shrink-0" />
+          <span>{copy.independentReview}</span>
+        </div>
+      )}
       {mapping && (
         <div className="mt-3 rounded-lg border border-primary/20 bg-primary/[0.04] p-3">
           <div className="flex flex-wrap items-center gap-2 text-[9px] font-semibold uppercase tracking-wide text-primary-bright">
@@ -512,8 +535,8 @@ function ImportRecord({ item, locale, busy, canEdit, copy, onApprove, onReject, 
           )}
           {reviewable && (
             <>
-              {item.status === 'open' && <button type="button" onClick={onReject} disabled={!canEdit || busy} className="inline-flex items-center gap-1 rounded border border-destructive/40 px-2 py-1.5 text-[10px] text-destructive hover:bg-destructive/10 disabled:opacity-40"><X className="size-3" />{copy.reject}</button>}
-              <button type="button" data-testid={`design-import-approve-${item.id}`} onClick={onApprove} disabled={!canEdit || busy} className="inline-flex items-center gap-1 rounded bg-primary px-2.5 py-1.5 text-[10px] font-semibold text-primary-foreground hover:bg-primary/90 disabled:opacity-40"><CheckCircle2 className="size-3" />{item.status === 'failed' ? copy.retryApprove : copy.approve}</button>
+              {item.status === 'open' && <button type="button" onClick={onReject} disabled={!independentReviewAllowed || busy} title={isCreator ? copy.independentReview : undefined} className="inline-flex items-center gap-1 rounded border border-destructive/40 px-2 py-1.5 text-[10px] text-destructive hover:bg-destructive/10 disabled:opacity-40"><X className="size-3" />{copy.reject}</button>}
+              <button type="button" data-testid={`design-import-approve-${item.id}`} onClick={onApprove} disabled={!independentReviewAllowed || busy} title={isCreator ? copy.independentReview : undefined} className="inline-flex items-center gap-1 rounded bg-primary px-2.5 py-1.5 text-[10px] font-semibold text-primary-foreground hover:bg-primary/90 disabled:opacity-40"><CheckCircle2 className="size-3" />{item.status === 'failed' ? copy.retryApprove : copy.approve}</button>
             </>
           )}
         </div>

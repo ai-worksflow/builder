@@ -131,7 +131,7 @@ type ActivityService interface {
 
 type GenerationService interface {
 	GenerateArtifactProposal(context.Context, string, string, string) (generation.ArtifactGenerationResult, error)
-	GenerateImplementation(context.Context, string, string, string, string) (generation.ImplementationGenerationResult, error)
+	GenerateImplementation(context.Context, generation.ImplementationGenerationRequest) (generation.ImplementationGenerationResult, error)
 }
 
 type DocumentCollaborationService interface {

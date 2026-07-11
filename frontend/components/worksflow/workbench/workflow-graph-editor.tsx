@@ -17,9 +17,12 @@ import type {
   WorkflowNodeType,
 } from '@/lib/platform/flow-contract'
 import {
+  appendPairedFanOutSubgraph,
+  estimateWorkflowSemanticStates,
   parseEditableDefinition as parseWorkflowDefinition,
   type EditableWorkflowDefinition,
   validateWorkflowNode as validateNodeContract,
+  workflowSemanticAnalysisLimit,
 } from '@/lib/platform/workflow-ui-contract'
 import { cn } from '@/lib/utils'
 
@@ -61,8 +64,14 @@ export function WorkflowGraphEditor({ value, onChange, capabilities }: WorkflowG
   const [toPort, setToPort] = useState('default')
   const [nodeDraft, setNodeDraft] = useState('')
   const [localError, setLocalError] = useState<string | null>(null)
-  const parsed = useMemo(() => parseWorkflowDefinition(value), [value])
+  const parsed = useMemo(() => parseWorkflowDefinition(value, false, capabilities), [capabilities, value])
   const definition = parsed.definition
+  const semanticStateLimit = workflowSemanticAnalysisLimit(capabilities)
+  const semanticStateEstimate = useMemo(() =>
+    definition && semanticStateLimit
+      ? estimateWorkflowSemanticStates(definition, semanticStateLimit)
+      : undefined,
+  [definition, semanticStateLimit])
   const selectedNode = definition?.nodes.find((node) => node.id === selectedNodeId)
 
   useEffect(() => {
@@ -104,15 +113,13 @@ export function WorkflowGraphEditor({ value, onChange, capabilities }: WorkflowG
   function addNode() {
     if (!definition) return
     if (newNodeType === 'fan_out' || newNodeType === 'merge') {
-      const fanOutId = uniqueNodeId('fan-out', definition.nodes)
-      const mergeId = uniqueNodeId('merge', definition.nodes)
-      const fanOut = createNode(fanOutId, 'fan_out', capabilities, mergeId)
-      const merge = createNode(mergeId, 'merge', capabilities, fanOutId)
-      const edge: WorkflowEdgeDto = {
-        id: uniqueEdgeId(`${fanOutId}-${mergeId}`, definition.edges), from: fanOutId, to: mergeId,
-      }
-      commit({ ...definition, nodes: [...definition.nodes, fanOut, merge], edges: [...definition.edges, edge] })
-      setSelectedNodeId(newNodeType === 'fan_out' ? fanOutId : mergeId)
+      const pair = appendPairedFanOutSubgraph(
+        definition,
+        newNodeType,
+        capabilities?.fanOutItemKinds.includes('blueprint_page') ? 'blueprint_page' : 'blueprint_selection_page',
+      )
+      commit(pair.definition)
+      setSelectedNodeId(pair.selectedNodeId)
       return
     }
     const id = uniqueNodeId(newNodeType.replaceAll('_', '-'), definition.nodes)
@@ -233,6 +240,23 @@ export function WorkflowGraphEditor({ value, onChange, capabilities }: WorkflowG
             </select>
             <button type="button" onClick={addNode} className="inline-flex h-8 items-center gap-1 rounded bg-primary px-2.5 text-[10px] font-semibold text-primary-foreground"><CirclePlus className="size-3" /> Add node</button>
             <span className="ml-auto text-[9px] text-faint-foreground">{definition.nodes.length} nodes · {definition.edges.length} edges</span>
+            {semanticStateEstimate && (
+              <span
+                className={cn(
+                  'rounded border px-1.5 py-1 font-mono text-[8px]',
+                  semanticStateEstimate.exceeded
+                    ? 'border-destructive/40 bg-destructive/10 text-destructive'
+                    : 'border-border bg-panel text-faint-foreground',
+                )}
+                title={semanticStateEstimate.exceeded
+                  ? 'Reduce independent Condition combinations or merge branches earlier.'
+                  : 'Peak deterministic semantic states estimated before server validation.'}
+              >
+                semantic states {semanticStateEstimate.exceeded ? '>' : ''}{semanticStateEstimate.exceeded
+                  ? semanticStateEstimate.maximumStates
+                  : semanticStateEstimate.peakStates}/{semanticStateEstimate.maximumStates}
+              </span>
+            )}
           </div>
 
           <div className="min-h-[300px] flex-1 overflow-auto scrollbar-thin">
@@ -314,6 +338,11 @@ export function WorkflowGraphEditor({ value, onChange, capabilities }: WorkflowG
           ) : (
             <p className="text-[10px] text-faint-foreground">Add or select a node to edit its typed contract.</p>
           )}
+          {semanticStateEstimate?.exceeded && (
+            <p role="alert" className="mt-2 text-[9px] leading-relaxed text-destructive">
+              This graph exceeds the server&apos;s semantic analysis budget. Reduce independent Condition combinations or merge branches earlier before saving.
+            </p>
+          )}
           {localError && <p role="alert" className="mt-2 text-[9px] leading-relaxed text-destructive">{localError}</p>}
         </aside>
       </div>
@@ -353,7 +382,7 @@ function createNode(
   const schema = { type: 'object', additionalProperties: true } as const
   const base = { id, name: NODE_TYPES.find((item) => item.value === type)?.label ?? type, type, inputSchema: schema, outputSchema: schema }
   switch (type) {
-    case 'artifact_input': return { ...base, artifactInput: { allowedTypes: ['document'], allowedKinds: ['project_brief'], requireApproved: true, minimumArtifacts: 1 } }
+    case 'artifact_input': return { ...base, artifactInput: { allowedTypes: ['document'], allowedKinds: ['project_brief'], requireApproved: true, minimumArtifacts: 1, maximumArtifacts: 1 } }
     case 'ai_transform': {
       const registered = capabilities?.aiTransforms.at(0) ?? { jobType: 'derive_requirements', outputSchemaVersion: 'requirements-proposal/v1', modelPolicies: ['project-default'] }
       return { ...base, aiTransform: { jobType: registered.jobType, outputSchemaVersion: registered.outputSchemaVersion, modelPolicy: registered.modelPolicies.at(0) ?? 'project-default', maxAttempts: 2, timeout: 120_000_000_000 } }
@@ -361,7 +390,11 @@ function createNode(
     case 'human_edit': return { ...base, humanEdit: { artifactType: 'document', artifactKind: 'product_requirements', requiredRole: 'editor', instructions: 'Submit an exact immutable revision.' } }
     case 'review_gate': return { ...base, reviewGate: { requiredRole: 'admin', minimumApprovals: 1, prohibitSelfReview: true, allowWaiver: false } }
     case 'condition': return { ...base, outputPorts: { yes: { schema }, otherwise: { schema } }, condition: { branches: [{ name: 'yes', expression: 'true', default: false }, { name: 'otherwise', default: true }] } }
-    case 'fan_out': return { ...base, fanOut: { itemsPath: '/items', sliceKeyPath: '/id', mergeNodeId: reciprocalId ?? `${id}-merge`, maxParallel: 4, itemKind: capabilities?.fanOutItemKinds.at(0) ?? 'generic' } }
+    case 'fan_out': {
+      const itemKind = capabilities?.fanOutItemKinds.at(0) ?? 'generic'
+      const maxItems = capabilities?.fanOutMaximumItems[itemKind] ?? 100
+      return { ...base, fanOut: { itemsPath: '/items', sliceKeyPath: '/id', mergeNodeId: reciprocalId ?? `${id}-merge`, maxParallel: 4, maxItems, itemKind } }
+    }
     case 'merge': return { ...base, merge: { fanOutNodeId: reciprocalId ?? `${id}-fan-out`, policy: 'all', allowWaiver: false } }
     case 'manifest_compiler': return { ...base, manifestCompiler: capabilities?.manifestCompilers.at(0) ?? { manifestKind: 'application_build', schemaVersion: 1, hook: 'application-build-manifest/v1' } }
     case 'workbench_build': return { ...base, workbenchBuild: { buildManifestSchemaVersion: capabilities?.workbenchSchemaVersions.at(0) ?? 1, maxAttempts: 2, timeout: 300_000_000_000 } }

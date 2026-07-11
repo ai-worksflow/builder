@@ -34,7 +34,10 @@ func NewMemoryStore(ids IDGenerator) *MemoryStore {
 func (s *MemoryStore) SaveDefinition(_ context.Context, record DefinitionRecord) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if err := record.Definition.Validate(); err != nil {
+	if err := normalizeDefinitionRecordProfile(&record); err != nil {
+		return err
+	}
+	if err := ValidateDefinitionForExecutionProfile(record.Definition, record.ExecutionProfile); err != nil {
 		return err
 	}
 	versions := s.definitions[record.Definition.ID]
@@ -133,6 +136,12 @@ func (s *MemoryStore) PublishDefinitionVersion(_ context.Context, projectID, def
 	if !exists || record.Definition.ID != definitionID || (record.ProjectID != "" && record.ProjectID != projectID) {
 		return DefinitionRecord{}, domain.ErrNotFound
 	}
+	if record.ExecutionProfile != CurrentWorkflowExecutionProfileRef() {
+		return DefinitionRecord{}, &domain.DomainError{Kind: domain.ErrValidation, Field: "workflow.executionProfile", Message: "only the current execution profile can be newly published"}
+	}
+	if err := ValidateDefinitionForExecutionProfile(record.Definition, record.ExecutionProfile); err != nil {
+		return DefinitionRecord{}, err
+	}
 	record.Published = true
 	s.definitionVersions[versionID] = record
 	s.definitions[definitionID][record.Definition.Version] = record
@@ -211,6 +220,10 @@ func (s *MemoryStore) CreateRun(_ context.Context, run *RunRecord, events []Even
 	if _, exists := s.runs[run.ID]; exists {
 		return ErrCASConflict
 	}
+	definition, exists := s.definitionVersions[run.DefinitionVersionID]
+	if !exists || definition.ExecutionProfile != run.ExecutionProfile || definition.Definition.RefForExecutionProfile(definition.ExecutionProfile) != run.Definition {
+		return ErrCASConflict
+	}
 	copyRun := cloneRunRecord(run)
 	copyRun.EventCursor = uint64(len(events))
 	run.EventCursor = copyRun.EventCursor
@@ -266,13 +279,39 @@ func (s *MemoryStore) ListRuns(_ context.Context, projectID string, filter Store
 func summaryFromRun(run *RunRecord) RunSummary {
 	return RunSummary{
 		ID: run.ID, ProjectID: run.ProjectID, DefinitionVersionID: run.DefinitionVersionID,
-		Status: run.Status, EventCursor: run.EventCursor, StartedBy: run.StartedBy,
+		ExecutionProfile: run.ExecutionProfile,
+		Status:           run.Status, EventCursor: run.EventCursor, StartedBy: run.StartedBy,
 		StartedAt: run.StartedAt, CompletedAt: run.CompletedAt, CancelledAt: run.CancelledAt,
 		Failure: cloneRaw(run.Failure), CreatedAt: run.CreatedAt, UpdatedAt: run.UpdatedAt,
 	}
 }
 
-func (s *MemoryStore) ClaimRunnable(_ context.Context, workerID string, now time.Time, leaseDuration time.Duration) (Lease, error) {
+func (s *MemoryStore) ListActiveExecutionProfiles(_ context.Context) ([]domain.WorkflowExecutionProfileRef, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	seen := map[domain.WorkflowExecutionProfileRef]bool{}
+	for _, run := range s.runs {
+		if !run.Status.Terminal() {
+			seen[run.ExecutionProfile] = true
+		}
+	}
+	result := make([]domain.WorkflowExecutionProfileRef, 0, len(seen))
+	for ref := range seen {
+		if err := ref.Validate(); err != nil {
+			return nil, err
+		}
+		result = append(result, ref)
+	}
+	sort.Slice(result, func(i, j int) bool {
+		if result[i].Version == result[j].Version {
+			return result[i].Hash < result[j].Hash
+		}
+		return result[i].Version < result[j].Version
+	})
+	return result, nil
+}
+
+func (s *MemoryStore) ClaimRunnable(_ context.Context, workerID string, now time.Time, leaseDuration time.Duration, supported ...domain.WorkflowExecutionProfileRef) (Lease, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	type candidate struct {
@@ -280,8 +319,17 @@ func (s *MemoryStore) ClaimRunnable(_ context.Context, workerID string, now time
 		node *NodeRecord
 	}
 	candidates := make([]candidate, 0)
+	profiles := make(map[domain.WorkflowExecutionProfileRef]struct{}, len(supported))
+	for _, ref := range supported {
+		if ref.Validate() == nil {
+			profiles[ref] = struct{}{}
+		}
+	}
 	for _, run := range s.runs {
 		if run.Status.Terminal() {
+			continue
+		}
+		if _, supported := profiles[run.ExecutionProfile]; !supported {
 			continue
 		}
 		for _, node := range run.Nodes {

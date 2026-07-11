@@ -119,30 +119,9 @@ func (s *Service) Create(ctx context.Context, projectID, actorID, commandKey str
 	if err := validateSelection(input.SelectedFrameIDs, upload.Catalog); err != nil {
 		return Import{}, err
 	}
-	pageSpec, err := s.loadCurrentApprovedPageSpec(ctx, actorID, input.PageSpecRevision)
-	if err != nil {
-		return Import{}, err
-	}
 	projectUUID, actorUUID, err := parseProjectActor(projectID, actorID)
 	if err != nil {
 		return Import{}, err
-	}
-	if pageSpec.Artifact.ProjectID != projectID {
-		return Import{}, core.ErrNotFound
-	}
-	var requestedTarget *core.VersionedArtifact
-	if input.TargetPrototypeArtifactID != "" {
-		target, targetErr := s.loadTargetPrototype(ctx, projectID, actorID, input.TargetPrototypeArtifactID)
-		if targetErr != nil {
-			return Import{}, targetErr
-		}
-		if err := ensureTargetPageSpec(target, input.PageSpecRevision); err != nil {
-			return Import{}, err
-		}
-		if target.LatestRevision == nil {
-			return Import{}, &Error{Kind: ErrConflict, Field: "targetPrototypeArtifactId", Detail: "target Prototype must have an immutable base revision"}
-		}
-		requestedTarget = &target
 	}
 	requestHash := sha256.Sum256([]byte(commandKey))
 	requestKeyHash := hex.EncodeToString(requestHash[:])
@@ -165,6 +144,27 @@ func (s *Service) Create(ctx context.Context, projectID, actorID, commandKey str
 	}
 	if !errors.Is(err, gorm.ErrRecordNotFound) {
 		return Import{}, err
+	}
+	pageSpec, err := s.loadCurrentApprovedPageSpec(ctx, actorID, input.PageSpecRevision)
+	if err != nil {
+		return Import{}, err
+	}
+	if pageSpec.Artifact.ProjectID != projectID {
+		return Import{}, core.ErrNotFound
+	}
+	var requestedTarget *core.VersionedArtifact
+	if input.TargetPrototypeArtifactID != "" {
+		target, targetErr := s.loadTargetPrototype(ctx, projectID, actorID, input.TargetPrototypeArtifactID)
+		if targetErr != nil {
+			return Import{}, targetErr
+		}
+		if err := ensureTargetPageSpec(target, input.PageSpecRevision); err != nil {
+			return Import{}, err
+		}
+		if target.LatestRevision == nil {
+			return Import{}, &Error{Kind: ErrConflict, Field: "targetPrototypeArtifactId", Detail: "target Prototype must have an immutable base revision"}
+		}
+		requestedTarget = &target
 	}
 
 	importID := designImportID(projectUUID, requestKeyHash)
@@ -237,7 +237,8 @@ func (s *Service) Create(ctx context.Context, projectID, actorID, commandKey str
 			var concurrent importModel
 			if loadErr := s.database.WithContext(ctx).Where("project_id = ? AND request_key_hash = ?", projectUUID, requestKeyHash).Take(&concurrent).Error; loadErr == nil && sameCreateRequest(concurrent, input, upload) {
 				if finalizeErr := s.contents.Finalize(ctx, concurrent.SnapshotRef); finalizeErr != nil {
-					return Import{}, finalizeErr
+					s.recordFailure(ctx, concurrent.ID, core.ErrContentNotReady, actorID)
+					return Import{}, fmt.Errorf("%w: finalize design snapshot: %v", core.ErrContentNotReady, finalizeErr)
 				}
 				if creationRecoverable(concurrent) {
 					if resumeErr := s.resumeCreate(ctx, &concurrent, actorID); resumeErr != nil {
@@ -295,6 +296,7 @@ func (s *Service) claimCreation(ctx context.Context, model *importModel, actorID
 		Stage: model.PipelineStage, ExpiresAt: now.Add(s.createLease),
 	}
 	priorStatus := model.Status
+	recovering := priorStatus == "failed" || model.CreateClaimToken != nil
 	err = s.database.WithContext(ctx).Transaction(func(transaction *gorm.DB) error {
 		result := transaction.Model(&importModel{}).
 			Where("id = ? AND version = ? AND status IN ? AND pipeline_stage <> ?", model.ID, model.Version, []string{"creating", "failed"}, stageProposalReady).
@@ -319,7 +321,7 @@ func (s *Service) claimCreation(ctx context.Context, model *importModel, actorID
 			return ErrConflict
 		}
 		eventType := "design_import.creation_claimed"
-		if priorStatus == "failed" {
+		if recovering {
 			eventType = "design_import.creation_recovered"
 		}
 		metadata := map[string]any{"stage": model.PipelineStage, "leaseExpiresAt": claim.ExpiresAt, "priorStatus": priorStatus}
@@ -498,7 +500,8 @@ func (s *Service) ensureCreationTarget(
 		return core.VersionedArtifact{}, core.ArtifactRevision{}, err
 	}
 	if target.Artifact.ID != expectedArtifactID || target.Artifact.ProjectID != model.ProjectID.String() ||
-		target.Artifact.Kind != "prototype" || target.Artifact.ArtifactKey != importArtifactKey(model.ID) {
+		target.Artifact.Kind != "prototype" || target.Artifact.ArtifactKey != importArtifactKey(model.ID) ||
+		target.Artifact.Title != model.SourceName || target.Artifact.Lifecycle != "active" {
 		return core.VersionedArtifact{}, core.ArtifactRevision{}, core.ErrConflict
 	}
 	if target.Draft != nil && !hasExactPageSpecSource(target.Draft.SourceVersions, pageRef) {
@@ -533,6 +536,13 @@ func (s *Service) ensureCreationTarget(
 		return core.VersionedArtifact{}, core.ArtifactRevision{}, err
 	}
 	if baseRevision.ID != expectedBaseID || baseRevision.ArtifactID != expectedArtifactID {
+		return core.VersionedArtifact{}, core.ArtifactRevision{}, core.ErrConflict
+	}
+	expectedPlaceholder, buildErr := buildPrototypeContent(model, envelope, pageSpec.LatestRevision, true)
+	if buildErr != nil || !canonicalJSONEqual(baseRevision.Content, expectedPlaceholder) {
+		if buildErr != nil {
+			return core.VersionedArtifact{}, core.ArtifactRevision{}, buildErr
+		}
 		return core.VersionedArtifact{}, core.ArtifactRevision{}, core.ErrConflict
 	}
 	if err := s.runCreationHook("base_revision"); err != nil {
@@ -630,7 +640,7 @@ func (s *Service) ensureCreationManifest(
 func manifestMatchesCreationContract(manifest domain.InputManifest, model importModel, input core.CreateManifestInput) bool {
 	if manifest.ID != model.ExpectedInputManifestID.String() || manifest.ProjectID != model.ProjectID.String() ||
 		manifest.JobType != input.JobType || manifest.OutputSchemaVersion != input.OutputSchemaVersion ||
-		manifest.BaseRevision == nil || input.BaseRevision == nil || len(manifest.Sources) != len(input.Sources) {
+		manifest.DeliverySliceID != "" || manifest.BaseRevision == nil || input.BaseRevision == nil || len(manifest.Sources) != len(input.Sources) {
 		return false
 	}
 	if !domainRefMatchesCore(*manifest.BaseRevision, *input.BaseRevision) {
@@ -680,6 +690,7 @@ func (s *Service) ensureCreationProposal(
 func proposalMatchesCreationContract(proposal domain.OutputProposal, model importModel, input core.CreateProposalInput) bool {
 	if proposal.ID != model.ExpectedOutputProposalID.String() || proposal.ProjectID != model.ProjectID.String() ||
 		proposal.ArtifactID != input.ArtifactID || proposal.Manifest.ID != input.ManifestID ||
+		proposal.Status != domain.ProposalOpen || proposal.Version != 1 ||
 		len(proposal.Operations) != len(input.Operations) || len(proposal.Assumptions) != len(input.Assumptions) ||
 		len(proposal.Questions) != len(input.Questions) {
 		return false
@@ -687,7 +698,8 @@ func proposalMatchesCreationContract(proposal domain.OutputProposal, model impor
 	for index, operation := range proposal.Operations {
 		expected := input.Operations[index]
 		if operation.ID != expected.ID || operation.Kind != expected.Kind || operation.Path != expected.Path ||
-			operation.Rationale != expected.Rationale || !canonicalJSONEqual(operation.Value, expected.Value) {
+			operation.Rationale != expected.Rationale || operation.Decision != domain.DecisionPending ||
+			!canonicalJSONEqual(operation.Value, expected.Value) {
 			return false
 		}
 	}
@@ -879,8 +891,8 @@ func (s *Service) Decide(ctx context.Context, importID, actorID, expectedETag st
 	// External design snapshots are untrusted input. The actor who introduced
 	// that input cannot be the independent reviewer who accepts or rejects its
 	// conversion proposal, even when their project role otherwise allows review.
-	if actorUUID == model.CreatedBy {
-		return Import{}, core.ErrForbidden
+	if err := requireIndependentReviewer(model, actorUUID); err != nil {
+		return Import{}, err
 	}
 	if expectedETag != importETag(model.ID, model.Version) || input.Version != model.Version {
 		return Import{}, ErrConflict
@@ -1552,6 +1564,13 @@ func findOperation(proposal domain.OutputProposal, operationID string) *domain.P
 		if proposal.Operations[index].ID == operationID {
 			return &proposal.Operations[index]
 		}
+	}
+	return nil
+}
+
+func requireIndependentReviewer(model importModel, actorID uuid.UUID) error {
+	if actorID == uuid.Nil || actorID == model.CreatedBy {
+		return core.ErrForbidden
 	}
 	return nil
 }

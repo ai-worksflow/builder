@@ -696,6 +696,33 @@ test('blueprints keep semantic facts independent from canvas layout', () => {
   assert.deepEqual(moved.nodes[0].position, { x: 240, y: 120 })
 })
 
+test('Blueprint normalization canonicalizes Permission role aliases', () => {
+  const legacy: BlueprintContentDto = {
+    nodes: [{
+      id: 'permission-orders',
+      key: 'PERMISSION-ORDERS',
+      kind: 'permission',
+      title: 'Read orders',
+      roles: [' viewer ', 'admin'],
+      requiredRoles: ['admin', 'editor'],
+      role: 'auditor',
+      position: { x: 48, y: 96 },
+      requirementIds: ['req-stable'],
+      assignedMemberIds: [],
+    }],
+    edges: [],
+    validation: [],
+  }
+
+  const normalized = normalizeBlueprintContent(legacy)
+  const semanticNode = normalized.semantic?.nodes[0]
+  assert.ok(semanticNode)
+  assert.deepEqual(semanticNode.roles, ['viewer', 'admin', 'editor', 'auditor'])
+  assert.equal(Object.hasOwn(semanticNode, 'requiredRoles'), false)
+  assert.equal(Object.hasOwn(semanticNode, 'role'), false)
+  assert.deepEqual(normalized.nodes[0]?.roles, ['viewer', 'admin', 'editor', 'auditor'])
+})
+
 test('Blueprint API operations require unique valid contracts and permission edges', () => {
   const base: BlueprintContentDto = {
     nodes: [

@@ -2,6 +2,7 @@ import { expect, test, type Page, type Route } from '@playwright/test'
 
 const now = '2026-07-10T08:00:00Z'
 const hash = (character: string) => character.repeat(64)
+const workflowExecutionProfile = { version: 'workflow-engine/v2', hash: 'dd247a77ce3cfa1095a575a238b93c4bd41dd991eac07e8b62ec170864470da1' }
 
 const user = {
   id: '11111111-1111-4111-8111-111111111111',
@@ -247,18 +248,32 @@ const workflowDefinition = {
   title: 'Minimum application loop',
   description: 'Brief to application.',
   published: true,
-  version: 2,
+  version: 4,
   contentHash: hash('f'),
+  executionProfile: workflowExecutionProfile,
   definition: {
     id: 'ffffffff-ffff-4fff-8fff-ffffffffffff',
-    version: 2,
+    version: 4,
     name: 'Minimum application loop',
-    schemaVersion: 'workflow/v2',
+    schemaVersion: '4',
+    executionProfile: workflowExecutionProfile,
+    inputContract: {
+      capability: 'project_brief',
+      manifestJobTypes: ['conversation.workflow_intent', 'workflow_start'],
+      artifactKinds: ['project_brief'], minimumArtifacts: 1, maximumArtifacts: 1, requireApproved: true,
+      requiredSourcePurposes: ['project_brief'],
+      manifestSchemaContracts: {
+        'conversation.workflow_intent': 'workflow-intent-input/v1', workflow_start: 'workflow-input/v1',
+      },
+    },
+    outputContract: {
+      capability: 'application', producedArtifactKinds: ['workspace'], terminalOutcome: 'deployment', terminalNodeType: 'publish',
+    },
     nodes: [{
       id: 'brief-input',
       name: 'Pinned Project Brief',
       type: 'artifact_input',
-      artifactInput: { allowedTypes: ['document'], requireApproved: true, minimumArtifacts: 1 },
+      artifactInput: { allowedTypes: ['document'], allowedKinds: ['project_brief'], requireApproved: true, minimumArtifacts: 1, maximumArtifacts: 1 },
     }],
     edges: [],
     hash: hash('f'),
@@ -275,25 +290,66 @@ const selectionWorkflowDefinition = {
   title: 'Build application from Blueprint selection',
   description: 'Selection to Workbench.',
   published: true,
-  version: 1,
+  version: 3,
   contentHash: hash('a'),
+  executionProfile: workflowExecutionProfile,
   definition: {
     id: 'abababab-abab-4bab-8bab-abababababab',
-    version: 1,
+    version: 3,
     name: 'Build application from Blueprint selection',
-    schemaVersion: '1',
+    schemaVersion: '3',
+    executionProfile: workflowExecutionProfile,
+    inputContract: {
+      capability: 'blueprint_selection', manifestJobTypes: ['blueprint.selection'],
+      artifactKinds: ['blueprint'], minimumArtifacts: 2, maximumArtifacts: 101, requireApproved: true,
+      requiredSourcePurposes: ['blueprint_selection_node', 'blueprint_selection_root'],
+      manifestSchemaContracts: { 'blueprint.selection': 'blueprint-selection/v1' },
+    },
+    outputContract: {
+      capability: 'application', producedArtifactKinds: ['workspace'], terminalOutcome: 'deployment', terminalNodeType: 'publish',
+    },
     nodes: [{
       id: 'selection', name: 'Frozen Blueprint selection', type: 'artifact_input',
-      artifactInput: { allowedTypes: ['blueprint'], requireApproved: true, minimumArtifacts: 1 },
+      artifactInput: { allowedTypes: ['blueprint'], allowedKinds: ['blueprint'], requireApproved: true, minimumArtifacts: 2, maximumArtifacts: 101 },
     }, {
       id: 'pages', name: 'Selected approved pages', type: 'fan_out',
       fanOut: {
         itemsPath: '/blueprintPages', sliceKeyPath: '/key', mergeNodeId: 'pages-merged',
-        maxParallel: 4, itemKind: 'blueprint_selection_page',
+        maxParallel: 4, maxItems: 100, itemKind: 'blueprint_selection_page',
       },
     }],
     edges: [],
     hash: hash('a'), createdBy: user.id, createdAt: now,
+  },
+}
+
+const workflowCapabilities = {
+  version: 4,
+  nodeTypes: ['artifact_input', 'ai_transform', 'human_edit', 'review_gate', 'condition', 'fan_out', 'merge', 'manifest_compiler', 'workbench_build', 'quality_gate', 'publish', 'transform'],
+  inputContracts: [{ ...workflowDefinition.definition.inputContract, requireApproved: false }, selectionWorkflowDefinition.definition.inputContract],
+  outputContracts: [workflowDefinition.definition.outputContract],
+  aiTransforms: [
+    { jobType: 'refine_project_brief', outputSchemaVersion: 'project-brief-proposal/v1', modelPolicies: ['project-default'], requiredArtifactKinds: ['project_brief'], requiredApprovedKinds: [], producedArtifactKinds: ['project_brief'] },
+    { jobType: 'derive_requirements', outputSchemaVersion: 'requirements-proposal/v1', modelPolicies: ['project-default'], requiredArtifactKinds: ['project_brief'], requiredApprovedKinds: ['project_brief'], producedArtifactKinds: ['product_requirements'] },
+    { jobType: 'decompose_pages', outputSchemaVersion: 'blueprint-proposal/v1', modelPolicies: ['project-default'], requiredArtifactKinds: ['product_requirements'], requiredApprovedKinds: ['product_requirements'], producedArtifactKinds: ['blueprint'] },
+    { jobType: 'generate_page_spec', outputSchemaVersion: 'page-spec-proposal/v1', modelPolicies: ['project-default'], requiredArtifactKinds: ['blueprint'], requiredApprovedKinds: ['blueprint'], producedArtifactKinds: ['page_spec'] },
+    { jobType: 'generate_prototype', outputSchemaVersion: 'prototype-proposal/v1', modelPolicies: ['project-default'], requiredArtifactKinds: ['page_spec'], requiredApprovedKinds: ['page_spec'], producedArtifactKinds: ['prototype'] },
+  ],
+  manifestCompilers: [{
+    manifestKind: 'application_build', schemaVersion: 1, hook: 'application-build-manifest/v1',
+    requiredArtifactKinds: ['blueprint', 'page_spec', 'prototype'], requiredApprovedKinds: ['blueprint', 'page_spec', 'prototype'],
+    requiresMergedSlices: true, producedSemanticKinds: ['application_build_manifest'],
+    allowedContextArtifactKinds: ['project_brief', 'product_requirements', 'requirement_baseline', 'blueprint', 'page_spec', 'prototype', 'api_contract', 'data_contract', 'permission_contract', 'design_system', 'token_set', 'component_registry'],
+  }],
+  transforms: ['selection_passthrough'],
+  fanOutItemKinds: ['blueprint_page', 'blueprint_selection_page'],
+  fanOutMaximumItems: { blueprint_page: 100, blueprint_selection_page: 100 },
+  qualityGates: ['release'], publishEnvironments: ['preview', 'production'], workbenchSchemaVersions: [1],
+  analysisLimits: {
+    maximumDefinitionNodes: 200,
+    maximumDefinitionEdges: 1000,
+    maxSemanticPathStates: 256,
+    maximumConditionExpressionBytes: 8192,
   },
 }
 
@@ -308,7 +364,11 @@ interface MockPlatformOptions {
   readonly multiWorkbenchGroups?: boolean
   readonly prototypeProposal?: boolean
   readonly designImportDecisionFails?: boolean
+  readonly designImportCreateProcessingOnce?: boolean
   readonly conversationSelectionTarget?: boolean
+  readonly conversationSelectedWorkbenchTarget?: boolean
+  readonly conversationSummaryConflict?: boolean
+  readonly conversationCheckpointSourcePageSize?: number
 }
 
 type DesignImportRecord = ReturnType<typeof designImportRecord>
@@ -337,8 +397,10 @@ interface MockPlatformState {
   prototypeProposal: ReturnType<typeof artifactProposal> | null
   prototypeCreatedRevision: Record<string, unknown> | null
   designImports: MockDesignImport[]
+  designImportCreateAttempts: number
   conversations: Array<ReturnType<typeof conversationRecord>>
   conversationMessages: Array<ReturnType<typeof conversationMessage>>
+  conversationSummaryCheckpoints: Array<ReturnType<typeof conversationSummaryCheckpoint>>
   intentProposal: MockWorkflowIntentProposal | null
   conversationCommand: ReturnType<typeof conversationCommand> | null
   graphBriefTitle: string
@@ -355,19 +417,27 @@ async function installPlatformMock(page: Page, options: MockPlatformOptions = {}
     run: options.multiWorkbenchGroups
       ? multiGroupWorkflowRun()
       : options.multiBundleWorkbench ? multiBundleWorkflowRun()
-      : options.conversationSelectionTarget ? selectionWorkflowRun('run-selection-active')
+      : options.conversationSelectedWorkbenchTarget ? selectionWorkflowRun('run-selection-active', 'build-root-1')
+      : options.conversationSelectionTarget ? workflowRun('run-current-other', 'waiting_input')
       : options.historicalRun ? workflowRun('run-history', 'waiting_input') : null,
     proposal: null,
     workspaceRevision: null,
-    workbenchBundle: buildManifest(options.conversationSelectionTarget ? 'run-selection-active' : undefined),
+    workbenchBundle: buildManifest(
+      options.conversationSelectionTarget || options.conversationSelectedWorkbenchTarget
+        ? 'run-selection-active'
+        : undefined,
+      options.conversationSelectedWorkbenchTarget ? 'build-root-1' : undefined,
+    ),
     multiWorkbench: options.multiWorkbenchGroups
       ? multiGroupWorkbenchState()
       : options.multiBundleWorkbench ? multiWorkbenchState() : null,
     prototypeProposal: options.prototypeProposal ? artifactProposal() : null,
     prototypeCreatedRevision: null,
     designImports: [],
+    designImportCreateAttempts: 0,
     conversations: [conversationRecord('33333333-3333-4333-8333-333333333333', 'Project discovery')],
     conversationMessages: [],
+    conversationSummaryCheckpoints: [],
     intentProposal: null,
     conversationCommand: null,
     graphBriefTitle: projectBrief.artifact.title,
@@ -560,6 +630,14 @@ async function handlePlatformRoute(
     return
   }
   if (path === `/v1/projects/${project.id}/design-imports` && method === 'POST') {
+    state.designImportCreateAttempts += 1
+    if (options.designImportCreateProcessingOnce && state.designImportCreateAttempts === 1) {
+      await respond({
+        type: 'urn:worksflow:problem:design_import_processing', title: 'Design import is processing', status: 503,
+        detail: 'Another worker holds the durable creation lease. Retry with the same idempotency key.', code: 'design_import_processing',
+      }, 503, { 'retry-after': '1' })
+      return
+    }
     const input = body as {
       sourceKind: 'figma'
       title?: string
@@ -684,11 +762,48 @@ async function handlePlatformRoute(
   const intentGeneratePath = path.match(new RegExp(`^${conversationBase}/([^/]+)/intent-proposals/generate$`))
   if (intentGeneratePath && method === 'POST') {
     const input = body as GenerateIntentBody
-    const proposal = options.conversationSelectionTarget
+    const inputMessages = state.conversationMessages
+      .filter((item) => item.conversationId === intentGeneratePath[1])
+      .sort((left, right) => left.sequence - right.sequence)
+    const trigger = inputMessages.find((item) => item.id === input.triggerMessageId)
+      ?? inputMessages.at(-1)
+    const recommended = inputMessages.filter((item) => (
+      trigger ? item.sequence < trigger.sequence : true
+    )).at(-1) ?? trigger
+    const approvedCheckpoint = recommended
+      ? [...state.conversationSummaryCheckpoints]
+        .reverse()
+        .find((item) => (
+          item.conversationId === intentGeneratePath[1]
+          && item.status === 'approved'
+          && item.throughSequence >= recommended.sequence
+        ))
+      : undefined
+    if (options.conversationSummaryConflict && trigger && recommended && !approvedCheckpoint) {
+      await respond({
+        type: 'urn:worksflow:problem:conversation_summary_checkpoint_required',
+        title: 'Controlled summary checkpoint required',
+        status: 409,
+        code: 'conversation_summary_checkpoint_required',
+        detail: 'Create and review a controlled summary checkpoint; no messages were silently omitted.',
+        extensions: {
+          triggerMessageId: trigger.id,
+          triggerSequence: trigger.sequence,
+          messageCount: inputMessages.length,
+          messageContentBytes: inputMessages.reduce((total, item) => total + item.content.length, 0),
+          contextBytes: 131072,
+          recommendedThroughMessageId: recommended.id,
+          recommendedThroughSequence: recommended.sequence,
+          createHref: `${conversationBase}/${intentGeneratePath[1]}/summary-checkpoints`,
+        },
+      }, 409)
+      return
+    }
+    const proposal = options.conversationSelectionTarget || options.conversationSelectedWorkbenchTarget
       ? {
           ...workbenchIntentProposal(intentGeneratePath[1], input.triggerMessageId, {
             expectedRunId: 'run-selection-active',
-            expectedBundleId: 'build-1',
+            expectedBundleId: options.conversationSelectedWorkbenchTarget ? 'build-root-1' : 'build-1',
             definitionVersionId: selectionWorkflowDefinition.versionId,
           }),
           status: 'pending' as 'pending' | 'accepted' | 'rejected',
@@ -705,7 +820,7 @@ async function handlePlatformRoute(
       intentGeneratePath[1],
       state.conversationMessages.filter((item) => item.conversationId === intentGeneratePath[1]).length + 1,
       'assistant',
-      options.conversationSelectionTarget
+      options.conversationSelectionTarget || options.conversationSelectedWorkbenchTarget
         ? 'Continue the active Blueprint-selection Workbench target.'
         : 'Start the published minimum application workflow from the approved Project Brief.',
       proposal.id,
@@ -749,13 +864,194 @@ async function handlePlatformRoute(
     await respond({ items: state.conversationCommand ? [state.conversationCommand] : [] })
     return
   }
+  const summaryCheckpointListPath = path.match(new RegExp(`^${conversationBase}/([^/]+)/summary-checkpoints$`))
+  if (summaryCheckpointListPath && method === 'GET') {
+    await respond({
+      items: state.conversationSummaryCheckpoints.filter(
+        (item) => item.conversationId === summaryCheckpointListPath[1],
+      ),
+    })
+    return
+  }
+  if (summaryCheckpointListPath && method === 'POST') {
+    const input = body as { throughMessageId: string; summary: string }
+    const throughMessage = state.conversationMessages.find((item) => (
+      item.conversationId === summaryCheckpointListPath[1]
+      && item.id === input.throughMessageId
+    ))
+    const conversation = state.conversations.find(
+      (item) => item.id === summaryCheckpointListPath[1],
+    )
+    if (!throughMessage || !conversation) {
+      await respond({ title: 'Not found', status: 404 }, 404)
+      return
+    }
+    const checkpoint = conversationSummaryCheckpoint(
+      `88888888-8888-4888-8888-${String(state.conversationSummaryCheckpoints.length + 1).padStart(12, '0')}`,
+      conversation.id,
+      throughMessage,
+      input.summary,
+      {
+        createdBy: user.id,
+        previousCheckpointId: conversation.summaryCheckpointHeadId,
+      },
+    )
+    state.conversationSummaryCheckpoints = [
+      ...state.conversationSummaryCheckpoints,
+      checkpoint,
+    ]
+    await respond(checkpoint, 201, { etag: checkpoint.etag })
+    return
+  }
+  const summaryCheckpointSourcePath = path.match(new RegExp(
+    `^${conversationBase}/([^/]+)/summary-checkpoints/([^/]+)/source-messages$`,
+  ))
+  if (summaryCheckpointSourcePath && method === 'GET') {
+    const checkpoint = state.conversationSummaryCheckpoints.find((item) => (
+      item.conversationId === summaryCheckpointSourcePath[1]
+      && item.id === summaryCheckpointSourcePath[2]
+    ))
+    if (!checkpoint) {
+      await respond({ title: 'Not found', status: 404 }, 404)
+      return
+    }
+    const previous = checkpoint.previousCheckpointId
+      ? state.conversationSummaryCheckpoints.find((item) => item.id === checkpoint.previousCheckpointId)
+      : undefined
+    const startSequence = (previous?.throughSequence ?? 0) + 1
+    const sourceItems = state.conversationMessages.filter((item) => (
+        item.conversationId === checkpoint.conversationId
+        && item.sequence >= startSequence
+        && item.sequence <= checkpoint.throughSequence
+      )).sort((left, right) => left.sequence - right.sequence)
+    const requestedLimit = Number(url.searchParams.get('limit') ?? '200')
+    const pageSize = Math.min(
+      Number.isFinite(requestedLimit) && requestedLimit > 0 ? requestedLimit : 200,
+      options.conversationCheckpointSourcePageSize ?? 200,
+    )
+    const offset = Number(url.searchParams.get('cursor') ?? '0')
+    const pageItems = sourceItems.slice(offset, offset + pageSize)
+    const nextOffset = offset + pageItems.length
+    await respond({
+      items: pageItems,
+      ...(nextOffset < sourceItems.length ? { nextCursor: String(nextOffset) } : {}),
+    })
+    return
+  }
+  const summaryCheckpointDecisionPath = path.match(new RegExp(
+    `^${conversationBase}/([^/]+)/summary-checkpoints/([^/]+)/decision$`,
+  ))
+  if (summaryCheckpointDecisionPath && method === 'POST') {
+    const input = body as { decision: 'approve' | 'reject'; reason?: string }
+    const current = state.conversationSummaryCheckpoints.find((item) => (
+      item.conversationId === summaryCheckpointDecisionPath[1]
+      && item.id === summaryCheckpointDecisionPath[2]
+    ))
+    if (!current) {
+      await respond({ title: 'Not found', status: 404 }, 404)
+      return
+    }
+    const updated = {
+      ...current,
+      status: input.decision === 'approve' ? 'approved' as const : 'rejected' as const,
+      version: current.version + 1,
+      etag: `"conversation-summary-checkpoint:${current.id}:${current.version + 1}"`,
+      reviewedBy: user.id,
+      reviewedAt: now,
+      ...(input.reason ? { reviewReason: input.reason } : {}),
+    }
+    state.conversationSummaryCheckpoints = state.conversationSummaryCheckpoints.map((item) => (
+      item.id === updated.id ? updated : item
+    ))
+    if (input.decision === 'approve') {
+      state.conversations = state.conversations.map((item) => item.id === current.conversationId
+        ? {
+            ...item,
+            summaryCheckpointHeadId: updated.id,
+            version: item.version + 1,
+            etag: `"conversation:${item.id}:${item.version + 1}"`,
+            updatedAt: now,
+          }
+        : item)
+    }
+    await respond(updated, 200, { etag: updated.etag })
+    return
+  }
+  const summaryCheckpointItemPath = path.match(new RegExp(
+    `^${conversationBase}/([^/]+)/summary-checkpoints/([^/]+)$`,
+  ))
+  if (summaryCheckpointItemPath && method === 'GET') {
+    const checkpoint = state.conversationSummaryCheckpoints.find((item) => (
+      item.conversationId === summaryCheckpointItemPath[1]
+      && item.id === summaryCheckpointItemPath[2]
+    ))
+    await respond(
+      checkpoint ?? { title: 'Not found', status: 404 },
+      checkpoint ? 200 : 404,
+      checkpoint ? { etag: checkpoint.etag } : {},
+    )
+    return
+  }
   const commandExecutePath = path.match(new RegExp(`^${conversationBase}/([^/]+)/commands/([^/]+)/execute$`))
   if (commandExecutePath && method === 'POST' && state.conversationCommand) {
-    const workbenchResult = (body as {
-      workbenchResult?: { runId: string; bundleId: string; implementationProposalId: string }
-    })?.workbenchResult
+    if (!body || typeof body !== 'object' || Array.isArray(body) || Object.keys(body).length !== 0) {
+      await respond({ code: 'unknown_json_field', detail: 'command execution body must be empty' }, 400)
+      return
+    }
+    let serverWorkbenchReceipt: Record<string, unknown> | undefined
     if (state.conversationCommand.kind === 'start_workflow') {
       state.run = workflowRun(state.conversationCommand.id, 'waiting_input')
+    } else {
+      const workbench = state.conversationCommand.payload.workbench as {
+        expectedRunId: string
+        expectedBundleId: string
+      }
+      if (options.conversationSelectionTarget || options.conversationSelectedWorkbenchTarget) {
+        // The command targets a different active run than the one the user had
+        // open when the conversation action was accepted.
+        state.run = selectionWorkflowRun(workbench.expectedRunId, workbench.expectedBundleId)
+        state.workbenchBundle = buildManifest(
+          workbench.expectedRunId,
+          state.workbenchBundle.rootBuildManifestId,
+        )
+      }
+      const rootBundleId = workbench.expectedBundleId
+      const activeBundleId = state.multiWorkbench?.activeBundleIds[rootBundleId]
+        ?? state.workbenchBundle.id
+      if (state.multiWorkbench) {
+        const generated = multiImplementationProposal(
+          state.conversationCommand.id,
+          activeBundleId,
+          'open',
+          'pending',
+          1,
+          'Server-authoritative conversation generation.',
+        )
+        state.multiWorkbench.proposals[generated.id] = {
+          ...generated,
+          executionSource: 'conversation_command',
+          conversationCommandId: state.conversationCommand.id,
+          instructionHash: hash('7'),
+        }
+        state.multiWorkbench.currentProposalIds[rootBundleId] = generated.id
+      } else {
+        state.proposal = {
+          ...implementationProposal('open'),
+          id: state.conversationCommand.id,
+          buildManifestId: activeBundleId,
+          executionSource: 'conversation_command',
+          conversationCommandId: state.conversationCommand.id,
+          instructionHash: hash('7'),
+        }
+      }
+      serverWorkbenchReceipt = {
+        runId: workbench.expectedRunId,
+        rootBundleId,
+        bundleId: activeBundleId,
+        implementationProposalId: state.conversationCommand.id,
+        instructionHash: hash('7'),
+        desiredOutputCapability: 'application',
+      }
     }
     state.conversationCommand = {
       ...state.conversationCommand,
@@ -767,7 +1063,7 @@ async function handlePlatformRoute(
           runId: state.conversationCommand.id,
           definitionVersionId: state.conversationCommand.payload.definitionVersionId,
           inputManifest: state.conversationCommand.payload.manifestIntent.inputManifest,
-        } : workbenchResult ?? {}),
+        } : serverWorkbenchReceipt),
       },
       executionActorId: user.id,
       executedBy: user.id,
@@ -1075,6 +1371,10 @@ async function handlePlatformRoute(
     await respond({ passed: false, checks: [], unresolvedBlockingCommentIds: [], traceCoverage: 1 })
     return
   }
+  if (path === `/v1/projects/${project.id}/workflow-capabilities`) {
+    await respond(workflowCapabilities)
+    return
+  }
   if (path === `/v1/projects/${project.id}/workflow-definitions`) {
     await respond({ items: [workflowDefinitionFor(options), selectionWorkflowDefinition], total: 2 })
     return
@@ -1083,8 +1383,23 @@ async function handlePlatformRoute(
     await respond({ items: [workflowDefinitionFor(options)], total: 1 })
     return
   }
-  if (path.endsWith(`/workflow-definitions/${selectionWorkflowDefinition.id}/versions`)) {
+  if (path.endsWith(`/workflow-definitions/${selectionWorkflowDefinition.id}/versions`) && method === 'GET') {
     await respond({ items: [selectionWorkflowDefinition], total: 1 })
+    return
+  }
+  if (path.endsWith(`/workflow-definitions/${selectionWorkflowDefinition.id}/versions`) && method === 'POST') {
+    await respond({
+      ...selectionWorkflowDefinition,
+      versionId: 'abababab-abab-4bab-8bab-ababababab02',
+      version: selectionWorkflowDefinition.version + 1,
+      contentHash: hash('2'),
+      definition: {
+        ...selectionWorkflowDefinition.definition,
+        ...(body as Record<string, unknown>),
+        version: selectionWorkflowDefinition.version + 1,
+        hash: hash('2'),
+      },
+    }, 201)
     return
   }
   if (path === `/v1/projects/${project.id}/workflow-runs` && method === 'GET') {
@@ -1150,6 +1465,9 @@ async function handlePlatformRoute(
     state.run = input.definitionVersionId === selectionWorkflowDefinition.versionId
       ? selectionWorkflowRun('run-selection')
       : workflowRun('run-started', 'waiting_input')
+    if (state.run.definitionVersionId === selectionWorkflowDefinition.versionId) {
+      state.workbenchBundle = buildManifest(state.run.id)
+    }
     await respond(state.run, 201)
     return
   }
@@ -1163,8 +1481,34 @@ async function handlePlatformRoute(
   }
   const multi = state.multiWorkbench
   const lineagePath = path.match(/^\/v1\/build-manifests\/([^/]+)\/lineage-state$/)
-  if (multi && lineagePath && method === 'GET') {
-    await respond(multiLineageState(multi, lineagePath[1]))
+  if (lineagePath && method === 'GET') {
+    if (multi) {
+      await respond(multiLineageState(multi, lineagePath[1]))
+      return
+    }
+    const rootBundleId = state.workbenchBundle.rootBuildManifestId ?? state.workbenchBundle.id
+    if (lineagePath[1] !== rootBundleId) {
+      await respond({ title: 'Not found' }, 404)
+      return
+    }
+    await respond({
+      rootBundleId,
+      activeBundle: state.workbenchBundle,
+      ...(state.proposal ? { currentProposal: state.proposal } : {}),
+      lineage: [{
+        bundleId: state.workbenchBundle.id,
+        status: 'active',
+        createdAt: state.workbenchBundle.createdAt,
+        ...(state.proposal ? {
+          latestProposal: {
+            id: state.proposal.id,
+            status: state.proposal.status,
+            version: state.proposal.version,
+            createdAt: state.proposal.createdAt,
+          },
+        } : {}),
+      }],
+    })
     return
   }
   const multiBundlePath = path.match(/^\/v1\/build-manifests\/([^/]+)$/)
@@ -1326,6 +1670,11 @@ async function handlePlatformRoute(
     await respond(state.workspaceRevision)
     return
   }
+  const implementationProposalPath = path.match(/^\/v1\/implementation-proposals\/([^/]+)$/)
+  if (implementationProposalPath && method === 'GET' && state.proposal?.id === implementationProposalPath[1]) {
+    await respond(state.proposal)
+    return
+  }
   if (path === '/v1/implementation-proposals/implementation-1' && method === 'GET') {
     await respond(state.proposal ?? implementationProposal('open'))
     return
@@ -1347,6 +1696,112 @@ test('anonymous Workbench fails closed without browser generation fallback', asy
   await expect(page.getByRole('button', { name: 'Freeze build input' })).toBeDisabled()
 })
 
+test('Workbench deep links reject bundles and proposals from another selected project', async ({ page }) => {
+  const state = await installPlatformMock(page, { authenticated: true })
+  let foreignBundleLoads = 0
+  let foreignWorkspaceArtifactLoads = 0
+  const foreignWorkspaceRevision = {
+    ...applicationRevision(),
+    id: 'foreign-workspace-r1',
+    artifactId: 'foreign-workspace',
+  }
+  const historicalWorkspaceRevision = {
+    ...applicationRevision(),
+    id: 'historical-workspace-r1',
+    artifactId: 'historical-workspace',
+  }
+  await page.route('**/v1/build-manifests/foreign-build', (route) => {
+    foreignBundleLoads += 1
+    return route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      headers: corsHeaders(),
+      body: JSON.stringify({
+        ...state.workbenchBundle,
+        id: 'foreign-build',
+        rootBuildManifestId: 'foreign-build',
+        projectId: 'foreign-project',
+      }),
+    })
+  })
+  await page.route('**/v1/implementation-proposals/foreign-proposal', (route) => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    headers: corsHeaders(),
+    body: JSON.stringify({
+      ...implementationProposal('ready', 'accepted', 2),
+      id: 'foreign-proposal',
+      projectId: 'foreign-project',
+      buildManifestId: 'foreign-build',
+    }),
+  }))
+  await page.route('**/v1/revisions/foreign-workspace-r1', (route) => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    headers: corsHeaders(),
+    body: JSON.stringify(foreignWorkspaceRevision),
+  }))
+  await page.route('**/v1/artifacts/foreign-workspace', (route) => {
+    foreignWorkspaceArtifactLoads += 1
+    return route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      headers: corsHeaders(),
+      body: JSON.stringify({
+        artifact: {
+          id: 'foreign-workspace',
+          projectId: 'foreign-project',
+          kind: 'workspace',
+        },
+        latestRevision: foreignWorkspaceRevision,
+        approvedRevision: foreignWorkspaceRevision,
+      }),
+    })
+  })
+  await page.route('**/v1/revisions/historical-workspace-r1', (route) => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    headers: corsHeaders(),
+    body: JSON.stringify(historicalWorkspaceRevision),
+  }))
+  await page.route('**/v1/artifacts/historical-workspace', (route) => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    headers: corsHeaders(),
+    body: JSON.stringify({
+      artifact: {
+        id: 'historical-workspace',
+        projectId: project.id,
+        kind: 'workspace',
+      },
+      // The deep link may intentionally target an older immutable revision.
+      latestRevision: applicationRevision(),
+      approvedRevision: applicationRevision(),
+    }),
+  }))
+
+  await page.goto('/workbench/planning?view=code&bundleId=foreign-build')
+  await expect(page.getByRole('alert').filter({ hasText: 'Workbench bundle belongs to another project.' }))
+    .toBeVisible()
+  expect(foreignBundleLoads).toBe(1)
+
+  foreignBundleLoads = 0
+  await page.goto('/workbench/planning?view=code&proposalId=foreign-proposal')
+  await expect(page.getByRole('alert').filter({ hasText: 'Implementation proposal belongs to another project.' }))
+    .toBeVisible()
+  expect(foreignBundleLoads).toBe(0)
+
+  await page.goto('/workbench/planning?view=code&workspaceRevisionId=foreign-workspace-r1')
+  await expect(page.getByRole('alert').filter({
+    hasText: 'Workspace revision belongs to another project',
+  })).toBeVisible()
+  expect(foreignWorkspaceArtifactLoads).toBe(1)
+
+  await page.goto('/workbench/planning?view=preview&workspaceRevisionId=historical-workspace-r1')
+  await expect(page.getByText(/historical-workspace-r1/)).toBeVisible()
+  await expect(page.getByRole('alert').filter({ hasText: 'another project' })).toHaveCount(0)
+})
+
 test('workflow run history and exact Project Brief start are server-backed', async ({ page }) => {
   const state = await installPlatformMock(page, { authenticated: true, historicalRun: true })
   await page.goto('/workbench/planning?view=code')
@@ -1355,6 +1810,7 @@ test('workflow run history and exact Project Brief start are server-backed', asy
   await expect(page.getByText('run-history', { exact: true })).toBeVisible()
   const closeConversation = page.getByRole('button', { name: 'Close conversation panel' })
   if (await closeConversation.isVisible()) await closeConversation.click()
+  await page.getByRole('combobox', { name: 'Workflow definition' }).selectOption(workflowDefinition.id)
   await page.getByRole('button', { name: 'Start from exact Project Brief' }).click()
   await expect(page.getByText('run-started', { exact: true }).first()).toBeVisible()
 
@@ -1382,6 +1838,260 @@ test('workflow run history and exact Project Brief start are server-backed', asy
   })
 })
 
+test('workflow authoring exposes the pinned execution profile and semantic analysis budget', async ({ page }) => {
+  await installPlatformMock(page, { authenticated: true })
+  await page.goto('/workbench/planning?view=code')
+
+  const closeConversation = page.getByRole('button', { name: 'Close conversation panel' })
+  if (await closeConversation.isVisible()) await closeConversation.click()
+
+  await expect(page.getByText(/execution workflow-engine\/v2/)).toBeVisible()
+  await expect(page.getByText(/registry v4 · semantic max 256/)).toBeVisible()
+  await page.getByRole('button', { name: 'New definition' }).click()
+  await expect(page.getByRole('dialog', { name: 'Workflow definition editor' })).toBeVisible()
+  await expect(page.getByText('semantic states 1/256', { exact: true })).toBeVisible()
+})
+
+test('workflow authoring keeps a hydrated run definition separate from the selected version chain', async ({ page }) => {
+  const state = await installPlatformMock(page, { authenticated: true, historicalRun: true })
+  await page.goto('/workbench/planning?view=code&runId=run-history')
+
+  const closeConversation = page.getByRole('button', { name: 'Close conversation panel' })
+  if (await closeConversation.isVisible()) await closeConversation.click()
+  await expect(page.getByText('run-history', { exact: true }).first()).toBeVisible()
+
+  const definitionSelect = page.getByRole('combobox', { name: 'Workflow definition' })
+  await definitionSelect.selectOption(selectionWorkflowDefinition.id)
+  await expect(definitionSelect).toHaveValue(selectionWorkflowDefinition.id)
+  await page.getByRole('button', { name: 'New version' }).click()
+  await page.getByRole('button', { name: 'JSON' }).click()
+  await page.getByRole('textbox', { name: 'Workflow definition JSON' }).fill(JSON.stringify({
+    name: 'Selected Blueprint application flow',
+    schemaVersion: '4',
+    inputContract: selectionWorkflowDefinition.definition.inputContract,
+    outputContract: selectionWorkflowDefinition.definition.outputContract,
+    nodes: [{
+      id: 'selection',
+      name: 'Frozen Blueprint selection',
+      type: 'artifact_input',
+      inputSchema: { type: 'object', additionalProperties: true },
+      outputSchema: { type: 'object', additionalProperties: true },
+      artifactInput: {
+        allowedTypes: ['blueprint'], allowedKinds: ['blueprint'], requireApproved: true,
+        minimumArtifacts: 2, maximumArtifacts: 101,
+      },
+    }, {
+      id: 'publish',
+      name: 'Publish selected application',
+      type: 'publish',
+      inputSchema: { type: 'object', additionalProperties: true },
+      outputSchema: { type: 'object', additionalProperties: true },
+      publish: { environment: 'preview', requiredRole: 'admin', allowRollback: true },
+    }],
+    edges: [{ id: 'selection-publish', from: 'selection', to: 'publish' }],
+  }, null, 2))
+  await page.getByRole('button', { name: 'Save immutable draft version' }).click()
+  await expect(page.getByRole('dialog', { name: 'Workflow definition editor' })).toBeHidden()
+
+  expect(state.requests.some((item) =>
+    item.method === 'POST'
+      && item.path.endsWith(`/workflow-definitions/${selectionWorkflowDefinition.id}/versions`),
+  )).toBe(true)
+  expect(state.requests.some((item) =>
+    item.method === 'POST'
+      && item.path.endsWith(`/workflow-definitions/${workflowDefinition.id}/versions`),
+  )).toBe(false)
+})
+
+test('loading a run never replaces the definition selected for authoring', async ({ page }) => {
+  await installPlatformMock(page, { authenticated: true, historicalRun: true })
+  await page.goto('/workbench/planning?view=code')
+
+  const closeConversation = page.getByRole('button', { name: 'Close conversation panel' })
+  if (await closeConversation.isVisible()) await closeConversation.click()
+  const definitionSelect = page.getByRole('combobox', { name: 'Workflow definition' })
+  await definitionSelect.selectOption(selectionWorkflowDefinition.id)
+  await expect(definitionSelect).toHaveValue(selectionWorkflowDefinition.id)
+
+  await page.getByRole('button', { name: /run-history/ }).click()
+  await expect(page.getByText('run-history', { exact: true }).first()).toBeVisible()
+  await expect(definitionSelect).toHaveValue(selectionWorkflowDefinition.id)
+  await expect(page.getByRole('combobox', { name: 'Workflow version' }))
+    .toHaveValue(selectionWorkflowDefinition.versionId)
+})
+
+test('workflow authoring ignores an older definition-version response after a newer selection', async ({ page }) => {
+  await installPlatformMock(page, { authenticated: true })
+  let delayPrimary = false
+  let resolvePrimaryStarted!: () => void
+  let releasePrimary!: () => void
+  let resolvePrimaryFinished!: () => void
+  const primaryStarted = new Promise<void>((resolve) => { resolvePrimaryStarted = resolve })
+  const primaryRelease = new Promise<void>((resolve) => { releasePrimary = resolve })
+  const primaryFinished = new Promise<void>((resolve) => { resolvePrimaryFinished = resolve })
+  const respond = (route: Route, data: unknown) => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    headers: corsHeaders(),
+    body: JSON.stringify(data),
+  })
+  await page.route(`**/v1/projects/${project.id}/workflow-definitions/${workflowDefinition.id}/versions`, async (route) => {
+    if (delayPrimary) {
+      resolvePrimaryStarted()
+      await primaryRelease
+    }
+    await respond(route, { items: [workflowDefinition], total: 1 })
+    if (delayPrimary) resolvePrimaryFinished()
+  })
+  await page.route(`**/v1/projects/${project.id}/workflow-definitions/${selectionWorkflowDefinition.id}/versions`, (route) =>
+    respond(route, { items: [selectionWorkflowDefinition], total: 1 }))
+
+  await page.goto('/workbench/planning?view=code')
+  const closeConversation = page.getByRole('button', { name: 'Close conversation panel' })
+  if (await closeConversation.isVisible()) await closeConversation.click()
+  const definitionSelect = page.getByRole('combobox', { name: 'Workflow definition' })
+  await expect(definitionSelect).toHaveValue(selectionWorkflowDefinition.id)
+  await expect(page.getByRole('combobox', { name: 'Workflow version' })).toHaveValue(selectionWorkflowDefinition.versionId)
+
+  delayPrimary = true
+  await definitionSelect.selectOption(workflowDefinition.id)
+  await primaryStarted
+  await definitionSelect.selectOption(selectionWorkflowDefinition.id)
+  await expect(definitionSelect).toHaveValue(selectionWorkflowDefinition.id)
+  await expect(page.getByRole('combobox', { name: 'Workflow version' })).toHaveValue(selectionWorkflowDefinition.versionId)
+  releasePrimary()
+  await primaryFinished
+
+  await expect(definitionSelect).toHaveValue(selectionWorkflowDefinition.id)
+  await expect(page.getByRole('combobox', { name: 'Workflow version' })).toHaveValue(selectionWorkflowDefinition.versionId)
+})
+
+test('an older run lineage response cannot replace the current run Workbench bundle', async ({ page }) => {
+  await installPlatformMock(page, { authenticated: true })
+  const runA = selectionWorkflowRun('run-race-a', 'bundle-race-a')
+  const runB = selectionWorkflowRun('run-race-b', 'bundle-race-b')
+  const bundleA = {
+    ...buildManifest(runA.id), id: 'bundle-race-a', contentHash: hash('a'),
+  }
+  const bundleB = {
+    ...buildManifest(runB.id), id: 'bundle-race-b', contentHash: hash('b'),
+  }
+  let resolveLineageAStarted!: () => void
+  let releaseLineageA!: () => void
+  let resolveLineageAFinished!: () => void
+  const lineageAStarted = new Promise<void>((resolve) => { resolveLineageAStarted = resolve })
+  const lineageARelease = new Promise<void>((resolve) => { releaseLineageA = resolve })
+  const lineageAFinished = new Promise<void>((resolve) => { resolveLineageAFinished = resolve })
+  const respond = (route: Route, data: unknown) => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    headers: corsHeaders(),
+    body: JSON.stringify(data),
+  })
+  await page.route(new RegExp(`/v1/projects/${project.id}/workflow-runs(?:\\?.*)?$`), (route) =>
+    respond(route, { items: [runA, runB], total: 2 }))
+  await page.route(`**/v1/projects/${project.id}/workflow-runs/${runA.id}`, (route) => respond(route, runA))
+  await page.route(`**/v1/projects/${project.id}/workflow-runs/${runB.id}`, (route) => respond(route, runB))
+  await page.route(`**/v1/projects/${project.id}/workflow-runs/${runA.id}/events`, (route) =>
+    respond(route, { items: [{ id: 'event-race-a', runId: runA.id, sequence: 1, type: 'run.created', createdAt: now }] }))
+  await page.route(`**/v1/projects/${project.id}/workflow-runs/${runB.id}/events`, (route) =>
+    respond(route, { items: [{ id: 'event-race-b', runId: runB.id, sequence: 1, type: 'run.created', createdAt: now }] }))
+  await page.route('**/v1/build-manifests/bundle-race-a/lineage-state', async (route) => {
+    resolveLineageAStarted()
+    await lineageARelease
+    await respond(route, { rootBundleId: bundleA.id, activeBundle: bundleA, lineage: [] })
+    resolveLineageAFinished()
+  })
+  await page.route('**/v1/build-manifests/bundle-race-b/lineage-state', (route) =>
+    respond(route, { rootBundleId: bundleB.id, activeBundle: bundleB, lineage: [] }))
+
+  await page.goto(`/workbench/planning?view=code&runId=${runA.id}`)
+  const closeConversation = page.getByRole('button', { name: 'Close conversation panel' })
+  if (await closeConversation.isVisible()) await closeConversation.click()
+  await lineageAStarted
+  await page.getByRole('button', { name: new RegExp(runB.id) }).click()
+  await expect(page.getByText(new RegExp(`${bundleB.id} ·`))).toBeVisible()
+  releaseLineageA()
+  await lineageAFinished
+
+  await expect(page.getByText(new RegExp(`${bundleB.id} ·`))).toBeVisible()
+  await expect(page.getByText(new RegExp(`${bundleA.id} ·`))).toHaveCount(0)
+})
+
+test('direct Bundle and Proposal URL hydration is latest-wins across delayed responses', async ({ page }) => {
+  const state = await installPlatformMock(page, {
+    authenticated: true,
+    multiBundleWorkbench: true,
+  })
+  const multi = state.multiWorkbench!
+  const checkoutProposal = multiImplementationProposal(
+    'proposal-checkout-latest',
+    'bundle-checkout',
+    'open',
+    'pending',
+    1,
+    'The latest direct proposal selection must remain active.',
+  )
+  multi.proposals[checkoutProposal.id] = checkoutProposal
+  let resolveHomeStarted!: () => void
+  let releaseHome!: () => void
+  let resolveHomeFinished!: () => void
+  const homeStarted = new Promise<void>((resolve) => { resolveHomeStarted = resolve })
+  const homeRelease = new Promise<void>((resolve) => { releaseHome = resolve })
+  const homeFinished = new Promise<void>((resolve) => { resolveHomeFinished = resolve })
+  await page.route('**/v1/build-manifests/bundle-home', async (route) => {
+    resolveHomeStarted()
+    await homeRelease
+    await route.fallback()
+    resolveHomeFinished()
+  })
+
+  await page.goto(
+    `/workbench/planning?view=code&bundleId=bundle-home&proposalId=${checkoutProposal.id}`,
+  )
+  await homeStarted
+  await expect(page).toHaveURL(/bundleId=bundle-checkout/)
+  await expect(page).toHaveURL(new RegExp(`proposalId=${checkoutProposal.id}`))
+  await expect(page.getByText(new RegExp(`bundle-checkout ·`))).toBeVisible()
+  releaseHome()
+  await homeFinished
+
+  await expect(page).toHaveURL(/bundleId=bundle-checkout/)
+  await expect(page).toHaveURL(new RegExp(`proposalId=${checkoutProposal.id}`))
+  await expect(page.getByText(new RegExp(`bundle-home ·`))).toHaveCount(0)
+})
+
+test('run hydration rejects a Workbench bundle whose canonical delivery slice drifts', async ({ page }) => {
+  const state = await installPlatformMock(page, {
+    authenticated: true,
+    conversationSelectedWorkbenchTarget: true,
+  })
+  const rootBundleId = state.workbenchBundle.rootBuildManifestId ?? state.workbenchBundle.id
+  const mismatchedBundle = {
+    ...state.workbenchBundle,
+    deliverySliceId: 'page-wrong',
+  }
+  await page.route(`**/v1/build-manifests/${rootBundleId}/lineage-state`, (route) => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    headers: corsHeaders(),
+    body: JSON.stringify({
+      rootBundleId,
+      activeBundle: mismatchedBundle,
+      lineage: [],
+    }),
+  }))
+
+  await page.goto('/workbench/planning?view=code&runId=run-selection-active')
+  const closeConversation = page.getByRole('button', { name: 'Close conversation panel' })
+  if (await closeConversation.isVisible()) await closeConversation.click()
+
+  await expect(page.getByRole('alert').filter({ hasText: 'Workbench lineage state for' })).toContainText(
+    'does not match its exact run, manifest group, ordinal, or delivery slice',
+  )
+  await expect(page.getByRole('heading', { name: 'Frozen application build manifest' })).toHaveCount(0)
+})
+
 test('direct workflow start checkpoints a newer Brief draft when approval is not required', async ({ page }) => {
   const state = await installPlatformMock(page, {
     authenticated: true,
@@ -1391,6 +2101,7 @@ test('direct workflow start checkpoints a newer Brief draft when approval is not
   await page.goto('/workbench/planning?view=code')
   const closeConversation = page.getByRole('button', { name: 'Close conversation panel' })
   if (await closeConversation.isVisible()) await closeConversation.click()
+  await page.getByRole('combobox', { name: 'Workflow definition' }).selectOption(workflowDefinition.id)
   await page.getByRole('button', { name: 'Start from exact Project Brief' }).click()
   await expect(page.getByText('run-started', { exact: true }).first()).toBeVisible()
 
@@ -1424,6 +2135,7 @@ test('direct workflow start fails closed when a required approved Brief has newe
   await page.goto('/workbench/planning?view=code')
   const closeConversation = page.getByRole('button', { name: 'Close conversation panel' })
   if (await closeConversation.isVisible()) await closeConversation.click()
+  await page.getByRole('combobox', { name: 'Workflow definition' }).selectOption(workflowDefinition.id)
   await page.getByRole('button', { name: 'Start from exact Project Brief' }).click()
 
   await expect(page.getByText('Project Brief has changes newer than its approved revision.')).toBeVisible()
@@ -1446,9 +2158,6 @@ test('conversation turns an approved brief into an accepted command and opens it
   await page.getByRole('button', { name: 'Send immutable message' }).click()
   await expect(page.getByText('Build an order operations application from the approved brief.')).toBeVisible()
 
-  await expect.poll(() => state.requests.some((item) =>
-    item.path.endsWith(`/workflow-definitions/${workflowDefinition.id}/versions`),
-  )).toBe(true)
   await page.getByRole('button', { name: 'Generate governed intent' }).click()
   await expect(page.getByText('Start workflow', { exact: true })).toBeVisible()
   await page.getByRole('button', { name: 'Accept', exact: true }).click()
@@ -1491,7 +2200,7 @@ test('conversation turns an approved brief into an accepted command and opens it
   expect(generateRequest?.headers['idempotency-key']).toBeTruthy()
   expect(generateRequest?.body).toMatchObject({
     triggerMessageId: '55555555-5555-4555-8555-555555555551',
-    candidateDefinitionVersionIds: [workflowDefinition.versionId],
+    desiredOutputCapability: 'application',
     sourceRefs: [{
       artifactId: projectBrief.artifact.id,
       revisionId: briefRevision.id,
@@ -1502,6 +2211,7 @@ test('conversation turns an approved brief into an accepted command and opens it
       inputManifest: { id: 'manifest-1', hash: hash('1') },
     },
   })
+  expect(generateRequest?.body).not.toHaveProperty('workbenchTargetHint')
   expect(state.requests.some((item) =>
     item.method === 'POST'
       && item.path.includes(`/documents/${projectBrief.artifact.id}/revisions`),
@@ -1536,7 +2246,7 @@ test('conversation turns an approved brief into an accepted command and opens it
   expect(exactRunLoadIndex).toBeGreaterThan(executeIndex)
 })
 
-test('Project Brief conversation continues an active selection Workbench target without making it startable', async ({ page }) => {
+test('Project Brief conversation switches from the open run to its authoritative selection Workbench target', async ({ page }) => {
   const state = await installPlatformMock(page, {
     authenticated: true,
     conversationSelectionTarget: true,
@@ -1555,10 +2265,9 @@ test('Project Brief conversation continues an active selection Workbench target 
   const generateRequest = state.requests.find((item) =>
     item.method === 'POST' && item.path.endsWith('/intent-proposals/generate'))
   expect(generateRequest?.body).toMatchObject({
-    candidateDefinitionVersionIds: [workflowDefinition.versionId],
+    desiredOutputCapability: 'application',
   })
-  expect((generateRequest?.body as GenerateIntentBody).candidateDefinitionVersionIds)
-    .not.toContain(selectionWorkflowDefinition.versionId)
+  expect(generateRequest?.body).not.toHaveProperty('candidateDefinitionVersionIds')
 
   await panel.getByRole('button', { name: 'Accept', exact: true }).click()
   await panel.getByRole('button', { name: 'Generate Workbench proposal' }).click()
@@ -1570,17 +2279,250 @@ test('Project Brief conversation continues an active selection Workbench target 
   const commandRequest = state.requests.find((item) =>
     item.method === 'POST'
       && item.path.endsWith('/commands/77777777-7777-4777-8777-777777777777/execute'))
-  expect(commandRequest?.body).toEqual({
-    workbenchResult: {
-      runId: 'run-selection-active',
-      bundleId: 'build-1',
-      implementationProposalId: 'implementation-1',
-    },
+  expect(commandRequest?.body).toEqual({})
+  expect(state.conversationCommand?.result).toMatchObject({
+    runId: 'run-selection-active',
+    rootBundleId: 'build-1',
+    bundleId: 'build-1',
+    implementationProposalId: '77777777-7777-4777-8777-777777777777',
   })
   expect(state.conversationCommand?.payload.definitionVersionId)
     .toBe(selectionWorkflowDefinition.versionId)
   expect(state.requests.some((item) =>
     item.method === 'POST' && item.path === `/v1/projects/${project.id}/workflow-runs`)).toBe(false)
+  await expect.poll(() => state.requests.some((item) =>
+    item.method === 'GET'
+      && item.path.endsWith('/workflow-runs/run-selection-active'))).toBe(true)
+  await expect.poll(() => state.requests.some((item) =>
+    item.method === 'GET'
+      && item.path.endsWith('/implementation-proposals/77777777-7777-4777-8777-777777777777'))).toBe(true)
+  const executeIndex = state.requests.findIndex((item) => item === commandRequest)
+  const targetRunLoadIndex = state.requests.findIndex((item, index) =>
+    index > executeIndex
+      && item.method === 'GET'
+      && item.path.endsWith('/workflow-runs/run-selection-active'))
+  const proposalLoadIndex = state.requests.findIndex((item, index) =>
+    index > targetRunLoadIndex
+      && item.method === 'GET'
+      && item.path.endsWith('/implementation-proposals/77777777-7777-4777-8777-777777777777'))
+  expect(targetRunLoadIndex).toBeGreaterThan(executeIndex)
+  expect(proposalLoadIndex).toBeGreaterThan(targetRunLoadIndex)
+})
+
+test('conversation sends the selected Workbench root as a hint and renders server page semantics', async ({ page }) => {
+  const state = await installPlatformMock(page, {
+    authenticated: true,
+    conversationSelectedWorkbenchTarget: true,
+  })
+  await page.goto('/workbench/planning?view=code&runId=run-selection-active')
+  await expect.poll(() => state.requests.some((item) =>
+    item.method === 'GET' && item.path === '/v1/build-manifests/build-root-1/lineage-state'),
+  ).toBe(true)
+
+  await page.getByPlaceholder('Describe requirements or a controlled next action…')
+    .fill('Continue the Orders page from the selected Workbench target.')
+  await page.getByRole('button', { name: 'Send immutable message' }).click()
+  await page.getByRole('button', { name: 'Generate governed intent' }).click()
+
+  const panel = page.getByRole('complementary', { name: 'Conversation control plane' })
+  await expect(panel.getByText('Page: Orders', { exact: true })).toBeVisible()
+  await expect(panel.getByText('ORDERS', { exact: true })).toBeVisible()
+  const generateRequest = state.requests.find((item) =>
+    item.method === 'POST' && item.path.endsWith('/intent-proposals/generate'))
+  expect(generateRequest?.body).toMatchObject({
+    workbenchTargetHint: {
+      runId: 'run-selection-active',
+      rootBundleId: 'build-root-1',
+    },
+  })
+})
+
+test('conversation displays the RFC summary-checkpoint conflict without hiding its detail', async ({ page }) => {
+  await installPlatformMock(page, {
+    authenticated: true,
+    conversationSummaryConflict: true,
+  })
+  await page.goto('/workbench/planning?view=code')
+  await page.getByPlaceholder('Describe requirements or a controlled next action…')
+    .fill('Generate the next governed intent.')
+  await page.getByRole('button', { name: 'Send immutable message' }).click()
+  await page.getByRole('button', { name: 'Generate governed intent' }).click()
+
+  const panel = page.getByRole('complementary', { name: 'Conversation control plane' })
+  await expect(panel.getByRole('alert')).toContainText(
+    'Create and review a controlled summary checkpoint; no messages were silently omitted.',
+  )
+})
+
+test('conversation creates an immutable summary checkpoint at the server-recommended prefix', async ({ page }) => {
+  const state = await installPlatformMock(page, {
+    authenticated: true,
+    conversationSummaryConflict: true,
+  })
+  await page.goto('/workbench/planning?view=code')
+  const panel = page.getByRole('complementary', { name: 'Conversation control plane' })
+  const composer = panel.getByPlaceholder('Describe requirements or a controlled next action…')
+
+  await composer.fill('Preserve the approved product requirements and constraints.')
+  await panel.getByRole('button', { name: 'Send immutable message' }).click()
+  await composer.fill('Generate a governed intent from the complete conversation.')
+  await panel.getByRole('button', { name: 'Send immutable message' }).click()
+  await panel.getByRole('button', { name: 'Generate governed intent' }).last().click()
+
+  const checkpointSection = panel.getByRole('region', {
+    name: 'Conversation summary checkpoint required',
+  })
+  await expect(checkpointSection).toBeVisible()
+  await expect(checkpointSection).toContainText('through message #1')
+  await panel.getByRole('textbox', { name: 'Conversation checkpoint summary' }).fill(
+    'The immutable prefix requires preserving all approved product constraints.',
+  )
+  await panel.getByRole('button', {
+    name: 'Submit immutable summary for independent review',
+  }).click()
+
+  await expect(panel.getByRole('region', { name: 'Summary checkpoint 1' })).toContainText(
+    'pending review',
+  )
+  await expect(panel.getByRole('button', { name: 'Approve summary checkpoint 1' })).toBeDisabled()
+  expect(state.conversationSummaryCheckpoints).toHaveLength(1)
+  const createRequest = state.requests.find((item) => (
+    item.method === 'POST'
+    && item.path.endsWith('/summary-checkpoints')
+  ))
+  expect(createRequest?.body).toEqual({
+    throughMessageId: state.conversationMessages[0].id,
+    summary: 'The immutable prefix requires preserving all approved product constraints.',
+  })
+  expect(createRequest?.headers['if-match']).toBe(state.conversations[0].etag)
+  expect(createRequest?.headers['idempotency-key']).toBeTruthy()
+})
+
+test('independent checkpoint review unlocks an exact governed-intent retry', async ({ page }) => {
+  const state = await installPlatformMock(page, {
+    authenticated: true,
+    conversationSummaryConflict: true,
+    conversationCheckpointSourcePageSize: 1,
+  })
+  const conversationId = state.conversations[0].id
+  const prefix = conversationMessage(
+    '91919191-9191-4191-8191-919191919191',
+    conversationId,
+    1,
+    'user',
+    'The approved product constraint remains immutable.',
+  )
+  const secondPrefix = conversationMessage(
+    '92929292-9292-4292-8292-929292929292',
+    conversationId,
+    2,
+    'user',
+    'The reviewed accessibility constraint remains immutable.',
+  )
+  const trigger = conversationMessage(
+    '94949494-9494-4494-8494-949494949494',
+    conversationId,
+    3,
+    'user',
+    'Generate the next governed intent.',
+  )
+  state.conversationMessages = [prefix, secondPrefix, trigger]
+  state.conversationSummaryCheckpoints = [conversationSummaryCheckpoint(
+    '93939393-9393-4393-8393-939393939393',
+    conversationId,
+    secondPrefix,
+    'The approved product and accessibility constraints must be preserved in every generated application.',
+    { createdBy: reviewer.id },
+  )]
+
+  await page.goto('/workbench/planning?view=code')
+  const panel = page.getByRole('complementary', { name: 'Conversation control plane' })
+  await panel.getByRole('button', { name: 'Generate governed intent' }).last().click()
+  await expect(panel.getByRole('region', {
+    name: 'Conversation summary checkpoint required',
+  })).toBeVisible()
+
+  await panel.getByRole('button', { name: 'Inspect exact bound source delta' }).click()
+  await expect(panel.getByText('Exact immutable source delta · 2 messages')).toBeVisible()
+  const approve = panel.getByRole('button', { name: 'Approve summary checkpoint 2' })
+  await expect(approve).toBeEnabled()
+  await approve.click()
+  const retry = panel.getByRole('button', {
+    name: 'Retry governed intent with approved checkpoint',
+  })
+  await expect(retry).toBeVisible()
+  await retry.click()
+
+  await expect(panel.getByText('Start workflow', { exact: true })).toBeVisible()
+  expect(state.conversationSummaryCheckpoints[0].status).toBe('approved')
+  expect(state.requests.filter((item) => (
+    item.method === 'POST'
+    && item.path.endsWith('/intent-proposals/generate')
+  ))).toHaveLength(2)
+  expect(state.requests.some((item) => (
+    item.method === 'POST'
+    && item.path.endsWith(`/summary-checkpoints/${state.conversationSummaryCheckpoints[0].id}/decision`)
+  ))).toBe(true)
+  const sourceRequests = state.requests.filter((item) => item.path.endsWith('/source-messages'))
+  expect(sourceRequests).toHaveLength(2)
+  const decisionRequest = state.requests.find((item) => (
+    item.method === 'POST'
+    && item.path.endsWith(`/summary-checkpoints/${state.conversationSummaryCheckpoints[0].id}/decision`)
+  ))
+  expect(decisionRequest?.headers['if-match']).toBe('"conversation-summary-checkpoint:93939393-9393-4393-8393-939393939393:1"')
+  expect(decisionRequest?.headers['idempotency-key']).toBeTruthy()
+})
+
+test('checkpoint review rejects a paginated source whose final message identity drifts', async ({ page }) => {
+  const state = await installPlatformMock(page, { authenticated: true })
+  const conversationId = state.conversations[0].id
+  const first = conversationMessage(
+    'a1919191-9191-4191-8191-919191919191',
+    conversationId,
+    1,
+    'user',
+    'First exact immutable source message.',
+  )
+  const through = conversationMessage(
+    'a2929292-9292-4292-8292-929292929292',
+    conversationId,
+    2,
+    'user',
+    'Second exact immutable source message.',
+  )
+  const checkpoint = conversationSummaryCheckpoint(
+    'a3939393-9393-4393-8393-939393939393',
+    conversationId,
+    through,
+    'Both immutable source messages must remain bound.',
+    { createdBy: reviewer.id },
+  )
+  state.conversationMessages = [first, through]
+  state.conversationSummaryCheckpoints = [checkpoint]
+  await page.route(
+    `**/v1/projects/${project.id}/conversations/${conversationId}/summary-checkpoints/${checkpoint.id}/source-messages**`,
+    (route) => route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      headers: corsHeaders(),
+      body: JSON.stringify({
+        items: [first, { ...through, id: 'a4949494-9494-4494-8494-949494949494' }],
+      }),
+    }),
+  )
+
+  await page.goto('/workbench/planning?view=code')
+  const panel = page.getByRole('complementary', { name: 'Conversation control plane' })
+  await panel.getByRole('button', { name: 'Inspect exact bound source delta' }).click()
+
+  await expect(panel.getByRole('alert')).toContainText(
+    'The checkpoint source response is not the exact continuous bound delta.',
+  )
+  await expect(panel.getByRole('button', { name: 'Approve summary checkpoint 2' })).toBeDisabled()
+  expect(state.requests.some((item) => (
+    item.method === 'POST'
+    && item.path.endsWith(`/summary-checkpoints/${checkpoint.id}/decision`)
+  ))).toBe(false)
 })
 
 test('conversation checkpoints the current Project Brief draft before generating intent', async ({ page }) => {
@@ -1626,6 +2568,342 @@ test('conversation checkpoints the current Project Brief draft before generating
     .not.toHaveProperty('messages')
 })
 
+test('conversation hydration ignores a delayed response from the previously selected conversation', async ({ page }) => {
+  await installPlatformMock(page, { authenticated: true })
+  const conversationA = conversationRecord('10101010-1010-4010-8010-101010101010', 'Conversation A')
+  const conversationB = conversationRecord('20202020-2020-4020-8020-202020202020', 'Conversation B')
+  const messageA = conversationMessage('30303030-3030-4030-8030-303030303030', conversationA.id, 1, 'user', 'stale conversation A content')
+  const messageB = conversationMessage('40404040-4040-4040-8040-404040404040', conversationB.id, 1, 'user', 'current conversation B content')
+  let delayedRequests = 0
+  let delayedResponses = 0
+  let resolveDelayedStarted!: () => void
+  let releaseDelayed!: () => void
+  let resolveDelayedFinished!: () => void
+  const delayedStarted = new Promise<void>((resolve) => { resolveDelayedStarted = resolve })
+  const delayedRelease = new Promise<void>((resolve) => { releaseDelayed = resolve })
+  const delayedFinished = new Promise<void>((resolve) => { resolveDelayedFinished = resolve })
+  const respond = (route: Route, data: unknown) => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    headers: corsHeaders(),
+    body: JSON.stringify(data),
+  })
+  await page.route(new RegExp(`/v1/projects/${project.id}/conversations(?:\\?.*)?$`), (route) =>
+    respond(route, { items: [conversationA, conversationB] }))
+  for (const resource of ['messages', 'intent-proposals', 'commands']) {
+    await page.route(new RegExp(`/v1/projects/${project.id}/conversations/${conversationA.id}/${resource}(?:\\?.*)?$`), async (route) => {
+      delayedRequests += 1
+      if (delayedRequests === 3) resolveDelayedStarted()
+      await delayedRelease
+      await respond(route, { items: resource === 'messages' ? [messageA] : [] })
+      delayedResponses += 1
+      if (delayedResponses === 3) resolveDelayedFinished()
+    })
+    await page.route(new RegExp(`/v1/projects/${project.id}/conversations/${conversationB.id}/${resource}(?:\\?.*)?$`), (route) =>
+      respond(route, { items: resource === 'messages' ? [messageB] : [] }))
+  }
+
+  await page.goto(`/workbench/planning?view=code&conversationId=${conversationA.id}`)
+  await delayedStarted
+  const conversationSelect = page.getByRole('complementary', { name: 'Conversation control plane' }).getByRole('combobox')
+  await conversationSelect.selectOption(conversationB.id)
+  await expect(page.getByText(messageB.content, { exact: true })).toBeVisible()
+  releaseDelayed()
+  await delayedFinished
+
+  await expect(conversationSelect).toHaveValue(conversationB.id)
+  await expect(page.getByText(messageB.content, { exact: true })).toBeVisible()
+  await expect(page.getByText(messageA.content, { exact: true })).toHaveCount(0)
+})
+
+test('conversation polling does not cancel an in-flight controlled Workbench execution', async ({ page }) => {
+  const state = await installPlatformMock(page, {
+    authenticated: true,
+    conversationSelectionTarget: true,
+  })
+  const conversationId = state.conversations[0].id
+  const trigger = conversationMessage(
+    '50505050-5050-4050-8050-505050505050',
+    conversationId,
+    1,
+    'user',
+    'Generate the governed Workbench proposal after polling.',
+  )
+  const proposal = workbenchIntentProposal(conversationId, trigger.id, {
+    expectedRunId: '88888888-8888-4888-8888-888888888888',
+    expectedBundleId: 'build-1',
+    definitionVersionId: selectionWorkflowDefinition.versionId,
+  })
+  state.conversationMessages = [trigger, conversationMessage(
+    proposal.assistantMessageId,
+    conversationId,
+    2,
+    'assistant',
+    'Execute this accepted Workbench command.',
+    proposal.id,
+  )]
+  state.intentProposal = proposal
+  state.conversationCommand = conversationCommand(proposal)
+  let resolveExecuteStarted!: () => void
+  let releaseExecute!: () => void
+  let resolvePollDuringExecute!: () => void
+  const executeStarted = new Promise<void>((resolve) => { resolveExecuteStarted = resolve })
+  const executeRelease = new Promise<void>((resolve) => { releaseExecute = resolve })
+  const pollDuringExecute = new Promise<void>((resolve) => { resolvePollDuringExecute = resolve })
+  let executePending = false
+  const messagePath = `/v1/projects/${project.id}/conversations/${conversationId}/messages`
+  await page.route(new RegExp(`${messagePath}(?:\\?.*)?$`), async (route) => {
+    if (executePending) resolvePollDuringExecute()
+    await route.fallback()
+  })
+  await page.route(`**/v1/projects/${project.id}/conversations/${conversationId}/commands/${state.conversationCommand.id}/execute`, async (route) => {
+    executePending = true
+    resolveExecuteStarted()
+    await executeRelease
+    await route.fallback()
+    executePending = false
+  })
+
+  await page.goto('/workbench/planning?view=code')
+  const panel = page.getByRole('complementary', { name: 'Conversation control plane' })
+  await panel.getByRole('button', { name: 'Generate Workbench proposal' }).click()
+  await executeStarted
+  await pollDuringExecute
+  releaseExecute()
+
+  await expect.poll(() => state.conversationCommand?.status).toBe('executed')
+  await expect.poll(() => state.requests.some((item) =>
+    item.method === 'GET'
+      && item.path.endsWith(`/workflow-runs/${proposal.workbenchInstruction.expectedRunId}`))).toBe(true)
+  await expect(page.getByText(proposal.workbenchInstruction.expectedRunId, { exact: true }).first()).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Finish current review' })).toBeVisible()
+})
+
+test('same-run polling coalesces with delayed receipt lineage hydration', async ({ page }) => {
+  const state = await installPlatformMock(page, {
+    authenticated: true,
+    conversationSelectionTarget: true,
+  })
+  const conversationId = state.conversations[0].id
+  const trigger = conversationMessage(
+    '51515151-5151-4151-8151-515151515151',
+    conversationId,
+    1,
+    'user',
+    'Keep the receipt hydration alive across the same-run poll.',
+  )
+  const proposal = workbenchIntentProposal(conversationId, trigger.id, {
+    expectedRunId: '89898989-8989-4989-8989-898989898989',
+    expectedBundleId: 'build-1',
+    definitionVersionId: selectionWorkflowDefinition.versionId,
+  })
+  state.conversationMessages = [trigger, conversationMessage(
+    proposal.assistantMessageId,
+    conversationId,
+    2,
+    'assistant',
+    'Hydrate this exact accepted Workbench receipt.',
+    proposal.id,
+  )]
+  state.intentProposal = proposal
+  state.conversationCommand = conversationCommand(proposal)
+  let resolveLineageStarted!: () => void
+  let releaseLineage!: () => void
+  const lineageStarted = new Promise<void>((resolve) => { resolveLineageStarted = resolve })
+  const lineageRelease = new Promise<void>((resolve) => { releaseLineage = resolve })
+  await page.route('**/v1/build-manifests/build-1/lineage-state', async (route) => {
+    resolveLineageStarted()
+    await lineageRelease
+    await route.fallback()
+  })
+
+  await page.goto('/workbench/planning?view=code')
+  const panel = page.getByRole('complementary', { name: 'Conversation control plane' })
+  await panel.getByRole('button', { name: 'Generate Workbench proposal' }).click()
+  await lineageStarted
+  await page.waitForTimeout(3_600)
+  releaseLineage()
+
+  await expect(page.getByRole('button', { name: 'Finish current review' })).toBeVisible()
+  await expect(panel.getByRole('alert')).toHaveCount(0)
+  expect(state.requests.filter((item) => (
+    item.method === 'GET'
+    && item.path === '/v1/build-manifests/build-1/lineage-state'
+  ))).toHaveLength(1)
+})
+
+test('conversation receipt hydration rejects a bundle from the wrong reviewed slice', async ({ page }) => {
+  const state = await installPlatformMock(page, {
+    authenticated: true,
+    conversationSelectionTarget: true,
+  })
+  const conversationId = state.conversations[0].id
+  const trigger = conversationMessage(
+    '60606060-6060-4060-8060-606060606060',
+    conversationId,
+    1,
+    'user',
+    'Generate only the reviewed Orders slice.',
+  )
+  const proposal = workbenchIntentProposal(conversationId, trigger.id, {
+    expectedRunId: '88888888-8888-4888-8888-888888888888',
+    expectedBundleId: 'build-1',
+    definitionVersionId: selectionWorkflowDefinition.versionId,
+  })
+  state.conversationMessages = [trigger, conversationMessage(
+    proposal.assistantMessageId,
+    conversationId,
+    2,
+    'assistant',
+    'Execute the exact reviewed Orders command.',
+    proposal.id,
+  )]
+  state.intentProposal = proposal
+  state.conversationCommand = conversationCommand(proposal)
+  const wrongSliceBundle = {
+    ...state.workbenchBundle,
+    deliverySliceId: 'page-wrong',
+    workflowContext: state.workbenchBundle.workflowContext
+      ? { ...state.workbenchBundle.workflowContext, deliverySliceId: 'page-wrong' }
+      : undefined,
+  }
+  await page.route('**/v1/build-manifests/build-1', (route) => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    headers: corsHeaders(),
+    body: JSON.stringify(wrongSliceBundle),
+  }))
+
+  await page.goto('/workbench/planning?view=code')
+  const panel = page.getByRole('complementary', { name: 'Conversation control plane' })
+  await panel.getByRole('button', { name: 'Generate Workbench proposal' }).click()
+
+  await expect(panel.getByRole('alert')).toContainText(
+    'does not match the reviewed run, group, root, and delivery slice receipt',
+  )
+})
+
+test('conversation receipt rejects a proposal manifest mismatch before hydrating another bundle', async ({ page }) => {
+  const state = await installPlatformMock(page, {
+    authenticated: true,
+    conversationSelectionTarget: true,
+  })
+  const conversationId = state.conversations[0].id
+  const trigger = conversationMessage(
+    '61616161-6161-4161-8161-616161616161',
+    conversationId,
+    1,
+    'user',
+    'Generate only from the exact reviewed Workbench receipt.',
+  )
+  const proposal = workbenchIntentProposal(conversationId, trigger.id, {
+    expectedRunId: '88888888-8888-4888-8888-888888888888',
+    expectedBundleId: 'build-1',
+    definitionVersionId: selectionWorkflowDefinition.versionId,
+  })
+  state.conversationMessages = [trigger, conversationMessage(
+    proposal.assistantMessageId,
+    conversationId,
+    2,
+    'assistant',
+    'Execute the exact reviewed Workbench command.',
+    proposal.id,
+  )]
+  state.intentProposal = proposal
+  state.conversationCommand = conversationCommand(proposal)
+  const corruptBundleId = 'build-unreviewed'
+  await page.route(
+    `**/v1/implementation-proposals/${state.conversationCommand.id}`,
+    (route) => route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      headers: corsHeaders(),
+      body: JSON.stringify({
+        ...implementationProposal('open'),
+        id: state.conversationCommand!.id,
+        buildManifestId: corruptBundleId,
+      }),
+    }),
+  )
+  await page.route(`**/v1/build-manifests/${corruptBundleId}`, (route) => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    headers: corsHeaders(),
+    body: JSON.stringify({
+      ...state.workbenchBundle,
+      id: corruptBundleId,
+      rootBuildManifestId: corruptBundleId,
+    }),
+  }))
+
+  await page.goto('/workbench/planning?view=code')
+  const panel = page.getByRole('complementary', { name: 'Conversation control plane' })
+  await panel.getByRole('button', { name: 'Generate Workbench proposal' }).click()
+
+  await expect(panel.getByRole('alert')).toContainText(
+    'The implementation proposal does not belong to the receipt bundle.',
+  )
+  expect(state.requests.some((item) => (
+    item.method === 'GET'
+    && item.path === `/v1/build-manifests/${corruptBundleId}`
+  ))).toBe(false)
+})
+
+test('conversation receipt rejects a proposal not bound to the executed command', async ({ page }) => {
+  const state = await installPlatformMock(page, {
+    authenticated: true,
+    conversationSelectionTarget: true,
+  })
+  const conversationId = state.conversations[0].id
+  const trigger = conversationMessage(
+    'a1616161-6161-4161-8161-616161616161',
+    conversationId,
+    1,
+    'user',
+    'Generate only the proposal bound to this accepted command.',
+  )
+  const proposal = workbenchIntentProposal(conversationId, trigger.id, {
+    expectedRunId: '88888888-8888-4888-8888-888888888888',
+    expectedBundleId: 'build-1',
+    definitionVersionId: selectionWorkflowDefinition.versionId,
+  })
+  state.conversationMessages = [trigger, conversationMessage(
+    proposal.assistantMessageId,
+    conversationId,
+    2,
+    'assistant',
+    'Execute the exact command-bound proposal.',
+    proposal.id,
+  )]
+  state.intentProposal = proposal
+  state.conversationCommand = conversationCommand(proposal)
+  await page.route(
+    `**/v1/implementation-proposals/${state.conversationCommand.id}`,
+    (route) => route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      headers: corsHeaders(),
+      body: JSON.stringify({
+        ...implementationProposal('open'),
+        id: state.conversationCommand!.id,
+        buildManifestId: 'build-1',
+        executionSource: 'conversation_command',
+        conversationCommandId: 'unreviewed-command',
+        instructionHash: hash('7'),
+      }),
+    }),
+  )
+
+  await page.goto('/workbench/planning?view=code')
+  const panel = page.getByRole('complementary', { name: 'Conversation control plane' })
+  await panel.getByRole('button', { name: 'Generate Workbench proposal' }).click()
+
+  await expect(panel.getByRole('alert')).toContainText(
+    'The implementation proposal does not belong to the receipt bundle.',
+  )
+  await expect(page.getByRole('button', { name: 'Finish current review' })).toHaveCount(0)
+})
+
 test('Workbench conversation commands decouple governance and run manifests while enforcing exact runtime inputs', async ({ page }) => {
   const state = await installPlatformMock(page, { authenticated: true })
   const conversationId = state.conversations[0].id
@@ -1658,18 +2936,6 @@ test('Workbench conversation commands decouple governance and run manifests whil
   const execute = panel.getByRole('button', { name: 'Generate Workbench proposal' })
   await expect(execute).toBeVisible()
   await execute.click()
-  await expect(panel.getByRole('alert')).toContainText(
-    'frozen Workbench bundle is not linked to the expected workflow run',
-  )
-  expect(state.requests.some((item) => item.path === '/v1/build-manifests/build-1')).toBe(true)
-  expect(state.requests.some((item) => item.path.endsWith('/build-manifests/build-1/generate'))).toBe(false)
-
-  await panel.getByRole('alert').getByRole('button').click()
-  state.workbenchBundle = buildManifest(proposal.workbenchInstruction.expectedRunId)
-  await execute.click()
-  await expect.poll(() => state.requests.some((item) =>
-    item.method === 'POST' && item.path.endsWith('/build-manifests/build-1/generate'),
-  )).toBe(true)
   await expect.poll(() => state.requests.some((item) =>
     item.method === 'POST'
       && item.path.endsWith('/commands/77777777-7777-4777-8777-777777777777/execute'),
@@ -1677,12 +2943,14 @@ test('Workbench conversation commands decouple governance and run manifests whil
   const commandRequest = state.requests.find((item) =>
     item.method === 'POST'
       && item.path.endsWith('/commands/77777777-7777-4777-8777-777777777777/execute'))
-  expect(commandRequest?.body).toEqual({
-    workbenchResult: {
-      runId: proposal.workbenchInstruction.expectedRunId,
-      bundleId: 'build-1',
-      implementationProposalId: 'implementation-1',
-    },
+  expect(commandRequest?.body).toEqual({})
+  expect(state.requests.some((item) =>
+    item.method === 'POST' && item.path.endsWith('/build-manifests/build-1/generate'),
+  )).toBe(false)
+  expect(state.conversationCommand?.result).toMatchObject({
+    runId: proposal.workbenchInstruction.expectedRunId,
+    rootBundleId: proposal.workbenchInstruction.expectedBundleId,
+    implementationProposalId: '77777777-7777-4777-8777-777777777777',
   })
   expect(commandRequest?.headers['if-match']).toBe(
     '"conversation-command:77777777-7777-4777-8777-777777777777:1"',
@@ -1725,24 +2993,20 @@ test('Workbench conversation commands select their exact DAG group before genera
   const panel = page.getByRole('complementary', { name: 'Conversation control plane' })
   await panel.getByRole('button', { name: 'Generate Workbench proposal' }).click()
 
-  await expect(page).toHaveURL(/workbenchNodeKey=workbench-b/)
-  await expect.poll(() => state.requests.some((item) =>
-    item.method === 'POST'
-      && item.path === '/v1/build-manifests/bundle-group-b/generate',
-  )).toBe(true)
   expect(state.requests.some((item) =>
     item.method === 'POST'
-      && item.path === '/v1/build-manifests/bundle-group-a/generate',
+      && item.path.startsWith('/v1/build-manifests/')
+      && item.path.endsWith('/generate'),
   )).toBe(false)
   const commandRequest = state.requests.find((item) =>
     item.method === 'POST'
       && item.path.endsWith('/commands/77777777-7777-4777-8777-777777777777/execute'))
-  expect(commandRequest?.body).toEqual({
-    workbenchResult: {
-      runId: 'run-groups',
-      bundleId: 'bundle-group-b',
-      implementationProposalId: 'proposal-checkout',
-    },
+  expect(commandRequest?.body).toEqual({})
+  expect(state.conversationCommand?.result).toMatchObject({
+    runId: 'run-groups',
+    rootBundleId: 'bundle-group-b',
+    bundleId: 'bundle-group-b',
+    implementationProposalId: '77777777-7777-4777-8777-777777777777',
   })
 })
 
@@ -1816,6 +3080,10 @@ test('multi-bundle Workbench rebases exact shared-file inputs and survives both 
   if (await closeConversation.isVisible()) await closeConversation.click()
 
   await expect(page.getByText('Frozen application build manifest')).toBeVisible()
+  await expect(page.getByText('blueprint.selection · 2 sources')).toBeVisible()
+  await page.getByText('Inspect frozen context evidence').click()
+  await expect(page.getByText('blueprint_selection_node', { exact: false })).toBeVisible()
+  await expect(page.getByText('reviewed-start-proposal', { exact: false })).toBeVisible()
   await expect(page.getByText('page-home', { exact: true })).toBeVisible()
   await page.getByRole('button', { name: '2 page-checkout blocked' }).click()
   await expect(page.getByRole('button', { name: 'Blocked by order' })).toBeDisabled()
@@ -2002,7 +3270,7 @@ test('node-scoped Workbench groups hydrate independently and complete only the s
   })
 })
 
-test('Design Import Center freezes an upload, reviews its proposal, and applies a Prototype revision', async ({ page }) => {
+test('Design Import Center freezes an upload, requires an independent reviewer, and applies a Prototype revision', async ({ page }) => {
   const state = await installPlatformMock(page, { authenticated: true })
   await page.goto(`/team/acme/project/${project.id}/imports`)
 
@@ -2043,6 +3311,16 @@ test('Design Import Center freezes an upload, reviews its proposal, and applies 
     file: { name: 'dashboard.json', mediaType: 'application/json' },
   })
 
+  const approveButton = page.getByTestId(`design-import-approve-${state.designImports[0].id}`)
+  await expect(approveButton).toBeDisabled()
+  await expect(page.getByTestId(`design-import-independent-review-${state.designImports[0].id}`)).toContainText('Creators cannot review')
+  state.designImports = [{
+    ...state.designImports[0],
+    createdBy: reviewer.id,
+    proposal: { ...state.designImports[0].proposal, createdBy: reviewer.id },
+  }]
+  await page.reload()
+  await expect(page.getByTestId(`design-import-approve-${state.designImports[0].id}`)).toBeEnabled()
   await page.getByTestId(`design-import-approve-${state.designImports[0].id}`).click()
   await expect(page.getByText('applied', { exact: true })).toBeVisible()
   await expect(page.getByTestId('design-import-list')).toContainText('99999999…999992')
@@ -2064,12 +3342,31 @@ test('Design Import Center keeps server-open state when approval CAS fails', asy
       revisionId: pageSpecRevision.id,
       contentHash: pageSpecRevision.contentHash,
     },
-  })]
+  }, reviewer.id)]
   await page.goto(`/team/acme/project/${project.id}/imports`)
   await page.getByTestId(`design-import-approve-${state.designImports[0].id}`).click()
   await expect(page.getByTestId('design-import-center').getByRole('alert')).toContainText('changed since it was loaded')
   await expect(page.getByText('open', { exact: true })).toBeVisible()
   expect(state.designImports[0].status).toBe('open')
+})
+
+test('Design Import Center retries a processing lease with the same command key', async ({ page }) => {
+  const state = await installPlatformMock(page, { authenticated: true, designImportCreateProcessingOnce: true })
+  await page.goto(`/team/acme/project/${project.id}/imports`)
+  await page.getByTestId('design-import-file').setInputFiles({
+    name: 'retry-design.json',
+    mimeType: 'application/json',
+    buffer: Buffer.from('{"pages":[{"id":"home","name":"Home"}]}'),
+  })
+  await page.getByTestId('design-import-submit').click()
+  await expect(page.getByTestId('design-import-center').getByRole('alert')).toContainText('durable creation lease')
+  await page.getByTestId('design-import-submit').click()
+  await expect(page.getByTestId('design-import-list')).toContainText('retry-design')
+  const requests = state.requests.filter((item) =>
+    item.method === 'POST' && item.path === `/v1/projects/${project.id}/design-imports`)
+  expect(requests).toHaveLength(2)
+  expect(requests[0].headers['idempotency-key']).toBeTruthy()
+  expect(requests[1].headers['idempotency-key']).toBe(requests[0].headers['idempotency-key'])
 })
 
 test('document dependency graph opens the exact document, PageSpec, and prototype workspaces', async ({ page }) => {
@@ -2383,7 +3680,7 @@ function corsHeaders() {
 
 interface GenerateIntentBody {
   readonly triggerMessageId: string
-  readonly candidateDefinitionVersionIds: readonly string[]
+  readonly desiredOutputCapability: 'application' | string
   readonly sourceRefs: ReadonlyArray<{
     readonly artifactId: string
     readonly revisionId: string
@@ -2393,6 +3690,10 @@ interface GenerateIntentBody {
     readonly mode: 'use_existing'
     readonly inputManifest: { readonly id: string; readonly hash: string }
     readonly purpose: string
+  }
+  readonly workbenchTargetHint?: {
+    readonly runId: string
+    readonly rootBundleId: string
   }
   readonly model?: string
 }
@@ -2412,6 +3713,7 @@ function conversationRecord(id: string, title: string) {
     createdBy: user.id,
     createdAt: now,
     updatedAt: now,
+    summaryCheckpointHeadId: undefined as string | undefined,
   }
 }
 
@@ -2435,6 +3737,43 @@ function conversationMessage(
   }
 }
 
+function conversationSummaryCheckpoint(
+  id: string,
+  conversationId: string,
+  throughMessage: ReturnType<typeof conversationMessage>,
+  summary: string,
+  options: {
+    readonly createdBy?: string
+    readonly previousCheckpointId?: string
+    readonly status?: 'pending_review' | 'approved' | 'rejected' | 'superseded'
+  } = {},
+) {
+  const status = options.status ?? 'pending_review'
+  const version = status === 'pending_review' ? 1 : 2
+  return {
+    id,
+    projectId: project.id,
+    conversationId,
+    previousCheckpointId: options.previousCheckpointId,
+    throughMessageId: throughMessage.id,
+    throughSequence: throughMessage.sequence,
+    messageCount: throughMessage.sequence,
+    contentBytes: throughMessage.content.length,
+    prefixHash: hash('e'),
+    hashAlgorithm: 'conversation-prefix-chain/v1' as const,
+    summary,
+    summaryHash: hash('f'),
+    status,
+    version,
+    etag: `"conversation-summary-checkpoint:${id}:${version}"`,
+    createdBy: options.createdBy ?? user.id,
+    createdAt: now,
+    reviewedBy: undefined as string | undefined,
+    reviewedAt: undefined as string | undefined,
+    reviewReason: undefined as string | undefined,
+  }
+}
+
 function workflowIntentProposal(conversationId: string, input: GenerateIntentBody) {
   const id = '66666666-6666-4666-8666-666666666666'
   const workbenchInstruction = {
@@ -2451,7 +3790,7 @@ function workflowIntentProposal(conversationId: string, input: GenerateIntentBod
     status: 'pending' as 'pending' | 'accepted' | 'rejected',
     version: 1,
     etag: `"intent-proposal:${id}:1"`,
-    suggestedDefinitionVersionId: input.candidateDefinitionVersionIds[0] ?? workflowDefinition.versionId,
+    suggestedDefinitionVersionId: workflowDefinition.versionId,
     scope: { conversationIntent: { workbenchInstruction } },
     sourceRefs: input.sourceRefs,
     manifestIntent: input.manifestIntent,
@@ -2480,7 +3819,7 @@ function workbenchIntentProposal(
 ) {
   const generated = workflowIntentProposal(conversationId, {
     triggerMessageId,
-    candidateDefinitionVersionIds: [workflowDefinition.versionId],
+    desiredOutputCapability: 'application',
     sourceRefs: [{
       artifactId: projectBrief.artifact.id,
       revisionId: briefRevision.id,
@@ -2498,6 +3837,9 @@ function workbenchIntentProposal(
     constraints: ['Use only the frozen Workbench bundle.'],
     expectedRunId: target.expectedRunId,
     expectedBundleId: target.expectedBundleId,
+    sliceId: 'page-orders',
+    sliceKey: 'ORDERS',
+    sliceTitle: 'Orders',
   }
   return {
     ...generated,
@@ -2526,6 +3868,7 @@ function conversationCommand(proposal: MockWorkflowIntentProposal) {
     etag: `"conversation-command:${id}:1"`,
     payload: {
       definitionVersionId: proposal.suggestedDefinitionVersionId,
+      desiredOutputCapability: 'application' as const,
       scope: proposal.scope,
       sourceRefs: proposal.sourceRefs,
       manifestIntent: proposal.manifestIntent,
@@ -2569,6 +3912,10 @@ function workflowDefinitionFor(options: MockPlatformOptions) {
     ...workflowDefinition,
     definition: {
       ...workflowDefinition.definition,
+      inputContract: {
+        ...workflowDefinition.definition.inputContract,
+        requireApproved: options.workflowRequireApproved ?? workflowDefinition.definition.inputContract.requireApproved,
+      },
       nodes: workflowDefinition.definition.nodes.map((node) => ({
         ...node,
         artifactInput: {
@@ -2647,7 +3994,7 @@ function designImportRecord(input: {
   selectedFrameIds?: string[]
   pageSpecRevision: { artifactId: string; revisionId: string; contentHash: string }
   targetPrototypeArtifactId?: string
-}) {
+}, createdBy = user.id) {
   const id = '99999999-9999-4999-8999-999999999999'
   const prototypeArtifactId = input.targetPrototypeArtifactId ?? '99999999-9999-4999-8999-999999999991'
   const baseRevision = {
@@ -2666,7 +4013,7 @@ function designImportRecord(input: {
       trust: { externalSourceIsFact: false, reviewRequired: true },
     },
     outputSchemaVersion: 'prototype@1',
-    createdBy: user.id,
+    createdBy,
     createdAt: now,
     hash: hash('9'),
   }
@@ -2696,6 +4043,7 @@ function designImportRecord(input: {
     id,
     projectId: project.id,
     status: 'open' as 'open' | 'applied' | 'rejected',
+    pipelineStage: 'proposal_ready' as const,
     version: 4,
     etag: `"design-import:${id}:4"`,
     snapshot: {
@@ -2717,7 +4065,7 @@ function designImportRecord(input: {
     outputProposalId: proposal.id,
     operationId: proposal.operations[0].id,
     createsPrototype: !input.targetPrototypeArtifactId,
-    createdBy: user.id,
+    createdBy,
     createdAt: now,
     updatedAt: now,
     manifest,
@@ -2825,7 +4173,13 @@ function workflowRun(id: string, status: 'waiting_input' | 'running') {
   }
 }
 
-function selectionWorkflowRun(id: string) {
+function selectionWorkflowRun(id: string, rootBundleId = 'build-1') {
+  const applicationBuild = {
+    bundleIds: [rootBundleId],
+    sliceIds: ['page-orders'],
+    manifestGroupKey: `${id}-manifest-group`,
+    hash: hash('6'),
+  }
   return {
     id,
     projectId: project.id,
@@ -2838,30 +4192,88 @@ function selectionWorkflowRun(id: string) {
     inputManifest: { id: 'selection-manifest-page-dashboard', hash: hash('8') },
     status: 'waiting_input' as const,
     scope: { blueprintSelection: { selectionId: `sha256:${hash('s')}` } },
-    context: { values: {}, nodes: {}, slices: {} },
+    context: {
+      values: { buildManifest: applicationBuild },
+      nodes: {
+        selection: { definitionNodeId: 'selection' },
+        workbench: {
+          definitionNodeId: 'workbench',
+          input: { bindings: [{ value: applicationBuild, output: applicationBuild }] },
+          output: { implementationProposals: [] },
+        },
+      },
+      slices: {},
+    },
     eventCursor: 1,
     startedBy: user.id,
     createdAt: now,
     updatedAt: now,
-    nodes: [{
-      id: `${id}-selection`, runId: id, key: 'selection', definitionNodeId: 'selection',
-      type: 'artifact_input', status: 'waiting_input', attempt: 0,
-      availableAt: now, createdAt: now, updatedAt: now,
-    }],
+    nodes: [
+      {
+        id: `${id}-selection`, runId: id, key: 'selection', definitionNodeId: 'selection',
+        type: 'artifact_input', status: 'completed', attempt: 1,
+        availableAt: now, createdAt: now, updatedAt: now, completedAt: now,
+      },
+      {
+        id: `${id}-workbench`, runId: id, key: 'workbench', definitionNodeId: 'workbench',
+        type: 'workbench_build', status: 'waiting_input', attempt: 1,
+        availableAt: now, createdAt: now, updatedAt: now,
+      },
+    ],
   }
 }
 
-function buildManifest(workflowRunId?: string) {
+function buildManifest(workflowRunId?: string, rootBuildManifestId?: string) {
+  const anchoredBlueprint = { ...blueprintRevision, anchorId: 'page-orders' }
   return {
     id: 'build-1',
     projectId: project.id,
-    ...(workflowRunId ? { workflowRunId } : {}),
+    ...(workflowRunId ? {
+      workflowRunId,
+      manifestGroupKey: `${workflowRunId}-manifest-group`,
+      deliverySliceId: 'page-orders',
+    } : {}),
+    ...(rootBuildManifestId ? { rootBuildManifestId } : {}),
     pageSpecRevision: exactRevision(pageSpecRevision.artifactId, pageSpecRevision.id, 2, pageSpecRevision.contentHash),
     prototypeRevision: exactRevision(approvedPrototypeRevision.artifactId, approvedPrototypeRevision.id, 2, approvedPrototypeRevision.contentHash),
     requirementRevisions: [exactRevision(briefRevision.artifactId, briefRevision.id, 3, briefRevision.contentHash)],
     blueprintRevision,
     contractRevisions: [],
     designSystemRevisions: [],
+    contextRevisions: [],
+    ...(workflowRunId ? {
+      workflowContext: {
+        definition: { id: workflowDefinition.id, version: 3, hash: workflowDefinition.contentHash },
+        inputManifest: {
+          id: 'selection-manifest-page-orders',
+          projectId: project.id,
+          jobType: 'blueprint.selection',
+          deliverySliceId: 'selection-orders',
+          sources: [
+            { ref: blueprintRevision, purpose: 'blueprint_selection_root' },
+            { ref: anchoredBlueprint, purpose: 'blueprint_selection_node' },
+          ],
+          constraints: { blueprintSelection: { selectionId: 'selection-orders', nodeIds: ['page-orders'] } },
+          outputSchemaVersion: 'blueprint-selection/v1',
+          createdBy: user.id,
+          createdAt: now,
+          hash: hash('8'),
+        },
+        deliverySliceId: 'page-orders',
+        runScope: {
+          conversationIntent: {
+            kind: 'start_workflow',
+            proposalId: 'reviewed-start-proposal',
+          },
+        },
+        outputContract: {
+          capability: 'application',
+          producedArtifactKinds: ['workspace'],
+          terminalOutcome: 'deployment',
+          terminalNodeType: 'publish',
+        },
+      },
+    } : {}),
     sceneGraph: asset('scene'),
     renderedFrames: [],
     interactionManifest: asset('interactions'),
@@ -2891,6 +4303,9 @@ function implementationProposal(
     id: 'implementation-1',
     projectId: project.id,
     buildManifestId: 'build-1',
+    executionSource: 'manual_submission' as 'manual_submission' | 'manual_generation' | 'workflow_runner' | 'conversation_command',
+    conversationCommandId: undefined as string | undefined,
+    instructionHash: undefined as string | undefined,
     operations: [{
       id: 'operation-1',
       kind: 'file.upsert',
@@ -3035,10 +4450,12 @@ function multiGroupWorkbenchState(): MockMultiWorkbenchState {
   const bundleA = {
     ...multiBuildManifest('bundle-group-a', 'slice-group-a'),
     workflowRunId: 'run-groups',
+    manifestGroupKey: 'manifest-group-a',
   }
   const bundleB = {
     ...multiBuildManifest('bundle-group-b', 'slice-group-b'),
     workflowRunId: 'run-groups',
+    manifestGroupKey: 'manifest-group-b',
     currentWorkspaceRevision: exactRevision(
       'workspace-application',
       'workspace-r1',
@@ -3132,10 +4549,14 @@ function multiBuildManifest(
   derivedFromBuildManifestId?: string,
   currentWorkspaceRevision?: ReturnType<typeof exactRevision>,
 ) {
+  const base = buildManifest('run-multi')
   return {
-    ...buildManifest('run-multi'),
+    ...base,
     id,
     deliverySliceId,
+    workflowContext: base.workflowContext
+      ? { ...base.workflowContext, deliverySliceId }
+      : undefined,
     ...(rootBuildManifestId ? { rootBuildManifestId } : {}),
     ...(derivedFromBuildManifestId ? { derivedFromBuildManifestId } : {}),
     ...(currentWorkspaceRevision ? { currentWorkspaceRevision } : {}),

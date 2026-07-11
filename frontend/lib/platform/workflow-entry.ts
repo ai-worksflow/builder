@@ -1,7 +1,6 @@
 import type {
   CreateInputManifestDto,
   ExactArtifactRefDto,
-  WorkflowDefinitionRecordDto,
 } from './flow-contract'
 
 export type ProjectBriefEntryAction =
@@ -9,37 +8,6 @@ export type ProjectBriefEntryAction =
   | 'checkpoint_draft'
   | 'blocked_unapproved_changes'
   | 'missing_revision'
-
-export function highestPublishedWorkflowVersionIds(
-  records: readonly {
-    readonly id: string
-    readonly versionId: string
-    readonly version: number
-    readonly published: boolean
-  }[],
-) {
-  const highest = new Map<string, { readonly versionId: string; readonly version: number }>()
-  for (const record of records) {
-    if (!record.published) continue
-    const current = highest.get(record.id)
-    if (!current || record.version > current.version) {
-      highest.set(record.id, { versionId: record.versionId, version: record.version })
-    }
-  }
-  return [...highest.values()].map((record) => record.versionId)
-}
-
-export function projectBriefIntentCandidateVersionIds(
-  records: readonly WorkflowDefinitionRecordDto[],
-) {
-  return highestPublishedWorkflowVersionIds(records.filter((record) => {
-    const entry = record.definition.nodes.find((node) => node.type === 'artifact_input')
-    const consumesProjectBrief = entry?.artifactInput?.allowedTypes.includes('document') ?? false
-    const selectionOnly = record.definition.nodes.some((node) =>
-      node.type === 'fan_out' && node.fanOut?.itemKind === 'blueprint_selection_page')
-    return consumesProjectBrief && !selectionOnly
-  }))
-}
 
 export function projectBriefEntryAction(input: {
   readonly requireApproved: boolean

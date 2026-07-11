@@ -38,6 +38,18 @@ func fanOutResolverExecution(
 	}
 }
 
+func TestFanOutRunnerEnforcesConfiguredItemLimit(t *testing.T) {
+	execution := fanOutResolverExecution(t, domain.FanOutNodeConfig{
+		ItemsPath: "/items", SliceKeyPath: "/id", MergeNodeID: "merge", MaxParallel: 2, MaxItems: 2,
+	}, json.RawMessage(`{"items":[]}`))
+	runner := FanOutRunner{Resolver: FanOutResolverFunc(func(context.Context, Execution) ([]FanOutItem, error) {
+		return []FanOutItem{{Key: "a"}, {Key: "b"}, {Key: "c"}}, nil
+	})}
+	if _, err := runner.Run(context.Background(), execution); err == nil || !strings.Contains(err.Error(), "maxItems") {
+		t.Fatalf("over-limit resolver output was accepted: %v", err)
+	}
+}
+
 func TestInputEnvelopeFanOutUsesConfiguredPointersAndPreservesPayload(t *testing.T) {
 	execution := fanOutResolverExecution(t, domain.FanOutNodeConfig{
 		ItemsPath: "/payload/jobs", SliceKeyPath: "/identity/key",
@@ -138,7 +150,6 @@ func blueprintPageResolverFixture(t *testing.T) (Execution, *fakeHumanEditArtifa
 	ref := platformRef("approved-blueprint-pages")
 	latest, approved := ref.RevisionID, ref.RevisionID
 	content := json.RawMessage(`{
-		"nodes":[{"id":"legacy-layout","key":"LEGACY","kind":"page","title":"Ignored legacy layout","route":"/ignored","userGoal":"Ignored"}],
 		"semantic":{"nodes":[
 			{"id":"page-orders","key":"PAGE-ORDERS","kind":"page","title":"Orders","route":"/orders","userGoal":"Review open orders","requirementIds":["REQ-1"]},
 			{"id":"feature-orders","key":"FEATURE-ORDERS","kind":"feature","title":"Orders feature"},
@@ -239,25 +250,34 @@ func workflowSelectionManifest(
 	pageSpec, prototype domain.ArtifactRef,
 ) domain.InputManifest {
 	t.Helper()
-	selectionID := platformHash(blueprint.RevisionID + "\x00" + nodeID)
 	anchored := blueprint
 	anchored.AnchorID = nodeID
 	scope := workflowBlueprintSelectionScope{
-		SchemaVersion: 1, SelectionID: selectionID, Blueprint: blueprint, NodeIDs: []string{nodeID},
+		SchemaVersion: 1, Blueprint: blueprint, NodeIDs: []string{nodeID},
+		Nodes: []workflowBlueprintSelectionNode{{
+			ID: nodeID, Key: nodeID, Kind: "page", Title: "Page " + nodeID,
+			Route: "/" + nodeID, UserGoal: "Use " + nodeID, RequirementIDs: []string{"REQ-001"},
+		}},
 		PageBindings: []workflowBlueprintSelectionPageBinding{{NodeID: nodeID, PageSpec: &pageSpec, Prototype: &prototype}},
 	}
+	sources := []domain.ManifestSource{
+		{Ref: blueprint, Purpose: "blueprint_selection_root"},
+		{Ref: anchored, Purpose: "blueprint_selection_node"},
+		{Ref: pageSpec, Purpose: "selected_page_spec"},
+		{Ref: prototype, Purpose: "selected_prototype"},
+	}
+	selectionID, err := workflowBlueprintSelectionIdentity(scope, sources)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scope.SelectionID = selectionID
 	constraints, err := domain.CanonicalJSON(map[string]any{"blueprintSelection": scope})
 	if err != nil {
 		t.Fatal(err)
 	}
 	manifest, err := domain.NewInputManifest(
 		uuid.NewString(), projectID, core.BlueprintSelectionJobType, selectionID, nil,
-		[]domain.ManifestSource{
-			{Ref: blueprint, Purpose: "blueprint_selection_root"},
-			{Ref: anchored, Purpose: "blueprint_selection_node"},
-			{Ref: pageSpec, Purpose: "selected_page_spec"},
-			{Ref: prototype, Purpose: "selected_prototype"},
-		},
+		sources,
 		constraints, "blueprint-selection/v1", actorID, time.Now().UTC(),
 	)
 	if err != nil {
@@ -341,7 +361,7 @@ func TestBlueprintPageResolverRunsThroughEngineWithAnchoredSlices(t *testing.T) 
 		}}},
 		revisions: map[string]core.ArtifactRevision{blueprint.RevisionID: {
 			ID: blueprint.RevisionID, ArtifactID: blueprint.ArtifactID, ContentHash: blueprint.ContentHash, WorkflowStatus: "approved",
-			Content: json.RawMessage(`{"semantic":{"nodes":[{"id":"page-a","key":"PAGE-A","kind":"page","title":"A","route":"/a","userGoal":"Use A"},{"id":"page-b","key":"PAGE-B","kind":"page","title":"B","route":"/b","userGoal":"Use B"}]}}`),
+			Content: json.RawMessage(`{"semantic":{"nodes":[{"id":"page-a","key":"PAGE-A","kind":"page","title":"A","route":"/a","userGoal":"Use A","requirementIds":["REQ-A"]},{"id":"page-b","key":"PAGE-B","kind":"page","title":"B","route":"/b","userGoal":"Use B","requirementIds":["REQ-B"]}]}}`),
 		}},
 	}
 	processed := map[string]bool{}
@@ -368,7 +388,7 @@ func TestBlueprintPageResolverRunsThroughEngineWithAnchoredSlices(t *testing.T) 
 	if err := registry.Register(domain.NodeFanOut, FanOutRunner{Resolver: DefinitionFanOutResolver{BlueprintPages: CoreBlueprintPageFanOutResolver{Artifacts: artifactAPI}}}); err != nil {
 		t.Fatal(err)
 	}
-	engine.Runners = registry
+	installCompleteTestExecutionProfileRuntime(t, engine, registry)
 	run, err := engine.Start(context.Background(), StartRequest{RunID: uuid.NewString(), ProjectID: projectID, DefinitionVersionID: record.VersionID, InputManifest: manifest.Ref(), StartedBy: startedBy})
 	if err != nil {
 		t.Fatal(err)

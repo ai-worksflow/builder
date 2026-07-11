@@ -22,6 +22,11 @@ type ConversationAPI interface {
 	Update(context.Context, string, string, string, string, conversation.UpdateConversationInput) (conversation.Conversation, error)
 	AppendMessage(context.Context, string, string, string, conversation.AppendMessageInput) (conversation.Message, error)
 	ListMessages(context.Context, string, string, string, conversation.ListOptions) (conversation.MessagePage, error)
+	CreateSummaryCheckpoint(context.Context, string, string, string, string, conversation.CreateSummaryCheckpointInput) (conversation.ConversationSummaryCheckpoint, error)
+	GetSummaryCheckpoint(context.Context, string, string, string, string) (conversation.ConversationSummaryCheckpoint, error)
+	ListSummaryCheckpoints(context.Context, string, string, string, conversation.ListOptions) (conversation.SummaryCheckpointPage, error)
+	ListSummaryCheckpointSourceMessages(context.Context, string, string, string, string, conversation.ListOptions) (conversation.MessagePage, error)
+	DecideSummaryCheckpoint(context.Context, string, string, string, string, string, conversation.DecideSummaryCheckpointInput) (conversation.ConversationSummaryCheckpoint, error)
 	CreateIntentProposal(context.Context, string, string, string, conversation.CreateIntentProposalInput) (conversation.WorkflowIntentProposal, conversation.Message, error)
 	GenerateIntentProposal(context.Context, string, string, string, conversation.GenerateIntentProposalInput) (conversation.GeneratedIntentProposal, error)
 	GetProposal(context.Context, string, string, string, string) (conversation.WorkflowIntentProposal, error)
@@ -75,6 +80,11 @@ func RegisterConversationRoutes(routes gin.IRoutes, handler *ConversationHandler
 
 	routes.GET("/projects/:projectId/conversations/:conversationId/messages", conversationNoStore, handler.listMessages)
 	routes.POST("/projects/:projectId/conversations/:conversationId/messages", mutation(handler.appendMessage)...)
+	routes.GET("/projects/:projectId/conversations/:conversationId/summary-checkpoints", conversationNoStore, handler.listSummaryCheckpoints)
+	routes.POST("/projects/:projectId/conversations/:conversationId/summary-checkpoints", conditional(handler.createSummaryCheckpoint)...)
+	routes.GET("/projects/:projectId/conversations/:conversationId/summary-checkpoints/:checkpointId", conversationNoStore, handler.getSummaryCheckpoint)
+	routes.GET("/projects/:projectId/conversations/:conversationId/summary-checkpoints/:checkpointId/source-messages", conversationNoStore, handler.listSummaryCheckpointSourceMessages)
+	routes.POST("/projects/:projectId/conversations/:conversationId/summary-checkpoints/:checkpointId/decision", conditional(handler.decideSummaryCheckpoint)...)
 
 	routes.GET("/projects/:projectId/conversations/:conversationId/intent-proposals", conversationNoStore, handler.listProposals)
 	routes.POST("/projects/:projectId/conversations/:conversationId/intent-proposals", mutation(handler.createProposal)...)
@@ -196,6 +206,105 @@ func (h *ConversationHandler) listMessages(c *gin.Context) {
 		writeConversationError(c, err, false)
 		return
 	}
+	c.JSON(http.StatusOK, result)
+}
+
+func (h *ConversationHandler) createSummaryCheckpoint(c *gin.Context) {
+	var input conversation.CreateSummaryCheckpointInput
+	if err := DecodeJSON(c, &input, h.maxBody); err != nil {
+		WriteJSONError(c, err)
+		return
+	}
+	actor, ok := actorID(c)
+	if !ok {
+		return
+	}
+	result, err := h.service.CreateSummaryCheckpoint(
+		c.Request.Context(), c.Param("projectId"), c.Param("conversationId"), actor,
+		worksmiddleware.IfMatch(c), input,
+	)
+	if err != nil {
+		writeConversationError(c, err, true)
+		return
+	}
+	c.Header("ETag", result.ETag)
+	c.Header("Location", conversationBasePath(c)+"/summary-checkpoints/"+result.ID)
+	c.JSON(http.StatusCreated, result)
+}
+
+func (h *ConversationHandler) getSummaryCheckpoint(c *gin.Context) {
+	actor, ok := actorID(c)
+	if !ok {
+		return
+	}
+	result, err := h.service.GetSummaryCheckpoint(
+		c.Request.Context(), c.Param("projectId"), c.Param("conversationId"), c.Param("checkpointId"), actor,
+	)
+	if err != nil {
+		writeConversationError(c, err, false)
+		return
+	}
+	c.Header("ETag", result.ETag)
+	c.JSON(http.StatusOK, result)
+}
+
+func (h *ConversationHandler) listSummaryCheckpoints(c *gin.Context) {
+	actor, ok := actorID(c)
+	if !ok {
+		return
+	}
+	options, ok := conversationListOptions(c)
+	if !ok {
+		return
+	}
+	result, err := h.service.ListSummaryCheckpoints(
+		c.Request.Context(), c.Param("projectId"), c.Param("conversationId"), actor, options,
+	)
+	if err != nil {
+		writeConversationError(c, err, false)
+		return
+	}
+	c.JSON(http.StatusOK, result)
+}
+
+func (h *ConversationHandler) listSummaryCheckpointSourceMessages(c *gin.Context) {
+	actor, ok := actorID(c)
+	if !ok {
+		return
+	}
+	options, ok := conversationListOptions(c)
+	if !ok {
+		return
+	}
+	result, err := h.service.ListSummaryCheckpointSourceMessages(
+		c.Request.Context(), c.Param("projectId"), c.Param("conversationId"), c.Param("checkpointId"), actor, options,
+	)
+	if err != nil {
+		writeConversationError(c, err, false)
+		return
+	}
+	c.JSON(http.StatusOK, result)
+}
+
+func (h *ConversationHandler) decideSummaryCheckpoint(c *gin.Context) {
+	var input conversation.DecideSummaryCheckpointInput
+	if err := DecodeJSON(c, &input, h.maxBody); err != nil {
+		WriteJSONError(c, err)
+		return
+	}
+	actor, ok := actorID(c)
+	if !ok {
+		return
+	}
+	result, err := h.service.DecideSummaryCheckpoint(
+		c.Request.Context(), c.Param("projectId"), c.Param("conversationId"), c.Param("checkpointId"),
+		actor, worksmiddleware.IfMatch(c), input,
+	)
+	if err != nil {
+		writeConversationError(c, err, true)
+		return
+	}
+	c.Header("ETag", result.ETag)
 	c.JSON(http.StatusOK, result)
 }
 
@@ -397,9 +506,31 @@ func conversationBasePath(c *gin.Context) string {
 }
 
 func writeConversationError(c *gin.Context, err error, conditional bool) {
+	var checkpointRequired *conversation.IntentSummaryCheckpointRequiredError
+	if errors.As(err, &checkpointRequired) {
+		details := problem.New(http.StatusConflict, "conversation_summary_checkpoint_required", "Controlled summary checkpoint required", "The approved conversation checkpoint plus the complete continuous tail through this message exceeds the explicit AI context budget. Create and review the recommended immutable prefix checkpoint; no messages were silently omitted.")
+		details.Extensions = map[string]interface{}{
+			"triggerMessageId":            checkpointRequired.TriggerMessageID,
+			"triggerSequence":             checkpointRequired.TriggerSequence,
+			"messageCount":                checkpointRequired.MessageCount,
+			"messageContentBytes":         checkpointRequired.MessageContentBytes,
+			"contextBytes":                checkpointRequired.ContextBytes,
+			"currentApprovedCheckpointId": checkpointRequired.CurrentApprovedCheckpointID,
+			"currentThroughSequence":      checkpointRequired.CurrentThroughSequence,
+			"recommendedThroughMessageId": checkpointRequired.RecommendedThroughMessageID,
+			"recommendedThroughSequence":  checkpointRequired.RecommendedThroughSequence,
+			"createHref":                  conversationBasePath(c) + "/summary-checkpoints",
+		}
+		problem.Write(c, details)
+		return
+	}
 	switch {
+	case errors.Is(err, conversation.ErrSummaryCheckpointChainStale):
+		problem.Write(c, problem.New(http.StatusConflict, "conversation_summary_checkpoint_chain_stale", "Summary checkpoint chain changed", "Another approved checkpoint advanced the conversation summary chain. Refresh and create a new checkpoint from the current approved head."))
 	case conditional && errors.Is(err, core.ErrConflict):
 		problem.Write(c, problem.New(http.StatusPreconditionFailed, "etag_mismatch", "Precondition failed", "The conversation control-plane resource changed since it was loaded."))
+	case errors.Is(err, conversation.ErrIntentSummaryCheckpointRequired):
+		problem.Write(c, problem.New(http.StatusConflict, "conversation_summary_checkpoint_required", "Controlled summary checkpoint required", "The complete ordered conversation through this message exceeds the explicit AI context budget. Create and review a controlled summary checkpoint before generating another intent; no messages were silently omitted."))
 	case errors.Is(err, ai.ErrNotConfigured), errors.Is(err, ai.ErrUnavailable):
 		problem.Write(c, problem.New(http.StatusServiceUnavailable, "ai_unavailable", "AI service unavailable", "The AI intent proposal service is not available."))
 	case errors.Is(err, ai.ErrRateLimited):

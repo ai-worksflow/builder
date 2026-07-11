@@ -9,6 +9,7 @@ import (
 	"github.com/worksflow/builder/backend/internal/ai"
 	"github.com/worksflow/builder/backend/internal/core"
 	"github.com/worksflow/builder/backend/internal/domain"
+	"github.com/worksflow/builder/backend/internal/generation"
 	"github.com/worksflow/builder/backend/internal/httpapi/problem"
 )
 
@@ -18,9 +19,11 @@ type generateArtifactInput struct {
 }
 
 type generateImplementationInput struct {
-	BundleID    string `json:"bundleId,omitempty"`
-	Model       string `json:"model,omitempty"`
-	Instruction string `json:"instruction,omitempty"`
+	BundleID               string `json:"bundleId,omitempty"`
+	Model                  string `json:"model,omitempty"`
+	Instruction            string `json:"instruction,omitempty"`
+	ReplaceProposalID      string `json:"replaceProposalId,omitempty"`
+	ReplaceProposalVersion uint64 `json:"replaceProposalVersion,omitempty"`
 }
 
 type createWorkbenchBundleRequest struct {
@@ -326,7 +329,13 @@ func (s *Server) GenerateImplementation(context *gin.Context) {
 		return
 	}
 	result, err := s.services.Generation.GenerateImplementation(
-		context.Request.Context(), bundleID, actor, strings.TrimSpace(input.Model), strings.TrimSpace(input.Instruction),
+		context.Request.Context(), generation.ImplementationGenerationRequest{
+			BundleID: bundleID, ActorID: actor, Model: strings.TrimSpace(input.Model),
+			Instruction:                   generation.ImplementationInstruction{Objective: strings.TrimSpace(input.Instruction)},
+			ExecutionSource:               core.ImplementationSourceManualGeneration,
+			ExpectedActiveProposalID:      strings.TrimSpace(input.ReplaceProposalID),
+			ExpectedActiveProposalVersion: input.ReplaceProposalVersion,
+		},
 	)
 	if err != nil {
 		s.generationError(context, err)
@@ -342,6 +351,11 @@ func (s *Server) generationError(context *gin.Context, err error) {
 		s.writeServiceError(context.GetString("request_id"), context.FullPath(), err)
 	}
 	switch {
+	case errors.Is(err, generation.ErrImplementationGenerationProcessing):
+		context.Header("Retry-After", "5")
+		problem.Write(context, problem.New(http.StatusConflict, "implementation_generation_processing", "Implementation generation is processing", "Another fenced worker is generating this active Workbench leaf. Retry after its lease completes or expires."))
+	case errors.Is(err, generation.ErrActiveImplementationProposal):
+		problem.Write(context, problem.New(http.StatusConflict, "active_implementation_proposal", "An active implementation proposal already exists", "Review, reject, apply, or explicitly recover the existing proposal before generating another one for this active leaf."))
 	case errors.Is(err, ai.ErrNotConfigured):
 		problem.Write(context, problem.New(http.StatusServiceUnavailable, "ai_not_configured", "AI provider is not configured", "Configure an AI provider before starting generation."))
 	case errors.Is(err, ai.ErrRateLimited):

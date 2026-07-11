@@ -207,6 +207,12 @@ function ImplementationWorkspace() {
   const blockingPredecessor = flow.workbenchQueue
     .slice(0, Math.max(selectedQueueIndex, 0))
     .find((item) => !proposalApplied(item.proposal))
+  const activeProposal = currentQueueItem?.proposal
+  const regenerationAllowed = !activeProposal || (
+    activeProposal.status === 'open'
+    && activeProposal.executionSource !== 'conversation_command'
+    && activeProposal.operations.every((operation) => operation.decision === 'pending')
+  )
 
   useEffect(() => {
     if (!selectedPath && selectedFile) setSelectedPath(selectedFile.path)
@@ -250,8 +256,8 @@ function ImplementationWorkspace() {
           <div className="flex min-w-[320px] flex-1 gap-1.5 max-md:min-w-0 max-md:basis-full">
             <input value={model} onChange={(event) => setModel(event.target.value)} className="h-8 w-24 rounded-md border border-border bg-panel px-2 text-[10px] text-foreground outline-none" aria-label="Generation model" />
             <input value={instruction} onChange={(event) => setInstruction(event.target.value)} className="h-8 min-w-0 flex-1 rounded-md border border-border bg-panel px-2 text-[10px] text-foreground outline-none" aria-label="Implementation instruction" />
-            <button type="button" onClick={() => void flow.generateImplementation(instruction, model)} disabled={!can('edit') || flow.busy || !instruction.trim() || !model.trim() || !orderedGenerationAllowed || flow.requiresWorkbenchRebase || proposalApplied(currentQueueItem?.proposal)} className="inline-flex h-8 shrink-0 items-center gap-1 rounded-md bg-primary px-3 text-[10px] font-semibold text-primary-foreground disabled:opacity-40">
-              {flow.busy ? <LoaderCircle className="size-3 animate-spin" /> : <Sparkles className="size-3" />} {!orderedGenerationAllowed ? 'Blocked by order' : currentQueueItem?.proposal ? 'Regenerate proposal' : 'Generate proposal'}
+            <button type="button" onClick={() => void flow.generateImplementation(instruction, model)} disabled={!can('edit') || flow.busy || !instruction.trim() || !model.trim() || !orderedGenerationAllowed || flow.requiresWorkbenchRebase || proposalApplied(currentQueueItem?.proposal) || !regenerationAllowed} className="inline-flex h-8 shrink-0 items-center gap-1 rounded-md bg-primary px-3 text-[10px] font-semibold text-primary-foreground disabled:opacity-40" title={!regenerationAllowed ? 'A reviewed or conversation-owned proposal cannot be superseded.' : undefined}>
+              {flow.busy ? <LoaderCircle className="size-3 animate-spin" /> : <Sparkles className="size-3" />} {!orderedGenerationAllowed ? 'Blocked by order' : !regenerationAllowed ? 'Finish current review' : currentQueueItem?.proposal ? 'Regenerate proposal' : 'Generate proposal'}
             </button>
           </div>
         </div>
@@ -385,17 +391,46 @@ function ManifestFacts() {
     ['Prototype revision', compactRef(bundle.prototypeRevision)],
     ['Contracts', bundle.contractRevisions.length],
     ['Design system refs', bundle.designSystemRevisions.length],
+    ['Context evidence', bundle.contextRevisions?.length ?? 0],
+    ['Workflow input', bundle.workflowContext ? `${bundle.workflowContext.inputManifest.jobType} · ${bundle.workflowContext.inputManifest.sources.length} sources` : 'legacy / manual'],
     ['Rendered states', bundle.renderedFrames.length],
   ] as const
   return (
-    <div className="mt-3 grid grid-cols-4 gap-1.5 max-xl:grid-cols-2 max-md:grid-cols-1">
-      {facts.map(([label, value]) => (
-        <div key={label} className="rounded border border-border bg-panel px-2 py-1.5">
-          <div className="text-[8px] uppercase tracking-wider text-faint-foreground">{label}</div>
-          <div className="mt-0.5 truncate font-mono text-[9px] text-muted-foreground" title={String(value)}>{value}</div>
-        </div>
-      ))}
-    </div>
+    <>
+      <div className="mt-3 grid grid-cols-4 gap-1.5 max-xl:grid-cols-2 max-md:grid-cols-1">
+        {facts.map(([label, value]) => (
+          <div key={label} className="rounded border border-border bg-panel px-2 py-1.5">
+            <div className="text-[8px] uppercase tracking-wider text-faint-foreground">{label}</div>
+            <div className="mt-0.5 truncate font-mono text-[9px] text-muted-foreground" title={String(value)}>{value}</div>
+          </div>
+        ))}
+      </div>
+      {((bundle.contextRevisions?.length ?? 0) > 0 || bundle.workflowContext) && (
+        <details className="mt-2 rounded border border-border bg-panel">
+          <summary className="cursor-pointer px-2 py-1.5 text-[8px] font-semibold text-faint-foreground">Inspect frozen context evidence</summary>
+          <div className="space-y-1 border-t border-border p-2 font-mono text-[8px] text-muted-foreground">
+            {bundle.contextRevisions?.map((context) => (
+              <div key={`${context.kind}:${context.revision.revisionId}:${context.revision.anchorId ?? ''}`} className="truncate" title={JSON.stringify(context.revision)}>
+                context:{context.kind} · {compactRef(context.revision)}{context.revision.anchorId ? `#${context.revision.anchorId}` : ''}
+              </div>
+            ))}
+            {bundle.workflowContext && (
+              <>
+                <div className="truncate" title={bundle.workflowContext.definition.hash}>definition · {bundle.workflowContext.definition.id}@v{bundle.workflowContext.definition.version}</div>
+                <div className="truncate" title={bundle.workflowContext.inputManifest.hash}>input manifest · {bundle.workflowContext.inputManifest.id} · {bundle.workflowContext.inputManifest.jobType}/{bundle.workflowContext.inputManifest.outputSchemaVersion}</div>
+                {bundle.workflowContext.inputManifest.baseRevision && <div className="truncate" title={JSON.stringify(bundle.workflowContext.inputManifest.baseRevision)}>base · {compactRef(bundle.workflowContext.inputManifest.baseRevision)}</div>}
+                {bundle.workflowContext.inputManifest.sources.map((source, index) => (
+                  <div key={`${source.purpose}:${source.ref.revisionId}:${source.ref.anchorId ?? ''}:${index}`} className="truncate" title={JSON.stringify(source.ref)}>
+                    {source.purpose} · {compactRef(source.ref)}{source.ref.anchorId ? `#${source.ref.anchorId}` : ''}
+                  </div>
+                ))}
+                <pre className="max-h-28 overflow-auto whitespace-pre-wrap rounded bg-black/20 p-1.5">run scope {JSON.stringify(bundle.workflowContext.runScope ?? {}, null, 2)}</pre>
+              </>
+            )}
+          </div>
+        </details>
+      )}
+    </>
   )
 }
 

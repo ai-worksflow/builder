@@ -1060,11 +1060,31 @@ func (s *ArtifactService) validateArtifactLineage(
 ) error {
 	switch kind {
 	case "blueprint":
-		return s.validateBlueprintBaselineSources(ctx, database, projectID, inputs)
+		return s.validateBlueprintBaselineSources(ctx, database, projectID, payload, inputs)
 	case "page_spec":
 		return s.validatePageSpecBlueprintSource(ctx, database, projectID, payload, inputs)
 	case "prototype":
-		return s.validatePrototypePageSpecSource(ctx, database, projectID, payload, inputs)
+		return s.validatePrototypePageSpecSource(ctx, database, projectID, payload, inputs, false)
+	default:
+		return nil
+	}
+}
+
+func (s *ArtifactService) validateArtifactLineageForReview(
+	ctx context.Context,
+	database *gorm.DB,
+	projectID uuid.UUID,
+	kind string,
+	payload json.RawMessage,
+	inputs []ArtifactSourceInput,
+) error {
+	switch kind {
+	case "blueprint":
+		return s.validateBlueprintBaselineSources(ctx, database, projectID, payload, inputs, true)
+	case "page_spec":
+		return s.validatePageSpecBlueprintSource(ctx, database, projectID, payload, inputs, true)
+	case "prototype":
+		return s.validatePrototypePageSpecSource(ctx, database, projectID, payload, inputs, true)
 	default:
 		return nil
 	}
@@ -1076,6 +1096,7 @@ func (s *ArtifactService) validatePageSpecBlueprintSource(
 	projectID uuid.UUID,
 	payload json.RawMessage,
 	inputs []ArtifactSourceInput,
+	strictValues ...bool,
 ) error {
 	var content map[string]any
 	if json.Unmarshal(payload, &content) != nil {
@@ -1104,12 +1125,39 @@ func (s *ArtifactService) validatePageSpecBlueprintSource(
 	if source.Artifact.Lifecycle != "active" || source.Revision.WorkflowStatus != "approved" {
 		return fmt.Errorf("%w: PageSpec Blueprint source must be an approved active revision", ErrBlockingGate)
 	}
+	strict := semanticStrict(strictValues)
+	if strict {
+		if source.Artifact.LatestApprovedRevisionID == nil || *source.Artifact.LatestApprovedRevisionID != source.Revision.ID {
+			return fmt.Errorf("%w: PageSpec must use the current approved Blueprint revision", ErrBlockingGate)
+		}
+		if err := requireCurrentArtifactHealth(ctx, database, source.Artifact.ID, "PageSpec Blueprint source"); err != nil {
+			return err
+		}
+	}
 	stored, err := s.contents.Get(ctx, source.Revision.ContentRef, source.Revision.ContentHash)
 	if err != nil {
 		return err
 	}
-	if !blueprintContainsPageNode(stored.Payload, pageNodeID) {
+	nodes, edges, err := DecodeBlueprintSemanticGraph(stored.Payload)
+	if err != nil {
+		return fmt.Errorf("%w: invalid Blueprint semantic graph: %v", ErrBlockingGate, err)
+	}
+	var page *BlueprintSemanticNode
+	for index := range nodes {
+		if nodes[index].ID == pageNodeID && nodes[index].Kind == "page" {
+			page = &nodes[index]
+			break
+		}
+	}
+	if page == nil {
 		return fmt.Errorf("%w: PageSpec Blueprint anchor must identify an existing Page node", ErrBlockingGate)
+	}
+	trace, err := s.loadBlueprintRequirementTrace(ctx, database, projectID, source.Revision, strict)
+	if err != nil {
+		return err
+	}
+	if err := validatePageSpecSemanticTrace(payload, *page, nodes, edges, trace, strictValues...); err != nil {
+		return fmt.Errorf("%w: %v", ErrBlockingGate, err)
 	}
 	return nil
 }
@@ -1120,6 +1168,7 @@ func (s *ArtifactService) validatePrototypePageSpecSource(
 	projectID uuid.UUID,
 	payload json.RawMessage,
 	inputs []ArtifactSourceInput,
+	requireCoverage bool,
 ) error {
 	var content struct {
 		PageSpecRevision VersionRef `json:"pageSpecRevision"`
@@ -1146,6 +1195,25 @@ func (s *ArtifactService) validatePrototypePageSpecSource(
 	if source.Artifact.Lifecycle != "active" {
 		return fmt.Errorf("%w: Prototype PageSpec source must be active", ErrBlockingGate)
 	}
+	if requireCoverage && content.Exploratory {
+		return fmt.Errorf("%w: exploratory Prototype revisions cannot be formally approved", ErrBlockingGate)
+	}
+	storedPageSpec, err := s.contents.Get(ctx, source.Revision.ContentRef, source.Revision.ContentHash)
+	if err != nil {
+		return err
+	}
+	if err := s.validatePrototypeComponentRefs(ctx, database, projectID, payload, resolved, requireCoverage); err != nil {
+		return err
+	}
+	authority, authorityErr := s.loadPrototypeSemanticAuthority(
+		ctx, database, projectID, source.Artifact, source.Revision, storedPageSpec.Payload, requireCoverage,
+	)
+	if authorityErr != nil {
+		return authorityErr
+	}
+	if err := validatePrototypeSemanticTrace(payload, storedPageSpec.Payload, requireCoverage, authority); err != nil {
+		return fmt.Errorf("%w: %v", ErrBlockingGate, err)
+	}
 	if content.Exploratory {
 		return nil
 	}
@@ -1164,6 +1232,236 @@ func (s *ArtifactService) validatePrototypePageSpecSource(
 		return fmt.Errorf("%w: formal Prototype requires a current PageSpec source", ErrBlockingGate)
 	}
 	return nil
+}
+
+func (s *ArtifactService) validatePrototypeComponentRefs(
+	ctx context.Context,
+	database *gorm.DB,
+	projectID uuid.UUID,
+	payload json.RawMessage,
+	sources []resolvedArtifactLineageSource,
+	strict bool,
+) error {
+	var prototype map[string]any
+	if json.Unmarshal(payload, &prototype) != nil {
+		return fmt.Errorf("%w: Prototype content must be a JSON object", ErrBlockingGate)
+	}
+	allowed := make([]resolvedArtifactLineageSource, 0)
+	for _, source := range sources {
+		if source.Artifact.Kind != "component_registry" && source.Artifact.Kind != "design_system" {
+			continue
+		}
+		if !source.Input.Required || strings.TrimSpace(source.Input.Purpose) != source.Artifact.Kind ||
+			source.Artifact.Lifecycle != "active" || source.Revision.WorkflowStatus != "approved" {
+			return fmt.Errorf("%w: Prototype component sources must be required approved component_registry/design_system revisions", ErrBlockingGate)
+		}
+		if strict {
+			if source.Artifact.LatestApprovedRevisionID == nil || *source.Artifact.LatestApprovedRevisionID != source.Revision.ID {
+				return fmt.Errorf("%w: Prototype component source must be its current approved revision", ErrBlockingGate)
+			}
+			if err := requireCurrentArtifactHealth(ctx, database, source.Artifact.ID, "Prototype component source"); err != nil {
+				return err
+			}
+		}
+		allowed = append(allowed, source)
+	}
+	trace := &TraceService{database: database, contents: s.contents}
+	for layerID, layer := range prototypeCanonicalLayerObjects(prototype) {
+		value, exists := layer["componentRef"]
+		if !exists || value == nil {
+			continue
+		}
+		ref, ok := semanticVersionRef(value)
+		if !ok {
+			return fmt.Errorf("%w: Prototype layer %q has an invalid componentRef", ErrBlockingGate, layerID)
+		}
+		if _, _, err := trace.validateRef(ctx, projectID, ref); err != nil {
+			return fmt.Errorf("%w: Prototype layer %q componentRef is not an exact project revision", ErrBlockingGate, layerID)
+		}
+		authorized := false
+		for _, source := range allowed {
+			if source.Input.Ref.ArtifactID != ref.ArtifactID || source.Input.Ref.RevisionID != ref.RevisionID ||
+				source.Input.Ref.ContentHash != ref.ContentHash {
+				continue
+			}
+			if hasVersionAnchor(source.Input.Ref) && !stringPointerEqual(source.Input.Ref.AnchorID, ref.AnchorID) {
+				continue
+			}
+			authorized = true
+			break
+		}
+		if !authorized {
+			return fmt.Errorf("%w: Prototype layer %q componentRef is not authorized by its immutable component sources", ErrBlockingGate, layerID)
+		}
+	}
+	return nil
+}
+
+func (s *ArtifactService) loadPrototypeSemanticAuthority(
+	ctx context.Context,
+	database *gorm.DB,
+	projectID uuid.UUID,
+	pageSpecArtifact storage.ArtifactModel,
+	pageSpecRevision storage.ArtifactRevisionModel,
+	pageSpecPayload json.RawMessage,
+	strict bool,
+) (prototypeSemanticAuthority, error) {
+	var pageSpecContent map[string]any
+	if json.Unmarshal(pageSpecPayload, &pageSpecContent) != nil {
+		return prototypeSemanticAuthority{}, fmt.Errorf("%w: PageSpec content must be a JSON object", ErrBlockingGate)
+	}
+	if strict {
+		if report := ValidateArtifactContent("page_spec", pageSpecPayload); !report.Valid {
+			return prototypeSemanticAuthority{}, fmt.Errorf("%w: formal Prototype source PageSpec no longer satisfies its canonical schema", ErrBlockingGate)
+		}
+	}
+	pageNodeID := strings.TrimSpace(firstString(pageSpecContent, "blueprintPageNodeId"))
+	if pageNodeID == "" {
+		return prototypeSemanticAuthority{}, fmt.Errorf("%w: PageSpec must declare blueprintPageNodeId", ErrBlockingGate)
+	}
+
+	var sourceModels []storage.ArtifactRevisionSourceModel
+	if err := database.WithContext(ctx).Where("revision_id = ?", pageSpecRevision.ID).
+		Order("ordinal ASC").Find(&sourceModels).Error; err != nil {
+		return prototypeSemanticAuthority{}, err
+	}
+	resolved, err := s.resolveArtifactLineageSources(
+		ctx, database, projectID, sourceInputsFromRevisionModels(sourceModels),
+	)
+	if err != nil {
+		return prototypeSemanticAuthority{}, err
+	}
+	blueprints := lineageSourcesByKind(resolved, "blueprint")
+	if len(blueprints) != 1 {
+		return prototypeSemanticAuthority{}, fmt.Errorf("%w: formal Prototype requires its PageSpec's exact Blueprint source closure", ErrBlockingGate)
+	}
+	blueprint := blueprints[0]
+	anchor := ""
+	if blueprint.Input.Ref.AnchorID != nil {
+		anchor = strings.TrimSpace(*blueprint.Input.Ref.AnchorID)
+	}
+	if !blueprint.Input.Required || strings.TrimSpace(blueprint.Input.Purpose) != "blueprint" || anchor != pageNodeID ||
+		blueprint.Artifact.Lifecycle != "active" || blueprint.Revision.WorkflowStatus != "approved" {
+		return prototypeSemanticAuthority{}, fmt.Errorf("%w: formal Prototype PageSpec must pin one approved Blueprint Page source", ErrBlockingGate)
+	}
+	if strict {
+		if blueprint.Artifact.LatestApprovedRevisionID == nil || *blueprint.Artifact.LatestApprovedRevisionID != blueprint.Revision.ID {
+			return prototypeSemanticAuthority{}, fmt.Errorf("%w: formal Prototype PageSpec must use the current approved Blueprint revision", ErrBlockingGate)
+		}
+		if err := requireCurrentArtifactHealth(ctx, database, blueprint.Artifact.ID, "formal Prototype Blueprint source"); err != nil {
+			return prototypeSemanticAuthority{}, err
+		}
+	}
+	storedBlueprint, err := s.contents.Get(ctx, blueprint.Revision.ContentRef, blueprint.Revision.ContentHash)
+	if err != nil {
+		return prototypeSemanticAuthority{}, err
+	}
+	if strict {
+		if report := ValidateArtifactContent("blueprint", storedBlueprint.Payload); !report.Valid {
+			return prototypeSemanticAuthority{}, fmt.Errorf("%w: formal Prototype source Blueprint no longer satisfies its canonical schema", ErrBlockingGate)
+		}
+	}
+	nodes, edges, err := DecodeBlueprintSemanticGraph(storedBlueprint.Payload)
+	if err != nil {
+		return prototypeSemanticAuthority{}, fmt.Errorf("%w: invalid Blueprint semantic graph: %v", ErrBlockingGate, err)
+	}
+	var page *BlueprintSemanticNode
+	for index := range nodes {
+		if nodes[index].ID == pageNodeID && nodes[index].Kind == "page" {
+			page = &nodes[index]
+			break
+		}
+	}
+	if page == nil {
+		return prototypeSemanticAuthority{}, fmt.Errorf("%w: formal Prototype PageSpec Blueprint anchor is not a Page", ErrBlockingGate)
+	}
+	trace, baselineRef, err := s.loadBlueprintRequirementTraceWithRef(ctx, database, projectID, blueprint.Revision, strict)
+	if err != nil {
+		return prototypeSemanticAuthority{}, err
+	}
+	if err := validateBlueprintRequirementTrace(storedBlueprint.Payload, trace, strict); err != nil {
+		return prototypeSemanticAuthority{}, fmt.Errorf("%w: Prototype source Blueprint has invalid Requirement Baseline trace: %v", ErrBlockingGate, err)
+	}
+	if err := validatePageSpecSemanticTrace(pageSpecPayload, *page, nodes, edges, trace, strict); err != nil {
+		return prototypeSemanticAuthority{}, fmt.Errorf("%w: formal Prototype source PageSpec is semantically incomplete: %v", ErrBlockingGate, err)
+	}
+	requirementIDs := map[string]bool{}
+	for _, requirementID := range page.RequirementIDs {
+		requirementIDs[requirementID] = true
+	}
+	return prototypeSemanticAuthority{
+		requirementIDs:     requirementIDs,
+		acceptanceIDs:      pageAcceptanceSet(*page, trace),
+		pageNodeID:         page.ID,
+		pageSpecArtifactID: pageSpecArtifact.ID.String(),
+		baselineRef:        baselineRef,
+		blueprintRef:       blueprint.Input.Ref,
+		pageSpecRef: VersionRef{
+			ArtifactID: pageSpecArtifact.ID.String(), RevisionID: pageSpecRevision.ID.String(),
+			ContentHash: pageSpecRevision.ContentHash,
+		},
+	}, nil
+}
+
+func (s *ArtifactService) loadBlueprintRequirementTrace(
+	ctx context.Context,
+	database *gorm.DB,
+	projectID uuid.UUID,
+	blueprintRevision storage.ArtifactRevisionModel,
+	strictValues ...bool,
+) (requirementTraceSnapshot, error) {
+	trace, _, err := s.loadBlueprintRequirementTraceWithRef(ctx, database, projectID, blueprintRevision, strictValues...)
+	return trace, err
+}
+
+func (s *ArtifactService) loadBlueprintRequirementTraceWithRef(
+	ctx context.Context,
+	database *gorm.DB,
+	projectID uuid.UUID,
+	blueprintRevision storage.ArtifactRevisionModel,
+	strictValues ...bool,
+) (requirementTraceSnapshot, VersionRef, error) {
+	var models []storage.ArtifactRevisionSourceModel
+	if err := database.WithContext(ctx).Where("revision_id = ?", blueprintRevision.ID).
+		Order("ordinal ASC").Find(&models).Error; err != nil {
+		return requirementTraceSnapshot{}, VersionRef{}, err
+	}
+	inputs := make([]ArtifactSourceInput, 0, len(models))
+	for _, model := range models {
+		inputs = append(inputs, ArtifactSourceInput{Ref: VersionRef{
+			ArtifactID: model.SourceArtifactID.String(), RevisionID: model.SourceRevisionID.String(),
+			ContentHash: model.SourceContentHash, AnchorID: cloneStringPointer(model.SourceAnchorID),
+		}, Purpose: model.Purpose, Required: model.Required})
+	}
+	resolved, err := s.resolveArtifactLineageSources(ctx, database, projectID, inputs)
+	if err != nil {
+		return requirementTraceSnapshot{}, VersionRef{}, err
+	}
+	baselines := lineageSourcesByKind(resolved, "requirement_baseline")
+	if len(baselines) != 1 || !baselines[0].Input.Required || hasVersionAnchor(baselines[0].Input.Ref) ||
+		strings.TrimSpace(baselines[0].Input.Purpose) != "requirement_baseline" ||
+		!isExactApprovedRequirementBaseline(baselines[0].Artifact, baselines[0].Revision, baselines[0].Input.Ref) {
+		return requirementTraceSnapshot{}, VersionRef{}, fmt.Errorf("%w: Blueprint must pin exactly one whole approved Requirement Baseline", ErrBlockingGate)
+	}
+	if semanticStrict(strictValues) && !isCurrentApprovedRequirementBaseline(
+		baselines[0].Artifact, baselines[0].Revision, baselines[0].Input.Ref,
+	) {
+		return requirementTraceSnapshot{}, VersionRef{}, fmt.Errorf("%w: Blueprint must pin the current approved Requirement Baseline", ErrBlockingGate)
+	}
+	if semanticStrict(strictValues) {
+		if err := requireCurrentArtifactHealth(ctx, database, baselines[0].Artifact.ID, "Blueprint Requirement Baseline source"); err != nil {
+			return requirementTraceSnapshot{}, VersionRef{}, err
+		}
+	}
+	stored, err := s.contents.Get(ctx, baselines[0].Revision.ContentRef, baselines[0].Revision.ContentHash)
+	if err != nil {
+		return requirementTraceSnapshot{}, VersionRef{}, err
+	}
+	trace, err := decodeRequirementTrace(stored.Payload)
+	if err != nil {
+		return requirementTraceSnapshot{}, VersionRef{}, fmt.Errorf("%w: decode Blueprint Requirement Baseline: %v", ErrBlockingGate, err)
+	}
+	return trace, baselines[0].Input.Ref, nil
 }
 
 func (s *ArtifactService) resolveArtifactLineageSources(
@@ -1236,9 +1534,12 @@ func (s *ArtifactService) validateBlueprintBaselineSources(
 	ctx context.Context,
 	database *gorm.DB,
 	projectID uuid.UUID,
+	payload json.RawMessage,
 	inputs []ArtifactSourceInput,
+	strictValues ...bool,
 ) error {
-	if len(inputs) != 1 || !inputs[0].Required || inputs[0].Ref.AnchorID != nil {
+	if len(inputs) != 1 || !inputs[0].Required || inputs[0].Ref.AnchorID != nil ||
+		strings.TrimSpace(inputs[0].Purpose) != "requirement_baseline" {
 		return fmt.Errorf("%w: Blueprint requires exactly one whole approved Requirement Baseline revision", ErrBlockingGate)
 	}
 	input := inputs[0]
@@ -1261,6 +1562,22 @@ func (s *ArtifactService) validateBlueprintBaselineSources(
 	if !isCurrentApprovedRequirementBaseline(artifact, revision, input.Ref) {
 		return fmt.Errorf("%w: Blueprint source must be the current approved Requirement Baseline revision", ErrBlockingGate)
 	}
+	if semanticStrict(strictValues) {
+		if err := requireCurrentArtifactHealth(ctx, database, artifact.ID, "Blueprint Requirement Baseline source"); err != nil {
+			return err
+		}
+	}
+	stored, err := s.contents.Get(ctx, revision.ContentRef, revision.ContentHash)
+	if err != nil {
+		return err
+	}
+	requirementTrace, err := decodeRequirementTrace(stored.Payload)
+	if err != nil {
+		return fmt.Errorf("%w: decode Blueprint Requirement Baseline: %v", ErrBlockingGate, err)
+	}
+	if err := validateBlueprintRequirementTrace(payload, requirementTrace, strictValues...); err != nil {
+		return fmt.Errorf("%w: %v", ErrBlockingGate, err)
+	}
 	return nil
 }
 
@@ -1269,11 +1586,38 @@ func isCurrentApprovedRequirementBaseline(
 	revision storage.ArtifactRevisionModel,
 	reference VersionRef,
 ) bool {
+	return isExactApprovedRequirementBaseline(artifact, revision, reference) &&
+		artifact.LatestApprovedRevisionID != nil && *artifact.LatestApprovedRevisionID == revision.ID
+}
+
+func isExactApprovedRequirementBaseline(
+	artifact storage.ArtifactModel,
+	revision storage.ArtifactRevisionModel,
+	reference VersionRef,
+) bool {
 	return artifact.Kind == "requirement_baseline" && artifact.Lifecycle == "active" &&
-		artifact.LatestApprovedRevisionID != nil && *artifact.LatestApprovedRevisionID == revision.ID &&
 		revision.ArtifactID == artifact.ID && revision.WorkflowStatus == "approved" &&
 		revision.ContentHash == reference.ContentHash && reference.ArtifactID == artifact.ID.String() &&
 		reference.RevisionID == revision.ID.String() && reference.AnchorID == nil
+}
+
+func requireCurrentArtifactHealth(
+	ctx context.Context,
+	database *gorm.DB,
+	artifactID uuid.UUID,
+	label string,
+) error {
+	var health storage.ArtifactHealthModel
+	if err := database.WithContext(ctx).Where("artifact_id = ?", artifactID).Take(&health).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return fmt.Errorf("%w: %s has no current health state", ErrBlockingGate, label)
+		}
+		return err
+	}
+	if health.SyncStatus != "current" {
+		return fmt.Errorf("%w: %s must be current", ErrBlockingGate, label)
+	}
+	return nil
 }
 
 func sourceInputsFromDraftModels(models []storage.ArtifactDraftSourceModel) []ArtifactSourceInput {
@@ -1351,6 +1695,20 @@ func revisionSourcesFromModels(models []storage.ArtifactRevisionSourceModel) []A
 	for _, model := range models {
 		result = append(result, ArtifactSource{
 			VersionRef: VersionRef{
+				ArtifactID: model.SourceArtifactID.String(), RevisionID: model.SourceRevisionID.String(),
+				ContentHash: model.SourceContentHash, AnchorID: cloneStringPointer(model.SourceAnchorID),
+			},
+			Purpose: model.Purpose, Required: model.Required,
+		})
+	}
+	return result
+}
+
+func sourceInputsFromRevisionModels(models []storage.ArtifactRevisionSourceModel) []ArtifactSourceInput {
+	result := make([]ArtifactSourceInput, 0, len(models))
+	for _, model := range models {
+		result = append(result, ArtifactSourceInput{
+			Ref: VersionRef{
 				ArtifactID: model.SourceArtifactID.String(), RevisionID: model.SourceRevisionID.String(),
 				ContentHash: model.SourceContentHash, AnchorID: cloneStringPointer(model.SourceAnchorID),
 			},

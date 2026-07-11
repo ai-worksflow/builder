@@ -54,6 +54,7 @@ func TestWorkbenchCompletionRejectsDerivedBundleFromAnotherWorkflowRunPostgres(t
 	if err := database.Create(&storage.WorkflowDefinitionVersionModel{
 		ID: definitionVersionID, DefinitionID: definitionID, Version: 1, SchemaVersion: 1,
 		Content: json.RawMessage(`{"nodes":[],"edges":[]}`), ContentHash: completionTestHash("definition"),
+		ExecutionProfileVersion: LegacyWorkflowExecutionProfileVersion, ExecutionProfileHash: LegacyWorkflowExecutionProfileHash,
 		ValidationReport: json.RawMessage(`{}`), Published: true, CreatedBy: userID, CreatedAt: now,
 	}).Error; err != nil {
 		t.Fatal(err)
@@ -64,6 +65,7 @@ func TestWorkbenchCompletionRejectsDerivedBundleFromAnotherWorkflowRunPostgres(t
 	for _, id := range []uuid.UUID{runID, foreignRunID} {
 		if err := database.Create(&storage.WorkflowRunModel{
 			ID: id, ProjectID: projectID, DefinitionVersionID: definitionVersionID, Status: "running",
+			ExecutionProfileVersion: LegacyWorkflowExecutionProfileVersion, ExecutionProfileHash: LegacyWorkflowExecutionProfileHash,
 			Scope: json.RawMessage(`{}`), Context: json.RawMessage(`{}`), StartedBy: userID,
 			StartedAt: &now, CreatedAt: now, UpdatedAt: now,
 		}).Error; err != nil {
@@ -74,9 +76,10 @@ func TestWorkbenchCompletionRejectsDerivedBundleFromAnotherWorkflowRunPostgres(t
 	rootID := uuid.New()
 	rootRunID := runID
 	rootOrdinal := 0
+	deliverySliceID := uuid.NewString()
 	root := storage.ApplicationBuildManifestModel{
 		ID: rootID, ProjectID: projectID, WorkflowRunID: &rootRunID, RootManifestID: rootID,
-		RootOrdinal: &rootOrdinal, ManifestGroupKey: &manifestGroupKey,
+		RootOrdinal: &rootOrdinal, ManifestGroupKey: &manifestGroupKey, DeliverySliceID: &deliverySliceID,
 		SchemaVersion: 1, ContentStore: "mongo", ContentRef: "completion-root",
 		ContentHash: completionTestHash("root-content"), ManifestHash: completionTestHash("root-manifest"),
 		Status: "frozen", CreatedBy: userID, CreatedAt: now,
@@ -90,7 +93,7 @@ func TestWorkbenchCompletionRejectsDerivedBundleFromAnotherWorkflowRunPostgres(t
 	derived := storage.ApplicationBuildManifestModel{
 		ID: derivedID, ProjectID: projectID, WorkflowRunID: &foreignDerivedRunID,
 		RootManifestID: rootID, DerivedFromID: &derivedFromID,
-		RootOrdinal: &rootOrdinal, ManifestGroupKey: &manifestGroupKey,
+		RootOrdinal: &rootOrdinal, ManifestGroupKey: &manifestGroupKey, DeliverySliceID: &deliverySliceID,
 		SchemaVersion: 1, ContentStore: "mongo", ContentRef: "completion-derived",
 		ContentHash: completionTestHash("derived-content"), ManifestHash: completionTestHash("derived-manifest"),
 		Status: "consumed", CreatedBy: userID, CreatedAt: now.Add(time.Second),
@@ -142,7 +145,7 @@ func TestWorkbenchCompletionRejectsDerivedBundleFromAnotherWorkflowRunPostgres(t
 	manifest := BuildManifest{
 		SchemaVersion: 1, ProjectID: projectID.String(), RunID: runID.String(),
 		ManifestGroupKey: manifestGroupKey,
-		SliceIDs:         []string{"slice-1"}, BundleIDs: []string{rootID.String()},
+		SliceIDs:         []string{deliverySliceID}, BundleIDs: []string{rootID.String()},
 		Sources: []domain.ArtifactRef{{
 			ArtifactID: workspaceArtifactID.String(), RevisionID: workspaceRevisionID.String(), ContentHash: workspaceHash,
 		}},
@@ -216,6 +219,7 @@ func TestWorkbenchCompletionAcceptsOrderedSameRunDerivedLineagePostgres(t *testi
 	if err := database.Create(&storage.WorkflowDefinitionVersionModel{
 		ID: definitionVersionID, DefinitionID: definitionID, Version: 1, SchemaVersion: 1,
 		Content: json.RawMessage(`{"nodes":[],"edges":[]}`), ContentHash: completionTestHash("positive-definition"),
+		ExecutionProfileVersion: LegacyWorkflowExecutionProfileVersion, ExecutionProfileHash: LegacyWorkflowExecutionProfileHash,
 		ValidationReport: json.RawMessage(`{}`), Published: true, CreatedBy: userID, CreatedAt: now,
 	}).Error; err != nil {
 		t.Fatal(err)
@@ -223,6 +227,7 @@ func TestWorkbenchCompletionAcceptsOrderedSameRunDerivedLineagePostgres(t *testi
 	runID := uuid.New()
 	if err := database.Create(&storage.WorkflowRunModel{
 		ID: runID, ProjectID: projectID, DefinitionVersionID: definitionVersionID, Status: "running",
+		ExecutionProfileVersion: LegacyWorkflowExecutionProfileVersion, ExecutionProfileHash: LegacyWorkflowExecutionProfileHash,
 		Scope: json.RawMessage(`{}`), Context: json.RawMessage(`{}`), StartedBy: userID,
 		StartedAt: &now, CreatedAt: now, UpdatedAt: now,
 	}).Error; err != nil {
@@ -230,6 +235,7 @@ func TestWorkbenchCompletionAcceptsOrderedSameRunDerivedLineagePostgres(t *testi
 	}
 	groupKey := uuid.NewString()
 	roots := []uuid.UUID{uuid.New(), uuid.New()}
+	deliverySliceIDs := []string{uuid.NewString(), uuid.NewString()}
 	for ordinal, rootID := range roots {
 		rootOrdinal := ordinal
 		status := "consumed"
@@ -240,7 +246,7 @@ func TestWorkbenchCompletionAcceptsOrderedSameRunDerivedLineagePostgres(t *testi
 		modelGroupKey := groupKey
 		if err := database.Create(&storage.ApplicationBuildManifestModel{
 			ID: rootID, ProjectID: projectID, WorkflowRunID: &modelRunID, RootManifestID: rootID,
-			RootOrdinal: &rootOrdinal, ManifestGroupKey: &modelGroupKey,
+			RootOrdinal: &rootOrdinal, ManifestGroupKey: &modelGroupKey, DeliverySliceID: &deliverySliceIDs[ordinal],
 			SchemaVersion: 1, ContentStore: "mongo", ContentRef: "positive-root-" + rootID.String(),
 			ContentHash:  completionTestHash("root-content-" + rootID.String()),
 			ManifestHash: completionTestHash("root-manifest-" + rootID.String()),
@@ -254,7 +260,7 @@ func TestWorkbenchCompletionAcceptsOrderedSameRunDerivedLineagePostgres(t *testi
 	if err := database.Create(&storage.ApplicationBuildManifestModel{
 		ID: derivedID, ProjectID: projectID, WorkflowRunID: &derivedRunID,
 		RootManifestID: roots[1], DerivedFromID: &derivedFromID,
-		RootOrdinal: &derivedOrdinal, ManifestGroupKey: &derivedGroupKey,
+		RootOrdinal: &derivedOrdinal, ManifestGroupKey: &derivedGroupKey, DeliverySliceID: &deliverySliceIDs[1],
 		SchemaVersion: 1, ContentStore: "mongo", ContentRef: "positive-derived",
 		ContentHash: completionTestHash("derived-content"), ManifestHash: completionTestHash("derived-manifest"),
 		Status: "consumed", CreatedBy: userID, CreatedAt: now.Add(2 * time.Second),
@@ -310,7 +316,7 @@ func TestWorkbenchCompletionAcceptsOrderedSameRunDerivedLineagePostgres(t *testi
 	}
 	manifest := BuildManifest{
 		SchemaVersion: 1, ProjectID: projectID.String(), RunID: runID.String(), ManifestGroupKey: groupKey,
-		SliceIDs: []string{"slice-a", "slice-b"}, BundleIDs: []string{roots[0].String(), roots[1].String()},
+		SliceIDs: deliverySliceIDs, BundleIDs: []string{roots[0].String(), roots[1].String()},
 		Sources: []domain.ArtifactRef{{
 			ArtifactID: workspaceArtifactID.String(), RevisionID: workspaceRevisionIDs[1].String(), ContentHash: workspaceHashes[1],
 		}}, Constraints: json.RawMessage(`{}`), CreatedAt: now,
@@ -377,6 +383,7 @@ func TestQualitySelectsFinalWorkspaceProducerAcrossManifestGroupsPostgres(t *tes
 	if err := database.Create(&storage.WorkflowDefinitionVersionModel{
 		ID: definitionVersionID, DefinitionID: definitionID, Version: 1, SchemaVersion: 1,
 		Content: json.RawMessage(`{"nodes":[],"edges":[]}`), ContentHash: completionTestHash("quality-assembly-definition"),
+		ExecutionProfileVersion: LegacyWorkflowExecutionProfileVersion, ExecutionProfileHash: LegacyWorkflowExecutionProfileHash,
 		ValidationReport: json.RawMessage(`{}`), Published: true, CreatedBy: actorID, CreatedAt: now,
 	}).Error; err != nil {
 		t.Fatal(err)
@@ -384,6 +391,7 @@ func TestQualitySelectsFinalWorkspaceProducerAcrossManifestGroupsPostgres(t *tes
 	runID := uuid.New()
 	if err := database.Create(&storage.WorkflowRunModel{
 		ID: runID, ProjectID: projectID, DefinitionVersionID: definitionVersionID, Status: "running",
+		ExecutionProfileVersion: LegacyWorkflowExecutionProfileVersion, ExecutionProfileHash: LegacyWorkflowExecutionProfileHash,
 		Scope: json.RawMessage(`{}`), Context: json.RawMessage(`{}`), StartedBy: actorID,
 		StartedAt: &now, CreatedAt: now, UpdatedAt: now,
 	}).Error; err != nil {
@@ -392,6 +400,7 @@ func TestQualitySelectsFinalWorkspaceProducerAcrossManifestGroupsPostgres(t *tes
 
 	groupIDs := []string{uuid.NewString(), uuid.NewString()}
 	rootIDs := []uuid.UUID{uuid.New(), uuid.New()}
+	deliverySliceIDs := []string{uuid.NewString(), uuid.NewString()}
 	proposalIDs := []uuid.UUID{uuid.New(), uuid.New()}
 	for index := range rootIDs {
 		ordinal := 0
@@ -399,7 +408,7 @@ func TestQualitySelectsFinalWorkspaceProducerAcrossManifestGroupsPostgres(t *tes
 		group := groupIDs[index]
 		if err := database.Create(&storage.ApplicationBuildManifestModel{
 			ID: rootIDs[index], ProjectID: projectID, WorkflowRunID: &modelRunID,
-			RootManifestID: rootIDs[index], RootOrdinal: &ordinal, ManifestGroupKey: &group,
+			RootManifestID: rootIDs[index], RootOrdinal: &ordinal, ManifestGroupKey: &group, DeliverySliceID: &deliverySliceIDs[index],
 			SchemaVersion: 1, ContentStore: "mongo", ContentRef: "quality-root-" + rootIDs[index].String(),
 			ContentHash:  completionTestHash("quality-root-content-" + rootIDs[index].String()),
 			ManifestHash: completionTestHash("quality-root-manifest-" + rootIDs[index].String()),
@@ -460,7 +469,7 @@ func TestQualitySelectsFinalWorkspaceProducerAcrossManifestGroupsPostgres(t *tes
 	for index := range manifests {
 		manifests[index] = BuildManifest{
 			SchemaVersion: 1, ProjectID: projectID.String(), RunID: runID.String(), ManifestGroupKey: groupIDs[index],
-			SliceIDs: []string{"slice-" + string(rune('a'+index))}, BundleIDs: []string{rootIDs[index].String()},
+			SliceIDs: []string{deliverySliceIDs[index]}, BundleIDs: []string{rootIDs[index].String()},
 			Sources: []domain.ArtifactRef{{
 				ArtifactID: uuid.NewString(), RevisionID: uuid.NewString(), ContentHash: completionTestHash("quality-source-" + string(rune('a'+index))),
 			}}, Constraints: json.RawMessage(`{}`), CreatedAt: now.Add(time.Duration(index) * time.Second),

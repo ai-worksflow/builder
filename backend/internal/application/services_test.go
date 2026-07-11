@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/worksflow/builder/backend/internal/domain"
+	runtime "github.com/worksflow/builder/backend/internal/workflow"
 )
 
 var appTestNow = time.Date(2026, 7, 10, 9, 0, 0, 0, time.UTC)
@@ -409,11 +410,11 @@ func TestWorkflowServiceVersionAndManifestPins(t *testing.T) {
 	runs := newRunMemory()
 	manifests := newManifestMemory()
 	service := WorkflowService{Definitions: definitions, Runs: runs, Manifests: manifests, Clock: fixedClock{appTestNow}}
-	definition, err := service.RegisterDefinition(ctx, RegisterWorkflowCommand{ID: "delivery", Version: 1, Name: "Delivery", SchemaVersion: "v1", Nodes: workflowNodesForApp(), Edges: []domain.WorkflowEdge{{ID: "e1", From: "draft", To: "generate"}}, CreatedBy: "owner"})
+	definition, err := service.RegisterDefinition(ctx, RegisterWorkflowCommand{ID: "delivery", Version: 1, Name: "Delivery", SchemaVersion: "v1", Nodes: workflowNodesForApp(), Edges: []domain.WorkflowEdge{{ID: "e1", From: "draft", To: "generate"}}, ExecutionProfile: runtime.CurrentWorkflowExecutionProfileRef(), CreatedBy: "owner"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := service.RegisterDefinition(ctx, RegisterWorkflowCommand{ID: "delivery", Version: 3, Name: "Gap", SchemaVersion: "v1", Nodes: workflowNodesForApp(), CreatedBy: "owner"}); !errors.Is(err, domain.ErrConflict) {
+	if _, err := service.RegisterDefinition(ctx, RegisterWorkflowCommand{ID: "delivery", Version: 3, Name: "Gap", SchemaVersion: "v1", Nodes: workflowNodesForApp(), ExecutionProfile: runtime.CurrentWorkflowExecutionProfileRef(), CreatedBy: "owner"}); !errors.Is(err, domain.ErrConflict) {
 		t.Fatalf("expected contiguous version guard, got %v", err)
 	}
 	revision := revisionForAppTest(t, "req-v1", "requirements", 1, `{}`)

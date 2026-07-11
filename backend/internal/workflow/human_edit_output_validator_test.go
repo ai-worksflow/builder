@@ -144,6 +144,42 @@ func humanEditProposalInputs(t *testing.T, manifest domain.ManifestRef, proposal
 	return envelope
 }
 
+func TestGovernedHumanEditConsumesProposalPinThroughCondition(t *testing.T) {
+	fixture := newHumanEditProposalFixture(t)
+	run := &RunRecord{ID: fixture.execution.Run.ID, Context: NewRunContext()}
+	condition := domain.NodeDefinition{ID: "proposal-condition", Type: domain.NodeCondition, Condition: &domain.ConditionNodeConfig{Branches: []domain.ConditionBranch{{Name: "yes"}, {Name: "no"}}}}
+	source := &NodeRecord{Key: "proposal-condition", DefinitionNodeID: condition.ID, Type: domain.NodeCondition, Status: NodeCompleted}
+	reference := nodeOutputReference(run, condition, source, json.RawMessage(`{}`), fixture.execution.Inputs, true, "")
+	if len(reference.ProposalPins) != 1 || reference.ProposalPins[0].ProducerDefinitionNodeID != "requirements-ai" {
+		t.Fatalf("Condition lost or rewrote proposal producer pins: %#v", reference.ProposalPins)
+	}
+	inputs, err := domain.NewNodeInputEnvelope([]domain.NodeInputBinding{{
+		EdgeID: "condition-edit", FromPort: "yes", ToPort: "default", Source: reference,
+		Output: json.RawMessage(`{}`), Value: json.RawMessage(`{}`),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.execution.Inputs = inputs
+	fixture.execution.Workflow.InputContract = &domain.WorkflowInputContract{Capability: domain.WorkflowInputProjectBrief}
+	if _, err := fixture.validator.ValidateHumanEdit(
+		context.Background(), fixture.execution, humanEditOutput(t, fixture.current), fixture.execution.Run.StartedBy,
+	); err != nil {
+		t.Fatalf("governed HumanEdit rejected exact proposal pin propagated through Condition: %v", err)
+	}
+}
+
+func TestGovernedHumanEditWithoutProposalPinFailsClosed(t *testing.T) {
+	fixture := newHumanEditProposalFixture(t)
+	fixture.execution.Inputs, _ = domain.NewNodeInputEnvelope(nil)
+	fixture.execution.Workflow.InputContract = &domain.WorkflowInputContract{Capability: domain.WorkflowInputProjectBrief}
+	if _, err := fixture.validator.ValidateHumanEdit(
+		context.Background(), fixture.execution, humanEditOutput(t, fixture.current), fixture.execution.Run.StartedBy,
+	); err == nil {
+		t.Fatal("governed HumanEdit accepted zero proposal pins")
+	}
+}
+
 func humanEditRef(artifactID, label string) domain.ArtifactRef {
 	hash, _ := domain.CanonicalHash(map[string]any{"humanEdit": label})
 	return domain.ArtifactRef{ArtifactID: artifactID, RevisionID: uuid.NewString(), ContentHash: hash}
@@ -301,11 +337,12 @@ func TestHumanEditSliceLineageUsesResolvedExactKind(t *testing.T) {
 	pageSpec := humanEditRef(uuid.NewString(), "page-spec")
 	prototype := humanEditRef(uuid.NewString(), "prototype")
 	run := &RunRecord{Context: NewRunContext()}
-	run.Context.Slices["slice"] = SliceContext{ID: "slice", Blueprint: blueprint}
+	stalePrototype := humanEditRef(uuid.NewString(), "stale-prototype")
+	run.Context.Slices["slice"] = SliceContext{ID: "slice", Blueprint: blueprint, Prototype: &stalePrototype}
 	if err := applyHumanEditSliceLineage(run, "slice", HumanEditValidation{ArtifactRefs: []domain.ArtifactRef{pageSpec}, Primary: pageSpec, ArtifactKind: "page_spec"}); err != nil {
 		t.Fatal(err)
 	}
-	if run.Context.Slices["slice"].PageSpec == nil || !run.Context.Slices["slice"].PageSpec.Equal(pageSpec) || !run.Context.Slices["slice"].Blueprint.Equal(blueprint) {
+	if run.Context.Slices["slice"].PageSpec == nil || !run.Context.Slices["slice"].PageSpec.Equal(pageSpec) || !run.Context.Slices["slice"].Blueprint.Equal(blueprint) || run.Context.Slices["slice"].Prototype != nil {
 		t.Fatalf("PageSpec was written into the wrong slice slot: %+v", run.Context.Slices["slice"])
 	}
 	if err := applyHumanEditSliceLineage(run, "slice", HumanEditValidation{ArtifactRefs: []domain.ArtifactRef{prototype}, Primary: prototype, ArtifactKind: "prototype"}); err != nil {

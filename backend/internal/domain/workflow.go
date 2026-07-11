@@ -44,6 +44,10 @@ type ArtifactInputNodeConfig struct {
 	AllowedKinds     []string `json:"allowedKinds,omitempty"`
 	RequireApproved  bool     `json:"requireApproved"`
 	MinimumArtifacts int      `json:"minimumArtifacts"`
+	// MaximumArtifacts is zero only for replay of historical definitions that
+	// predate an explicit upper bound. Governed authoring contracts always pin
+	// a positive maximum.
+	MaximumArtifacts int `json:"maximumArtifacts,omitempty"`
 }
 
 type AITransformNodeConfig struct {
@@ -121,8 +125,13 @@ type FanOutNodeConfig struct {
 	SliceKeyPath string `json:"sliceKeyPath"`
 	MergeNodeID  string `json:"mergeNodeId"`
 	MaxParallel  int    `json:"maxParallel"`
-	ItemKind     string `json:"itemKind,omitempty"`
+	// MaxItems is zero only for historical definitions. Runtime applies the
+	// platform safety default, while newly governed definitions pin it exactly.
+	MaxItems int    `json:"maxItems,omitempty"`
+	ItemKind string `json:"itemKind,omitempty"`
 }
+
+const MaximumWorkflowFanOutItems = 100
 
 type MergePolicy string
 
@@ -246,6 +255,9 @@ func (n NodeDefinition) Validate() error {
 		if n.ArtifactInput == nil || len(n.ArtifactInput.AllowedTypes) == 0 || n.ArtifactInput.MinimumArtifacts < 1 {
 			issues = append(issues, ValidationIssue{Path: "node.artifactInput", Message: "matching config with allowedTypes and positive minimumArtifacts is required"})
 		} else {
+			if n.ArtifactInput.MaximumArtifacts < 0 || (n.ArtifactInput.MaximumArtifacts > 0 && n.ArtifactInput.MaximumArtifacts < n.ArtifactInput.MinimumArtifacts) {
+				issues = append(issues, ValidationIssue{Path: "node.artifactInput.maximumArtifacts", Message: "must be zero for historical replay or at least minimumArtifacts"})
+			}
 			for _, artifactType := range n.ArtifactInput.AllowedTypes {
 				if !artifactType.Valid() {
 					issues = append(issues, ValidationIssue{Path: "node.artifactInput.allowedTypes", Message: "contains an invalid artifact type"})
@@ -285,8 +297,8 @@ func (n NodeDefinition) Validate() error {
 			issues = append(issues, ValidationIssue{Path: "node.condition.branches", Message: err.Error()})
 		}
 	case NodeFanOut:
-		if n.FanOut == nil || !strings.HasPrefix(n.FanOut.ItemsPath, "/") || !strings.HasPrefix(n.FanOut.SliceKeyPath, "/") || strings.TrimSpace(n.FanOut.MergeNodeID) == "" || n.FanOut.MaxParallel < 1 || (n.FanOut.ItemKind != "" && n.FanOut.ItemKind != "generic" && n.FanOut.ItemKind != "delivery_slice" && n.FanOut.ItemKind != "blueprint_page" && n.FanOut.ItemKind != "blueprint_selection_page") {
-			issues = append(issues, ValidationIssue{Path: "node.fanOut", Message: "matching config with JSON pointers, mergeNodeId and positive maxParallel is required"})
+		if n.FanOut == nil || !strings.HasPrefix(n.FanOut.ItemsPath, "/") || !strings.HasPrefix(n.FanOut.SliceKeyPath, "/") || strings.TrimSpace(n.FanOut.MergeNodeID) == "" || n.FanOut.MaxParallel < 1 || n.FanOut.MaxItems < 0 || n.FanOut.MaxItems > MaximumWorkflowFanOutItems || (n.FanOut.ItemKind != "" && n.FanOut.ItemKind != "generic" && n.FanOut.ItemKind != "delivery_slice" && n.FanOut.ItemKind != "blueprint_page" && n.FanOut.ItemKind != "blueprint_selection_page") {
+			issues = append(issues, ValidationIssue{Path: "node.fanOut", Message: "matching config with JSON pointers, mergeNodeId, positive maxParallel, and maxItems no greater than 100 is required"})
 		}
 	case NodeMerge:
 		if n.Merge == nil || strings.TrimSpace(n.Merge.FanOutNodeID) == "" || !n.Merge.Policy.Valid() || (n.Merge.Policy == MergeQuorum && n.Merge.Quorum < 1) {
@@ -410,17 +422,52 @@ type WorkflowEdge struct {
 }
 
 type WorkflowDefinition struct {
-	ID             string                  `json:"id"`
-	Version        int                     `json:"version"`
-	Name           string                  `json:"name"`
-	SchemaVersion  string                  `json:"schemaVersion"`
-	Nodes          []NodeDefinition        `json:"nodes"`
-	Edges          []WorkflowEdge          `json:"edges"`
-	InputContract  *WorkflowInputContract  `json:"inputContract,omitempty"`
-	OutputContract *WorkflowOutputContract `json:"outputContract,omitempty"`
-	Hash           string                  `json:"hash"`
-	CreatedBy      string                  `json:"createdBy"`
-	CreatedAt      time.Time               `json:"createdAt"`
+	ID               string                      `json:"id"`
+	Version          int                         `json:"version"`
+	Name             string                      `json:"name"`
+	SchemaVersion    string                      `json:"schemaVersion"`
+	ExecutionProfile WorkflowExecutionProfileRef `json:"executionProfile,omitempty"`
+	Nodes            []NodeDefinition            `json:"nodes"`
+	Edges            []WorkflowEdge              `json:"edges"`
+	InputContract    *WorkflowInputContract      `json:"inputContract,omitempty"`
+	OutputContract   *WorkflowOutputContract     `json:"outputContract,omitempty"`
+	Hash             string                      `json:"hash"`
+	CreatedBy        string                      `json:"createdBy"`
+	CreatedAt        time.Time                   `json:"createdAt"`
+}
+
+func (d WorkflowDefinition) MarshalJSON() ([]byte, error) {
+	type wire WorkflowDefinition
+	encoded, err := json.Marshal(wire(d))
+	if err != nil || !d.ExecutionProfile.IsZero() {
+		return encoded, err
+	}
+	var object map[string]any
+	if err := json.Unmarshal(encoded, &object); err != nil {
+		return nil, err
+	}
+	delete(object, "executionProfile")
+	return json.Marshal(object)
+}
+
+// WorkflowExecutionProfileRef pins the complete interpreter contract used to
+// validate and execute a workflow. Version is a human-readable compatibility
+// identifier; Hash protects the full descriptor, including capability and
+// analysis-limit snapshots, from being silently changed in place.
+type WorkflowExecutionProfileRef struct {
+	Version string `json:"version"`
+	Hash    string `json:"hash"`
+}
+
+func (r WorkflowExecutionProfileRef) IsZero() bool {
+	return strings.TrimSpace(r.Version) == "" && strings.TrimSpace(r.Hash) == ""
+}
+
+func (r WorkflowExecutionProfileRef) Validate() error {
+	if strings.TrimSpace(r.Version) == "" || !IsCanonicalHash(r.Hash) {
+		return invalid("workflowExecutionProfileRef", "version and SHA-256 descriptor hash are required")
+	}
+	return nil
 }
 
 const (
@@ -436,9 +483,15 @@ const (
 // select a DAG before a run exists. It deliberately names both semantic
 // capability and exact manifest/artifact constraints.
 type WorkflowInputContract struct {
-	Capability              string            `json:"capability"`
-	ManifestJobTypes        []string          `json:"manifestJobTypes"`
-	ArtifactKinds           []string          `json:"artifactKinds"`
+	Capability       string   `json:"capability"`
+	ManifestJobTypes []string `json:"manifestJobTypes"`
+	ArtifactKinds    []string `json:"artifactKinds"`
+	MinimumArtifacts int      `json:"minimumArtifacts"`
+	// MaximumArtifacts is omitted only by historical governed definitions. New
+	// definitions pin both bounds so exact-one and bounded selections are
+	// enforceable before a run is written.
+	MaximumArtifacts        int               `json:"maximumArtifacts,omitempty"`
+	RequireApproved         bool              `json:"requireApproved"`
 	RequiredSourcePurposes  []string          `json:"requiredSourcePurposes"`
 	ManifestSchemaContracts map[string]string `json:"manifestSchemaContracts"`
 }
@@ -460,6 +513,12 @@ func (c WorkflowInputContract) Validate() error {
 	issues = append(issues, validateContractStrings("inputContract.manifestJobTypes", c.ManifestJobTypes, nil)...)
 	issues = append(issues, validateContractStrings("inputContract.requiredSourcePurposes", c.RequiredSourcePurposes, nil)...)
 	issues = append(issues, validateContractStrings("inputContract.artifactKinds", c.ArtifactKinds, validWorkflowArtifactKind)...)
+	if c.MinimumArtifacts < 1 {
+		issues = append(issues, ValidationIssue{Path: "inputContract.minimumArtifacts", Message: "must be positive"})
+	}
+	if c.MaximumArtifacts < 0 || (c.MaximumArtifacts > 0 && c.MaximumArtifacts < c.MinimumArtifacts) {
+		issues = append(issues, ValidationIssue{Path: "inputContract.maximumArtifacts", Message: "must be zero for historical replay or at least minimumArtifacts"})
+	}
 	if len(c.ManifestSchemaContracts) != len(c.ManifestJobTypes) {
 		issues = append(issues, ValidationIssue{Path: "inputContract.manifestSchemaContracts", Message: "must map every allowed manifest job type exactly once"})
 	}
@@ -511,16 +570,31 @@ func validateContractStrings(path string, values []string, valid func(string) bo
 }
 
 type WorkflowDefinitionRef struct {
-	ID      string `json:"id"`
-	Version int    `json:"version"`
-	Hash    string `json:"hash"`
+	ID               string                      `json:"id"`
+	Version          int                         `json:"version"`
+	Hash             string                      `json:"hash"`
+	ExecutionProfile WorkflowExecutionProfileRef `json:"executionProfile"`
+}
+
+func (r WorkflowDefinitionRef) MarshalJSON() ([]byte, error) {
+	type wire WorkflowDefinitionRef
+	encoded, err := json.Marshal(wire(r))
+	if err != nil || !r.ExecutionProfile.IsZero() {
+		return encoded, err
+	}
+	var object map[string]any
+	if err := json.Unmarshal(encoded, &object); err != nil {
+		return nil, err
+	}
+	delete(object, "executionProfile")
+	return json.Marshal(object)
 }
 
 func (r WorkflowDefinitionRef) Validate() error {
 	if strings.TrimSpace(r.ID) == "" || r.Version < 1 || !IsCanonicalHash(r.Hash) {
 		return invalid("workflowDefinitionRef", "id, positive version and SHA-256 hash are required")
 	}
-	return nil
+	return r.ExecutionProfile.Validate()
 }
 
 // WorkflowSliceRef is the immutable lineage pointer carried across a fan-out
@@ -535,20 +609,49 @@ type WorkflowSliceRef struct {
 	Prototype    *ArtifactRef `json:"prototype,omitempty"`
 }
 
+// ProposalLineagePin binds an AI proposal to the exact manifest from which it
+// was produced and to the producer identity in the immutable workflow graph.
+// A set is required because transparent control nodes can join inputs without
+// being allowed to silently collapse distinct proposal producers.
+type ProposalLineagePin struct {
+	Proposal                 ProposalRef `json:"proposal"`
+	Manifest                 ManifestRef `json:"manifest"`
+	ProducerNodeKey          string      `json:"producerNodeKey"`
+	ProducerDefinitionNodeID string      `json:"producerDefinitionNodeId"`
+}
+
+func (p ProposalLineagePin) Validate() error {
+	if err := p.Proposal.Validate(); err != nil {
+		return err
+	}
+	if err := p.Manifest.Validate(); err != nil {
+		return err
+	}
+	if strings.TrimSpace(p.ProducerNodeKey) == "" || strings.TrimSpace(p.ProducerDefinitionNodeID) == "" {
+		return invalid("proposalLineagePin", "producerNodeKey and producerDefinitionNodeId are required")
+	}
+	return nil
+}
+
 // NodeOutputReference identifies the exact predecessor state from which an
 // input binding was materialized. Artifact and slice refs are propagated
 // through control nodes so downstream runners never need to scan global run
 // context to rediscover their lineage.
 type NodeOutputReference struct {
-	RunID             string             `json:"runId"`
-	NodeKey           string             `json:"nodeKey"`
-	DefinitionNodeID  string             `json:"definitionNodeId"`
-	SliceID           string             `json:"sliceId,omitempty"`
-	InputManifest     *ManifestRef       `json:"inputManifest,omitempty"`
-	OutputProposal    *ProposalRef       `json:"outputProposal,omitempty"`
-	OutputRevisionID  string             `json:"outputRevisionId,omitempty"`
-	ArtifactRevisions []ArtifactRef      `json:"artifactRevisions,omitempty"`
-	DeliverySliceRefs []WorkflowSliceRef `json:"deliverySliceRefs,omitempty"`
+	RunID             string               `json:"runId"`
+	NodeKey           string               `json:"nodeKey"`
+	DefinitionNodeID  string               `json:"definitionNodeId"`
+	SliceID           string               `json:"sliceId,omitempty"`
+	InputManifest     *ManifestRef         `json:"inputManifest,omitempty"`
+	OutputProposal    *ProposalRef         `json:"outputProposal,omitempty"`
+	ProposalPins      []ProposalLineagePin `json:"proposalPins,omitempty"`
+	OutputRevisionID  string               `json:"outputRevisionId,omitempty"`
+	ArtifactRevisions []ArtifactRef        `json:"artifactRevisions,omitempty"`
+	// MaterializedArtifactRevisions marks only the current HumanEdit output.
+	// ArtifactRevisions remains the complete generation context; ReviewGate
+	// consumes this narrower marker so a new quorum is not reapplied upstream.
+	MaterializedArtifactRevisions []ArtifactRef      `json:"materializedArtifactRevisions,omitempty"`
+	DeliverySliceRefs             []WorkflowSliceRef `json:"deliverySliceRefs,omitempty"`
 }
 
 // NodeInputBinding is a frozen edge transfer. Output is the predecessor's
@@ -694,6 +797,57 @@ func (e NodeInputEnvelope) ArtifactRefs() []ArtifactRef {
 	return refs
 }
 
+func (e NodeInputEnvelope) MaterializedArtifactRefs() []ArtifactRef {
+	refs := make([]ArtifactRef, 0)
+	for _, binding := range e.Bindings() {
+		for _, ref := range binding.Source.MaterializedArtifactRevisions {
+			duplicate := false
+			for _, existing := range refs {
+				if existing.Equal(ref) {
+					duplicate = true
+					break
+				}
+			}
+			if !duplicate {
+				refs = append(refs, ref)
+			}
+		}
+	}
+	return refs
+}
+
+// ProposalPins returns the lossless set of proposal/manifest producer pins
+// carried by all enabled predecessors. Legacy single-pointer snapshots are
+// folded into the same set for historical replay.
+func (e NodeInputEnvelope) ProposalPins() []ProposalLineagePin {
+	pins := make([]ProposalLineagePin, 0)
+	seen := map[string]bool{}
+	appendPin := func(pin ProposalLineagePin) {
+		key := pin.ProducerNodeKey + "\x00" + pin.ProducerDefinitionNodeID + "\x00" + pin.Proposal.ID + "\x00" + pin.Proposal.PayloadHash + "\x00" + pin.Manifest.ID + "\x00" + pin.Manifest.Hash
+		if !seen[key] {
+			seen[key] = true
+			pins = append(pins, pin)
+		}
+	}
+	for _, binding := range e.Bindings() {
+		for _, pin := range binding.Source.ProposalPins {
+			appendPin(pin)
+		}
+		if binding.Source.OutputProposal != nil && binding.Source.InputManifest != nil {
+			appendPin(ProposalLineagePin{
+				Proposal: *binding.Source.OutputProposal, Manifest: *binding.Source.InputManifest,
+				ProducerNodeKey: binding.Source.NodeKey, ProducerDefinitionNodeID: binding.Source.DefinitionNodeID,
+			})
+		}
+	}
+	sort.Slice(pins, func(left, right int) bool {
+		leftKey := pins[left].ProducerNodeKey + "\x00" + pins[left].Proposal.ID + "\x00" + pins[left].Manifest.ID
+		rightKey := pins[right].ProducerNodeKey + "\x00" + pins[right].Proposal.ID + "\x00" + pins[right].Manifest.ID
+		return leftKey < rightKey
+	})
+	return pins
+}
+
 func (e NodeInputEnvelope) SliceRefs() []WorkflowSliceRef {
 	refs := make([]WorkflowSliceRef, 0)
 	seen := map[string]bool{}
@@ -769,7 +923,17 @@ func normalizeNodeInputBinding(binding NodeInputBinding) (NodeInputBinding, erro
 			return NodeInputBinding{}, err
 		}
 	}
+	for _, pin := range binding.Source.ProposalPins {
+		if err := pin.Validate(); err != nil {
+			return NodeInputBinding{}, err
+		}
+	}
 	for _, ref := range binding.Source.ArtifactRevisions {
+		if err := ref.Validate(); err != nil {
+			return NodeInputBinding{}, err
+		}
+	}
+	for _, ref := range binding.Source.MaterializedArtifactRevisions {
 		if err := ref.Validate(); err != nil {
 			return NodeInputBinding{}, err
 		}
@@ -823,6 +987,14 @@ func normalizeNodeInputBinding(binding NodeInputBinding) (NodeInputBinding, erro
 		leftRef, rightRef := binding.Source.ArtifactRevisions[left], binding.Source.ArtifactRevisions[right]
 		return leftRef.ArtifactID+"\x00"+leftRef.RevisionID+"\x00"+leftRef.AnchorID < rightRef.ArtifactID+"\x00"+rightRef.RevisionID+"\x00"+rightRef.AnchorID
 	})
+	sort.Slice(binding.Source.MaterializedArtifactRevisions, func(left, right int) bool {
+		leftRef, rightRef := binding.Source.MaterializedArtifactRevisions[left], binding.Source.MaterializedArtifactRevisions[right]
+		return leftRef.ArtifactID+"\x00"+leftRef.RevisionID+"\x00"+leftRef.AnchorID < rightRef.ArtifactID+"\x00"+rightRef.RevisionID+"\x00"+rightRef.AnchorID
+	})
+	sort.Slice(binding.Source.ProposalPins, func(left, right int) bool {
+		leftPin, rightPin := binding.Source.ProposalPins[left], binding.Source.ProposalPins[right]
+		return leftPin.ProducerNodeKey+"\x00"+leftPin.Proposal.ID+"\x00"+leftPin.Manifest.ID < rightPin.ProducerNodeKey+"\x00"+rightPin.Proposal.ID+"\x00"+rightPin.Manifest.ID
+	})
 	sort.Slice(binding.Source.DeliverySliceRefs, func(left, right int) bool {
 		leftRef, rightRef := binding.Source.DeliverySliceRefs[left], binding.Source.DeliverySliceRefs[right]
 		return leftRef.FanOutNodeID+"\x00"+leftRef.Key+"\x00"+leftRef.ID < rightRef.FanOutNodeID+"\x00"+rightRef.Key+"\x00"+rightRef.ID
@@ -840,7 +1012,9 @@ func cloneNodeOutputReference(source NodeOutputReference) NodeOutputReference {
 		value := *source.OutputProposal
 		clone.OutputProposal = &value
 	}
+	clone.ProposalPins = append([]ProposalLineagePin(nil), source.ProposalPins...)
 	clone.ArtifactRevisions = append([]ArtifactRef(nil), source.ArtifactRevisions...)
+	clone.MaterializedArtifactRevisions = append([]ArtifactRef(nil), source.MaterializedArtifactRevisions...)
 	clone.DeliverySliceRefs = append([]WorkflowSliceRef(nil), source.DeliverySliceRefs...)
 	for index := range clone.DeliverySliceRefs {
 		if source.DeliverySliceRefs[index].Blueprint != nil {
@@ -880,6 +1054,40 @@ func NewWorkflowDefinitionWithContracts(
 	normalizedInput := normalizeWorkflowInputContract(input)
 	normalizedOutput := normalizeWorkflowOutputContract(output)
 	return newWorkflowDefinition(id, version, name, schemaVersion, nodes, edges, &normalizedInput, &normalizedOutput, createdBy, now)
+}
+
+// NewWorkflowDefinitionWithExecutionProfile creates a governed definition
+// whose definition hash includes the exact execution-profile descriptor ref.
+// Server authoring and built-in seed paths use this constructor. The older
+// constructor remains solely for immutable pre-pin content and hash replay.
+func NewWorkflowDefinitionWithExecutionProfile(
+	id string,
+	version int,
+	name, schemaVersion string,
+	nodes []NodeDefinition,
+	edges []WorkflowEdge,
+	input WorkflowInputContract,
+	output WorkflowOutputContract,
+	profile WorkflowExecutionProfileRef,
+	createdBy string,
+	now time.Time,
+) (WorkflowDefinition, error) {
+	if err := profile.Validate(); err != nil {
+		return WorkflowDefinition{}, err
+	}
+	normalizedInput := normalizeWorkflowInputContract(input)
+	normalizedOutput := normalizeWorkflowOutputContract(output)
+	definition, err := newWorkflowDefinition(id, version, name, schemaVersion, nodes, edges, &normalizedInput, &normalizedOutput, createdBy, now)
+	if err != nil {
+		return WorkflowDefinition{}, err
+	}
+	definition.ExecutionProfile = profile
+	hash, err := definition.calculateHash()
+	if err != nil {
+		return WorkflowDefinition{}, err
+	}
+	definition.Hash = hash
+	return definition, definition.Validate()
 }
 
 func newWorkflowDefinition(
@@ -941,7 +1149,38 @@ func normalizedStringSet(values []string) []string {
 }
 
 func (d WorkflowDefinition) Ref() WorkflowDefinitionRef {
-	return WorkflowDefinitionRef{ID: d.ID, Version: d.Version, Hash: d.Hash}
+	return WorkflowDefinitionRef{ID: d.ID, Version: d.Version, Hash: d.Hash, ExecutionProfile: d.ExecutionProfile}
+}
+
+// RefForExecutionProfile binds historical definition content, which predates
+// the embedded field, to the immutable profile stored beside its DB row.
+func (d WorkflowDefinition) RefForExecutionProfile(profile WorkflowExecutionProfileRef) WorkflowDefinitionRef {
+	return WorkflowDefinitionRef{ID: d.ID, Version: d.Version, Hash: d.Hash, ExecutionProfile: profile}
+}
+
+// WithExecutionProfile returns a new immutable definition identity. It is used
+// by trusted server migration/test assembly; API authoring uses the governed
+// constructor that injects the current profile before the first hash is made.
+func (d WorkflowDefinition) WithExecutionProfile(profile WorkflowExecutionProfileRef) (WorkflowDefinition, error) {
+	if err := d.Validate(); err != nil {
+		return WorkflowDefinition{}, err
+	}
+	if !d.ExecutionProfile.IsZero() {
+		if d.ExecutionProfile == profile {
+			return d, nil
+		}
+		return WorkflowDefinition{}, invalid("workflow.executionProfile", "an immutable definition profile cannot be replaced")
+	}
+	if err := profile.Validate(); err != nil {
+		return WorkflowDefinition{}, err
+	}
+	d.ExecutionProfile = profile
+	hash, err := d.calculateHash()
+	if err != nil {
+		return WorkflowDefinition{}, err
+	}
+	d.Hash = hash
+	return d, d.Validate()
 }
 
 func (d WorkflowDefinition) FindNode(id string) (NodeDefinition, bool) {
@@ -1070,6 +1309,11 @@ func (d WorkflowDefinition) validate(requireHash bool) error {
 	}
 	if (d.InputContract == nil) != (d.OutputContract == nil) {
 		issues = append(issues, ValidationIssue{Path: "workflow.contracts", Message: "inputContract and outputContract must be declared together"})
+	}
+	if !d.ExecutionProfile.IsZero() {
+		if err := d.ExecutionProfile.Validate(); err != nil {
+			issues = append(issues, ValidationIssue{Path: "workflow.executionProfile", Message: err.Error()})
+		}
 	}
 	if d.InputContract != nil && d.OutputContract != nil {
 		if err := d.InputContract.Validate(); err != nil {
@@ -1271,6 +1515,9 @@ func validateFanOutMergePairs(nodes map[string]NodeDefinition, adjacency map[str
 			}
 		}
 		region := fanOutRegionIDs(id, merge.ID, adjacency)
+		if len(region) == 0 {
+			issues = append(issues, ValidationIssue{Path: "workflow.nodes." + id, Message: "fan-out region must contain at least one branch node before its paired merge"})
+		}
 		for member := range region {
 			if owner, overlaps := regionOwners[member]; overlaps && owner != id {
 				issues = append(issues, ValidationIssue{Path: "workflow.nodes." + id, Message: fmt.Sprintf("fan-out region overlaps %q at node %q", owner, member)})
@@ -1312,6 +1559,22 @@ func fanOutRegionIDs(fanOutID, mergeID string, adjacency map[string][]string) ma
 }
 
 func (d WorkflowDefinition) calculateHash() (string, error) {
+	if !d.ExecutionProfile.IsZero() {
+		payload := struct {
+			ID               string                      `json:"id"`
+			Version          int                         `json:"version"`
+			Name             string                      `json:"name"`
+			SchemaVersion    string                      `json:"schemaVersion"`
+			ExecutionProfile WorkflowExecutionProfileRef `json:"executionProfile"`
+			Nodes            []NodeDefinition            `json:"nodes"`
+			Edges            []WorkflowEdge              `json:"edges"`
+			InputContract    *WorkflowInputContract      `json:"inputContract"`
+			OutputContract   *WorkflowOutputContract     `json:"outputContract"`
+			CreatedBy        string                      `json:"createdBy"`
+			CreatedAt        time.Time                   `json:"createdAt"`
+		}{d.ID, d.Version, d.Name, d.SchemaVersion, d.ExecutionProfile, d.Nodes, d.Edges, d.InputContract, d.OutputContract, d.CreatedBy, d.CreatedAt}
+		return CanonicalHash(payload)
+	}
 	// Definitions created before workflow-level contracts existed retain their
 	// original hash payload and remain replayable byte-for-byte.
 	if d.InputContract == nil && d.OutputContract == nil {

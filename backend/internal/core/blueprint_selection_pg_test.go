@@ -41,8 +41,8 @@ func TestBlueprintSelectionManifestsStayIsolatedPostgres(t *testing.T) {
 		json.RawMessage(`{
 			"semantic":{"nodes":[
 				{"id":"feature-orders","key":"FEATURE-ORDERS","kind":"feature","title":"Orders","requirementIds":["REQ-1"]},
-				{"id":"page-orders","key":"PAGE-ORDERS","kind":"page","title":"Orders page","requirementIds":["REQ-1"]},
-				{"id":"page-history","key":"PAGE-HISTORY","kind":"page","title":"History page","requirementIds":["REQ-1"]}
+				{"id":"page-orders","key":"PAGE-ORDERS","kind":"page","title":"Orders page","route":"/orders","userGoal":"Manage orders","requirementIds":["REQ-1"]},
+				{"id":"page-history","key":"PAGE-HISTORY","kind":"page","title":"History page","route":"/history","userGoal":"Review order history","requirementIds":["REQ-1"]}
 			],"edges":[
 				{"id":"edge-orders","sourceNodeId":"feature-orders","targetNodeId":"page-orders","kind":"contains","required":true},
 				{"id":"edge-history","sourceNodeId":"feature-orders","targetNodeId":"page-history","kind":"contains","required":true}
@@ -87,6 +87,38 @@ func TestBlueprintSelectionManifestsStayIsolatedPostgres(t *testing.T) {
 
 	orders := compile("page-orders")
 	history := compile("page-history")
+	featureOnly, err := proposals.CreateManifest(
+		context.Background(), projectID.String(), ownerID.String(), CreateManifestInput{
+			JobType:               BlueprintSelectionJobType,
+			BlueprintSelection:    &BlueprintSelectionInput{BlueprintRevision: blueprint, NodeIDs: []string{"feature-orders"}},
+			ExpectedBlueprintETag: artifactETag(uuid.MustParse(blueprint.ArtifactID), 1),
+		},
+	)
+	if err != nil {
+		t.Fatalf("non-Page selection used for documentation did not compile: %v", err)
+	}
+	var featureScope struct {
+		BlueprintSelection BlueprintSelectionScope `json:"blueprintSelection"`
+	}
+	if err := json.Unmarshal(featureOnly.Constraints, &featureScope); err != nil || len(featureScope.BlueprintSelection.PageBindings) != 0 {
+		t.Fatalf("non-Page documentation selection produced Page bindings: scope=%+v err=%v", featureScope, err)
+	}
+	mixed, err := proposals.CreateManifest(
+		context.Background(), projectID.String(), ownerID.String(), CreateManifestInput{
+			JobType:               BlueprintSelectionJobType,
+			BlueprintSelection:    &BlueprintSelectionInput{BlueprintRevision: blueprint, NodeIDs: []string{"feature-orders", "page-orders"}},
+			ExpectedBlueprintETag: artifactETag(uuid.MustParse(blueprint.ArtifactID), 1),
+		},
+	)
+	if err != nil {
+		t.Fatalf("mixed contextual-node and Page selection did not compile: %v", err)
+	}
+	var mixedScope struct {
+		BlueprintSelection BlueprintSelectionScope `json:"blueprintSelection"`
+	}
+	if err := json.Unmarshal(mixed.Constraints, &mixedScope); err != nil || len(mixedScope.BlueprintSelection.PageBindings) != 1 {
+		t.Fatalf("mixed selection lost its exact Page binding: scope=%+v err=%v", mixedScope, err)
+	}
 	if orders.ManifestID == history.ManifestID || orders.Hash == history.Hash || orders.Scope.SelectionID == history.Scope.SelectionID {
 		t.Fatalf("different selections collapsed to one immutable identity: orders=%#v history=%#v", orders, history)
 	}
@@ -182,8 +214,128 @@ func TestBlueprintSelectionManifestsStayIsolatedPostgres(t *testing.T) {
 	if err := database.Model(&storage.OutboxEventModel{}).Where("event_type = 'blueprint.selection.compiled'").Count(&outbox).Error; err != nil {
 		t.Fatal(err)
 	}
-	if audits != 2 || outbox != 2 {
-		t.Fatalf("selection audit/outbox counts = %d/%d, want 2/2", audits, outbox)
+	if audits != 4 || outbox != 4 {
+		t.Fatalf("selection audit/outbox counts = %d/%d, want 4/4", audits, outbox)
+	}
+}
+
+func TestBlueprintSelectionOmitsApprovedExploratoryPrototypePostgres(t *testing.T) {
+	database, cleanup := multiBundlePostgresDatabase(t)
+	defer cleanup()
+
+	ownerID := seedMultiBundleUser(t, database, "selection-exploratory-owner")
+	projectID := seedMultiBundleProject(t, database, ownerID, "selection-exploratory")
+	seedMultiBundleMembership(t, database, projectID, ownerID, RoleOwner)
+	contents := newMultiBundleMemoryContentStore()
+	access, err := NewAccessControl(database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proposals, err := NewProposalService(database, contents, access)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	blueprint := seedMultiBundleApprovedRevision(
+		t, database, contents, projectID, ownerID, "blueprint",
+		json.RawMessage(`{"semantic":{"nodes":[{"id":"page-orders","key":"PAGE-ORDERS","kind":"page","title":"Orders","route":"/orders","userGoal":"Manage orders","requirementIds":["REQ-1"]}],"edges":[]}}`), nil,
+	)
+	pageSpec := seedMultiBundleApprovedRevision(
+		t, database, contents, projectID, ownerID, "page_spec",
+		json.RawMessage(`{"blueprintPageNodeId":"page-orders","title":"Orders"}`), nil,
+	)
+	pageAnchor := "page-orders"
+	seedBlueprintSelectionRevisionSource(t, database, ownerID, pageSpec, blueprint, &pageAnchor, "blueprint")
+	exploratory := seedMultiBundleApprovedRevision(
+		t, database, contents, projectID, ownerID, "prototype",
+		json.RawMessage(`{"exploratory":true,"frames":[]}`), nil,
+	)
+	seedBlueprintSelectionRevisionSource(t, database, ownerID, exploratory, pageSpec, nil, "page_spec")
+
+	compile := func() (BlueprintSelectionScope, []domain.ManifestSource, error) {
+		manifest, compileErr := proposals.CreateManifest(
+			context.Background(), projectID.String(), ownerID.String(), CreateManifestInput{
+				JobType: BlueprintSelectionJobType,
+				BlueprintSelection: &BlueprintSelectionInput{
+					BlueprintRevision: blueprint,
+					NodeIDs:           []string{"page-orders"},
+				},
+				ExpectedBlueprintETag: artifactETag(uuid.MustParse(blueprint.ArtifactID), 1),
+			},
+		)
+		if compileErr != nil {
+			return BlueprintSelectionScope{}, nil, compileErr
+		}
+		var constraints struct {
+			BlueprintSelection BlueprintSelectionScope `json:"blueprintSelection"`
+		}
+		if err := json.Unmarshal(manifest.Constraints, &constraints); err != nil {
+			return BlueprintSelectionScope{}, nil, err
+		}
+		return constraints.BlueprintSelection, manifest.Sources, nil
+	}
+
+	scope, sources, err := compile()
+	if err != nil {
+		t.Fatalf("compile selection with exploratory Prototype: %v", err)
+	}
+	if len(scope.PageBindings) != 1 || scope.PageBindings[0].PageSpec == nil || scope.PageBindings[0].Prototype != nil {
+		t.Fatalf("exploratory Prototype entered frozen selection binding: %#v", scope.PageBindings)
+	}
+	if selectionContainsExactRef(sources, exploratory) {
+		t.Fatalf("exploratory Prototype entered selection sources: %#v", sources)
+	}
+	if err := database.Model(&storage.ArtifactHealthModel{}).Where("artifact_id = ?", pageSpec.ArtifactID).
+		Update("sync_status", "needs_sync").Error; err != nil {
+		t.Fatal(err)
+	}
+	if _, err := proposals.resolveBlueprintSelectionPageBinding(
+		context.Background(), projectID, uuid.MustParse(blueprint.RevisionID), "page-orders",
+	); !errors.Is(err, ErrBlockingGate) {
+		t.Fatalf("stale approved PageSpec entered a formal selection: %v", err)
+	}
+	if err := database.Model(&storage.ArtifactHealthModel{}).Where("artifact_id = ?", pageSpec.ArtifactID).
+		Update("sync_status", "current").Error; err != nil {
+		t.Fatal(err)
+	}
+
+	formal := seedMultiBundleApprovedRevision(
+		t, database, contents, projectID, ownerID, "prototype",
+		json.RawMessage(`{"exploratory":false,"frames":[]}`), nil,
+	)
+	seedBlueprintSelectionRevisionSource(t, database, ownerID, formal, pageSpec, nil, "page_spec")
+	scope, sources, err = compile()
+	if err != nil {
+		t.Fatalf("compile selection with formal and exploratory Prototypes: %v", err)
+	}
+	if len(scope.PageBindings) != 1 || scope.PageBindings[0].Prototype == nil ||
+		scope.PageBindings[0].Prototype.RevisionID != formal.RevisionID {
+		t.Fatalf("formal Prototype was not selected after exploratory candidate was filtered: %#v", scope.PageBindings)
+	}
+	if selectionContainsExactRef(sources, exploratory) || !selectionContainsExactRef(sources, formal) {
+		t.Fatalf("selection sources did not contain only the formal Prototype: %#v", sources)
+	}
+	if err := database.Model(&storage.ArtifactHealthModel{}).Where("artifact_id = ?", formal.ArtifactID).
+		Update("sync_status", "needs_sync").Error; err != nil {
+		t.Fatal(err)
+	}
+	if _, err := proposals.resolveBlueprintSelectionPageBinding(
+		context.Background(), projectID, uuid.MustParse(blueprint.RevisionID), "page-orders",
+	); !errors.Is(err, ErrBlockingGate) {
+		t.Fatalf("stale approved formal Prototype entered a formal selection: %v", err)
+	}
+	if err := database.Model(&storage.ArtifactHealthModel{}).Where("artifact_id = ?", formal.ArtifactID).
+		Update("sync_status", "current").Error; err != nil {
+		t.Fatal(err)
+	}
+
+	malformed := seedMultiBundleApprovedRevision(
+		t, database, contents, projectID, ownerID, "prototype",
+		json.RawMessage(`{"exploratory":"sometimes","frames":[]}`), nil,
+	)
+	seedBlueprintSelectionRevisionSource(t, database, ownerID, malformed, pageSpec, nil, "page_spec")
+	if _, _, err := compile(); !errors.Is(err, ErrBlockingGate) {
+		t.Fatalf("malformed approved Prototype content did not fail selection closed: %v", err)
 	}
 }
 

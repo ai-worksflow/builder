@@ -25,6 +25,7 @@ func TestApplicationBuildManifestModelMapsLineageColumns(t *testing.T) {
 		{field: "WorkspaceRevisionID", column: "workspace_revision_id", notNull: false},
 		{field: "RootOrdinal", column: "root_ordinal", notNull: false},
 		{field: "ManifestGroupKey", column: "manifest_group_key", notNull: false},
+		{field: "DeliverySliceID", column: "delivery_slice_id", notNull: false},
 	}
 	for _, test := range tests {
 		field := parsed.LookUpField(test.field)

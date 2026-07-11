@@ -13,7 +13,7 @@ import (
 
 const (
 	MinimumLoopKey            = "minimum-product-loop"
-	MinimumLoopCurrentVersion = 3
+	MinimumLoopCurrentVersion = 5
 	minimumLoopTitle          = "Minimum product delivery loop"
 	minimumLoopDescription    = "Project brief interview, requirements and blueprint proposals, per-page prototype collaboration, frozen build manifest, workbench build, quality gate, and publish."
 )
@@ -96,15 +96,20 @@ func SeedMinimumLoop(ctx context.Context, store Store, seed MinimumLoopSeed, now
 }
 
 func minimumLoopRecord(seed MinimumLoopSeed, versionID string, published bool, definition domain.WorkflowDefinition) DefinitionRecord {
-	return DefinitionRecord{
+	record := DefinitionRecord{
 		VersionID: versionID, ProjectID: seed.ProjectID, Key: MinimumLoopKey,
 		Title: minimumLoopTitle, Description: minimumLoopDescription,
 		Published: published, Definition: definition,
 	}
+	_ = normalizeDefinitionRecordProfile(&record)
+	return record
 }
 
 func ensureSeedPublication(ctx context.Context, store Store, seed MinimumLoopSeed, record DefinitionRecord) (DefinitionRecord, error) {
 	if record.ProjectID != seed.ProjectID || record.Key != MinimumLoopKey || record.Definition.ID != seed.DefinitionID {
+		return DefinitionRecord{}, ErrCASConflict
+	}
+	if record.Definition.Version == MinimumLoopCurrentVersion && (record.ExecutionProfile != CurrentWorkflowExecutionProfileRef() || record.Definition.ExecutionProfile != record.ExecutionProfile) {
 		return DefinitionRecord{}, ErrCASConflict
 	}
 	if seed.Published && !record.Published {
@@ -148,18 +153,22 @@ func minimumLoopDefinitionForVersion(id string, version int, createdBy string, n
 	case 1:
 		return minimumLoopDefinitionV1(id, createdBy, now)
 	case 2:
-		return minimumLoopDefinitionCurrent(id, 2, "2", createdBy, now)
+		return minimumLoopDefinitionCurrent(id, 2, "2", domain.WorkflowExecutionProfileRef{}, createdBy, now)
+	case 3:
+		return minimumLoopDefinitionCurrent(id, 3, "3", domain.WorkflowExecutionProfileRef{}, createdBy, now)
+	case 4:
+		return minimumLoopDefinitionCurrent(id, 4, "4", WorkflowExecutionProfileV1Ref(), createdBy, now)
 	case MinimumLoopCurrentVersion:
-		return minimumLoopDefinitionCurrent(id, MinimumLoopCurrentVersion, "3", createdBy, now)
+		return minimumLoopDefinitionCurrent(id, MinimumLoopCurrentVersion, "5", CurrentWorkflowExecutionProfileRef(), createdBy, now)
 	default:
 		return domain.WorkflowDefinition{}, fmt.Errorf("unsupported minimum loop version %d", version)
 	}
 }
 
-func minimumLoopDefinitionCurrent(id string, version int, schemaVersion string, createdBy string, now time.Time) (domain.WorkflowDefinition, error) {
+func minimumLoopDefinitionCurrent(id string, version int, schemaVersion string, profile domain.WorkflowExecutionProfileRef, createdBy string, now time.Time) (domain.WorkflowDefinition, error) {
 	envelope := json.RawMessage(`{"type":"object","additionalProperties":true}`)
 	nodes := []domain.NodeDefinition{
-		{ID: "source", Name: "Project brief input", Type: domain.NodeArtifactInput, InputSchema: envelope, OutputSchema: envelope, ArtifactInput: &domain.ArtifactInputNodeConfig{AllowedTypes: []domain.ArtifactType{domain.ArtifactDocument}, AllowedKinds: []string{"project_brief"}, RequireApproved: false, MinimumArtifacts: 1}},
+		{ID: "source", Name: "Project brief input", Type: domain.NodeArtifactInput, InputSchema: envelope, OutputSchema: envelope, ArtifactInput: &domain.ArtifactInputNodeConfig{AllowedTypes: []domain.ArtifactType{domain.ArtifactDocument}, AllowedKinds: []string{"project_brief"}, RequireApproved: false, MinimumArtifacts: 1, MaximumArtifacts: 1}},
 		{ID: "project-brief-ai", Name: "Refine project brief proposal", Type: domain.NodeAITransform, InputSchema: envelope, OutputSchema: envelope, AITransform: &domain.AITransformNodeConfig{JobType: "refine_project_brief", ModelPolicy: "project-default", OutputSchemaVersion: "project-brief-proposal/v1", MaxAttempts: 3, Timeout: 5 * time.Minute}},
 		{ID: "project-brief-edit", Name: "Interview and edit project brief", Type: domain.NodeHumanEdit, InputSchema: envelope, OutputSchema: envelope, HumanEdit: &domain.HumanEditNodeConfig{ArtifactType: domain.ArtifactDocument, ArtifactKind: "project_brief", RequiredRole: "editor", Instructions: "Review the AI proposal, resolve blocking questions, and create an exact Project Brief revision."}},
 		{ID: "project-brief-review", Name: "Approve project brief", Type: domain.NodeReviewGate, InputSchema: envelope, OutputSchema: envelope, ReviewGate: &domain.ReviewGateNodeConfig{RequiredRole: "owner", MinimumApprovals: 1, ProhibitSelfReview: true}},
@@ -172,7 +181,7 @@ func minimumLoopDefinitionCurrent(id string, version int, schemaVersion string, 
 		// blueprint_page is a specialized resolver contract: the runner derives
 		// one branch per page from this node's exact approved Blueprint input and
 		// anchors every emitted slice back to that immutable Blueprint revision.
-		{ID: "pages", Name: "Create Blueprint page branches", Type: domain.NodeFanOut, InputSchema: envelope, OutputSchema: envelope, FanOut: &domain.FanOutNodeConfig{ItemsPath: "/blueprintPages", SliceKeyPath: "/key", MergeNodeID: "pages-merged", MaxParallel: 4, ItemKind: "blueprint_page"}},
+		{ID: "pages", Name: "Create Blueprint page branches", Type: domain.NodeFanOut, InputSchema: envelope, OutputSchema: envelope, FanOut: &domain.FanOutNodeConfig{ItemsPath: "/blueprintPages", SliceKeyPath: "/key", MergeNodeID: "pages-merged", MaxParallel: 4, MaxItems: domain.MaximumWorkflowFanOutItems, ItemKind: "blueprint_page"}},
 		{ID: "page-spec-ai", Name: "Generate page specification proposal", Type: domain.NodeAITransform, InputSchema: envelope, OutputSchema: envelope, AITransform: &domain.AITransformNodeConfig{JobType: "generate_page_spec", ModelPolicy: "project-default", OutputSchemaVersion: "page-spec-proposal/v1", MaxAttempts: 3, Timeout: 5 * time.Minute}},
 		{ID: "page-spec-edit", Name: "Edit page specification", Type: domain.NodeHumanEdit, InputSchema: envelope, OutputSchema: envelope, HumanEdit: &domain.HumanEditNodeConfig{ArtifactType: domain.ArtifactBlueprint, ArtifactKind: "page_spec", RequiredRole: "editor", Instructions: "Review the proposal and create one exact PageSpec revision anchored to this branch's approved Blueprint page."}},
 		{ID: "page-spec-review", Name: "Approve page specification", Type: domain.NodeReviewGate, InputSchema: envelope, OutputSchema: envelope, ReviewGate: &domain.ReviewGateNodeConfig{RequiredRole: "owner", MinimumApprovals: 1, ProhibitSelfReview: true, AllowWaiver: false}},
@@ -201,10 +210,14 @@ func minimumLoopDefinitionCurrent(id string, version int, schemaVersion string, 
 	for index, pair := range edgePairs {
 		edges[index] = domain.WorkflowEdge{ID: fmt.Sprintf("edge-%02d", index+1), From: pair[0], To: pair[1]}
 	}
-	return domain.NewWorkflowDefinitionWithContracts(
-		id, version, minimumLoopTitle, schemaVersion, nodes, edges,
-		ProjectBriefInputContract(), ApplicationOutputContract(), createdBy, now,
-	)
+	if !profile.IsZero() {
+		return domain.NewWorkflowDefinitionWithExecutionProfile(
+			id, version, minimumLoopTitle, schemaVersion, nodes, edges,
+			ProjectBriefInputContract(), ApplicationOutputContract(), profile, createdBy, now,
+		)
+	}
+	return domain.NewWorkflowDefinitionWithContracts(id, version, minimumLoopTitle, schemaVersion, nodes, edges,
+		ProjectBriefInputContract(), ApplicationOutputContract(), createdBy, now)
 }
 
 func minimumLoopDefinitionV1(id, createdBy string, now time.Time) (domain.WorkflowDefinition, error) {

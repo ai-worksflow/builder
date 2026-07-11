@@ -3,6 +3,7 @@ package collaboration
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -344,9 +345,8 @@ func (s *Service) implementationGraph(ctx context.Context, projectID uuid.UUID) 
 			Title: "Workflow run " + shortGraphID(run.ID), Status: run.Status, Metadata: metadata, UpdatedAt: run.UpdatedAt,
 		})
 	}
-	var manifests []storage.ApplicationBuildManifestModel
-	if err := s.database.WithContext(ctx).Where("project_id = ?", projectID).Order("created_at DESC, id DESC").Limit(1000).
-		Find(&manifests).Error; err != nil {
+	manifests, err := s.activatedBuildManifestsForGraph(ctx, projectID, 1000)
+	if err != nil {
 		return nil, nil, err
 	}
 	for _, manifest := range manifests {
@@ -394,6 +394,61 @@ func (s *Service) implementationGraph(ctx context.Context, projectID uuid.UUID) 
 		})
 	}
 	return nodes, edges, nil
+}
+
+func (s *Service) activatedBuildManifestsForGraph(
+	ctx context.Context,
+	projectID uuid.UUID,
+	limit int,
+) ([]storage.ApplicationBuildManifestModel, error) {
+	if limit <= 0 {
+		return []storage.ApplicationBuildManifestModel{}, nil
+	}
+	const batchSize = 250
+	result := make([]storage.ApplicationBuildManifestModel, 0, limit)
+	var cursorCreatedAt time.Time
+	var cursorID uuid.UUID
+	for len(result) < limit {
+		query := s.database.WithContext(ctx).
+			Where("project_id = ?", projectID).
+			Where(`workflow_run_id IS NULL OR manifest_group_key = 'legacy' OR EXISTS (
+				SELECT 1
+				FROM workflow_node_runs AS compiler
+				WHERE CAST(compiler.id AS text) = application_build_manifests.manifest_group_key
+				  AND compiler.run_id = application_build_manifests.workflow_run_id
+				  AND compiler.node_type = ?
+				  AND compiler.status = 'completed'
+				  AND compiler.completed_at IS NOT NULL
+			)`, domain.NodeManifestCompiler)
+		if !cursorCreatedAt.IsZero() {
+			query = query.Where("(created_at, id) < (?, ?)", cursorCreatedAt, cursorID)
+		}
+		var batch []storage.ApplicationBuildManifestModel
+		if err := query.Order("created_at DESC, id DESC").Limit(batchSize).Find(&batch).Error; err != nil {
+			return nil, err
+		}
+		if len(batch) == 0 {
+			break
+		}
+		for _, manifest := range batch {
+			if err := core.EnsureWorkflowManifestGroupActivated(ctx, s.database, manifest); err != nil {
+				if errors.Is(err, core.ErrBlockingGate) {
+					continue
+				}
+				return nil, err
+			}
+			result = append(result, manifest)
+			if len(result) == limit {
+				break
+			}
+		}
+		last := batch[len(batch)-1]
+		cursorCreatedAt, cursorID = last.CreatedAt, last.ID
+		if len(batch) < batchSize {
+			break
+		}
+	}
+	return result, nil
 }
 
 func (s *Service) deploymentGraph(ctx context.Context, projectID uuid.UUID) ([]DocumentGraphNode, []DocumentGraphEdge, error) {

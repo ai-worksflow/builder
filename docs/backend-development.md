@@ -115,6 +115,10 @@ The current migration chain is:
 | `000012_application_build_manifest_lineage` | tenant-bound build-manifest roots, compiler groups/root ordinals, one-child linear rebase lineage and exact workspace pins |
 | `000013_design_imports` | immutable untrusted-design snapshots and exact PageSpec/Prototype/manifest/proposal/applied-revision lineage |
 | `000014_document_collaboration` | collaboration-state ETags, tenant-safe member responsibilities, recoverable downstream-document commands, and AI provider/model provenance |
+| `000015_workbench_generation_fencing` | server-authoritative Workbench generation claims, deterministic conversation Proposal identity, immutable replay inputs, and one-active-Proposal-per-leaf fencing |
+| `000016_workflow_execution_profiles` | immutable execution-profile pins on definition versions and runs, with a rolling-deploy-compatible legacy profile |
+| `000017_application_build_manifest_slice_identity` | exact durable DeliverySlice pins for current workflow Bundle roots and every derived lineage row |
+| `000018_conversation_summary_checkpoints` | independently reviewed immutable prefix summaries, forward-only checkpoint heads, exact conversation/provider-input receipts, and fail-closed proposal/command provenance |
 
 Migration `000012` makes each workflow root unique within
 `(project, workflow run, manifest group, root ordinal)`. `manifest_group_key` is
@@ -135,6 +139,40 @@ OutputProposal metadata with AI provider/model identity, and rejects
 cross-project bindings, resolved owners and downstream generation relations.
 The generation command's request hash, source-binding ETag and owner snapshot
 are immutable so a recovered or replayed command cannot silently change scope.
+Migration `000015` intentionally fails with an actionable diagnostic if legacy
+data contains multiple active ImplementationProposals on one leaf; it never
+guesses which reviewed Proposal to discard. Operators must explicitly reject or
+mark obsolete rows stale before retrying the migration.
+
+Migration `000017` is a fail-closed contract migration. It deliberately aborts
+if the database already contains a non-`legacy` workflow manifest group and it
+does not derive `delivery_slice_id` from `workflow_runs.context` or a compiler
+`BuildManifest`: that output is the value the new activation barrier must
+independently verify, so copying it would let a historical SliceIDs permutation
+self-certify. Before rollout, pause manifest writers and inventory affected rows:
+
+```sql
+SELECT project_id, workflow_run_id, manifest_group_key, root_ordinal,
+       id, root_manifest_id, derived_from_id, content_ref, content_hash
+FROM application_build_manifests
+WHERE workflow_run_id IS NOT NULL
+  AND manifest_group_key <> 'legacy'
+ORDER BY project_id, workflow_run_id, manifest_group_key, root_ordinal,
+         created_at, id;
+```
+
+For each root, an operator must resolve and hash-check the immutable Workbench
+Bundle at `content_ref`, verify its row/root/parent coordinates, and establish
+its `DeliverySliceID` from the independently authoritative DeliverySlice and
+approved Prototype/Blueprint lineage. Every derived row must inherit that same
+identity. Preserve the evidence and mapping as an audited deployment artifact;
+never use compiler `SliceIDs` as the source of truth. Environments with no such
+rows can apply canonical `000017` directly. Environments with rows must either
+quarantine genuinely pre-contract data as `legacy`, archive obsolete groups, or
+ship a reviewed environment-specific replacement for `000017` that installs
+the verified mapping and the same constraints/triggers atomically. Do not edit
+an already recorded migration checksum. Keep writers paused until a swapped-ID
+CAS probe is rejected and exact read/export/graph/conversation probes pass.
 
 Large immutable JSON and binary-safe content is stored in MongoDB. PostgreSQL
 stores the content reference and SHA-256 relation. Content creation uses a
@@ -182,6 +220,16 @@ ordinal zero. A compiler retry after partial success reuses an existing root
 only when run/project/started-by/compiler-node, ordinal, delivery slice,
 prototype ref, and immutable payload identity all match; otherwise it fails
 closed instead of colliding with or adopting another group.
+
+Creating those roots does not publish them to generation. The workflow CAS
+must first commit the matching ManifestCompiler NodeRun as `completed` together
+with its hash-valid BuildManifest output. The output must pin the complete root
+set in exact ordinal order, and the commit transaction locks and compares every
+root before succeeding. Bundle reads, lineage, rebase, conversation discovery,
+and manual or automatic generation enforce the same activation proof. A
+partial retry, terminal compiler failure, or lost lease can therefore leave
+recoverable immutable rows, but cannot expose a half-compiled application
+input.
 
 If those frozen product inputs must be applied on top of a newer workspace,
 `POST /v1/build-manifests/:bundleId/rebase` accepts only
@@ -256,9 +304,18 @@ node output. Artifact writes, human review, conditions, fan-out, merge,
 ManifestCompiler, Workbench, quality and publish remain typed nodes controlled
 by the server. The built-in full product loop is an installed versioned
 template, not a hard-coded worker sequence. New projects receive its historical
-v1 and published v2 in the project-creation transaction; the explicit startup
-provisioner upgrades existing projects without performing writes in GET/List
-handlers or altering old runs.
+v1/v2/v3 versions, the frozen `workflow-engine/v1`-pinned v4, and the published
+`workflow-engine/v2`-pinned v5 in the project-creation transaction. The explicit
+startup provisioner upgrades existing projects without performing writes in
+GET/List handlers or altering old definitions or runs.
+
+`workflow-engine/v2` changes only reconciliation. When a Condition excludes a
+FanOut route before it creates any slice, v2 cancels that FanOut's paired Merge
+after proving the FanOut has no effective predecessor, so an alternative path
+can continue through a shared tail. A valid but unfinished predecessor keeps the
+Merge pending. The exact legacy/v0 and v1 descriptors retain their frozen input,
+execution, validation, result-apply and old reconcile entry points; they never
+dispatch through this v2 rule.
 
 ### Blueprint Selection compilation and fan-out
 
@@ -279,8 +336,10 @@ The product exposes three operations over that same frozen manifest:
    parent Selection Manifest and reproduce its scope and exact source set.
 2. A prototype operation creates formal Prototype drafts only for selected
    Pages that have an exact PageSpec and no approved Prototype.
-3. A Workbench operation starts the published `blueprint-selection-app` v1
+3. A Workbench operation starts the published `blueprint-selection-app` v4
    definition only when every selected Page has both exact approved bindings.
+   Historical v3 remains pinned to `workflow-engine/v1`; current v4 is pinned to
+   `workflow-engine/v2`.
 
 The selection definition runs `artifact_input -> blueprint_selection_page
 fan_out -> selection_passthrough -> merge -> manifest_compiler ->
@@ -364,6 +423,10 @@ workflow executor. Its implemented route family is:
 GET|POST  /v1/projects/:projectId/conversations
 GET|PATCH /v1/projects/:projectId/conversations/:conversationId
 GET|POST  /v1/projects/:projectId/conversations/:conversationId/messages
+GET|POST  /v1/projects/:projectId/conversations/:conversationId/summary-checkpoints
+GET       /v1/projects/:projectId/conversations/:conversationId/summary-checkpoints/:checkpointId
+GET       /v1/projects/:projectId/conversations/:conversationId/summary-checkpoints/:checkpointId/source-messages
+POST      /v1/projects/:projectId/conversations/:conversationId/summary-checkpoints/:checkpointId/decision
 GET|POST  /v1/projects/:projectId/conversations/:conversationId/intent-proposals
 POST      /v1/projects/:projectId/conversations/:conversationId/intent-proposals/generate
 GET       /v1/projects/:projectId/conversations/:conversationId/intent-proposals/:proposalId
@@ -375,10 +438,45 @@ POST      /v1/projects/:projectId/conversations/:conversationId/commands/:comman
 
 For AI this control plane is an explicit input/output boundary. Input consists
 of the immutable user message plus server-resolved Definition Versions,
-Manifest refs, exact source revisions and allowable Workbench targets. Output
-is `{proposal,message,provider,model}` under a constrained schema. The model
+the validated Manifest ref, cryptographic source/intent bindings and allowable
+Workbench targets. Client-controlled source anchors and manifest purposes are
+not copied into the provider view; the server backfills their exact validated
+values after generation. Output is `{proposal,message,provider,model}` under a
+constrained schema. The model
 cannot append its own authoritative assistant record, accept the proposal,
 execute a command, mutate an Artifact, or schedule a WorkflowRun.
+
+Discovery never accepts a browser candidate list and never truncates a set as
+if it were complete. Compatible definitions are loaded in bounded database
+batches and exposed to AI as a compact metadata/I/O/node index; 512 candidates
+or a 256 KiB index is an explicit conflict that requires catalog narrowing.
+Workbench rows are fully checked through the authoritative lineage/generation
+gate before the 100-target limit is applied; a 101st executable target is also
+an explicit conflict. Thus a large non-ready fan-out cannot hide a later ready
+run or silently steer the model to a different process.
+
+The message context is equally fail-closed. Without a checkpoint, generation
+reads the complete, continuous sequence from message 1 through the selected
+user trigger. The 200-entry and 128 KiB limits are applied to the actual
+canonical provider conversation payload. An over-budget request returns a
+typed conflict with the exact recommended cutoff. The client creates an
+immutable prefix checkpoint, and a different member with `review` permission
+must inspect its exact paginated source delta and approve it with `If-Match`.
+Subsequent generation sends only the approved summary plus every continuous
+tail message through the trigger; it never sends or silently drops a covered
+raw message. Workbench continuation first scopes targets to runs
+already executed by this conversation. For a first-time handoff the client may
+send an exact `{runId,rootBundleId}` navigation hint, which is revalidated
+server-side and never treated as an execution result. Every AI-visible target
+also carries server-resolved slice ID/key/title. Duplicate page semantics from
+different runs are an explicit ambiguity unless an exact hint resolves them.
+The provider instruction treats every descriptive string anywhere in the JSON
+input—including checkpoint summaries, raw tail messages and slice key/title
+labels—as untrusted data that cannot override authorization, schema enums,
+exact ID constraints or server-validated bindings. Definition title,
+description and other authoring text are omitted from Workbench target prompt
+records; only the exact target identities and necessary untrusted page labels
+remain.
 
 Users with `comment` permission may append user messages; only the server may
 append assistant messages. Creating conversations, generating or submitting
@@ -395,6 +493,12 @@ identity, and `workbenchInstruction` into a command payload whose wire key is
 `payload.workbench`. The reviewed instruction is also preserved under
 `scope.conversationIntent.workbenchInstruction`.
 
+`scope.conversationIntent` is server-reserved. Public Workflow Start rejects
+it even for an editor; only the accepted Conversation Command path can mint the
+private in-process provenance that authorizes this reviewed envelope. Ordinary
+application-specific scope remains available as a JSON object, but cannot be
+used to forge proposal, conversation, or Workbench instruction identity.
+
 The governance InputManifest for a new conversation decision (`M1`) is
 independent from an already-running workflow's original InputManifest (`M0`).
 An accepted M1 command may govern an authoritative active target from the M0
@@ -405,16 +509,50 @@ group, and ordinal from frozen lineage, and the AI output schema can select one
 authoritative target but cannot invent another ID. Execution re-resolves the
 leaf instead of freezing a soon-stale leaf ID into the command.
 
-`start_workflow` accepts an empty execution body and creates a run whose ID is
-the command ID. `workbench_instruction` requires
-`workbenchInstruction.expectedRunId` and an execution body containing the exact
-`workbenchResult.runId`, active-leaf `bundleId`, and
-`implementationProposalId`. This is an exact proposal receipt: before accepting
-it, the server rechecks project ownership, DefinitionVersion, M1 governance
-manifest, M0 run, expected root, current structural leaf/workspace pin, and that
-the named Proposal belongs to that leaf, is open/reviewing/ready, and remains
-unapplied. AI generation remains a proposal-only step;
-it cannot accept or execute its own intent.
+Both `start_workflow` and `workbench_instruction` accept only an empty execution
+body. A browser never supplies a Workbench result, active leaf, or Proposal ID.
+For a Workbench command the server claims a durable command lease, rechecks edit
+authorization, project ownership, DefinitionVersion, the M1 governance manifest
+and its exact source contents, the M0 run, expected root, current structural
+leaf/workspace pin, and any active Proposal. It then uses the command ID as both
+the generation request key and deterministic ImplementationProposal ID. The
+server writes the completed generation claim, exact Proposal receipt and command
+completion atomically. A safe failed attempt leaves the command pending with a
+new ETag; another currently authorized editor may take over after failure or
+lease expiry. AI generation remains proposal-only and cannot accept its own
+intent. Conversation generation rejects a request that omits either the expected
+run or expected root. Migration `000015` independently binds the claimed leaf's
+WorkflowRun, root manifest and that run's DefinitionVersion to the immutable
+accepted command payload. A rejected/failed command cannot acquire a claim.
+While a command receipt is still pending, its deterministic Proposal must remain
+open and undecided: PostgreSQL rejects operation-decision writes and review,
+ready or apply transitions. Command rejection is also fenced while either a
+live generation claim or the deterministic Proposal exists, so receipt-loss
+recovery cannot strand an unreviewable product.
+
+`implementation_generation_claims` is the replay and fencing record for manual,
+workflow-runner and conversation generation. It snapshots canonical
+`{objective,constraints}` JSON and hash, requested model,
+`implementation-proposal-generation/v1`, system-prompt hash, output-schema hash,
+governance manifest/source identities, actor, leaf/root, and an optional exact
+Proposal ID/version supersede CAS. Retries with the same request key must match
+that immutable identity. Database constraints allow only one processing claim
+and one open/reviewing/ready Proposal per leaf. Manual generation may replace
+only an undecided ordinary open Proposal with an exact CAS; neither a later
+conversation command nor the direct HTTP generation route may replace a
+conversation-owned Proposal. Any prompt or schema semantic change requires a
+new generation contract version, so an old failed request cannot silently run
+under new semantics.
+
+The registered ApplicationBuild ManifestCompiler is also the sole writer of a
+Bundle's optional `workflowContext`. It freezes the exact Definition ref, full
+InputManifest (base plus every source ref/purpose pair, anchors, constraints and
+schema), DeliverySlice, reviewed Run scope, and OutputContract. The public
+Bundle-create request has no such field and strict JSON decoding rejects an
+attempt to inject it. Legacy/manual Bundles omit the field and retain their old
+content-hash shape. Implementation generation resolves the actual content for
+those exact InputManifest sources and sends both content and ref/purpose
+evidence to the model.
 
 WorkflowDefinition and WorkflowRun are separate persisted objects. Every run
 pins one published definition version. Typed edges map `fromPort` to `toPort`;
@@ -613,6 +751,48 @@ Other operational behavior:
 - SIGINT/SIGTERM stops accepting HTTP work, cancels workflow, content and
   outbox workers, closes WebSockets, drains NATS, and closes MongoDB, Redis and
   PostgreSQL within the configured shutdown window.
+
+### Conversation summary checkpoint rollout
+
+Migration `000018_conversation_summary_checkpoints` introduces required,
+immutable conversation-context provenance for newly inserted workflow intent
+proposals and commands. Roll it out only after old API writers have been
+drained. The migration deliberately uses expand/backfill/contract: it marks
+rows that already exist as `legacy_unrecorded`, then makes
+`conversation_context` `NOT NULL` without a default. A post-migration writer
+must explicitly provide `submitted`, `full_prefix`, or `checkpoint_tail`
+provenance; omitted fields and new AI rows claiming `legacy_unrecorded` fail at
+the database boundary.
+
+Do not add a legacy default to ease a mixed-version rollout. That would let a
+new AI proposal permanently bypass its approved-checkpoint, continuous-tail,
+and provider-input-hash receipt. During deployment, stop or drain old writers,
+apply migrations once, start the new API, and verify readiness before allowing
+conversation mutations again.
+
+Checkpoint mutations are available under
+`/v1/projects/:projectId/conversations/:conversationId/summary-checkpoints`.
+Creation requires the current Conversation ETag and an idempotency key;
+`/:checkpointId/decision` requires the checkpoint ETag. Checkpoints start only
+as `pending_review`, cannot be edited or deleted, prohibit creator self-review,
+and advance the conversation head by exactly one approved child. The prefix
+hash is the versioned, domain-separated SHA-256 chain over every immutable
+message from sequence 1 through the bound cutoff, so a later checkpoint can
+continue hashing from its approved predecessor without weakening full-prefix
+identity.
+
+Every new AI intent proposal stores its checkpoint reference, continuous tail
+range/hash, complete context hash, and exact canonical provider-input hash.
+The generation service computes that provider-input hash from the bytes sent to
+the provider and passes it separately as trusted in-process provenance; proposal
+persistence rejects a different otherwise well-formed hash. Tail and complete
+context hashes are recomputed from PostgreSQL messages immediately before the
+proposal insert rather than trusted from model or browser data.
+An accepted command copies the same provenance, and PostgreSQL rejects any
+command whose receipt differs from its proposal. A summary remains untrusted
+conversation content: it cannot establish permissions, artifact or workflow
+identity, approval state, or execution results, all of which continue to be
+resolved from authoritative platform records.
 
 ## Verification
 

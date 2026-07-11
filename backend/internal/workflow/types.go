@@ -58,13 +58,14 @@ func (s NodeStatus) Terminal() bool {
 }
 
 type DefinitionRecord struct {
-	VersionID   string
-	ProjectID   string
-	Key         string
-	Title       string
-	Description string
-	Published   bool
-	Definition  domain.WorkflowDefinition
+	VersionID        string                             `json:"versionId"`
+	ProjectID        string                             `json:"projectId"`
+	Key              string                             `json:"key"`
+	Title            string                             `json:"title"`
+	Description      string                             `json:"description"`
+	Published        bool                               `json:"published"`
+	ExecutionProfile domain.WorkflowExecutionProfileRef `json:"executionProfile"`
+	Definition       domain.WorkflowDefinition          `json:"definition"`
 }
 
 type NodeMetadata struct {
@@ -208,40 +209,42 @@ func artifactRefsFromNodeOutput(output json.RawMessage) ([]domain.ArtifactRef, e
 }
 
 type RunRecord struct {
-	ID                  string                       `json:"id"`
-	ProjectID           string                       `json:"projectId"`
-	DefinitionVersionID string                       `json:"definitionVersionId"`
-	Definition          domain.WorkflowDefinitionRef `json:"definition"`
-	InputManifest       *domain.ManifestRef          `json:"inputManifest,omitempty"`
-	Status              RunStatus                    `json:"status"`
-	Scope               json.RawMessage              `json:"scope"`
-	Context             RunContext                   `json:"context"`
-	EventCursor         uint64                       `json:"eventCursor"`
-	StartedBy           string                       `json:"startedBy"`
-	StartedAt           *time.Time                   `json:"startedAt,omitempty"`
-	CompletedAt         *time.Time                   `json:"completedAt,omitempty"`
-	CancelledAt         *time.Time                   `json:"cancelledAt,omitempty"`
-	Failure             json.RawMessage              `json:"failure,omitempty"`
-	CreatedAt           time.Time                    `json:"createdAt"`
-	UpdatedAt           time.Time                    `json:"updatedAt"`
-	Nodes               map[string]*NodeRecord       `json:"nodes"`
+	ID                  string                             `json:"id"`
+	ProjectID           string                             `json:"projectId"`
+	DefinitionVersionID string                             `json:"definitionVersionId"`
+	Definition          domain.WorkflowDefinitionRef       `json:"definition"`
+	ExecutionProfile    domain.WorkflowExecutionProfileRef `json:"executionProfile"`
+	InputManifest       *domain.ManifestRef                `json:"inputManifest,omitempty"`
+	Status              RunStatus                          `json:"status"`
+	Scope               json.RawMessage                    `json:"scope"`
+	Context             RunContext                         `json:"context"`
+	EventCursor         uint64                             `json:"eventCursor"`
+	StartedBy           string                             `json:"startedBy"`
+	StartedAt           *time.Time                         `json:"startedAt,omitempty"`
+	CompletedAt         *time.Time                         `json:"completedAt,omitempty"`
+	CancelledAt         *time.Time                         `json:"cancelledAt,omitempty"`
+	Failure             json.RawMessage                    `json:"failure,omitempty"`
+	CreatedAt           time.Time                          `json:"createdAt"`
+	UpdatedAt           time.Time                          `json:"updatedAt"`
+	Nodes               map[string]*NodeRecord             `json:"nodes"`
 }
 
 // RunSummary is the bounded project-history representation. Detailed context,
 // node outputs, and immutable manifest references remain available from GetRun.
 type RunSummary struct {
-	ID                  string          `json:"id"`
-	ProjectID           string          `json:"projectId"`
-	DefinitionVersionID string          `json:"definitionVersionId"`
-	Status              RunStatus       `json:"status"`
-	EventCursor         uint64          `json:"eventCursor"`
-	StartedBy           string          `json:"startedBy"`
-	StartedAt           *time.Time      `json:"startedAt,omitempty"`
-	CompletedAt         *time.Time      `json:"completedAt,omitempty"`
-	CancelledAt         *time.Time      `json:"cancelledAt,omitempty"`
-	Failure             json.RawMessage `json:"failure,omitempty"`
-	CreatedAt           time.Time       `json:"createdAt"`
-	UpdatedAt           time.Time       `json:"updatedAt"`
+	ID                  string                             `json:"id"`
+	ProjectID           string                             `json:"projectId"`
+	DefinitionVersionID string                             `json:"definitionVersionId"`
+	ExecutionProfile    domain.WorkflowExecutionProfileRef `json:"executionProfile"`
+	Status              RunStatus                          `json:"status"`
+	EventCursor         uint64                             `json:"eventCursor"`
+	StartedBy           string                             `json:"startedBy"`
+	StartedAt           *time.Time                         `json:"startedAt,omitempty"`
+	CompletedAt         *time.Time                         `json:"completedAt,omitempty"`
+	CancelledAt         *time.Time                         `json:"cancelledAt,omitempty"`
+	Failure             json.RawMessage                    `json:"failure,omitempty"`
+	CreatedAt           time.Time                          `json:"createdAt"`
+	UpdatedAt           time.Time                          `json:"updatedAt"`
 }
 
 type RunListOptions struct {
@@ -268,6 +271,9 @@ func (r *RunRecord) Validate() error {
 	}
 	if err := r.Definition.Validate(); err != nil {
 		return err
+	}
+	if err := r.ExecutionProfile.Validate(); err != nil || r.Definition.ExecutionProfile != r.ExecutionProfile {
+		return fmt.Errorf("run execution profile and definition ref must match exactly")
 	}
 	if r.InputManifest != nil {
 		if err := r.InputManifest.Validate(); err != nil {
@@ -376,7 +382,8 @@ type Store interface {
 	CreateRun(context.Context, *RunRecord, []Event) error
 	GetRun(context.Context, string) (*RunRecord, error)
 	ListRuns(context.Context, string, StoreRunFilter) ([]RunSummary, error)
-	ClaimRunnable(context.Context, string, time.Time, time.Duration) (Lease, error)
+	ListActiveExecutionProfiles(context.Context) ([]domain.WorkflowExecutionProfileRef, error)
+	ClaimRunnable(context.Context, string, time.Time, time.Duration, ...domain.WorkflowExecutionProfileRef) (Lease, error)
 	RenewLease(context.Context, Lease, time.Time, time.Duration) (Lease, error)
 	Commit(context.Context, RunMutation) error
 	ListEvents(context.Context, string, uint64, int) ([]Event, error)
@@ -406,6 +413,10 @@ type Execution struct {
 	Workflow   domain.WorkflowDefinition
 	Lease      Lease
 	Inputs     domain.NodeInputEnvelope
+	// legacyProfileView is set only by the exact registered legacy execution
+	// bundle. It is deliberately private so a runner result or transport payload
+	// cannot opt a current run into profile-less compatibility behavior.
+	legacyProfileView bool
 }
 
 // ExecutionActor returns the server-recorded actor for a privileged node and
@@ -477,6 +488,19 @@ type FanOutItem struct {
 	PageSpec  *domain.ArtifactRef `json:"pageSpec,omitempty"`
 	Prototype *domain.ArtifactRef `json:"prototype,omitempty"`
 	OwnerID   string              `json:"ownerId,omitempty"`
+}
+
+func effectiveFanOutMaxItems(config *domain.FanOutNodeConfig) (int, error) {
+	if config == nil {
+		return 0, fmt.Errorf("fan-out node config is required")
+	}
+	if config.MaxItems == 0 {
+		return domain.MaximumWorkflowFanOutItems, nil
+	}
+	if config.MaxItems < 1 || config.MaxItems > domain.MaximumWorkflowFanOutItems {
+		return 0, fmt.Errorf("fan-out maxItems must be between 1 and %d", domain.MaximumWorkflowFanOutItems)
+	}
+	return config.MaxItems, nil
 }
 
 type WorkerResult struct {
@@ -693,6 +717,16 @@ type ArtifactInputValidator interface {
 // example Blueprint-selection roots) and never trusts client JSON.
 type StartArtifactKindResolver interface {
 	ResolveStartArtifactKinds(context.Context, domain.InputManifest) ([]string, error)
+}
+
+type StartArtifactMetadata struct {
+	Kinds       []string
+	Count       int
+	AllApproved bool
+}
+
+type StartArtifactMetadataResolver interface {
+	ResolveStartArtifactMetadata(context.Context, domain.InputManifest) (StartArtifactMetadata, error)
 }
 
 // HumanEditValidation is the server-resolved identity of a submitted human

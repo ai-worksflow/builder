@@ -19,6 +19,7 @@ import type {
   WorkflowNodeRunDto,
   WorkflowNodeType,
   WorkflowOutputContractDto,
+  WorkflowProposalLineagePinDto,
   WorkflowRunDto,
 } from './flow-contract'
 
@@ -30,6 +31,21 @@ export interface EditableWorkflowDefinition {
   readonly nodes: readonly WorkflowNodeDefinitionDto[]
   readonly edges: readonly WorkflowEdgeDto[]
 }
+
+export interface WorkflowSemanticStateEstimate {
+  readonly peakStates: number
+  readonly maximumStates: number
+  readonly exceeded: boolean
+}
+
+export interface WorkflowAuthoringAnalysisLimits {
+  readonly maximumDefinitionNodes: number
+  readonly maximumDefinitionEdges: number
+  readonly maxSemanticPathStates?: number
+  readonly maximumConditionExpressionBytes?: number
+}
+
+type ConditionChoiceAssignment = Record<string, string>
 
 export interface WorkflowArtifactSnapshot {
   readonly documents: readonly VersionedArtifactDto<DocumentContentDto>[]
@@ -62,9 +78,12 @@ interface LineageSliceRef {
 }
 
 interface LineageBinding {
+  readonly sourceNodeKey: string
+  readonly sourceDefinitionNodeId: string
   readonly artifactRevisions: readonly ExactArtifactRefDto[]
   readonly deliverySliceRefs: readonly LineageSliceRef[]
-  readonly outputProposal?: { readonly id: string; readonly payloadHash: string }
+  readonly proposalPins: readonly WorkflowProposalLineagePinDto[]
+  readonly legacyOutputProposal?: { readonly id: string; readonly payloadHash: string }
 }
 
 const WORKFLOW_NODE_TYPES: readonly WorkflowNodeType[] = [
@@ -93,11 +112,14 @@ export function starterWorkflowDefinition(): {
   const envelope: JsonObject = { type: 'object', additionalProperties: true }
   return {
     name: 'Minimum product delivery loop',
-    schemaVersion: '3',
+    schemaVersion: '4',
     inputContract: {
       capability: 'project_brief',
       manifestJobTypes: ['conversation.workflow_intent', 'workflow_start'],
       artifactKinds: ['project_brief'],
+      minimumArtifacts: 1,
+      maximumArtifacts: 1,
+      requireApproved: false,
       requiredSourcePurposes: ['project_brief'],
       manifestSchemaContracts: {
         'conversation.workflow_intent': 'workflow-intent-input/v1',
@@ -112,7 +134,7 @@ export function starterWorkflowDefinition(): {
     },
     nodes: [
       node('source', 'Project brief input', 'artifact_input', envelope, {
-        artifactInput: { allowedTypes: ['document'], allowedKinds: ['project_brief'], requireApproved: false, minimumArtifacts: 1 },
+        artifactInput: { allowedTypes: ['document'], allowedKinds: ['project_brief'], requireApproved: false, minimumArtifacts: 1, maximumArtifacts: 1 },
       }),
       node('project-brief-ai', 'Refine project brief proposal', 'ai_transform', envelope, {
         aiTransform: {
@@ -162,7 +184,7 @@ export function starterWorkflowDefinition(): {
         reviewGate: { requiredRole: 'owner', minimumApprovals: 1, prohibitSelfReview: true, allowWaiver: false },
       }),
       node('pages', 'Create Blueprint page branches', 'fan_out', envelope, {
-        fanOut: { itemsPath: '/blueprintPages', sliceKeyPath: '/key', mergeNodeId: 'pages-merged', maxParallel: 4, itemKind: 'blueprint_page' },
+        fanOut: { itemsPath: '/blueprintPages', sliceKeyPath: '/key', mergeNodeId: 'pages-merged', maxParallel: 4, maxItems: 100, itemKind: 'blueprint_page' },
       }),
       node('page-spec-ai', 'Generate page specification proposal', 'ai_transform', envelope, {
         aiTransform: {
@@ -236,6 +258,55 @@ export function starterWorkflowDefinition(): {
   }
 }
 
+export function appendPairedFanOutSubgraph(
+  definition: EditableWorkflowDefinition,
+  selectedType: 'fan_out' | 'merge',
+  itemKind: 'blueprint_page' | 'blueprint_selection_page' = 'blueprint_page',
+): { readonly definition: EditableWorkflowDefinition; readonly selectedNodeId: string } {
+  const schema: JsonObject = { type: 'object', additionalProperties: true }
+  const fanOutId = uniqueWorkflowNodeId('fan-out', definition.nodes)
+  const mergeId = uniqueWorkflowNodeId('merge', definition.nodes)
+  const branchId = uniqueWorkflowNodeId(itemKind === 'blueprint_selection_page' ? 'selection-passthrough' : 'configure-page-branch', definition.nodes)
+  const firstEdgeId = uniqueWorkflowEdgeId(`${fanOutId}-${branchId}`, definition.edges)
+  const secondEdgeId = uniqueWorkflowEdgeId(`${branchId}-${mergeId}`, [...definition.edges, { id: firstEdgeId, from: fanOutId, to: branchId }])
+  const fanOut: WorkflowNodeDefinitionDto = node(fanOutId, 'Fan out', 'fan_out', schema, {
+    fanOut: { itemsPath: '/items', sliceKeyPath: '/id', mergeNodeId: mergeId, maxParallel: 4, maxItems: 100, itemKind },
+  })
+  const merge: WorkflowNodeDefinitionDto = node(mergeId, 'Merge', 'merge', schema, {
+    merge: { fanOutNodeId: fanOutId, policy: 'all', allowWaiver: false },
+  })
+  const branch: WorkflowNodeDefinitionDto = itemKind === 'blueprint_selection_page'
+    ? node(branchId, 'Use frozen page binding', 'transform', schema, { transform: { transform: 'selection_passthrough' } })
+    : node(branchId, 'Configure page branch', 'ai_transform', schema, {
+      aiTransform: {
+        jobType: 'generate_page_spec', modelPolicy: 'project-default',
+        outputSchemaVersion: 'page-spec-proposal/v1', maxAttempts: 3, timeout: 300_000_000_000,
+      },
+    })
+  return {
+    definition: {
+      ...definition,
+      nodes: [...definition.nodes, fanOut, branch, merge],
+      edges: [...definition.edges, { id: firstEdgeId, from: fanOutId, to: branchId }, { id: secondEdgeId, from: branchId, to: mergeId }],
+    },
+    selectedNodeId: selectedType === 'fan_out' ? fanOutId : mergeId,
+  }
+}
+
+function uniqueWorkflowNodeId(base: string, nodes: readonly WorkflowNodeDefinitionDto[]) {
+  let candidate = base
+  let index = 2
+  while (nodes.some((node) => node.id === candidate)) candidate = `${base}-${index++}`
+  return candidate
+}
+
+function uniqueWorkflowEdgeId(base: string, edges: readonly WorkflowEdgeDto[]) {
+  let candidate = base
+  let index = 2
+  while (edges.some((edge) => edge.id === candidate)) candidate = `${base}-${index++}`
+  return candidate
+}
+
 function node(
   id: string,
   name: string,
@@ -280,8 +351,9 @@ export function validateWorkflowDefinition(
   if (!Array.isArray(value.nodes)) return 'nodes must be an array.'
   if (!Array.isArray(value.edges)) return 'edges must be an array.'
   if (value.nodes.length === 0) return 'nodes must contain at least one node.'
-  if (value.nodes.length > 200) return 'nodes cannot contain more than 200 entries.'
-  if (value.edges.length > 1_000) return 'edges cannot contain more than 1000 entries.'
+  const analysisLimits = workflowAnalysisLimits(capabilities)
+  if (value.nodes.length > analysisLimits.maximumDefinitionNodes) return `nodes cannot contain more than ${analysisLimits.maximumDefinitionNodes} entries.`
+  if (value.edges.length > analysisLimits.maximumDefinitionEdges) return `edges cannot contain more than ${analysisLimits.maximumDefinitionEdges} entries.`
 
   const nodes = new Map<string, WorkflowNodeDefinitionDto>()
   for (const [index, rawNode] of value.nodes.entries()) {
@@ -325,6 +397,16 @@ export function validateWorkflowDefinition(
   if (reachable(entries.at(0)!, adjacency).size !== nodes.size) return 'Every node must be reachable from the entry node.'
   if (reachable(terminals.at(0)!, reverse).size !== nodes.size) return 'Every node must have a path to the terminal node.'
   if (containsCycle(nodes.keys(), adjacency)) return 'Workflow graph must be acyclic.'
+  const maximumSemanticStates = workflowSemanticAnalysisLimit(capabilities)
+  if (maximumSemanticStates !== undefined) {
+    const estimate = estimateWorkflowSemanticStates(
+      value as unknown as EditableWorkflowDefinition,
+      maximumSemanticStates,
+    )
+    if (estimate.exceeded) {
+      return `Workflow semantic analysis would exceed ${maximumSemanticStates} states. Reduce independent Condition combinations or merge branches earlier.`
+    }
+  }
   const entry = nodes.get(entries[0])
   const inputContract = value.inputContract as unknown as WorkflowInputContractDto
   if (entry?.type !== 'artifact_input') return 'inputContract requires artifact_input as the single entry node.'
@@ -335,6 +417,7 @@ export function validateWorkflowDefinition(
     if (workflowNode.type === 'fan_out') {
       const merge = workflowNode.fanOut && nodes.get(workflowNode.fanOut.mergeNodeId)
       if (!merge || merge.type !== 'merge' || merge.merge?.fanOutNodeId !== workflowNode.id) return `Node ${workflowNode.id} must reference a reciprocal merge node.`
+      if (value.edges.some((edge) => object(edge) && edge.from === workflowNode.id && edge.to === merge.id)) return `Node ${workflowNode.id} fan-out region must contain at least one branch node.`
     }
     if (workflowNode.type === 'merge') {
       const fanOut = workflowNode.merge && nodes.get(workflowNode.merge.fanOutNodeId)
@@ -349,6 +432,148 @@ export function validateWorkflowDefinition(
     if (capabilityError) return capabilityError
   }
   return undefined
+}
+
+export function workflowSemanticAnalysisLimit(
+  capabilities?: WorkflowCapabilitiesDto | null,
+): number | undefined {
+  const value = workflowAnalysisLimits(capabilities).maxSemanticPathStates
+  return positiveInteger(value) ? Number(value) : undefined
+}
+
+export function workflowAnalysisLimits(
+  capabilities?: WorkflowCapabilitiesDto | null,
+): WorkflowAuthoringAnalysisLimits {
+  const limits = (capabilities as (WorkflowCapabilitiesDto & {
+    readonly analysisLimits?: Partial<WorkflowAuthoringAnalysisLimits>
+  }) | null | undefined)?.analysisLimits
+  return {
+    maximumDefinitionNodes: positiveInteger(limits?.maximumDefinitionNodes)
+      ? Number(limits?.maximumDefinitionNodes)
+      : 200,
+    maximumDefinitionEdges: positiveInteger(limits?.maximumDefinitionEdges)
+      ? Number(limits?.maximumDefinitionEdges)
+      : 1_000,
+    maxSemanticPathStates: positiveInteger(limits?.maxSemanticPathStates)
+      ? Number(limits?.maxSemanticPathStates)
+      : undefined,
+    maximumConditionExpressionBytes: positiveInteger(limits?.maximumConditionExpressionBytes)
+      ? Number(limits?.maximumConditionExpressionBytes)
+      : undefined,
+  }
+}
+
+// Mirrors the server's deterministic Condition-assignment expansion and
+// saturates at maximumStates + 1. It is deliberately independent from visual
+// layout, so JSON and graph authoring receive the same preflight result.
+export function estimateWorkflowSemanticStates(
+  definition: Pick<EditableWorkflowDefinition, 'nodes' | 'edges'>,
+  maximumStates: number,
+): WorkflowSemanticStateEstimate {
+  const maximum = positiveInteger(maximumStates) ? Number(maximumStates) : 1
+  const saturated = maximum + 1
+  const nodes = new Map(definition.nodes.map((node) => [node.id, node]))
+  const indegree = new Map(definition.nodes.map((node) => [node.id, 0]))
+  const incoming = new Map(definition.nodes.map((node) => [node.id, [] as WorkflowEdgeDto[]]))
+  const adjacency = new Map(definition.nodes.map((node) => [node.id, [] as string[]]))
+  for (const edge of definition.edges) {
+    if (!nodes.has(edge.from) || !nodes.has(edge.to)) continue
+    indegree.set(edge.to, (indegree.get(edge.to) ?? 0) + 1)
+    incoming.get(edge.to)?.push(edge)
+    adjacency.get(edge.from)?.push(edge.to)
+  }
+  const queue = [...indegree]
+    .filter(([, degree]) => degree === 0)
+    .map(([id]) => id)
+    .sort()
+  const after = new Map<string, readonly ConditionChoiceAssignment[]>()
+  let peakStates = queue.length > 0 ? 1 : 0
+  let visited = 0
+  while (queue.length > 0) {
+    const id = queue.shift()!
+    visited += 1
+    const edges = [...(incoming.get(id) ?? [])].sort((left, right) => left.id.localeCompare(right.id))
+    let states: readonly ConditionChoiceAssignment[] = [{}]
+    if (edges.length > 0) {
+      const choiceMaps: ConditionChoiceAssignment[] = []
+      for (const edge of edges) {
+        const source = nodes.get(edge.from)
+        for (const assignment of after.get(edge.from) ?? []) {
+          const next = { ...assignment }
+          if (source?.type === 'condition') next[source.id] = edge.fromPort?.trim() || 'default'
+          appendUniqueChoiceAssignment(choiceMaps, next)
+          if (choiceMaps.length >= saturated) break
+        }
+        if (choiceMaps.length >= saturated) break
+      }
+      states = maximalCompatibleChoiceAssignments(choiceMaps, maximum)
+    }
+    after.set(id, states)
+    peakStates = Math.max(peakStates, states.length)
+    if (peakStates >= saturated) {
+      return { peakStates: saturated, maximumStates: maximum, exceeded: true }
+    }
+    for (const successor of adjacency.get(id) ?? []) {
+      const nextDegree = (indegree.get(successor) ?? 0) - 1
+      indegree.set(successor, nextDegree)
+      if (nextDegree === 0) {
+        queue.push(successor)
+        queue.sort()
+      }
+    }
+  }
+  // Cycles are reported by the structural validator. Keep this helper total so
+  // the graph editor can still render and explain partially-authored content.
+  if (visited !== nodes.size) return { peakStates, maximumStates: maximum, exceeded: false }
+  return { peakStates, maximumStates: maximum, exceeded: peakStates > maximum }
+}
+
+function maximalCompatibleChoiceAssignments(
+  values: readonly ConditionChoiceAssignment[],
+  maximumStates: number,
+): readonly ConditionChoiceAssignment[] {
+  const saturated = maximumStates + 1
+  const unique = values.reduce<ConditionChoiceAssignment[]>((result, value) => {
+    appendUniqueChoiceAssignment(result, value)
+    return result
+  }, []).sort((left, right) => choiceAssignmentKey(left).localeCompare(choiceAssignmentKey(right)))
+  const assignments: ConditionChoiceAssignment[] = [{}]
+  for (const choices of unique) {
+    const base = [...assignments]
+    for (const assignment of base) {
+      if (!choiceAssignmentsCompatible(assignment, choices)) continue
+      appendUniqueChoiceAssignment(assignments, { ...assignment, ...choices })
+      if (assignments.length >= saturated) return Array.from({ length: saturated }, () => ({}))
+    }
+  }
+  return assignments.filter((assignment, index) => !assignments.some((other, otherIndex) =>
+    index !== otherIndex
+    && Object.keys(other).length > Object.keys(assignment).length
+    && choiceAssignmentSubset(assignment, other)))
+}
+
+function appendUniqueChoiceAssignment(
+  values: ConditionChoiceAssignment[],
+  candidate: ConditionChoiceAssignment,
+) {
+  const key = choiceAssignmentKey(candidate)
+  if (!values.some((value) => choiceAssignmentKey(value) === key)) values.push(candidate)
+}
+
+function choiceAssignmentsCompatible(left: ConditionChoiceAssignment, right: ConditionChoiceAssignment) {
+  return Object.entries(left).every(([condition, branch]) =>
+    right[condition] === undefined || right[condition] === branch)
+}
+
+function choiceAssignmentSubset(subset: ConditionChoiceAssignment, superset: ConditionChoiceAssignment) {
+  return Object.entries(subset).every(([condition, branch]) => superset[condition] === branch)
+}
+
+function choiceAssignmentKey(value: ConditionChoiceAssignment) {
+  return Object.entries(value)
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([condition, branch]) => `${condition}\u0000${branch}`)
+    .join('\u0001')
 }
 
 export function validateWorkflowNode(value: unknown, path = 'node'): string | undefined {
@@ -394,6 +619,7 @@ function validateInputContract(value: unknown) {
   if (!nonEmpty(value.capability)) return 'inputContract.capability is required.'
   if (!nonEmptyStringArray(value.manifestJobTypes)) return 'inputContract.manifestJobTypes must contain supported job types.'
   if (!nonEmptyStringArray(value.artifactKinds) || !value.artifactKinds.every(validArtifactKind)) return 'inputContract.artifactKinds must contain exact artifact kinds.'
+  if (!positiveInteger(value.minimumArtifacts) || !positiveInteger(value.maximumArtifacts) || Number(value.maximumArtifacts) < Number(value.minimumArtifacts) || typeof value.requireApproved !== 'boolean') return 'inputContract entry policy is malformed.'
   if (!nonEmptyStringArray(value.requiredSourcePurposes)) return 'inputContract.requiredSourcePurposes must not be empty.'
   if (!stringRecord(value.manifestSchemaContracts)) return 'inputContract.manifestSchemaContracts must map job types to schema versions.'
   const schemaContracts = value.manifestSchemaContracts
@@ -418,11 +644,21 @@ function validateRegisteredCapabilities(
 ) {
   const inputRegistered = capabilities.inputContracts.some((contract) =>
     contract.capability === definition.inputContract.capability
+    && contract.minimumArtifacts === definition.inputContract.minimumArtifacts
+    && contract.maximumArtifacts === definition.inputContract.maximumArtifacts
+    && contract.requireApproved === definition.inputContract.requireApproved
     && sameStringSet(contract.manifestJobTypes, definition.inputContract.manifestJobTypes)
     && sameStringSet(contract.artifactKinds, definition.inputContract.artifactKinds)
     && sameStringSet(contract.requiredSourcePurposes, definition.inputContract.requiredSourcePurposes)
     && sameStringRecord(contract.manifestSchemaContracts, definition.inputContract.manifestSchemaContracts))
   if (!inputRegistered) return 'inputContract is not registered by the workflow service.'
+  const incoming = new Set(definition.edges.map((edge) => edge.to))
+  const entry = definition.nodes.find((node) => !incoming.has(node.id))
+  if (!entry?.artifactInput
+    || entry.artifactInput.minimumArtifacts !== definition.inputContract.minimumArtifacts
+    || entry.artifactInput.maximumArtifacts !== definition.inputContract.maximumArtifacts
+    || entry.artifactInput.requireApproved !== definition.inputContract.requireApproved
+    || !sameStringSet(entry.artifactInput.allowedKinds ?? [], definition.inputContract.artifactKinds)) return 'Artifact Input entry policy must exactly match inputContract.'
   const outputRegistered = capabilities.outputContracts.some((contract) =>
     contract.capability === definition.outputContract.capability
     && contract.terminalOutcome === definition.outputContract.terminalOutcome
@@ -435,6 +671,8 @@ function validateRegisteredCapabilities(
       capability.jobType === node.aiTransform?.jobType
       && capability.outputSchemaVersion === node.aiTransform?.outputSchemaVersion
       && capability.modelPolicies.includes(node.aiTransform?.modelPolicy ?? ''))) return `Node ${node.id} uses an unregistered AI transform.`
+    if (node.reviewGate && (node.reviewGate.allowWaiver || !node.reviewGate.prohibitSelfReview || node.reviewGate.minimumApprovals < 1)) return `Node ${node.id} review policy cannot establish governed approval.`
+    if (node.merge && (node.merge.policy !== 'all' || node.merge.allowWaiver)) return `Node ${node.id} merge policy must require all branches without waiver.`
     if (node.manifestCompiler && !capabilities.manifestCompilers.some((capability) =>
       capability.manifestKind === node.manifestCompiler?.manifestKind
       && capability.schemaVersion === node.manifestCompiler?.schemaVersion
@@ -442,6 +680,10 @@ function validateRegisteredCapabilities(
     if (node.transform && !capabilities.transforms.includes(node.transform.transform)) return `Node ${node.id} uses an unregistered transform.`
     const fanOutKind = node.fanOut?.itemKind ?? (node.fanOut ? 'generic' : undefined)
     if (fanOutKind && !capabilities.fanOutItemKinds.includes(fanOutKind)) return `Node ${node.id} uses an unregistered fan-out resolver.`
+    if (fanOutKind) {
+      const limit = capabilities.fanOutMaximumItems[fanOutKind]
+      if (!positiveInteger(limit) || !positiveInteger(node.fanOut?.maxItems) || Number(node.fanOut?.maxItems) > limit) return `Node ${node.id} fan-out maxItems exceeds the registered resolver limit.`
+    }
     if (node.qualityGate && !capabilities.qualityGates.includes(node.qualityGate.gateName)) return `Node ${node.id} uses an unregistered quality gate.`
     if (node.publish && !capabilities.publishEnvironments.includes(node.publish.environment)) return `Node ${node.id} uses an unregistered publish environment.`
     if (node.workbenchBuild && !capabilities.workbenchSchemaVersions.includes(node.workbenchBuild.buildManifestSchemaVersion)) return `Node ${node.id} uses an unregistered Workbench schema.`
@@ -466,7 +708,7 @@ function nonEmptyStringArray(value: unknown): value is string[] {
 function validateNodeConfig(type: WorkflowNodeType, config: Record<string, unknown>, path: string) {
   switch (type) {
     case 'artifact_input':
-      if (!Array.isArray(config.allowedTypes) || config.allowedTypes.length === 0 || !config.allowedTypes.every(validArtifactType) || (config.allowedKinds !== undefined && (!nonEmptyStringArray(config.allowedKinds) || !config.allowedKinds.every(validArtifactKind))) || typeof config.requireApproved !== 'boolean' || !positiveInteger(config.minimumArtifacts)) return `${path}.artifactInput is malformed.`
+    if (!Array.isArray(config.allowedTypes) || config.allowedTypes.length === 0 || !config.allowedTypes.every(validArtifactType) || (config.allowedKinds !== undefined && (!nonEmptyStringArray(config.allowedKinds) || !config.allowedKinds.every(validArtifactKind))) || typeof config.requireApproved !== 'boolean' || !positiveInteger(config.minimumArtifacts) || !positiveInteger(config.maximumArtifacts) || Number(config.maximumArtifacts) < Number(config.minimumArtifacts)) return `${path}.artifactInput is malformed.`
       break
     case 'ai_transform':
       if (!nonEmpty(config.jobType) || !nonEmpty(config.modelPolicy) || !nonEmpty(config.outputSchemaVersion) || !positiveInteger(config.maxAttempts) || !positiveNumber(config.timeout)) return `${path}.aiTransform is malformed.`
@@ -484,7 +726,7 @@ function validateNodeConfig(type: WorkflowNodeType, config: Record<string, unkno
       if (config.branches.some((branch) => object(branch) && branch.default === false && !nonEmpty(branch.expression))) return `${path}.condition non-default branches require an expression.`
       break
     case 'fan_out':
-      if (!jsonPointer(config.itemsPath) || !jsonPointer(config.sliceKeyPath) || !nonEmpty(config.mergeNodeId) || !positiveInteger(config.maxParallel) || (config.itemKind !== undefined && !['generic', 'delivery_slice', 'blueprint_page', 'blueprint_selection_page'].includes(String(config.itemKind)))) return `${path}.fanOut is malformed.`
+      if (!jsonPointer(config.itemsPath) || !jsonPointer(config.sliceKeyPath) || !nonEmpty(config.mergeNodeId) || !positiveInteger(config.maxParallel) || (config.maxItems !== undefined && !positiveInteger(config.maxItems)) || (config.itemKind !== undefined && !['generic', 'delivery_slice', 'blueprint_page', 'blueprint_selection_page'].includes(String(config.itemKind)))) return `${path}.fanOut is malformed.`
       break
     case 'merge':
       if (!nonEmpty(config.fanOutNodeId) || !['all', 'any', 'quorum'].includes(String(config.policy)) || typeof config.allowWaiver !== 'boolean' || (config.policy === 'quorum' && !positiveInteger(config.quorum))) return `${path}.merge is malformed.`
@@ -565,10 +807,24 @@ export function revisionCandidates(
         : type === 'prototype'
           ? artifacts.prototypes
           : []
-  const proposalRefs = uniqueBy(
-    bindings.flatMap((binding) => binding.outputProposal ? [binding.outputProposal] : []),
-    (proposal) => `${proposal.id}:${proposal.payloadHash}`,
+  const proposalPins = uniqueBy(
+    bindings.flatMap((binding) => binding.proposalPins),
+    (pin) => `${pin.producerNodeKey}:${pin.producerDefinitionNodeId}:${pin.proposal.id}:${pin.proposal.payloadHash}:${pin.manifest.id}:${pin.manifest.hash}`,
   )
+  const pinnedProducerKeys = new Set(proposalPins.map((pin) => `${pin.producerNodeKey}:${pin.producerDefinitionNodeId}:${pin.proposal.id}:${pin.proposal.payloadHash}`))
+  const legacyProposalEvidence = uniqueBy(
+    bindings.flatMap((binding) => binding.legacyOutputProposal ? [{
+      proposal: binding.legacyOutputProposal,
+      producerKey: `${binding.sourceNodeKey}:${binding.sourceDefinitionNodeId}:${binding.legacyOutputProposal.id}:${binding.legacyOutputProposal.payloadHash}`,
+    }] : []).filter((evidence) => !pinnedProducerKeys.has(evidence.producerKey)),
+    (evidence) => evidence.producerKey,
+  )
+  if (proposalPins.length + legacyProposalEvidence.length !== 1) {
+    return { candidates: [], error: 'Human Edit requires exactly one proposal producer in its typed input lineage.' }
+  }
+  const soleProposal = proposalPins.at(0)?.proposal ?? legacyProposalEvidence.at(0)?.proposal
+  if (!soleProposal) return { candidates: [], error: 'Human Edit proposal lineage is unavailable.' }
+  const proposalRefs = [soleProposal]
   const proposalTargetIds = new Set<string>()
   const appliedProposalIds = new Set<string>()
   for (const proposalRef of proposalRefs) {
@@ -736,6 +992,7 @@ function nodeInputLineage(
   const bindings: LineageBinding[] = []
   for (const [index, rawBinding] of input.bindings.entries()) {
     if (!object(rawBinding) || !object(rawBinding.source)) return { bindings: [], error: `Typed input binding ${index} is malformed.` }
+    if (!nonEmpty(rawBinding.source.nodeKey) || !nonEmpty(rawBinding.source.definitionNodeId)) return { bindings: [], error: `Typed input binding ${index} has malformed producer identity.` }
     const rawArtifacts = rawBinding.source.artifactRevisions ?? []
     const rawSlices = rawBinding.source.deliverySliceRefs ?? []
     if (!Array.isArray(rawArtifacts) || !Array.isArray(rawSlices)) return { bindings: [], error: `Typed input binding ${index} lineage is malformed.` }
@@ -745,10 +1002,17 @@ function nodeInputLineage(
     if (deliverySliceRefs.length !== rawSlices.length) return { bindings: [], error: `Typed input binding ${index} contains a malformed delivery-slice reference.` }
     const outputProposal = rawBinding.source.outputProposal
     if (outputProposal !== undefined && (!object(outputProposal) || !nonEmpty(outputProposal.id) || !nonEmpty(outputProposal.payloadHash))) return { bindings: [], error: `Typed input binding ${index} contains a malformed proposal reference.` }
+    const rawProposalPins = rawBinding.source.proposalPins ?? []
+    if (!Array.isArray(rawProposalPins)) return { bindings: [], error: `Typed input binding ${index} proposal pins are malformed.` }
+    const proposalPins = rawProposalPins.filter(proposalLineagePin)
+    if (proposalPins.length !== rawProposalPins.length) return { bindings: [], error: `Typed input binding ${index} contains a malformed proposal lineage pin.` }
     bindings.push({
+      sourceNodeKey: rawBinding.source.nodeKey,
+      sourceDefinitionNodeId: rawBinding.source.definitionNodeId,
       artifactRevisions,
       deliverySliceRefs,
-      ...(outputProposal ? { outputProposal: outputProposal as LineageBinding['outputProposal'] } : {}),
+      proposalPins,
+      ...(outputProposal ? { legacyOutputProposal: outputProposal as LineageBinding['legacyOutputProposal'] } : {}),
     })
   }
   return bindings.length > 0 ? { bindings } : { bindings, error: 'The typed input envelope has no enabled incoming bindings.' }
@@ -771,6 +1035,13 @@ function lineageSlice(value: unknown): value is LineageSliceRef {
   return object(value) && nonEmpty(value.id) && nonEmpty(value.key) && nonEmpty(value.fanOutNodeId)
     && (value.blueprint === undefined || exactRef(value.blueprint)) && (value.pageSpec === undefined || exactRef(value.pageSpec))
     && (value.prototype === undefined || exactRef(value.prototype))
+}
+
+function proposalLineagePin(value: unknown): value is WorkflowProposalLineagePinDto {
+  return object(value)
+    && object(value.proposal) && nonEmpty(value.proposal.id) && nonEmpty(value.proposal.payloadHash)
+    && object(value.manifest) && nonEmpty(value.manifest.id) && nonEmpty(value.manifest.hash)
+    && nonEmpty(value.producerNodeKey) && nonEmpty(value.producerDefinitionNodeId)
 }
 
 export function exactArtifactRefsEqual(left: VersionRefDto, right: VersionRefDto) {

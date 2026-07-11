@@ -3,6 +3,7 @@ package workflow
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -25,10 +26,106 @@ func dryRunPostgres(t *testing.T) *gorm.DB {
 
 func TestGORMLeaseClaimUsesSkipLockedAndRecoveryPredicate(t *testing.T) {
 	normalized := strings.ToLower(claimRunnableSQL)
-	for _, fragment := range []string{"for update skip locked", "status = 'ready'", "lease_expires_at < @now", "attempt = attempt + 1", "returning node.*"} {
+	for _, fragment := range []string{"for update skip locked", "run.status not in ('completed', 'failed', 'cancelled', 'stale')", "status = 'ready'", "lease_expires_at < @now", "attempt = attempt + 1", "returning node.*"} {
 		if !strings.Contains(normalized, fragment) {
 			t.Fatalf("claim SQL missing %q", fragment)
 		}
+	}
+}
+
+func TestGORMClaimRunnableDoesNotConsumeTerminalRunNodesPostgres(t *testing.T) {
+	database, cleanup := multiBundleCompletionPostgresDatabase(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	now := time.Now().UTC()
+	userID, projectID, definitionID, definitionVersionID := uuid.New(), uuid.New(), uuid.New(), uuid.New()
+	profile := CurrentWorkflowExecutionProfileRef()
+	if err := database.Exec(
+		`INSERT INTO users (id,email,display_name,password_hash) VALUES (?,?,?,?)`,
+		userID, userID.String()+"@claim.test", "Claim owner", "unused",
+	).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Exec(
+		`INSERT INTO projects (id,name,created_by) VALUES (?,?,?)`, projectID, "Claim project", userID,
+	).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Exec(
+		`INSERT INTO workflow_definitions (id,project_id,workflow_key,title,created_by) VALUES (?,?,?,?,?)`,
+		definitionID, projectID, "terminal-claim", "Terminal claim", userID,
+	).Error; err != nil {
+		t.Fatal(err)
+	}
+	definitionContent, err := json.Marshal(map[string]any{"executionProfile": profile})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Exec(
+		`INSERT INTO workflow_definition_versions (id,definition_id,version,schema_version,content,content_hash,execution_profile_version,execution_profile_hash,created_by) VALUES (?,?,?,?,?,?,?,?,?)`,
+		definitionVersionID, definitionID, 1, 1, definitionContent, strings.Repeat("d", 64), profile.Version, profile.Hash, userID,
+	).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	type seededNode struct {
+		runID  uuid.UUID
+		nodeID uuid.UUID
+		status NodeStatus
+	}
+	seeded := []seededNode{
+		{runID: uuid.New(), nodeID: uuid.New(), status: NodeReady},
+		{runID: uuid.New(), nodeID: uuid.New(), status: NodeRunning},
+	}
+	for index, item := range seeded {
+		if err := database.Exec(
+			`INSERT INTO workflow_runs (id,project_id,definition_version_id,status,scope,context,started_by,execution_profile_version,execution_profile_hash,started_at,created_at,updated_at) VALUES (?,?,?,'failed','{}','{}',?,?,?,?,?,?)`,
+			item.runID, projectID, definitionVersionID, userID, profile.Version, profile.Hash, now, now, now,
+		).Error; err != nil {
+			t.Fatal(err)
+		}
+		leaseOwner := any(nil)
+		leaseExpiry := any(nil)
+		if item.status == NodeRunning {
+			leaseOwner = "expired-worker"
+			leaseExpiry = now.Add(-time.Minute)
+		}
+		if err := database.Exec(
+			`INSERT INTO workflow_node_runs (id,run_id,node_key,node_type,status,attempt,lease_owner,lease_expires_at,available_at,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+			item.nodeID, item.runID, "terminal-node-"+string(rune('a'+index)), string(domain.NodeTransform), item.status, 7, leaseOwner, leaseExpiry, now.Add(-time.Hour), now, now,
+		).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	store, err := NewGORMStore(database, InlineContentStore{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ClaimRunnable(ctx, "new-worker", now, time.Minute, profile); !errors.Is(err, ErrNoRunnableNode) {
+		t.Fatalf("terminal run node was claimed: %v", err)
+	}
+	for _, item := range seeded {
+		var row nodeRunRow
+		if err := database.First(&row, "id = ?", item.nodeID).Error; err != nil {
+			t.Fatal(err)
+		}
+		if row.Attempt != 7 || NodeStatus(row.Status) != item.status || (item.status == NodeReady && row.LeaseOwner != nil) || (item.status == NodeRunning && (row.LeaseOwner == nil || *row.LeaseOwner != "expired-worker")) {
+			t.Fatalf("terminal node lease state was consumed: %+v", row)
+		}
+	}
+
+	// The same ready node becomes claimable once its aggregate is active, proving
+	// the terminal filter did not accidentally suppress supported work.
+	if err := database.Model(&runRow{}).Where("id = ?", seeded[0].runID).Update("status", RunRunning).Error; err != nil {
+		t.Fatal(err)
+	}
+	lease, err := store.ClaimRunnable(ctx, "new-worker", now, time.Minute, profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lease.NodeID != seeded[0].nodeID.String() || lease.Attempt != 8 {
+		t.Fatalf("active control node was not claimed exactly: %+v", lease)
 	}
 }
 
@@ -59,7 +156,8 @@ func TestGORMMappingPersistsAggregateContextAndEventSequence(t *testing.T) {
 	now := time.Now().UTC()
 	manifestHash, _ := domain.CanonicalHash(map[string]any{"manifest": 1})
 	definitionHash, _ := domain.CanonicalHash(map[string]any{"definition": 1})
-	run := &RunRecord{ID: uuid.NewString(), ProjectID: uuid.NewString(), DefinitionVersionID: uuid.NewString(), Definition: domain.WorkflowDefinitionRef{ID: uuid.NewString(), Version: 1, Hash: definitionHash}, InputManifest: &domain.ManifestRef{ID: uuid.NewString(), Hash: manifestHash}, Status: RunRunning, Scope: json.RawMessage(`{"slice":"all"}`), Context: NewRunContext(), StartedBy: uuid.NewString(), CreatedAt: now, UpdatedAt: now, Nodes: map[string]*NodeRecord{}}
+	profile := CurrentWorkflowExecutionProfileRef()
+	run := &RunRecord{ID: uuid.NewString(), ProjectID: uuid.NewString(), DefinitionVersionID: uuid.NewString(), Definition: domain.WorkflowDefinitionRef{ID: uuid.NewString(), Version: 1, Hash: definitionHash, ExecutionProfile: profile}, ExecutionProfile: profile, InputManifest: &domain.ManifestRef{ID: uuid.NewString(), Hash: manifestHash}, Status: RunRunning, Scope: json.RawMessage(`{"slice":"all"}`), Context: NewRunContext(), StartedBy: uuid.NewString(), CreatedAt: now, UpdatedAt: now, Nodes: map[string]*NodeRecord{}}
 	node := &NodeRecord{ID: uuid.NewString(), RunID: run.ID, Key: "input", DefinitionNodeID: "input", Type: domain.NodeArtifactInput, Status: NodeReady, AvailableAt: now, CreatedAt: now, UpdatedAt: now}
 	run.Nodes[node.Key] = node
 	executionActorID := uuid.NewString()
@@ -71,7 +169,7 @@ func TestGORMMappingPersistsAggregateContextAndEventSequence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(nodes) != 1 || !strings.Contains(string(row.Context), "maxAttempts") || !strings.Contains(string(row.Context), executionActorID) || !strings.Contains(string(row.Context), string(ActorSourceAuthenticatedCommand)) {
+	if len(nodes) != 1 || row.ExecutionProfileVersion != profile.Version || row.ExecutionProfileHash != profile.Hash || !strings.Contains(string(row.Context), "maxAttempts") || !strings.Contains(string(row.Context), executionActorID) || !strings.Contains(string(row.Context), string(ActorSourceAuthenticatedCommand)) {
 		t.Fatalf("aggregate context was not persisted: %s", row.Context)
 	}
 	events, err := store.eventsToRows(run.ID, []Event{{ID: uuid.NewString(), Type: "one", CreatedAt: now}, {ID: uuid.NewString(), Type: "two", CreatedAt: now}}, 9)

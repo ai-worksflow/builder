@@ -126,6 +126,7 @@ func TestPublicBuildManifestCreateRejectsWorkflowLineageInjection(t *testing.T) 
 	}{
 		{name: "workflow run", field: "workflowRunId", value: `"` + uuid.NewString() + `"`},
 		{name: "root ordinal", field: "rootOrdinal", value: `0`},
+		{name: "workflow context", field: "workflowContext", value: `{"definition":{"id":"forged"}}`},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			workbench := &fakeWorkbenchRebaseService{}

@@ -56,6 +56,203 @@ func (DeclarativeConditionEvaluator) Evaluate(_ context.Context, execution Execu
 	return defaultBranch, nil
 }
 
+// DeclarativeConditionEvaluatorV1 is the deterministic typed-input evaluator
+// for the current execution profile. Unlike the frozen pre-pin evaluator above,
+// it cannot inspect whichever unrelated node/value happens to have committed
+// first. Its entire decision context is immutable run identity/scope, the
+// current NodeInputEnvelope, and the current fan-out slice identity.
+type DeclarativeConditionEvaluatorV1 struct{}
+
+func (DeclarativeConditionEvaluatorV1) Evaluate(_ context.Context, execution Execution, branches []domain.ConditionBranch) (string, error) {
+	root, err := conditionContextV1(execution)
+	if err != nil {
+		return "", err
+	}
+	defaultBranch := ""
+	for _, branch := range branches {
+		if branch.Default {
+			defaultBranch = branch.Name
+			continue
+		}
+		if len(branch.Expression) > maxConditionExpressionBytes {
+			return "", fmt.Errorf("condition branch %q expression exceeds %d bytes", branch.Name, maxConditionExpressionBytes)
+		}
+		raw := json.RawMessage(branch.Expression)
+		if err := validateConditionRuleRootsV1(raw, 0); err != nil {
+			return "", fmt.Errorf("condition branch %q: %w", branch.Name, err)
+		}
+		matched, err := evaluateConditionRule(raw, root, 0)
+		if err != nil {
+			return "", fmt.Errorf("evaluate condition branch %q: %w", branch.Name, err)
+		}
+		if matched {
+			return branch.Name, nil
+		}
+	}
+	if defaultBranch == "" {
+		return "", fmt.Errorf("condition has no matching or default branch")
+	}
+	return defaultBranch, nil
+}
+
+func validateCurrentConditionExpressions(definition domain.WorkflowDefinition) error {
+	for _, node := range definition.Nodes {
+		if node.Condition == nil {
+			continue
+		}
+		for _, branch := range node.Condition.Branches {
+			if branch.Default {
+				continue
+			}
+			raw := json.RawMessage(branch.Expression)
+			if _, err := evaluateConditionRule(raw, map[string]any{}, 0); err != nil {
+				return capabilityError("workflow.nodes."+node.ID+".condition", err.Error())
+			}
+			if err := validateConditionRuleRootsV1(raw, 0); err != nil {
+				return capabilityError("workflow.nodes."+node.ID+".condition", err.Error())
+			}
+		}
+	}
+	return nil
+}
+
+func conditionContextV1(execution Execution) (map[string]any, error) {
+	if err := execution.Inputs.Validate(); err != nil {
+		return nil, fmt.Errorf("validate immutable condition inputs: %w", err)
+	}
+	inputs, err := decodeConditionJSON(execution.Inputs.Canonical())
+	if err != nil {
+		return nil, fmt.Errorf("decode immutable condition inputs: %w", err)
+	}
+	inputObject, ok := inputs.(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("immutable condition inputs are not an envelope object")
+	}
+	ports := map[string]any{}
+	edges := map[string]any{}
+	portValues := map[string][]any{}
+	edgeValues := map[string][]any{}
+	for _, binding := range execution.Inputs.Bindings() {
+		value, err := decodeConditionJSON(binding.Value)
+		if err != nil {
+			return nil, fmt.Errorf("decode immutable condition edge %s: %w", binding.EdgeID, err)
+		}
+		portValues[binding.ToPort] = append(portValues[binding.ToPort], value)
+		edgeValues[binding.EdgeID] = append(edgeValues[binding.EdgeID], value)
+	}
+	for port, values := range portValues {
+		ports[port] = values
+	}
+	for edge, values := range edgeValues {
+		edges[edge] = values
+	}
+	// These are deterministic indexes over the hash-bound bindings, not another
+	// source of state. They let definitions address named ports/edges without
+	// depending on a global node key or scheduler completion order.
+	inputObject["ports"] = ports
+	inputObject["edges"] = edges
+	scope, err := decodeConditionJSON(execution.Run.Scope)
+	if err != nil {
+		return nil, fmt.Errorf("decode immutable run scope: %w", err)
+	}
+	definition := map[string]any{
+		"id": execution.Run.Definition.ID, "version": execution.Run.Definition.Version,
+		"hash": execution.Run.Definition.Hash,
+	}
+	executionProfile := map[string]any{
+		"version": execution.Run.ExecutionProfile.Version, "hash": execution.Run.ExecutionProfile.Hash,
+	}
+	var inputManifest any
+	if execution.Run.InputManifest != nil {
+		inputManifest = map[string]any{
+			"id": execution.Run.InputManifest.ID, "hash": execution.Run.InputManifest.Hash,
+		}
+	}
+	run := map[string]any{
+		"id": execution.Run.ID, "projectId": execution.Run.ProjectID,
+		"definitionVersionId": execution.Run.DefinitionVersionID,
+		"definition":          definition, "executionProfile": executionProfile,
+		"inputManifest": inputManifest,
+	}
+	var sliceIdentity any
+	if execution.Node.SliceID != "" {
+		slice, exists := execution.Run.Context.Slices[execution.Node.SliceID]
+		if !exists || slice.ID != execution.Node.SliceID || slice.Key == "" || slice.FanOutNodeID == "" {
+			return nil, fmt.Errorf("current condition slice identity is missing or stale")
+		}
+		sliceIdentity = map[string]any{
+			"id": slice.ID, "key": slice.Key, "title": slice.Title,
+			"fanOutNodeId": slice.FanOutNodeID,
+		}
+	}
+	return map[string]any{
+		"run": run, "scope": scope, "inputs": inputObject, "slice": sliceIdentity,
+	}, nil
+}
+
+func validateConditionRuleRootsV1(raw json.RawMessage, depth int) error {
+	if depth > maxConditionDepth {
+		return fmt.Errorf("condition nesting exceeds %d", maxConditionDepth)
+	}
+	decoded, err := decodeConditionJSON(raw)
+	if err != nil {
+		return err
+	}
+	if _, literal := decoded.(bool); literal {
+		return nil
+	}
+	if _, ok := decoded.(map[string]any); !ok {
+		return fmt.Errorf("expression must be a boolean or rule object")
+	}
+	var rule declarativeRule
+	if err := json.Unmarshal(raw, &rule); err != nil {
+		return err
+	}
+	for _, children := range [][]json.RawMessage{rule.All, rule.Any} {
+		for _, child := range children {
+			if err := validateConditionRuleRootsV1(child, depth+1); err != nil {
+				return err
+			}
+		}
+	}
+	if len(rule.Not) > 0 {
+		return validateConditionRuleRootsV1(rule.Not, depth+1)
+	}
+	if rule.Path == "" {
+		return nil // structural validation reports a malformed rule separately
+	}
+	root, err := conditionPathRoot(rule.Path)
+	if err != nil {
+		return err
+	}
+	switch root {
+	case "run", "scope", "inputs", "slice":
+		return nil
+	default:
+		return fmt.Errorf("condition path root %q is forbidden; use /run, /scope, /inputs, or /slice", root)
+	}
+}
+
+func conditionPathRoot(pointer string) (string, error) {
+	if !strings.HasPrefix(pointer, "/") {
+		return "", fmt.Errorf("condition path must be a JSON pointer")
+	}
+	encoded := strings.SplitN(pointer[1:], "/", 2)[0]
+	if encoded == "" {
+		return "", fmt.Errorf("condition path must select an allowed root")
+	}
+	for index := 0; index < len(encoded); index++ {
+		if encoded[index] != '~' {
+			continue
+		}
+		if index+1 >= len(encoded) || encoded[index+1] != '0' && encoded[index+1] != '1' {
+			return "", fmt.Errorf("condition path contains an invalid JSON pointer escape")
+		}
+		index++
+	}
+	return strings.ReplaceAll(strings.ReplaceAll(encoded, "~1", "/"), "~0", "~"), nil
+}
+
 func conditionContext(execution Execution) (map[string]any, error) {
 	root := map[string]any{
 		"run": map[string]any{

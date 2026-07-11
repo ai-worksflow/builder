@@ -251,3 +251,14 @@ func TestCreateReplayComparesFullNormalizedRequestSemantics(t *testing.T) {
 		t.Fatal("changed filename incorrectly replayed")
 	}
 }
+
+func TestDesignImportReviewMustBeIndependent(t *testing.T) {
+	creator := uuid.New()
+	model := importModel{CreatedBy: creator}
+	if err := requireIndependentReviewer(model, creator); !errors.Is(err, core.ErrForbidden) {
+		t.Fatalf("creator review error = %v", err)
+	}
+	if err := requireIndependentReviewer(model, uuid.New()); err != nil {
+		t.Fatalf("independent reviewer rejected: %v", err)
+	}
+}

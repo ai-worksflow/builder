@@ -1,10 +1,10 @@
 import assert from 'node:assert/strict'
-import { PlatformConversationClient } from '../lib/platform/conversation-client'
+import { collectConversationPages, PlatformConversationClient } from '../lib/platform/conversation-client'
 import type {
   ConversationCommandDto,
   WorkflowIntentProposalDto,
 } from '../lib/platform/conversation-contract'
-import { HttpClient, type FetchLike } from '../lib/platform/http'
+import { HttpClient, PlatformHttpError, type FetchLike } from '../lib/platform/http'
 
 type Call = {
   readonly method: string
@@ -33,7 +33,7 @@ async function main() {
   await client.addMessage('project/1', 'conversation/1', 'Build an order console.')
   await client.generateIntentProposal('project/1', 'conversation/1', {
     triggerMessageId: 'message-1',
-    candidateDefinitionVersionIds: ['definition-version-1'],
+    desiredOutputCapability: 'application',
     sourceRefs: [{
       artifactId: 'brief-1',
       revisionId: 'brief-revision-2',
@@ -43,6 +43,10 @@ async function main() {
       mode: 'use_existing',
       inputManifest: { id: 'manifest-1', hash: 'sha256:manifest' },
       purpose: 'start_application_workflow',
+    },
+    workbenchTargetHint: {
+      runId: 'run-1',
+      rootBundleId: 'bundle-root-1',
     },
     model: 'gpt-5',
   })
@@ -68,9 +72,13 @@ async function main() {
     kind: 'workbench_instruction',
     etag: '"conversation-command:1"',
   } as ConversationCommandDto
-  await client.executeCommand('project/1', 'conversation/1', command, {
-    workbenchResult: { runId: 'run-1', bundleId: 'bundle-1', implementationProposalId: 'proposal-1' },
-  })
+  await client.executeCommand('project/1', 'conversation/1', command)
+  const refreshedRetryCommand = {
+    ...command,
+    etag: '"conversation-command:2"',
+    failure: { code: 'ai_unavailable', message: 'Retry safely.' },
+  } as ConversationCommandDto
+  await client.executeCommand('project/1', 'conversation/1', refreshedRetryCommand)
 
   assert.deepEqual(calls.map((call) => [call.method, call.path]), [
     ['POST', '/v1/projects/project%2F1/conversations'],
@@ -79,31 +87,72 @@ async function main() {
     ['POST', '/v1/projects/project%2F1/conversations/conversation%2F1/intent-proposals/proposal%2F1/decision'],
     ['POST', '/v1/projects/project%2F1/conversations/conversation%2F1/commands/start-command%2F1/execute'],
     ['POST', '/v1/projects/project%2F1/conversations/conversation%2F1/commands/command%2F1/execute'],
+    ['POST', '/v1/projects/project%2F1/conversations/conversation%2F1/commands/command%2F1/execute'],
   ])
   for (const call of calls) {
     assert.ok(call.headers.get('idempotency-key'), `${call.path} omitted Idempotency-Key`)
   }
   assert.deepEqual(calls[1].body, { content: 'Build an order console.' })
   assert.equal(Object.hasOwn(calls[1].body as object, 'role'), false)
-  const generated = calls[2].body as { sourceRefs: readonly Record<string, unknown>[] }
+  const generated = calls[2].body as {
+    desiredOutputCapability: string
+    sourceRefs: readonly Record<string, unknown>[]
+    workbenchTargetHint: { readonly runId: string; readonly rootBundleId: string }
+  }
+  assert.equal(generated.desiredOutputCapability, 'application')
+  assert.equal(Object.hasOwn(generated, 'candidateDefinitionVersionIds'), false)
   assert.equal(Object.hasOwn(generated.sourceRefs[0], 'revisionNumber'), false)
+  assert.deepEqual(generated.workbenchTargetHint, { runId: 'run-1', rootBundleId: 'bundle-root-1' })
   assert.equal(calls[3].headers.get('if-match'), '"intent-proposal:1"')
   assert.equal(calls[4].headers.get('if-match'), '"conversation-command:start:1"')
   assert.deepEqual(calls[4].body, {})
   assert.equal(calls[5].headers.get('if-match'), '"conversation-command:1"')
-  assert.deepEqual(calls[5].body, {
-    workbenchResult: { runId: 'run-1', bundleId: 'bundle-1', implementationProposalId: 'proposal-1' },
-  })
+  assert.deepEqual(calls[5].body, {})
+  assert.equal(calls[6].headers.get('if-match'), '"conversation-command:2"')
+  assert.deepEqual(calls[6].body, {})
 
-  const callCount = calls.length
-  assert.throws(() => client.executeCommand('project/1', 'conversation/1', startCommand, {
-    workbenchResult: { runId: 'run-1', bundleId: 'bundle-1', implementationProposalId: 'proposal-1' },
-  }), /does not accept/)
-  assert.throws(() => client.executeCommand('project/1', 'conversation/1', command), /requires an exact run/)
-  assert.throws(() => client.executeCommand('project/1', 'conversation/1', command, {
-    workbenchResult: { runId: 'run-1', bundleId: 'bundle-1', implementationProposalId: '' },
-  }), /identities must be non-empty/)
-  assert.equal(calls.length, callCount, 'invalid command shapes reached the server')
+  const conflictClient = new PlatformConversationClient(new HttpClient({
+    baseUrl: 'https://platform.example.test',
+    fetch: (async () => Response.json({
+      type: 'urn:worksflow:problem:conversation_summary_checkpoint_required',
+      title: 'Controlled summary checkpoint required',
+      status: 409,
+      code: 'conversation_summary_checkpoint_required',
+      detail: 'Create and review a controlled summary checkpoint; no messages were silently omitted.',
+    }, { status: 409, headers: { 'content-type': 'application/problem+json' } })) as FetchLike,
+  }))
+  await assert.rejects(
+    conflictClient.generateIntentProposal('project-1', 'conversation-1', {
+      triggerMessageId: 'message-51',
+      desiredOutputCapability: 'application',
+      sourceRefs: [{ artifactId: 'brief-1', revisionId: 'revision-1', contentHash: 'sha256:brief' }],
+      manifestIntent: {
+        mode: 'use_existing',
+        inputManifest: { id: 'manifest-1', hash: 'sha256:manifest' },
+        purpose: 'start_or_continue_application_workflow',
+      },
+    }),
+    (error: unknown) => error instanceof PlatformHttpError
+      && error.status === 409
+      && error.code === 'conversation_summary_checkpoint_required'
+      && error.message.includes('no messages were silently omitted'),
+  )
+
+  const requestedCursors: Array<string | undefined> = []
+  const completeHistory = await collectConversationPages(async (cursor) => {
+    requestedCursors.push(cursor)
+    return {
+      data: cursor
+        ? { items: [{ id: 'message-201' }], nextCursor: undefined }
+        : { items: Array.from({ length: 200 }, (_, index) => ({ id: `message-${index + 1}` })), nextCursor: 'after-200' },
+    }
+  })
+  assert.equal(completeHistory.length, 201)
+  assert.deepEqual(requestedCursors, [undefined, 'after-200'])
+  await assert.rejects(
+    collectConversationPages(async () => ({ data: { items: [], nextCursor: 'repeat' } })),
+    /repeated cursor/,
+  )
   console.log('✓ governed conversation client preserves immutable intent and command boundaries')
 }
 

@@ -156,11 +156,12 @@ func TestBlueprintRequiresOneCurrentApprovedRequirementBaseline(t *testing.T) {
 			{Ref: VersionRef{}, Required: true},
 			{Ref: VersionRef{}, Required: true},
 		},
-		"optional": {{Ref: VersionRef{}, Required: false}},
-		"anchored": {{Ref: VersionRef{AnchorID: &anchor}, Required: true}},
+		"optional":      {{Ref: VersionRef{}, Required: false}},
+		"anchored":      {{Ref: VersionRef{AnchorID: &anchor}, Required: true}},
+		"wrong_purpose": {{Ref: VersionRef{}, Purpose: "requirements", Required: true}},
 	} {
 		t.Run(name, func(t *testing.T) {
-			err := service.validateBlueprintBaselineSources(context.Background(), nil, projectID, sources)
+			err := service.validateBlueprintBaselineSources(context.Background(), nil, projectID, nil, sources)
 			if !errors.Is(err, ErrBlockingGate) {
 				t.Fatalf("expected Blueprint baseline gate, got %v", err)
 			}

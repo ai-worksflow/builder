@@ -189,7 +189,9 @@ P0 节点类型：
 
 NodeRun 状态：`pending`、`ready`、`running`、`waiting_input`、`waiting_review`、`completed`、`failed`、`cancelled`、`stale`。
 
-每个端口声明输入/输出 Schema。保存 Definition 时校验 DAG、端口兼容、唯一入口、可达性、条件分支、Merge 配对和终止路径。运行时按边的 `fromPort -> toPort` 建立不可变 NodeInputEnvelope，记录 canonical payload、输入 Hash、来源节点和准确制品引用；执行前再次验证目标端口 Schema。Fan-out 为每个分支复制独立输入，ManifestCompiler 只汇总当前节点的入边 lineage，不能从全局上下文偷读旁路数据。运行时同时提供幂等、数据库租约、心跳、重试、超时、取消、失败恢复和单调事件游标。
+每个端口声明输入/输出 Schema。保存 Definition 时校验 DAG、端口兼容、唯一入口、可达性、条件分支、Merge 配对和终止路径。当前 execution profile 的端口校验不是只比较顶层 `type`：服务端会递归证明“任意合法上游输出经 edge mapping 后都能被目标 Schema 接受”，包括嵌套 required/type、enum/const、array items、数值/字符串边界和 `additionalProperties`；无法证明的复合约束一律 fail-closed。旧 profile 仍按冻结的历史校验器回放。运行时按边的 `fromPort -> toPort` 建立不可变 NodeInputEnvelope，记录 canonical payload、输入 Hash、来源节点和准确制品引用；执行前再次验证目标端口 Schema。Fan-out 为每个分支复制独立输入，ManifestCompiler 只汇总当前节点的入边 lineage，不能从全局上下文偷读旁路数据。运行时同时提供幂等、数据库租约、心跳、重试、超时、取消、失败恢复和单调事件游标。
+
+当前 profile 的 `condition` 也只读取确定性上下文：`/inputs` 是当前节点的 immutable NodeInputEnvelope，`/slice` 是当前 fan-out slice 的稳定身份，`/scope` 与 `/run` 只包含冻结的运行身份。`/nodes`、`/values`、`/slices` 等全局可变视图在新 Definition 中被拒绝，避免平行节点提交先后改变分支；迁移前 Run 则由 legacy evaluator 保留原语义。
 
 一整套产品流程因此可以映射为 typed/versioned DAG：`artifact_input` 负责选择准确事实，`ai_transform` 负责 Proposal 生成，`human_edit` 与 `review_gate` 负责人成为事实的门禁，`condition`、`fan_out`、`merge` 负责分支组合，`manifest_compiler` 把任意上游形状归一为应用输入，随后由 `workbench_build`、`quality_gate` 和 `publish` 完成应用生成与交付。每次 Run 固定 Definition Version；模板升级不会改变进行中的 Run。
 
@@ -206,11 +208,19 @@ NodeRun 状态：`pending`、`ready`、`running`、`waiting_input`、`waiting_re
 对话不能直接修改业务数据。当前控制面只把用户消息转换为两类可审阅意图：
 
 - `start_workflow`：固定已发布 Definition Version、准确来源 Revision/Hash 与 InputManifest；人工接受后形成 Command，执行体为空，服务端以 Command ID 作为 Run ID 幂等启动并回写准确运行身份。
-- `workbench_instruction`：在相同冻结输入上增加必须的 `workbenchInstruction.expectedRunId`，可选固定 `expectedBundleId`；人工接受后，前端必须先载入并核对 Run、Definition Version、Manifest ID/Hash、冻结 Bundle 与 Bundle→Run 关联，才允许请求 Workbench 生成 Proposal。服务端在命令完成前再次验证相同身份。
+- `workbench_instruction`：固定 `workbenchInstruction.expectedRunId` 与 root `expectedBundleId`；人工接受后形成不可变 Command。浏览器执行时只提交 `{}`，不能提交 leaf、Proposal ID 或生成结果；服务端持有命令租约，重新解析当前准确 leaf、工作区、M0/M1 与编辑权限，然后生成并完成命令。
 
 用户消息是不可变追加记录，`commenter` 可发送；assistant 消息只能由服务端随 Proposal 创建。创建会话、生成/提交 Proposal、接受/拒绝以及执行/拒绝 Command 均需要 `edit`。AI 的职责止于 `{proposal,message,provider,model}`，不能自行接受或执行。接受 Proposal 后，顶层 `workbenchInstruction` 被快照为 Command 的 `payload.workbench`，并在 `scope.conversationIntent.workbenchInstruction` 中保留被审阅的运行范围语义。
 
-对话治理 Manifest `M1` 与既有 WorkflowRun 启动时的 Manifest `M0` 独立冻结：M1 可以治理仍在运行的 M0，而无需伪造二者相等。服务端从 active WorkflowRun 的 frozen structural leaf 计算权威 Workbench targets（DefinitionVersion、Run、root、active leaf、manifest group、ordinal），AI 只能在约束 Schema 中选择，不能自造身份。执行 `workbench_instruction` 时客户端必须回传 `{runId,bundleId,implementationProposalId}` 精确收据；服务端验证 M1、M0、预期 root、当前 leaf/workspace 及该 leaf 上仍未应用的 open/reviewing/ready Proposal 后才确认命令。
+`scope.conversationIntent` 是服务端保留字段：公开 Workflow Start 即使由 editor 调用也不能提交它，只有已接受 Conversation Command 的内部构造器能携带不可由 JSON 伪造的 provenance 放行。兼容 Definition 不接受浏览器候选列表，也不会静默截取 UUID 排序的前 N 项；服务端用紧凑索引承载完整候选集合，超过显式数量/字节预算则返回 conflict。Workbench target 同样先做完整可执行性过滤再检查响应上限，因此一个 100-page group 不能吞掉排序靠后的其他 ready run。
+
+对话上下文具有完整的 Summary Checkpoint 闭环。未建立 checkpoint 时，provider 输入必须覆盖 sequence 1 到 trigger 的完整连续历史；实际 canonical payload 超过 200 项或 128 KiB 时，服务端返回带准确 cutoff 的受控冲突。编辑者只能创建不可变的 `pending_review` prefix candidate，另一名具备 `review` 权限的成员必须分页检查准确 source delta，并以 checkpoint ETag 批准；前端还必须核对分页结果最后一项的 message ID 与 checkpoint 的准确 cutoff ID 一致，作者不能自审。批准事务以 CAS 把 conversation head 推进到当前 head 的唯一 child，数据库同时禁止直接 approved insert、回滚、跳链、改写和删除。每个 prefix 用版本化、域隔离的 SHA-256 message chain 绑定 1..N 全量消息，后续 checkpoint 从已批准 hash 继续增长。批准后 provider 只能看到 `{approvedCheckpoint,tailMessages}`：已覆盖原文不再发送，checkpoint 后到 trigger 的消息一条也不能省略。Proposal 固化 checkpoint、tail/context hash 与完整 provider-input hash；tail/context 由 PostgreSQL 原始消息重算，provider-input hash 同时以服务端可信参数独立传入并在落库前比对，Command 再原样复制。任一层篡改都会 fail closed；摘要本身仍是不可信对话内容，不能自证权限、来源身份、批准状态或执行结果。
+
+对话治理 Manifest `M1` 与既有 WorkflowRun 启动时的 Manifest `M0` 独立冻结：M1 可以治理仍在运行的 M0，而无需伪造二者相等。服务端从 active WorkflowRun 的 frozen structural leaf 计算权威 Workbench targets（DefinitionVersion、Run、root、active leaf、manifest group、ordinal、slice ID/key/title），AI 只能在约束 Schema 中选择，不能自造身份。若该会话已有执行过的流程命令，只枚举这些命令关联的 Run；首次接管既有 Run 时，前端可提交当前导航的 `{runId,rootBundleId}` 作为 hint，但服务端必须把它重新解析为唯一、可执行的权威 target。没有关联或 hint 时，两个不同 Run 若映射成相同页面语义则返回 conflict，不允许模型按 UUID 猜测。服务端把解析后的 slice 语义写回待审 Proposal，供人工接受前核对。执行 `workbench_instruction` 时，服务端读取 M1 钉住的实际 Revision 内容，核对 M0 Run、预期 root、当前 leaf/workspace，再以 Command ID 同时作为 generation request key 与确定性 ImplementationProposal ID。Proposal 与 generation claim 完成后才在同一事务中写入命令收据；浏览器不参与任何权威结果选择。
+
+应用生成有独立的持久化 generation claim。它冻结 canonical `{objective,constraints}` 正文及 hash、requested model、生成契约版本、系统提示词 hash、输出 Schema hash、准确治理来源和显式 supersede CAS；同一 request key 的重试必须完全相同。失败或租约过期但尚无产物时，另一名当前具备 `edit` 权限的成员可接管已接受的会话命令；若产物已存在则只恢复同一确定性 Proposal。每个 leaf 最多一个 processing claim 和一个 open/reviewing/ready Proposal，后续会话命令或手工生成绝不能覆盖一个 conversation-owned Proposal。
+
+对话来源的生成请求必须同时携带 `expectedRunId` 与 root `expectedBundleId`。数据库再次把 leaf 的 WorkflowRun、root 和该 Run 的 DefinitionVersion 绑定到已接受 Command 的不可变载荷，并拒绝 rejected/failed Command 创建 claim。Command 收据提交前，确定性 Proposal 只能保持 `open` 且没有 operation decision；数据库禁止它进入 reviewing/ready/applied。只要生成 claim 仍有效或确定性 Proposal 已存在，Command 也不能被拒绝，因此服务崩溃或回执丢失后仍只能恢复同一个产物。
 
 换言之，对话是流程的 input/output 控制面：输入是用户消息与服务端提供的可选、准确目标集合，AI 输出是待审阅 Intent Proposal；人工接受后才形成 Command。对话不承担 DAG 调度，也不直接写 Artifact、Workspace 或 Deployment。
 
@@ -227,6 +237,7 @@ exact PageSpec revisions
 exact prototype revisions
 API/data/permission contracts
 design system and component registry
+typed decision/glossary/reference/change/prototype-flow/fixture context revisions
 current workspace revision
 acceptance matrix and trace matrix
 policies, assumptions and waivers
@@ -235,7 +246,13 @@ manifest content hash
 
 `manifestGroupKey` 是 ManifestCompiler NodeRun ID。一个 WorkflowRun 可包含多组 ManifestCompiler，每组独立从 ordinal 0 开始；数据库唯一域为 project/run/group/ordinal，并用 run/project 复合外键隔离租户。部分编译成功后的重试只有在 compiler node、slice、prototype、ordinal 与冻结内容完全一致时才复用旧 root。
 
+Root 写入不等于对外激活。只有 ManifestCompiler NodeRun 以准确 lease/CAS 提交为 `completed`，且同一事务验证其 hash-valid BuildManifest 与数据库全部 root 的数量、ID 和 ordinal 完全一致后，该组才可被读取、rebase、对话发现或生成 Proposal。第二个 root 失败、租约丢失或编译节点终态失败时，之前写入的 partial root 始终不可作为 Workbench 输入。
+
+Workflow 创建的 Bundle 还携带 `workflowContext`：准确 Definition ref、完整冻结 InputManifest（包括 base、每个 source 的 ref↔purpose、selection anchors、constraints 和 schema）、DeliverySlice、被审阅的 Run scope，以及 OutputContract。该字段只能由注册的 ManifestCompiler 通过内部构造器注入；公开创建 Bundle 的 HTTP DTO 不接受它。历史/手工 Bundle 不含该可选字段，因此原 v1 内容哈希保持兼容。Workbench AI 同时收到这份上下文与每个 InputManifest source 的实际 Revision 内容，不能只看到一个失去用途关系的引用集合。
+
 Workbench 返回 ImplementationProposal：文件操作、路由、组件、API、数据库迁移、测试、预览、诊断、假设、未实现项以及 `requirement/page/layer -> file/symbol/test` 追踪。应用操作时再次校验基础工作区 Revision，并原子生成新的 WorkspaceRevision。
+
+手工重新生成只能显式提交当前 Proposal 的 ID 与 Version 作为 CAS，并且只允许替换尚无任何决策的普通 open Proposal。Workflow runner 不隐式替换，conversation-owned Proposal 永不可被该接口替换。`implementation-proposal-generation/v1` 是当前生成契约版本；修改系统提示词或输出 Schema 时必须发布新版本。旧失败 claim 不会在新代码下悄悄改变语义，而是因版本/hash 不同而拒绝原 request key 的重放。
 
 当同一套冻结需求与设计输入需要继续应用到一个更新后的工作区时，不修改原 ApplicationBuildManifest。客户端调用 `POST /v1/build-manifests/:bundleId/rebase`，只提交一个完整的 `workspaceRevision` 精确引用（artifact、revision、content hash）；服务端重新校验项目归属与内容摘要，并创建新的派生 Manifest。派生 Manifest 保留根 Manifest 和直接父 Manifest 身份，使后续 Proposal、质量与发布可以证明使用的是哪一次 rebase；旧 Manifest 及其已生成结果继续保持可审计。该命令需要认证、编辑权限和 `Idempotency-Key`，响应为 `201 Created`、新 Manifest 的 `Location` 与 `ETag`。
 
@@ -328,6 +345,10 @@ HTTP 使用 `/v1`，JSON 字段统一 camelCase；错误采用 `application/prob
 /v1/projects/:projectId/documents/sync-back
 /v1/projects/:projectId/conversations
 /v1/projects/:projectId/conversations/:conversationId/messages
+/v1/projects/:projectId/conversations/:conversationId/summary-checkpoints
+/v1/projects/:projectId/conversations/:conversationId/summary-checkpoints/:checkpointId
+/v1/projects/:projectId/conversations/:conversationId/summary-checkpoints/:checkpointId/source-messages
+/v1/projects/:projectId/conversations/:conversationId/summary-checkpoints/:checkpointId/decision
 /v1/projects/:projectId/conversations/:conversationId/intent-proposals/*
 /v1/projects/:projectId/conversations/:conversationId/commands/*
 /v1/projects/:projectId/input-manifests
@@ -359,7 +380,7 @@ HTTP 使用 `/v1`，JSON 字段统一 camelCase；错误采用 `application/prob
 
 WebSocket `/v1/ws` 用于 presence、评论/评审通知、制品变更、Proposal/AI 进度、WorkflowRun/NodeRun 状态和 Workbench 日志。客户端先发送认证与订阅消息；服务端返回单调 event cursor。断线后客户端在新的 `subscribe` 消息中携带上次 `cursor` 进行有界恢复；游标超出保留范围或补偿上限时收到 `cursor.reset`。WebSocket 不能作为唯一持久事实源。
 
-新增持久化边界由 Migration `000013_design_imports` 和 `000014_document_collaboration` 固化：前者保存 Design Import 生命周期、不可变快照和跨 PageSpec/Prototype/Manifest/Proposal/Revision 的同项目约束；后者保存 Artifact collaboration ETag、可恢复的下游文档生成命令、解析后的 owner 集合及 AI provider/model，并通过触发器拒绝跨项目成员、制品和生成血缘。
+新增持久化边界由 Migration `000013_design_imports`、`000014_document_collaboration`、`000015_workbench_generation_fencing`、`000016_workflow_execution_profiles`、`000017_application_build_manifest_slice_identity` 和 `000018_conversation_summary_checkpoints` 固化。`000018` 只把迁移前历史 Proposal/Command 标记为 `legacy_unrecorded`；新 writer 必须显式写入 `submitted`、`full_prefix` 或 `checkpoint_tail`，不能省略来源，也不能把新 AI 行伪装成 legacy。部署前必须排空旧 writer，数据库随后强制 pending-only checkpoint insert、独立审核、单步 head 前进，以及 Proposal 到 Command 的准确上下文/provider-hash 复制。
 
 ## 14. 权限与责任
 
@@ -413,11 +434,15 @@ Project Brief ArtifactInput (exact checkpoint)
 
 新项目先把当前 Project Brief Draft 固化为准确 checkpoint；它可以尚未批准，但必须同时作为入口 Manifest 的 baseRevision 和 source。对话只产生可审阅的工作流 Intent，人工接受后，首个 AI 节点基于该 checkpoint 与服务端封存的 conversationIntent 生成 Project Brief Proposal。Proposal 应用并形成新 Revision 后，才进入正式文档审批。
 
-Blueprint 批准后，服务端从该准确、当前且已批准的 Blueprint Revision 读取语义 Page 节点，为每页生成带 Page anchor 的分支。每个分支先完成 PageSpec Proposal、人工编辑和审批，再允许 Prototype AI 消费准确 PageSpec；客户端不能在 Blueprint 审批前预拼 DeliverySlice 或 PageSpec。Merge 只在配置的门禁满足时放行，不要求所有非关键 Slice 同时完成。
+Blueprint 批准后，服务端从该准确、当前且已批准的 Blueprint Revision 读取语义 Page 节点，为每页生成带 Page anchor 的分支。每个分支先完成 PageSpec Proposal、人工编辑和审批，再允许 Prototype AI 消费准确 PageSpec；客户端不能在 Blueprint 审批前预拼 DeliverySlice 或 PageSpec。应用流程的 Merge 固定使用不可豁免的 `policy=all`：只有同一 fan-out epoch 的全部冻结分支都完成准确 PageSpec、Prototype 与审批后才会放行。
 
-内置模板当前为不可变 v2。新项目在创建事务中安装 v1 历史版本和已发布 v2；启动期显式 provisioner 为已有项目幂等发布 v2 并撤销有死锁语义的 v1 发布状态。旧 WorkflowRun 仍按原 Definition Version 回放，GET/List 接口不执行安装或升级写操作。
+`minimum-product-loop` 内置模板当前为不可变 v5。新项目保留 v1、v2、v3 历史版本以及准确钉住 `workflow-engine/v1` 的 v4，并发布同时带 workflow-level I/O contract 与准确 `workflow-engine/v2` ref 的 v5；启动期显式 provisioner 为已有项目幂等补齐并发布 v5，同时撤销旧版本的发布状态。旧 WorkflowRun 仍按原 Definition Version、定义哈希与 execution-profile descriptor hash 回放，GET/List 接口不执行安装或升级写操作。
 
-项目还会安装独立的 `blueprint-selection-app` v1 模板：冻结 Selection -> 选中 Page fan-out -> 精确 PageSpec/Prototype passthrough -> merge -> ManifestCompiler -> Workbench -> Quality -> Publish。它证明最小闭环和 Selection 闭环都只是可复用 Definition Version；用户可以保存其他合法 DAG，但所有版本仍受相同端口、血缘和门禁约束。
+项目还会安装独立的 `blueprint-selection-app` v4 模板，并保留 v1、v2 以及准确钉住 `workflow-engine/v1` 的 v3：冻结 Selection -> 选中 Page fan-out -> 精确 PageSpec/Prototype passthrough -> merge -> ManifestCompiler -> Workbench -> Quality -> Publish。当前 v4 同时冻结 `blueprint_selection -> application/deployment` I/O contract 与 `workflow-engine/v2`。它证明最小闭环和 Selection 闭环都只是可复用 Definition Version；用户可以保存其他合法 DAG，但所有新版本仍受相同端口、语义血缘、能力注册表和门禁约束。
+
+Execution profile 不是一个可变的“引擎版本号”。descriptor hash 覆盖能力注册表、分析上限以及 interpreter/input/result/apply/reconcile/runner/compiler/condition/proposal 等组件 ID；定义、运行、运行摘要和 Workbench ApplicationBuildContext 均保存准确 ref。进程启动时，每个 exact profile 还会一次性封存 runner、manifest compiler、condition evaluator、start/input gate、HumanEdit/Workbench/Review validator、proposal dispatcher 与 human-context allowlist；之后替换 Engine 字段也不能重新解释已钉住 Run。迁移前 payload 只映射固定 `legacy-pre-pin/v0`，且不回写 JSON。worker 在领取 lease 前按本进程支持的 profile 过滤；readiness 会报告任何没有本地 bundle 的活动运行，因此 legacy/current worker 可以在滚动阶段共同处理各自已钉住的 Run，而不会静默改用最新解释器。数据库 expand 默认仅兼容旧 HTTP binary 创建 legacy 定义及其 Run；发布 current profile 属于 contract phase，必须等 pre-016 HTTP writers 排空，旧 binary 尝试启动 current 定义会被复合外键拒绝。
+
+当前 `workflow-engine/v2` 只把 reconcile 组件从 `typed-dag-reconcile/v1` 提升为 `typed-dag-reconcile/v2`：当 Condition 未选择的路径通向尚未产生 slice 的 FanOut 时，调度器必须先证明该 FanOut 已没有任何有效前驱，才取消它的配对 Merge，并让已选择路径与该 Merge 汇合后的共享尾继续运行。只要仍有一个有效但尚未完成的前驱，Merge 就保持 pending。legacy/v0 与 `workflow-engine/v1` 的 evaluator、input、result validation/apply 和旧 reconcile 入口全部冻结，历史 Run 不会获得这条新取消语义。
 
 ## 17. 闭环验收不变量
 

@@ -18,6 +18,7 @@ import (
 	"github.com/worksflow/builder/backend/internal/core"
 	"github.com/worksflow/builder/backend/internal/storage/content"
 	storage "github.com/worksflow/builder/backend/internal/storage/postgres"
+	runtime "github.com/worksflow/builder/backend/internal/workflow"
 	"github.com/worksflow/builder/backend/migrations"
 	gormpostgres "gorm.io/driver/postgres"
 	"gorm.io/gorm"
@@ -151,7 +152,9 @@ func TestPublishResolvesAndStoresDerivedWorkspaceProducerPostgres(t *testing.T) 
 	definitionVersionID := publishLineageSeedWorkflowDefinition(t, database, actorID, projectID, now)
 	runID := publishLineageSeedWorkflowRun(t, database, actorID, projectID, definitionVersionID, now)
 	otherRunID := publishLineageSeedWorkflowRun(t, database, actorID, projectID, definitionVersionID, now.Add(time.Second))
-	groupKey := uuid.NewString()
+	// This fixture models a pre-activation lineage. Migration-owned historical
+	// rows are the only workflow manifests allowed to bypass a compiler CAS.
+	groupKey := "legacy"
 
 	rootID := uuid.New()
 	rootRunID := runID
@@ -352,7 +355,7 @@ func TestPublishResolvesAndStoresDerivedWorkspaceProducerPostgres(t *testing.T) 
 	}
 
 	foreignRunID := otherRunID
-	foreignGroupKey := uuid.NewString()
+	foreignGroupKey := "legacy"
 	foreignOrdinal := 0
 	foreignChildID := uuid.New()
 	foreignParentID := derivedID
@@ -433,6 +436,7 @@ func publishLineageSeedWorkflowDefinition(
 	if err := database.Create(&storage.WorkflowDefinitionVersionModel{
 		ID: versionID, DefinitionID: definitionID, Version: 1, SchemaVersion: 1,
 		Content: json.RawMessage(`{"nodes":[],"edges":[]}`), ContentHash: publishLineagePGHash("definition"),
+		ExecutionProfileVersion: runtime.LegacyWorkflowExecutionProfileVersion, ExecutionProfileHash: runtime.LegacyWorkflowExecutionProfileHash,
 		ValidationReport: json.RawMessage(`{}`), Published: true, CreatedBy: actorID, CreatedAt: now,
 	}).Error; err != nil {
 		t.Fatal(err)
@@ -452,6 +456,7 @@ func publishLineageSeedWorkflowRun(
 	runID := uuid.New()
 	if err := database.Create(&storage.WorkflowRunModel{
 		ID: runID, ProjectID: projectID, DefinitionVersionID: definitionVersionID, Status: "running",
+		ExecutionProfileVersion: runtime.LegacyWorkflowExecutionProfileVersion, ExecutionProfileHash: runtime.LegacyWorkflowExecutionProfileHash,
 		Scope: json.RawMessage(`{}`), Context: json.RawMessage(`{}`), StartedBy: actorID,
 		StartedAt: &now, CreatedAt: now, UpdatedAt: now,
 	}).Error; err != nil {
@@ -486,6 +491,10 @@ func publishLineageSeedRootManifest(
 		model.WorkflowRunID = &modelRunID
 		model.ManifestGroupKey = &modelGroupKey
 		model.RootOrdinal = &modelOrdinal
+		if groupKey != "legacy" {
+			deliverySliceID := uuid.NewString()
+			model.DeliverySliceID = &deliverySliceID
+		}
 	}
 	if err := database.Create(&model).Error; err != nil {
 		t.Fatal(err)

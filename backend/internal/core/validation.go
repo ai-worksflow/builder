@@ -37,6 +37,9 @@ func ValidateArtifactContent(kind string, payload json.RawMessage) ValidationRep
 		findings = append(findings, validateRequirementBaseline(value)...)
 	case "blueprint":
 		findings = append(findings, validateBlueprint(value)...)
+		if _, _, err := DecodeBlueprintSemanticGraph(payload); err != nil {
+			findings = append(findings, blocker("blueprint.application_pages", "$.nodes", err.Error()))
+		}
 	case "page_spec":
 		findings = append(findings, validatePageSpec(value)...)
 	case "prototype":
@@ -279,6 +282,12 @@ func validateStructuredRequirements(blocks, requirements, criteria []map[string]
 }
 
 func validateBlueprint(value map[string]any) []ValidationFinding {
+	if semantic, exists := value["semantic"].(map[string]any); exists {
+		// Approval validates the same representation consumed by selection and
+		// runtime fan-out. DecodeBlueprintSemanticGraph separately rejects drift
+		// when both root and semantic representations are present.
+		value = semantic
+	}
 	nodes := objectSlice(value["nodes"])
 	edges := objectSlice(value["edges"])
 	findings := make([]ValidationFinding, 0)
@@ -286,8 +295,8 @@ func validateBlueprint(value map[string]any) []ValidationFinding {
 		return []ValidationFinding{blocker("blueprint.nodes_required", "$.nodes", "Blueprint must contain semantic nodes.")}
 	}
 	allowedNodes := map[string]bool{
-		"feature": true, "page": true, "component": true, "apiOperation": true,
-		"api": true, "dataEntity": true, "dataModel": true, "permission": true,
+		"feature": true, "page": true, "component": true, "apioperation": true,
+		"api": true, "dataentity": true, "datamodel": true, "permission": true,
 	}
 	allowedEdges := map[string]bool{
 		"drives": true, "satisfied_by": true, "contains": true, "navigates_to": true,
@@ -304,7 +313,7 @@ func validateBlueprint(value map[string]any) []ValidationFinding {
 	for index, node := range nodes {
 		id := firstString(node, "id")
 		key := firstString(node, "key", "businessKey")
-		kind := firstString(node, "type", "kind")
+		kind := strings.ToLower(firstString(node, "type", "kind"))
 		if id == "" || key == "" || !allowedNodes[kind] {
 			findings = append(findings, blocker("blueprint.invalid_node", fmt.Sprintf("$.nodes[%d]", index), "Each editable node needs an ID, stable business key, and supported type."))
 			continue
@@ -336,7 +345,7 @@ func validateBlueprint(value map[string]any) []ValidationFinding {
 				findings = append(findings, blocker("blueprint.page_requirement", fmt.Sprintf("$.nodes[%d].requirementIds", index), "Every Page must trace to at least one stable requirement ID."))
 			}
 		}
-		if kind == "apiOperation" || kind == "api" {
+		if kind == "apioperation" || kind == "api" {
 			method := strings.ToUpper(firstString(node, "method"))
 			path := firstString(node, "path", "route")
 			if !allowedHTTPMethod(method) || path == "" || !strings.HasPrefix(path, "/") {
@@ -353,18 +362,18 @@ func validateBlueprint(value map[string]any) []ValidationFinding {
 	for index, edge := range edges {
 		from := firstString(edge, "from", "sourceNodeId", "source")
 		to := firstString(edge, "to", "targetNodeId", "target")
-		relation := firstString(edge, "type", "kind", "relation")
+		relation := strings.ToLower(firstString(edge, "type", "kind", "relation"))
 		if nodeByID[from] == nil || nodeByID[to] == nil || !allowedEdges[relation] || from == to {
 			findings = append(findings, blocker("blueprint.invalid_edge", fmt.Sprintf("$.edges[%d]", index), "Edges must use valid endpoints and a supported semantic relation."))
 			continue
 		}
 		if relation == "contains" {
 			contains[from] = append(contains[from], to)
-			if firstString(nodeByID[from], "type", "kind") == "feature" && firstString(nodeByID[to], "type", "kind") == "page" {
+			if strings.EqualFold(firstString(nodeByID[from], "type", "kind"), "feature") && strings.EqualFold(firstString(nodeByID[to], "type", "kind"), "page") {
 				pageHasFeature[to] = true
 			}
 		}
-		if relation == "requires" && firstString(nodeByID[to], "type", "kind") == "permission" {
+		if relation == "requires" && strings.EqualFold(firstString(nodeByID[to], "type", "kind"), "permission") {
 			protectedOperations[from] = true
 		}
 	}
@@ -372,11 +381,11 @@ func validateBlueprint(value map[string]any) []ValidationFinding {
 		findings = append(findings, blocker("blueprint.contains_cycle", "$.edges", "The contains relationship must be acyclic."))
 	}
 	for id, node := range nodeByID {
-		if firstString(node, "type", "kind") == "page" && !pageHasFeature[id] {
+		if strings.EqualFold(firstString(node, "type", "kind"), "page") && !pageHasFeature[id] {
 			findings = append(findings, blocker("blueprint.page_feature", "$.nodes", fmt.Sprintf("Page %s must belong to a Feature.", id)))
 		}
-		kind := firstString(node, "type", "kind")
-		if (kind == "apiOperation" || kind == "api") && !protectedOperations[id] {
+		kind := strings.ToLower(firstString(node, "type", "kind"))
+		if (kind == "apioperation" || kind == "api") && !protectedOperations[id] {
 			findings = append(findings, blocker("blueprint.api_permission", "$.edges", fmt.Sprintf("API operation %s must require a Permission node.", id)))
 		}
 	}
@@ -425,6 +434,12 @@ func validatePageSpec(value map[string]any) []ValidationFinding {
 	for _, required := range []string{"ready", "loading", "empty", "error"} {
 		if !stateKeys[required] {
 			findings = append(findings, blocker("page_spec.required_state", "$.states", fmt.Sprintf("PageSpec must declare the %s state.", required)))
+			continue
+		}
+		for index, state := range states {
+			if firstString(state, "key", "name") == required && !boolean(state["required"]) {
+				findings = append(findings, blocker("page_spec.required_state_flag", fmt.Sprintf("$.states[%d].required", index), fmt.Sprintf("The canonical %s state must be marked required.", required)))
+			}
 		}
 	}
 	if len(objectSlice(value["acceptanceRefs"])) == 0 && len(stringSlice(value["acceptanceCriterionIds"])) == 0 {
@@ -439,6 +454,9 @@ func validatePageSpec(value map[string]any) []ValidationFinding {
 		}
 		if bindingIDs[identifier] {
 			findings = append(findings, blocker("page_spec.duplicate_binding", fmt.Sprintf("$.dataBindings[%d].id", index), "PageSpec data binding IDs must be unique."))
+		}
+		if source == "api" && strings.TrimSpace(firstString(binding, "operationId")) == "" {
+			findings = append(findings, blocker("page_spec.api_operation", fmt.Sprintf("$.dataBindings[%d].operationId", index), "API data bindings must name one stable Blueprint operation ID."))
 		}
 		bindingIDs[identifier] = true
 	}
@@ -467,6 +485,20 @@ func allowedPageDataSource(source string) bool {
 
 func validatePrototype(value map[string]any) []ValidationFinding {
 	findings := make([]ValidationFinding, 0)
+	for _, field := range []string{
+		"states", "breakpoints", "frames", "overrides", "interactions", "fixtures",
+		"tokenBindings", "componentBindings", "assets", "traceLinks",
+	} {
+		if raw, exists := value[field]; exists && !isJSONObjectArray(raw) {
+			findings = append(findings, blocker(
+				"prototype.array_contract", "$."+field,
+				fmt.Sprintf("Prototype %s must be an array containing only JSON objects.", field),
+			))
+		}
+	}
+	if raw, exists := value["layers"]; exists && !isPrototypeLayerCollection(raw) {
+		findings = append(findings, blocker("prototype.layer_contract", "$.layers", "Prototype layers must be a record or array containing only JSON objects."))
+	}
 	legacyPageSpecRef := firstString(value, "sourcePageSpecArtifactId") != "" &&
 		firstString(value, "sourcePageSpecRevisionId") != "" &&
 		firstString(value, "sourcePageSpecHash") != ""
@@ -484,6 +516,9 @@ func validatePrototype(value map[string]any) []ValidationFinding {
 		key := firstString(state, "key")
 		if identifier == "" || key == "" || firstString(state, "title") == "" {
 			findings = append(findings, blocker("prototype.invalid_state", fmt.Sprintf("$.states[%d]", index), "Every prototype state needs a stable ID, key, and title."))
+		}
+		if _, exists := state["required"].(bool); !exists || !hasJSONStringArray(state, "fixtureIds") {
+			findings = append(findings, blocker("prototype.state_contract", fmt.Sprintf("$.states[%d]", index), "Every prototype state must explicitly declare required and fixtureIds."))
 		}
 		if stateIDs[identifier] || stateKeys[key] {
 			findings = append(findings, blocker("prototype.duplicate_state", fmt.Sprintf("$.states[%d]", index), "Prototype state IDs and keys must be unique."))
@@ -514,12 +549,11 @@ func validatePrototype(value map[string]any) []ValidationFinding {
 			findings = append(findings, blocker("prototype.required_breakpoint", "$.breakpoints", fmt.Sprintf("Prototype must declare the %s breakpoint.", required)))
 		}
 	}
-	layerObjects := prototypeLayerObjects(value["layers"])
+	layerObjects := prototypeCanonicalLayerObjects(value)
 	layers := objectSlice(value["layers"])
 	if len(layerObjects) == 0 && len(layers) == 0 {
 		if scene, ok := value["scene"].(map[string]any); ok {
 			layers = objectSlice(scene["layers"])
-			layerObjects = prototypeLayerObjects(scene["layers"])
 		}
 	}
 	if len(layerObjects) == 0 && len(layers) == 0 {
@@ -546,6 +580,11 @@ func validatePrototype(value map[string]any) []ValidationFinding {
 		for childIndex, childID := range stringSlice(layer["childIds"]) {
 			if layerObjects[childID] == nil || childID == id {
 				findings = append(findings, blocker("prototype.layer_child", fmt.Sprintf("$.layers.%s.childIds[%d]", id, childIndex), "Layer childIds must reference another existing layer."))
+			}
+		}
+		for _, field := range []string{"childIds", "requirementIds", "acceptanceCriterionIds"} {
+			if _, exists := layer[field]; exists && !hasJSONStringArray(layer, field) {
+				findings = append(findings, blocker("prototype.layer_array_contract", "$.layers."+id+"."+field, "Prototype layer trace and child fields must contain only stable string IDs."))
 			}
 		}
 	}
@@ -580,27 +619,128 @@ func validatePrototype(value map[string]any) []ValidationFinding {
 			}
 		}
 	}
-	for index, fixture := range objectSlice(value["fixtures"]) {
-		if sanitized, exists := fixture["sanitized"].(bool); !exists || !sanitized {
-			findings = append(findings, blocker("prototype.fixture_sanitized", fmt.Sprintf("$.fixtures[%d]", index), "Prototype fixtures must be marked sanitized."))
+	fixtures := objectSlice(value["fixtures"])
+	fixtureIDs := map[string]bool{}
+	fixtureStateIDs := map[string]string{}
+	for index, fixture := range fixtures {
+		fixtureID := strings.TrimSpace(firstString(fixture, "id"))
+		if fixtureID == "" || fixtureIDs[fixtureID] {
+			findings = append(findings, blocker("prototype.fixture_id", fmt.Sprintf("$.fixtures[%d].id", index), "Prototype fixtures need unique stable IDs."))
 		}
-		if !stateIDs[firstString(fixture, "stateId")] {
+		fixtureIDs[fixtureID] = true
+		stateID := strings.TrimSpace(firstString(fixture, "stateId"))
+		fixtureStateIDs[fixtureID] = stateID
+		if !stateIDs[stateID] {
 			findings = append(findings, blocker("prototype.fixture_state", fmt.Sprintf("$.fixtures[%d].stateId", index), "Prototype fixture stateId must reference an existing state."))
+		}
+		if err := validatePrototypeFixtureDTO(fixture); err != nil {
+			findings = append(findings, blocker("prototype.fixture_contract", fmt.Sprintf("$.fixtures[%d]", index), err.Error()))
+		}
+		if _, exists := fixture["operationId"]; exists && strings.TrimSpace(firstString(fixture, "operationId")) == "" {
+			findings = append(findings, blocker("prototype.fixture_operation", fmt.Sprintf("$.fixtures[%d].operationId", index), "Fixture operationId must be a non-empty stable operation ID when present."))
+		}
+	}
+	declaredFixtureState := map[string]string{}
+	for stateIndex, state := range states {
+		stateID := strings.TrimSpace(firstString(state, "id"))
+		for fixtureIndex, fixtureID := range stringSlice(state["fixtureIds"]) {
+			fixtureID = strings.TrimSpace(fixtureID)
+			if fixtureID == "" || !fixtureIDs[fixtureID] || fixtureStateIDs[fixtureID] != stateID || declaredFixtureState[fixtureID] != "" {
+				findings = append(findings, blocker("prototype.state_fixture_set", fmt.Sprintf("$.states[%d].fixtureIds[%d]", stateIndex, fixtureIndex), "State fixtureIds must be a duplicate-free exact set of fixtures owned by that state."))
+			}
+			declaredFixtureState[fixtureID] = stateID
+		}
+	}
+	for fixtureID := range fixtureIDs {
+		if declaredFixtureState[fixtureID] == "" {
+			findings = append(findings, blocker("prototype.state_fixture_set", "$.states", fmt.Sprintf("Fixture %s must be declared by exactly one state fixtureIds set.", fixtureID)))
 		}
 	}
 	allowedTriggers := map[string]bool{"click": true, "submit": true, "change": true, "hover": true, "load": true}
 	allowedActions := map[string]bool{"navigate": true, "setState": true, "openOverlay": true, "closeOverlay": true, "updateBinding": true, "submitFixture": true}
+	interactionIDs := map[string]bool{}
 	for index, interaction := range objectSlice(value["interactions"]) {
-		if firstString(interaction, "id") == "" || layerObjects[firstString(interaction, "sourceLayerId")] == nil || !allowedTriggers[firstString(interaction, "trigger")] {
+		interactionID := strings.TrimSpace(firstString(interaction, "id"))
+		if interactionID == "" || interactionIDs[interactionID] || layerObjects[firstString(interaction, "sourceLayerId")] == nil || !allowedTriggers[firstString(interaction, "trigger")] {
 			findings = append(findings, blocker("prototype.invalid_interaction", fmt.Sprintf("$.interactions[%d]", index), "Interactions require a stable ID, existing source layer, and whitelisted trigger."))
 		}
-		for actionIndex, action := range objectSlice(interaction["actions"]) {
-			if !allowedActions[firstString(action, "type")] {
+		interactionIDs[interactionID] = true
+		actions := objectSlice(interaction["actions"])
+		if !isJSONObjectArray(interaction["actions"]) {
+			findings = append(findings, blocker("prototype.interaction_actions", fmt.Sprintf("$.interactions[%d].actions", index), "Prototype interaction actions must be an array containing only declarative action objects."))
+		}
+		if len(actions) == 0 {
+			findings = append(findings, blocker("prototype.interaction_actions", fmt.Sprintf("$.interactions[%d].actions", index), "Every prototype interaction must declare at least one action."))
+		}
+		for actionIndex, action := range actions {
+			actionType := firstString(action, "type")
+			if !allowedActions[actionType] {
 				findings = append(findings, blocker("prototype.invalid_action", fmt.Sprintf("$.interactions[%d].actions[%d]", index, actionIndex), "Prototype interaction actions must use the declarative whitelist."))
+				continue
+			}
+			validReference := true
+			switch actionType {
+			case "navigate":
+				target, err := canonicalBlueprintAlias(
+					"Prototype navigate action target", false,
+					firstString(action, "targetPageNodeId"), firstString(action, "targetPageSpecId"),
+				)
+				validReference = err == nil && target != ""
+			case "setState":
+				validReference = stateIDs[strings.TrimSpace(firstString(action, "stateId"))]
+			case "openOverlay":
+				layer := layerObjects[strings.TrimSpace(firstString(action, "layerId"))]
+				validReference = layer != nil && strings.EqualFold(strings.TrimSpace(firstString(layer, "kind")), "overlay")
+			case "updateBinding":
+				_, hasValue := action["value"]
+				validReference = strings.TrimSpace(firstString(action, "bindingId")) != "" && hasValue
+			case "submitFixture":
+				validReference = fixtureIDs[strings.TrimSpace(firstString(action, "fixtureId"))]
+			}
+			if !validReference {
+				findings = append(findings, blocker("prototype.action_reference", fmt.Sprintf("$.interactions[%d].actions[%d]", index, actionIndex), "Prototype action fields must reference the exact declared state, overlay, binding, fixture, or navigation target."))
 			}
 		}
 	}
 	return findings
+}
+
+func hasJSONStringArray(value map[string]any, key string) bool {
+	items, exists := value[key].([]any)
+	if !exists {
+		return false
+	}
+	for _, item := range items {
+		if _, ok := item.(string); !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func isJSONObjectArray(value any) bool {
+	items, ok := value.([]any)
+	if !ok {
+		return false
+	}
+	for _, item := range items {
+		if _, ok := item.(map[string]any); !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func isPrototypeLayerCollection(value any) bool {
+	if object, ok := value.(map[string]any); ok {
+		for _, item := range object {
+			if _, ok := item.(map[string]any); !ok {
+				return false
+			}
+		}
+		return true
+	}
+	return isJSONObjectArray(value)
 }
 
 func validVersionReference(value any) bool {

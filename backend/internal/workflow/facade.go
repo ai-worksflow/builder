@@ -77,7 +77,7 @@ func (f Facade) WorkflowCapabilities(ctx context.Context, projectID, actorID str
 	if err := f.authorize(ctx, projectID, actorID, core.ActionView); err != nil {
 		return WorkflowCapabilities{}, err
 	}
-	return f.Engine.Capabilities, nil
+	return CurrentWorkflowExecutionProfileDescriptor().Capabilities, nil
 }
 
 // DiscoverCompatibleDefinitionVersions is the authoritative control-plane
@@ -102,19 +102,31 @@ func (f Facade) DiscoverCompatibleDefinitionVersions(
 	if manifest.Ref() != request.InputManifest || manifest.ProjectID != projectID {
 		return nil, domain.ErrManifestUnpinned
 	}
-	if f.Engine.StartArtifactKinds == nil {
-		return nil, fmt.Errorf("workflow start artifact-kind resolver is required")
-	}
-	artifactKinds, err := f.Engine.StartArtifactKinds.ResolveStartArtifactKinds(ctx, manifest)
+	profile, err := f.Engine.executionProfile(CurrentWorkflowExecutionProfileRef())
 	if err != nil {
 		return nil, err
 	}
-	descriptor := DescribeStartManifest(manifest, artifactKinds)
+	runtime := profile.executionRuntime(f.Engine)
+	if runtime.startArtifactKinds == nil {
+		return nil, fmt.Errorf("workflow start artifact-kind resolver is required")
+	}
+	metadata := StartArtifactMetadata{}
+	if resolver, ok := runtime.startArtifactKinds.(StartArtifactMetadataResolver); ok {
+		metadata, err = resolver.ResolveStartArtifactMetadata(ctx, manifest)
+	} else {
+		metadata.Kinds, err = runtime.startArtifactKinds.ResolveStartArtifactKinds(ctx, manifest)
+		metadata.Count = len(artifactInputRefs(manifest))
+	}
+	if err != nil {
+		return nil, err
+	}
+	descriptor := DescribeStartManifest(manifest, metadata)
 	definitions, err := f.Store.ListDefinitions(ctx, projectID)
 	if err != nil {
 		return nil, err
 	}
 	compatible := make([]DefinitionRecord, 0)
+	currentProfile := CurrentWorkflowExecutionProfileRef()
 	for _, latest := range definitions {
 		versions, err := f.Store.ListDefinitionVersions(ctx, latest.Definition.ID)
 		if err != nil {
@@ -125,13 +137,16 @@ func (f Facade) DiscoverCompatibleDefinitionVersions(
 			if !version.Published || (version.ProjectID != "" && version.ProjectID != projectID) {
 				continue
 			}
-			if err := version.Definition.Validate(); err != nil {
+			if version.ExecutionProfile != currentProfile || version.Definition.ExecutionProfile != currentProfile {
+				continue
+			}
+			if err := ValidateDefinitionForExecutionProfile(version.Definition, version.ExecutionProfile); err != nil {
 				return nil, err
 			}
 			// Discovery is for new runs, not historical replay. Pre-contract
 			// versions remain loadable by already pinned runs but are never offered
 			// as candidates, and removed execution capabilities fail closed.
-			if version.Definition.InputContract == nil || f.Engine.Capabilities.ValidateDefinition(version.Definition) != nil {
+			if version.Definition.InputContract == nil {
 				continue
 			}
 			if CompatibleStart(version.Definition, descriptor, request.DesiredOutputCapability) == nil {
@@ -163,6 +178,80 @@ func (f Facade) CompatibleDefinitionVersions(
 	return f.DiscoverCompatibleDefinitionVersions(ctx, projectID, actorID, DefinitionDiscoveryRequest{
 		InputManifest: manifestRef, DesiredOutputCapability: desiredOutputCapability,
 	})
+}
+
+// ValidateCompatibleDefinitionVersion revalidates an exact proposed start at
+// both proposal-creation and command-execution time. It is intentionally not a
+// membership check against a client candidate list.
+func (f Facade) ValidateCompatibleDefinitionVersion(
+	ctx context.Context,
+	projectID, actorID, versionID string,
+	manifestRef domain.ManifestRef,
+	desiredOutputCapability string,
+) error {
+	if err := f.authorize(ctx, projectID, actorID, core.ActionView); err != nil {
+		return err
+	}
+	record, err := f.Store.GetDefinitionVersion(ctx, versionID)
+	if err != nil {
+		return err
+	}
+	if !record.Published || (record.ProjectID != "" && record.ProjectID != projectID) {
+		return core.ErrInvalidInput
+	}
+	if record.ExecutionProfile != CurrentWorkflowExecutionProfileRef() || record.Definition.ExecutionProfile != record.ExecutionProfile {
+		return core.ErrInvalidInput
+	}
+	if err := ValidateDefinitionForExecutionProfile(record.Definition, record.ExecutionProfile); err != nil {
+		return err
+	}
+	if record.Definition.InputContract == nil {
+		return core.ErrInvalidInput
+	}
+	_, descriptor, err := f.resolveStartDescriptor(ctx, projectID, manifestRef)
+	if err != nil {
+		return err
+	}
+	if err := CompatibleStart(record.Definition, descriptor, desiredOutputCapability); err != nil {
+		return &domain.DomainError{Kind: domain.ErrInvalidArgument, Field: "inputManifest", Message: err.Error()}
+	}
+	return nil
+}
+
+func (f Facade) resolveStartDescriptor(
+	ctx context.Context,
+	projectID string,
+	manifestRef domain.ManifestRef,
+) (domain.InputManifest, StartManifestDescriptor, error) {
+	if err := manifestRef.Validate(); err != nil {
+		return domain.InputManifest{}, StartManifestDescriptor{}, core.ErrInvalidInput
+	}
+	manifest, err := f.Store.GetManifest(ctx, manifestRef.ID)
+	if err != nil {
+		return domain.InputManifest{}, StartManifestDescriptor{}, err
+	}
+	if manifest.Ref() != manifestRef || manifest.ProjectID != projectID {
+		return domain.InputManifest{}, StartManifestDescriptor{}, domain.ErrManifestUnpinned
+	}
+	profile, err := f.Engine.executionProfile(CurrentWorkflowExecutionProfileRef())
+	if err != nil {
+		return domain.InputManifest{}, StartManifestDescriptor{}, err
+	}
+	runtime := profile.executionRuntime(f.Engine)
+	if runtime.startArtifactKinds == nil {
+		return domain.InputManifest{}, StartManifestDescriptor{}, fmt.Errorf("workflow start artifact-kind resolver is required")
+	}
+	metadata := StartArtifactMetadata{}
+	if resolver, ok := runtime.startArtifactKinds.(StartArtifactMetadataResolver); ok {
+		metadata, err = resolver.ResolveStartArtifactMetadata(ctx, manifest)
+	} else {
+		metadata.Kinds, err = runtime.startArtifactKinds.ResolveStartArtifactKinds(ctx, manifest)
+		metadata.Count = len(artifactInputRefs(manifest))
+	}
+	if err != nil {
+		return domain.InputManifest{}, StartManifestDescriptor{}, err
+	}
+	return manifest, DescribeStartManifest(manifest, metadata), nil
 }
 func (f Facade) ListDefinitionVersions(ctx context.Context, projectID, definitionID, actorID string) ([]DefinitionRecord, error) {
 	if err := f.authorize(ctx, projectID, actorID, core.ActionView); err != nil {
@@ -198,9 +287,10 @@ func (f Facade) CreateDefinition(ctx context.Context, projectID, actorID string,
 	if input.SchemaVersion == "" {
 		input.SchemaVersion = "2"
 	}
-	definition, err := domain.NewWorkflowDefinitionWithContracts(
+	profile := CurrentWorkflowExecutionProfileRef()
+	definition, err := domain.NewWorkflowDefinitionWithExecutionProfile(
 		uuid.NewString(), 1, input.Name, input.SchemaVersion, input.Nodes, input.Edges,
-		input.InputContract, input.OutputContract, actorID, time.Now().UTC(),
+		input.InputContract, input.OutputContract, profile, actorID, time.Now().UTC(),
 	)
 	if err != nil {
 		return DefinitionRecord{}, err
@@ -210,7 +300,7 @@ func (f Facade) CreateDefinition(ctx context.Context, projectID, actorID string,
 	}
 	record := DefinitionRecord{
 		VersionID: uuid.NewString(), ProjectID: projectID, Key: input.Key,
-		Title: input.Title, Description: input.Description, Published: false, Definition: definition,
+		Title: input.Title, Description: input.Description, Published: false, ExecutionProfile: profile, Definition: definition,
 	}
 	if err := f.Store.SaveDefinition(ctx, record); err != nil {
 		return DefinitionRecord{}, err
@@ -244,9 +334,10 @@ func (f Facade) CreateDefinitionVersion(ctx context.Context, projectID, definiti
 	if input.OutputContract.Capability == "" && latest.Definition.OutputContract != nil {
 		input.OutputContract = *latest.Definition.OutputContract
 	}
-	definition, err := domain.NewWorkflowDefinitionWithContracts(
+	profile := CurrentWorkflowExecutionProfileRef()
+	definition, err := domain.NewWorkflowDefinitionWithExecutionProfile(
 		latest.Definition.ID, latest.Definition.Version+1, input.Name, input.SchemaVersion,
-		input.Nodes, input.Edges, input.InputContract, input.OutputContract, actorID, time.Now().UTC(),
+		input.Nodes, input.Edges, input.InputContract, input.OutputContract, profile, actorID, time.Now().UTC(),
 	)
 	if err != nil {
 		return DefinitionRecord{}, err
@@ -256,7 +347,7 @@ func (f Facade) CreateDefinitionVersion(ctx context.Context, projectID, definiti
 	}
 	record := DefinitionRecord{
 		VersionID: uuid.NewString(), ProjectID: projectID, Key: latest.Key,
-		Title: latest.Title, Description: latest.Description, Published: false, Definition: definition,
+		Title: latest.Title, Description: latest.Description, Published: false, ExecutionProfile: profile, Definition: definition,
 	}
 	if err := f.Store.SaveDefinition(ctx, record); err != nil {
 		return DefinitionRecord{}, err
@@ -275,6 +366,9 @@ func (f Facade) PublishDefinitionVersion(ctx context.Context, projectID, definit
 	if record.ProjectID != projectID || record.Definition.ID != definitionID {
 		return DefinitionRecord{}, core.ErrNotFound
 	}
+	if record.ExecutionProfile != CurrentWorkflowExecutionProfileRef() || record.Definition.ExecutionProfile != record.ExecutionProfile {
+		return DefinitionRecord{}, &domain.DomainError{Kind: domain.ErrInvalidArgument, Field: "workflow.executionProfile", Message: "only the current exact execution profile can be published"}
+	}
 	if err := validateAuthoredDefinition(record.Definition, f.Engine.Capabilities); err != nil {
 		return DefinitionRecord{}, err
 	}
@@ -282,74 +376,8 @@ func (f Facade) PublishDefinitionVersion(ctx context.Context, projectID, definit
 }
 
 func validateAuthoredDefinition(definition domain.WorkflowDefinition, registries ...WorkflowCapabilities) error {
-	if err := definition.Validate(); err != nil {
-		return err
-	}
-	if len(definition.Nodes) > 200 || len(definition.Edges) > 1000 {
-		return &domain.DomainError{Kind: domain.ErrValidation, Field: "workflow", Message: "workflow exceeds 200 nodes or 1000 edges"}
-	}
-	for _, node := range definition.Nodes {
-		switch node.Type {
-		case domain.NodeArtifactInput, domain.NodeAITransform, domain.NodeHumanEdit, domain.NodeReviewGate,
-			domain.NodeCondition, domain.NodeFanOut, domain.NodeMerge, domain.NodeQualityGate,
-			domain.NodeManifestCompiler, domain.NodeWorkbenchBuild, domain.NodePublish:
-		case domain.NodeTransform:
-			if node.Transform == nil || node.Transform.Transform != "selection_passthrough" {
-				return &domain.DomainError{Kind: domain.ErrValidation, Field: "workflow.nodes." + node.ID, Message: "only selection_passthrough transforms are supported"}
-			}
-		default:
-			return &domain.DomainError{Kind: domain.ErrValidation, Field: "workflow.nodes." + node.ID, Message: "legacy node type cannot be used in a new workflow version"}
-		}
-		for _, requiredRole := range workflowNodeRoles(node) {
-			if !validWorkflowRole(requiredRole) {
-				return &domain.DomainError{Kind: domain.ErrValidation, Field: "workflow.nodes." + node.ID, Message: "requiredRole is not a project role"}
-			}
-		}
-		if node.Condition != nil {
-			for _, branch := range node.Condition.Branches {
-				if branch.Default {
-					continue
-				}
-				if len(branch.Expression) > maxConditionExpressionBytes {
-					return &domain.DomainError{Kind: domain.ErrValidation, Field: "workflow.nodes." + node.ID, Message: "condition expression is too large"}
-				}
-				if _, err := evaluateConditionRule(json.RawMessage(branch.Expression), map[string]any{}, 0); err != nil {
-					return &domain.DomainError{Kind: domain.ErrValidation, Field: "workflow.nodes." + node.ID, Message: err.Error()}
-				}
-			}
-		}
-	}
-	capabilities := PlatformWorkflowCapabilities(true, true)
-	if len(registries) > 0 {
-		capabilities = registries[0]
-	}
-	return capabilities.ValidateDefinition(definition)
-}
-
-func workflowNodeRoles(node domain.NodeDefinition) []string {
-	roles := make([]string, 0, 1)
-	if node.HumanEdit != nil {
-		roles = append(roles, node.HumanEdit.RequiredRole)
-	}
-	if node.ReviewGate != nil {
-		roles = append(roles, node.ReviewGate.RequiredRole)
-	}
-	if node.QualityGate != nil && strings.TrimSpace(node.QualityGate.RequiredRole) != "" {
-		roles = append(roles, node.QualityGate.RequiredRole)
-	}
-	if node.Publish != nil {
-		roles = append(roles, node.Publish.RequiredRole)
-	}
-	return roles
-}
-
-func validWorkflowRole(role string) bool {
-	switch core.Role(strings.TrimSpace(role)) {
-	case core.RoleOwner, core.RoleAdmin, core.RoleEditor, core.RoleCommenter, core.RoleViewer:
-		return true
-	default:
-		return false
-	}
+	_ = registries // Kept for source compatibility; profile descriptor is authoritative.
+	return ValidateDefinitionForExecutionProfile(definition, CurrentWorkflowExecutionProfileRef())
 }
 
 func (f Facade) Start(ctx context.Context, projectID, actorID string, request StartRequest) (*RunRecord, error) {

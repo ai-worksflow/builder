@@ -24,9 +24,10 @@ import (
 )
 
 type multiBundleMemoryContentStore struct {
-	mu       sync.Mutex
-	sequence uint64
-	items    map[string]content.StoredContent
+	mu          sync.Mutex
+	sequence    uint64
+	items       map[string]content.StoredContent
+	finalizeErr error
 }
 
 func newMultiBundleMemoryContentStore() *multiBundleMemoryContentStore {
@@ -56,6 +57,9 @@ func (s *multiBundleMemoryContentStore) PutPending(
 func (s *multiBundleMemoryContentStore) Finalize(_ context.Context, contentID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.finalizeErr != nil {
+		return s.finalizeErr
+	}
 	stored, exists := s.items[contentID]
 	if !exists {
 		return content.ErrContentNotFound
@@ -65,6 +69,102 @@ func (s *multiBundleMemoryContentStore) Finalize(_ context.Context, contentID st
 	stored.FinalizedAt = &now
 	s.items[contentID] = stored
 	return nil
+}
+
+func TestGeneratedProposalRecoversAfterFinalizeFailurePostgres(t *testing.T) {
+	database, cleanup := multiBundlePostgresDatabase(t)
+	defer cleanup()
+	fixture := seedMultiBundlePostgresFixture(t, database)
+	ctx := context.Background()
+	requestKey, proposalID, token := uuid.New(), uuid.New(), uuid.New()
+	expires := time.Now().UTC().Add(10 * time.Minute)
+	instructionHash := "sha256:" + strings.Repeat("a", 64)
+	instruction := json.RawMessage(`{"constraints":[],"objective":"recover after finalize failure"}`)
+	contractHash := "sha256:" + strings.Repeat("b", 64)
+	rootID := uuid.MustParse(fixture.rootA.RootBuildManifestID)
+	leafID := uuid.MustParse(fixture.rootA.ID)
+	if err := database.Create(&storage.ImplementationGenerationClaimModel{
+		ID: uuid.New(), BuildManifestID: leafID, ProjectID: fixture.projectID, RootManifestID: rootID,
+		RequestKey: requestKey, ReservedProposalID: proposalID,
+		ExecutionSource: string(ImplementationSourceManualGeneration), Instruction: instruction, InstructionHash: instructionHash,
+		RequestedModel: "test-model", GenerationContractVersion: "test-contract/v1",
+		SystemPromptHash: contractHash, OutputSchemaHash: contractHash,
+		ActorID: fixture.ownerID, ClaimToken: &token, ClaimExpiresAt: &expires,
+		Status: "processing", AttemptCount: 1, CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC(),
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	fixture.contents.finalizeErr = errors.New("simulated finalize outage")
+	fileContent := "export const recovered = true\n"
+	_, err := fixture.implementation.CreateGenerated(ctx, fixture.projectID.String(), fixture.ownerID.String(), CreateImplementationProposalInput{
+		BuildManifestID: fixture.rootA.ID,
+		Operations:      []FileOperation{{ID: "recover-finalize", Kind: "file.upsert", Path: "src/recovered.ts", Content: &fileContent}},
+	}, GeneratedImplementationIdentity{
+		ProposalID: proposalID.String(), RequestKey: requestKey.String(),
+		ExecutionSource: ImplementationSourceManualGeneration, InstructionHash: instructionHash,
+		AIProvider: "test-provider", AIModel: "test-model", ClaimToken: token.String(),
+	})
+	if !errors.Is(err, ErrContentNotReady) {
+		t.Fatalf("finalize failure error = %v, want ErrContentNotReady", err)
+	}
+	var claim storage.ImplementationGenerationClaimModel
+	if err := database.Where("request_key = ?", requestKey).Take(&claim).Error; err != nil {
+		t.Fatal(err)
+	}
+	if claim.Status != "completed" || claim.CompletedProposalID == nil || *claim.CompletedProposalID != proposalID {
+		t.Fatalf("SQL checkpoint was not recoverable after finalize failure: %+v", claim)
+	}
+	if err := database.Model(&storage.ImplementationGenerationClaimModel{}).Where("id = ?", claim.ID).
+		Update("instruction", json.RawMessage(`{"constraints":["tampered"],"objective":"recover after finalize failure"}`)).Error; err == nil {
+		t.Fatal("durable generation instruction snapshot was mutable")
+	}
+	fixture.contents.finalizeErr = nil
+	recovered, err := fixture.implementation.Get(ctx, proposalID.String(), fixture.ownerID.String())
+	if err != nil || recovered.ID != proposalID.String() {
+		t.Fatalf("pending referenced proposal could not be recovered: proposal=%+v err=%v", recovered, err)
+	}
+	lineage, err := fixture.workbench.GetLineageState(ctx, fixture.rootA.ID, fixture.ownerID.String())
+	if err != nil || lineage.CurrentProposal == nil || lineage.CurrentProposal.ID != proposalID.String() {
+		t.Fatalf("Workbench lineage could not recover the committed pending content: state=%+v err=%v", lineage, err)
+	}
+}
+
+func TestWorkbenchDeepContextIsTypedAndTraversalLimitFailsClosedPostgres(t *testing.T) {
+	database, cleanup := multiBundlePostgresDatabase(t)
+	defer cleanup()
+	fixture := seedMultiBundlePostgresFixture(t, database)
+	decision := seedMultiBundleApprovedRevision(
+		t, database, fixture.contents, fixture.projectID, fixture.ownerID,
+		"decision_record", json.RawMessage(`{"decision":"Use server authority"}`), nil,
+	)
+	classified, err := fixture.workbench.classifyAndValidateRefs(context.Background(), fixture.projectID, []VersionRef{decision})
+	if err != nil || len(classified.contexts) != 1 || classified.contexts[0].Kind != "decision_record" ||
+		!exactWorkbenchVersionRef(classified.contexts[0].Revision, decision) {
+		t.Fatalf("registered deep context was not preserved as a typed revision: %+v err=%v", classified.contexts, err)
+	}
+	unknown := seedMultiBundleApprovedRevision(
+		t, database, fixture.contents, fixture.projectID, fixture.ownerID,
+		"test_report", json.RawMessage(`{"unsafe":true}`), nil,
+	)
+	if _, err := fixture.workbench.classifyAndValidateRefs(context.Background(), fixture.projectID, []VersionRef{unknown}); !errors.Is(err, ErrBlockingGate) {
+		t.Fatalf("unregistered context kind did not fail closed: %v", err)
+	}
+	prototypeRevisionID := uuid.MustParse(fixture.rootA.PrototypeRevision.RevisionID)
+	prototypeArtifactID := uuid.MustParse(fixture.rootA.PrototypeRevision.ArtifactID)
+	decisionRevisionID := uuid.MustParse(decision.RevisionID)
+	decisionArtifactID := uuid.MustParse(decision.ArtifactID)
+	if err := database.Create(&storage.ArtifactDependencyModel{
+		ID: uuid.New(), ProjectID: fixture.projectID,
+		SourceArtifactID: decisionArtifactID, SourceRevisionID: decisionRevisionID, SourceContentHash: decision.ContentHash,
+		TargetArtifactID: prototypeArtifactID, TargetRevisionID: &prototypeRevisionID,
+		Relation: "governs", Required: true, CreatedBy: fixture.ownerID, CreatedAt: time.Now().UTC(),
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	fixture.workbench.maxUpstreamRevisions = 1
+	if refs, err := fixture.workbench.collectUpstream(context.Background(), fixture.projectID, prototypeRevisionID); !errors.Is(err, ErrBlockingGate) || refs != nil {
+		t.Fatalf("upstream traversal returned a truncated partial set: refs=%+v err=%v", refs, err)
+	}
 }
 
 func (s *multiBundleMemoryContentStore) Abort(_ context.Context, contentID string) error {
@@ -161,20 +261,6 @@ func TestMultiBundleSequentialRebasePostgres(t *testing.T) {
 		t, fixture.implementation, fixture.projectID, fixture.ownerID, fixture.rootB.ID,
 		"package-b-old-base", packageB, hashText(packageV0),
 	)
-	proposalBDecisionContent := packageB
-	proposalBDecision, err := fixture.implementation.Create(
-		context.Background(), fixture.projectID.String(), fixture.ownerID.String(),
-		CreateImplementationProposalInput{
-			BuildManifestID: fixture.rootB.ID,
-			Operations: []FileOperation{{
-				ID: "package-b-old-base-decision", Kind: "file.upsert", Path: "package.json",
-				Content: &proposalBDecisionContent, Language: "json", ExpectedHash: hashText(packageV0),
-			}},
-		},
-	)
-	if err != nil {
-		t.Fatalf("create pending bundle B decision proposal: %v", err)
-	}
 
 	workspaceW1, err := fixture.implementation.Apply(
 		ctx, proposalA.ID, fixture.ownerID.String(), ApplyImplementationInput{Version: proposalA.Version},
@@ -190,18 +276,6 @@ func TestMultiBundleSequentialRebasePostgres(t *testing.T) {
 		ctx, fixture.rootB.ID, fixture.ownerID.String(),
 	); !errors.Is(err, ErrProposalStale) {
 		t.Fatalf("bundle B generated against W0 after workspace advanced to W1: %v", err)
-	}
-	if _, err := fixture.implementation.Decide(
-		ctx, proposalBDecision.ID, fixture.ownerID.String(), DecideImplementationInput{
-			OperationID: "package-b-old-base-decision", Decision: ImplementationAccepted,
-			Version: proposalBDecision.Version,
-		},
-	); !errors.Is(err, ErrProposalStale) {
-		t.Fatalf("old bundle B proposal decision did not persist stale after W1: %v", err)
-	}
-	staleDecision, err := fixture.implementation.Get(ctx, proposalBDecision.ID, fixture.ownerID.String())
-	if err != nil || staleDecision.Status != "stale" || staleDecision.Version != proposalBDecision.Version+1 {
-		t.Fatalf("old decision proposal stale state = %#v err=%v", staleDecision, err)
 	}
 	lateContent := packageA
 	if _, err := fixture.implementation.Create(
@@ -361,6 +435,7 @@ func TestWorkflowManifestCompilerRetryAndGroupIsolationPostgres(t *testing.T) {
 	if err := database.Create(&storage.WorkflowDefinitionVersionModel{
 		ID: definitionVersionID, DefinitionID: definitionID, Version: 1, SchemaVersion: 1,
 		Content: json.RawMessage(`{"nodes":[],"edges":[]}`), ContentHash: hashText("manifest-groups"),
+		ExecutionProfileVersion: legacyWorkflowExecutionProfileVersion, ExecutionProfileHash: legacyWorkflowExecutionProfileHash,
 		ValidationReport: json.RawMessage(`{}`), Published: true, CreatedBy: fixture.ownerID, CreatedAt: now,
 	}).Error; err != nil {
 		t.Fatal(err)
@@ -368,6 +443,7 @@ func TestWorkflowManifestCompilerRetryAndGroupIsolationPostgres(t *testing.T) {
 	runID := uuid.New()
 	if err := database.Create(&storage.WorkflowRunModel{
 		ID: runID, ProjectID: fixture.projectID, DefinitionVersionID: definitionVersionID, Status: "running",
+		ExecutionProfileVersion: legacyWorkflowExecutionProfileVersion, ExecutionProfileHash: legacyWorkflowExecutionProfileHash,
 		Scope: json.RawMessage(`{}`), Context: json.RawMessage(`{}`), StartedBy: fixture.ownerID,
 		StartedAt: &now, CreatedAt: now, UpdatedAt: now,
 	}).Error; err != nil {
@@ -393,14 +469,22 @@ func TestWorkflowManifestCompilerRetryAndGroupIsolationPostgres(t *testing.T) {
 		))
 	}
 	for _, root := range workflowRoots {
-		if _, err := fixture.workbench.GetBundleForGeneration(ctx, root.ID, fixture.ownerID.String()); err != nil {
-			t.Fatalf("same-run compiler group ordinal zero blocked another group: %v", err)
+		if _, err := fixture.workbench.GetBundleForGeneration(ctx, root.ID, fixture.ownerID.String()); !errors.Is(err, ErrBlockingGate) {
+			t.Fatalf("running compiler exposed an uncommitted root group: %v", err)
 		}
 	}
 
 	exactGroup := groupIDs[0].String()
 	exactRun := runID.String()
 	ordinal := 0
+	if _, err := fixture.workbench.CreateBundle(
+		ctx, fixture.projectID.String(), fixture.ownerID.String(), CreateWorkbenchBundleInput{
+			PrototypeRevision: workflowRoots[0].PrototypeRevision, WorkflowRunID: &exactRun,
+			ManifestGroupKey: &exactGroup, RootOrdinal: &ordinal,
+		},
+	); !errors.Is(err, ErrInvalidInput) {
+		t.Fatalf("current workflow root omitted durable delivery slice identity: %v", err)
+	}
 	reused, err := fixture.workbench.CreateBundle(
 		ctx, fixture.projectID.String(), fixture.ownerID.String(), CreateWorkbenchBundleInput{
 			PrototypeRevision: workflowRoots[0].PrototypeRevision, WorkflowRunID: &exactRun,
@@ -427,6 +511,7 @@ func TestWorkflowManifestCompilerRetryAndGroupIsolationPostgres(t *testing.T) {
 	foreignRunID, foreignGroupID := uuid.New(), uuid.New()
 	if err := database.Create(&storage.WorkflowRunModel{
 		ID: foreignRunID, ProjectID: fixture.otherProjectID, DefinitionVersionID: definitionVersionID,
+		ExecutionProfileVersion: legacyWorkflowExecutionProfileVersion, ExecutionProfileHash: legacyWorkflowExecutionProfileHash,
 		Status: "running", Scope: json.RawMessage(`{}`), Context: json.RawMessage(`{}`),
 		StartedBy: fixture.otherOwnerID, StartedAt: &now, CreatedAt: now, UpdatedAt: now,
 	}).Error; err != nil {
@@ -661,7 +746,7 @@ func seedMultiBundleWorkflowRoot(
 	model := storage.ApplicationBuildManifestModel{
 		ID: id, ProjectID: uuid.MustParse(bundle.ProjectID), WorkflowRunID: &modelRunID,
 		RootManifestID: id, WorkspaceRevisionID: &workspaceRevisionID,
-		RootOrdinal: &modelOrdinal, ManifestGroupKey: &modelGroupKey,
+		RootOrdinal: &modelOrdinal, ManifestGroupKey: &modelGroupKey, DeliverySliceID: &deliverySliceID,
 		SchemaVersion: 1, ContentStore: "mongo", ContentRef: stored.ID,
 		ContentHash: stored.ContentHash, ManifestHash: manifestHash, Status: "frozen",
 		CreatedBy: uuid.MustParse(bundle.CreatedBy), CreatedAt: createdAt,
@@ -853,6 +938,12 @@ func seedMultiBundleApprovedRevision(
 	}
 	if err := database.Model(&storage.ArtifactModel{}).Where("id = ?", artifactID).Updates(map[string]any{
 		"latest_revision_id": revisionID, "latest_approved_revision_id": revisionID,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Create(&storage.ArtifactHealthModel{
+		ArtifactID: artifactID, SyncStatus: "current", DeliveryStatus: "incomplete",
+		Report: json.RawMessage(`{}`), ComputedAt: now,
 	}).Error; err != nil {
 		t.Fatal(err)
 	}

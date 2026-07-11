@@ -18,13 +18,14 @@ type WorkflowService struct {
 }
 
 type RegisterWorkflowCommand struct {
-	ID            string
-	Version       int
-	Name          string
-	SchemaVersion string
-	Nodes         []domain.NodeDefinition
-	Edges         []domain.WorkflowEdge
-	CreatedBy     string
+	ID               string
+	Version          int
+	Name             string
+	SchemaVersion    string
+	Nodes            []domain.NodeDefinition
+	Edges            []domain.WorkflowEdge
+	ExecutionProfile domain.WorkflowExecutionProfileRef
+	CreatedBy        string
 }
 
 func (s WorkflowService) RegisterDefinition(ctx context.Context, command RegisterWorkflowCommand) (domain.WorkflowDefinition, error) {
@@ -46,6 +47,10 @@ func (s WorkflowService) RegisterDefinition(ctx context.Context, command Registe
 		command.ID, command.Version, command.Name, command.SchemaVersion,
 		command.Nodes, command.Edges, command.CreatedBy, serviceNow(s.Clock),
 	)
+	if err != nil {
+		return domain.WorkflowDefinition{}, err
+	}
+	definition, err = definition.WithExecutionProfile(command.ExecutionProfile)
 	if err != nil {
 		return domain.WorkflowDefinition{}, err
 	}

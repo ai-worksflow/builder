@@ -32,6 +32,10 @@ func TestDesignImportMigrationDeclaresImmutableTenantScopedSnapshots(t *testing.
 		"design_import_state_transition",
 		"design_import_claim_shape",
 		"design_import_independent_reviewer",
+		"design_import_proposal_independent_decision",
+		"design_import_proposal_independent_apply",
+		"prohibit_design_import_creator_proposal_decision",
+		"prohibit_design_import_creator_proposal_apply",
 		"expected_output_proposal_id",
 	} {
 		if !strings.Contains(string(up), expected) {
@@ -43,6 +47,8 @@ func TestDesignImportMigrationDeclaresImmutableTenantScopedSnapshots(t *testing.
 		"DROP FUNCTION IF EXISTS validate_design_import_tenant_refs",
 		"DROP FUNCTION IF EXISTS validate_design_import_state_transition",
 		"DROP FUNCTION IF EXISTS design_import_stage_rank",
+		"DROP FUNCTION IF EXISTS prohibit_design_import_creator_proposal_decision",
+		"DROP FUNCTION IF EXISTS prohibit_design_import_creator_proposal_apply",
 		"DROP TABLE IF EXISTS design_imports",
 	} {
 		if !strings.Contains(string(down), expected) {
@@ -98,6 +104,21 @@ WHERE tgrelid = 'design_imports'::regclass
 	}
 	if triggers != 3 {
 		t.Fatalf("expected all design import invariant triggers, got %d", triggers)
+	}
+	if err := database.QueryRowContext(ctx, `
+SELECT count(*)
+FROM pg_trigger
+WHERE NOT tgisinternal
+  AND (
+    (tgrelid = 'proposal_operation_decisions'::regclass AND tgname = 'design_import_proposal_independent_decision')
+    OR
+    (tgrelid = 'output_proposals'::regclass AND tgname = 'design_import_proposal_independent_apply')
+  )
+`).Scan(&triggers); err != nil {
+		t.Fatal(err)
+	}
+	if triggers != 2 {
+		t.Fatalf("expected both design import proposal review guards, got %d", triggers)
 	}
 }
 

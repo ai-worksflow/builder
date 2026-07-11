@@ -12,6 +12,7 @@ export const PROJECT_ACTIONS = [
   'view',
   'comment',
   'edit',
+  'review',
   'publish',
   'admin',
 ] as const

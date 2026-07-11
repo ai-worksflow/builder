@@ -75,6 +75,7 @@ export interface DesignImportDto {
   readonly id: string
   readonly projectId: string
   readonly status: DesignImportStatus
+  readonly pipelineStage: 'snapshot_frozen' | 'target_frozen' | 'manifest_frozen' | 'proposal_ready'
   readonly version: number
   readonly etag: string
   readonly snapshot: DesignImportSnapshotDto

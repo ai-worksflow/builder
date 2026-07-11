@@ -4,13 +4,14 @@ import type {
   ConversationDto,
   ConversationMessageDto,
   ConversationPageDto,
+  ConversationSummaryCheckpointDto,
+  CreateConversationSummaryCheckpointDto,
   CreatedWorkflowIntentProposalDto,
   CreateWorkflowIntentProposalDto,
   DecideWorkflowIntentProposalResultDto,
   GenerateWorkflowIntentProposalDto,
   GeneratedWorkflowIntentProposalDto,
   WorkflowIntentProposalDto,
-  WorkbenchExecutionResultDto,
 } from './conversation-contract'
 import { HttpClient } from './http'
 
@@ -35,6 +36,28 @@ function mutationOptions(options?: ClientMutationOptions, ifMatch?: string) {
     ifMatch: options?.ifMatch ?? ifMatch,
     idempotencyKey: options?.idempotencyKey ?? true,
   }
+}
+
+export async function collectConversationPages<T>(
+  load: (cursor?: string) => Promise<{ readonly data: ConversationPageDto<T> }>,
+): Promise<T[]> {
+  const items: T[] = []
+  const cursors = new Set<string>()
+  let cursor: string | undefined
+  let hasNextPage = true
+  while (hasNextPage) {
+    const page = await load(cursor)
+    items.push(...page.data.items)
+    const next = page.data.nextCursor?.trim()
+    if (!next) {
+      hasNextPage = false
+      continue
+    }
+    if (cursors.has(next)) throw new Error('Conversation pagination returned a repeated cursor.')
+    cursors.add(next)
+    cursor = next
+  }
+  return items
 }
 
 export class PlatformConversationClient {
@@ -100,6 +123,68 @@ export class PlatformConversationClient {
       `${this.base(projectId)}/${segment(conversationId)}/messages`,
       { content },
       mutationOptions(options),
+    )
+  }
+
+  listSummaryCheckpoints(projectId: string, conversationId: string, options?: ListOptions) {
+    return this.http.get<ConversationPageDto<ConversationSummaryCheckpointDto>>(
+      `${this.base(projectId)}/${segment(conversationId)}/summary-checkpoints`,
+      listOptions(options),
+    )
+  }
+
+  createSummaryCheckpoint(
+    projectId: string,
+    conversation: Pick<ConversationDto, 'id' | 'etag'>,
+    input: CreateConversationSummaryCheckpointDto,
+    options?: ClientMutationOptions,
+  ) {
+    return this.http.post<ConversationSummaryCheckpointDto, CreateConversationSummaryCheckpointDto>(
+      `${this.base(projectId)}/${segment(conversation.id)}/summary-checkpoints`,
+      input,
+      mutationOptions(options, conversation.etag),
+    )
+  }
+
+  getSummaryCheckpoint(
+    projectId: string,
+    conversationId: string,
+    checkpointId: string,
+    options?: ClientRequestOptions,
+  ) {
+    return this.http.get<ConversationSummaryCheckpointDto>(
+      `${this.base(projectId)}/${segment(conversationId)}/summary-checkpoints/${segment(checkpointId)}`,
+      requestOptions(options),
+    )
+  }
+
+  listSummaryCheckpointSourceMessages(
+    projectId: string,
+    conversationId: string,
+    checkpointId: string,
+    options?: ListOptions,
+  ) {
+    return this.http.get<ConversationPageDto<ConversationMessageDto>>(
+      `${this.base(projectId)}/${segment(conversationId)}/summary-checkpoints/${segment(checkpointId)}/source-messages`,
+      listOptions(options),
+    )
+  }
+
+  decideSummaryCheckpoint(
+    projectId: string,
+    conversationId: string,
+    checkpoint: Pick<ConversationSummaryCheckpointDto, 'id' | 'etag'>,
+    decision: 'approve' | 'reject',
+    reason = '',
+    options?: ClientMutationOptions,
+  ) {
+    return this.http.post<ConversationSummaryCheckpointDto, {
+      readonly decision: 'approve' | 'reject'
+      readonly reason?: string
+    }>(
+      `${this.base(projectId)}/${segment(conversationId)}/summary-checkpoints/${segment(checkpoint.id)}/decision`,
+      { decision, ...(reason.trim() ? { reason: reason.trim() } : {}) },
+      mutationOptions(options, checkpoint.etag),
     )
   }
 
@@ -189,29 +274,11 @@ export class PlatformConversationClient {
     projectId: string,
     conversationId: string,
     command: Pick<ConversationCommandDto, 'id' | 'etag' | 'kind'>,
-    input: { readonly workbenchResult?: WorkbenchExecutionResultDto } = {},
     options?: ClientMutationOptions,
   ) {
-    if (command.kind === 'start_workflow' && input.workbenchResult) {
-      throw new Error('start_workflow does not accept a client Workbench result.')
-    }
-    if (command.kind === 'workbench_instruction' && !input.workbenchResult) {
-      throw new Error('workbench_instruction requires an exact run, active bundle, and implementation proposal result.')
-    }
-    if (
-      command.kind === 'workbench_instruction'
-      && input.workbenchResult
-      && (
-        !input.workbenchResult.runId.trim()
-        || !input.workbenchResult.bundleId.trim()
-        || !input.workbenchResult.implementationProposalId.trim()
-      )
-    ) {
-      throw new Error('workbench_instruction result identities must be non-empty.')
-    }
-    return this.http.post<ConversationCommandDto, typeof input>(
+    return this.http.post<ConversationCommandDto, Record<string, never>>(
       `${this.base(projectId)}/${segment(conversationId)}/commands/${segment(command.id)}/execute`,
-      input,
+      {},
       mutationOptions(options, command.etag),
     )
   }

@@ -99,7 +99,17 @@ func actorSecurityRuntime(t *testing.T, definition domain.WorkflowDefinition, ed
 	if err != nil {
 		t.Fatal(err)
 	}
-	engine.BuildManifestHook = actorBuildManifestHook{source: manifest.Sources[0].Ref}
+	hook := actorBuildManifestHook{source: manifest.Sources[0].Ref}
+	engine.BuildManifestHook = hook
+	engine.ManifestCompilers = NewBuildManifestRegistry()
+	for _, capability := range []ManifestCompilerCapability{
+		CurrentWorkflowExecutionProfileDescriptor().Capabilities.ManifestCompilers[0],
+		{ManifestKind: "application", SchemaVersion: 1, Hook: "test"},
+	} {
+		if err := engine.ManifestCompilers.Register(capability, hook); err != nil {
+			t.Fatal(err)
+		}
+	}
 	access := actorTestAccess{roles: map[string]core.Role{editorID: core.RoleEditor, adminID: core.RoleAdmin}}
 	facade := &Facade{Engine: engine, Store: store, Access: access}
 	return facade, engine, store, manifest, record
@@ -127,7 +137,7 @@ func TestPrivilegedNodesUseAuthenticatedActorNotRunStarterOrOutput(t *testing.T)
 	})}); err != nil {
 		t.Fatal(err)
 	}
-	engine.Runners = registry
+	installCompleteTestExecutionProfileRuntime(t, engine, registry)
 	run, err := facade.Start(context.Background(), manifest.ProjectID, editorID, StartRequest{RunID: uuid.NewString(), DefinitionVersionID: record.VersionID, InputManifest: manifest.Ref()})
 	if err != nil {
 		t.Fatal(err)
@@ -210,7 +220,7 @@ func TestReviewApprovalAtomicallyHandsOffAuthorizedPublishActor(t *testing.T) {
 	})}); err != nil {
 		t.Fatal(err)
 	}
-	engine.Runners = registry
+	installCompleteTestExecutionProfileRuntime(t, engine, registry)
 	run, err := facade.Start(context.Background(), manifest.ProjectID, editorID, StartRequest{RunID: uuid.NewString(), DefinitionVersionID: record.VersionID, InputManifest: manifest.Ref()})
 	if err != nil {
 		t.Fatal(err)

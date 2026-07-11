@@ -69,6 +69,28 @@ test('PageSpec review gate accepts a complete canonical content contract', () =>
   }).requiredRoles, ['editor', 'admin'])
 })
 
+test('PageSpec normalization migrates legacy navigation targets to Blueprint page node IDs', () => {
+  const content = createEmptyPageSpecContent(
+    'page-node-orders',
+    'Orders PageSpec',
+    '/orders',
+    'Review and resolve order exceptions.',
+  )
+  const normalized = normalizePageSpecContent({
+    ...content,
+    interactions: [{
+      id: 'interaction-checkout',
+      trigger: 'Click checkout',
+      outcome: 'Open checkout',
+      targetPageSpecId: 'page-node-checkout',
+      acceptanceCriterionIds: [],
+    }],
+  })
+
+  assert.equal(normalized.interactions[0]?.targetPageNodeId, 'page-node-checkout')
+  assert.equal(Object.hasOwn(normalized.interactions[0] ?? {}, 'targetPageSpecId'), false)
+})
+
 test('PageSpec review gate blocks missing stable states, traces, and binding identity', () => {
   const content = {
     ...createEmptyPageSpecContent('page-node-orders', 'Orders', 'orders', ''),

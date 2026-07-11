@@ -396,14 +396,14 @@ func allowWorkflowQuery(c *gin.Context, allowed ...string) bool {
 	return true
 }
 func definitionResponse(record runtime.DefinitionRecord) gin.H {
-	return gin.H{"id": record.Definition.ID, "versionId": record.VersionID, "projectId": record.ProjectID, "key": record.Key, "title": record.Title, "description": record.Description, "published": record.Published, "version": record.Definition.Version, "contentHash": record.Definition.Hash, "definition": record.Definition}
+	return gin.H{"id": record.Definition.ID, "versionId": record.VersionID, "projectId": record.ProjectID, "key": record.Key, "title": record.Title, "description": record.Description, "published": record.Published, "version": record.Definition.Version, "contentHash": record.Definition.Hash, "executionProfile": record.ExecutionProfile, "definition": record.Definition}
 }
 func runResponse(run *runtime.RunRecord) gin.H {
 	nodes := make([]*runtime.NodeRecord, 0, len(run.Nodes))
 	for _, node := range run.Nodes {
 		nodes = append(nodes, node)
 	}
-	return gin.H{"id": run.ID, "projectId": run.ProjectID, "definitionVersionId": run.DefinitionVersionID, "definition": run.Definition, "inputManifest": run.InputManifest, "status": run.Status, "scope": run.Scope, "context": run.Context, "eventCursor": run.EventCursor, "startedBy": run.StartedBy, "startedAt": run.StartedAt, "completedAt": run.CompletedAt, "cancelledAt": run.CancelledAt, "failure": run.Failure, "createdAt": run.CreatedAt, "updatedAt": run.UpdatedAt, "nodes": nodes}
+	return gin.H{"id": run.ID, "projectId": run.ProjectID, "definitionVersionId": run.DefinitionVersionID, "definition": run.Definition, "executionProfile": run.ExecutionProfile, "inputManifest": run.InputManifest, "status": run.Status, "scope": run.Scope, "context": run.Context, "eventCursor": run.EventCursor, "startedBy": run.StartedBy, "startedAt": run.StartedAt, "completedAt": run.CompletedAt, "cancelledAt": run.CancelledAt, "failure": run.Failure, "createdAt": run.CreatedAt, "updatedAt": run.UpdatedAt, "nodes": nodes}
 }
 func writeWorkflowError(c *gin.Context, err error) {
 	switch {

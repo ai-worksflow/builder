@@ -48,8 +48,9 @@ func ProvisionBlueprintSelectionFlows(ctx context.Context, database *gorm.DB, no
 }
 
 // UpgradeExistingMinimumLoops is an explicit startup provisioner. It runs
-// after database migrations, upgrades every project-scoped built-in v1 to the
-// current immutable version, publishes the current version, and unpublishes v1.
+// after database migrations, upgrades every project-scoped built-in definition
+// to the current immutable version, publishes it, and unpublishes every prior
+// version.
 // Existing runs remain replayable because they pin a definition version ID.
 func UpgradeExistingMinimumLoops(ctx context.Context, database *gorm.DB, now time.Time) (int, error) {
 	if database == nil {
@@ -100,11 +101,17 @@ func upgradeMinimumLoopInstallations(
 		if currentErr != nil && !needsUpgrade {
 			return upgraded, currentErr
 		}
-		legacy, legacyErr := store.GetDefinition(ctx, installation.definitionID, 1)
-		if legacyErr != nil && !errors.Is(legacyErr, domain.ErrNotFound) {
-			return upgraded, legacyErr
+		versions, versionsErr := store.ListDefinitionVersions(ctx, installation.definitionID)
+		if versionsErr != nil && !errors.Is(versionsErr, domain.ErrNotFound) {
+			return upgraded, versionsErr
 		}
-		needsUnpublish := legacyErr == nil && legacy.Published
+		needsUnpublish := false
+		for _, version := range versions {
+			if version.Definition.Version != MinimumLoopCurrentVersion && version.Published {
+				needsUnpublish = true
+				break
+			}
+		}
 		if currentErr == nil && current.Published && !needsUnpublish {
 			continue
 		}

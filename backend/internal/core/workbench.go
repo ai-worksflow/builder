@@ -34,43 +34,119 @@ type RenderedFrameRef struct {
 }
 
 type WorkbenchBundle struct {
-	ID                         string             `json:"id"`
-	ProjectID                  string             `json:"projectId"`
-	RootBuildManifestID        string             `json:"rootBuildManifestId,omitempty"`
-	DerivedFromBuildManifestID *string            `json:"derivedFromBuildManifestId,omitempty"`
-	WorkflowRunID              *string            `json:"workflowRunId,omitempty"`
-	ManifestGroupKey           *string            `json:"manifestGroupKey,omitempty"`
-	DeliverySliceID            *string            `json:"deliverySliceId,omitempty"`
-	PageSpecRevision           VersionRef         `json:"pageSpecRevision"`
-	PrototypeRevision          VersionRef         `json:"prototypeRevision"`
-	RequirementRevisions       []VersionRef       `json:"requirementRevisions"`
-	BlueprintRevision          VersionRef         `json:"blueprintRevision"`
-	ContractRevisions          []VersionRef       `json:"contractRevisions"`
-	DesignSystemRevisions      []VersionRef       `json:"designSystemRevisions"`
-	CurrentWorkspaceRevision   *VersionRef        `json:"currentWorkspaceRevision,omitempty"`
-	SceneGraph                 AssetRef           `json:"sceneGraph"`
-	RenderedFrames             []RenderedFrameRef `json:"renderedFrames"`
-	InteractionManifest        AssetRef           `json:"interactionManifest"`
-	FixtureBundle              AssetRef           `json:"fixtureBundle"`
-	TokenManifest              AssetRef           `json:"tokenManifest"`
-	ComponentMapping           AssetRef           `json:"componentMapping"`
-	TraceMatrix                AssetRef           `json:"traceMatrix"`
-	AcceptanceManifest         AssetRef           `json:"acceptanceManifest"`
-	Assumptions                []string           `json:"assumptions"`
-	Waivers                    []string           `json:"waivers"`
-	CreatedBy                  string             `json:"createdBy"`
-	CreatedAt                  time.Time          `json:"createdAt"`
-	ManifestHash               string             `json:"contentHash"`
+	ID                         string                     `json:"id"`
+	ProjectID                  string                     `json:"projectId"`
+	RootBuildManifestID        string                     `json:"rootBuildManifestId,omitempty"`
+	DerivedFromBuildManifestID *string                    `json:"derivedFromBuildManifestId,omitempty"`
+	WorkflowRunID              *string                    `json:"workflowRunId,omitempty"`
+	ManifestGroupKey           *string                    `json:"manifestGroupKey,omitempty"`
+	DeliverySliceID            *string                    `json:"deliverySliceId,omitempty"`
+	PageSpecRevision           VersionRef                 `json:"pageSpecRevision"`
+	PrototypeRevision          VersionRef                 `json:"prototypeRevision"`
+	RequirementRevisions       []VersionRef               `json:"requirementRevisions"`
+	BlueprintRevision          VersionRef                 `json:"blueprintRevision"`
+	ContractRevisions          []VersionRef               `json:"contractRevisions"`
+	DesignSystemRevisions      []VersionRef               `json:"designSystemRevisions"`
+	ContextRevisions           []WorkbenchContextRevision `json:"contextRevisions,omitempty"`
+	WorkflowContext            *ApplicationBuildContext   `json:"workflowContext,omitempty"`
+	CurrentWorkspaceRevision   *VersionRef                `json:"currentWorkspaceRevision,omitempty"`
+	SceneGraph                 AssetRef                   `json:"sceneGraph"`
+	RenderedFrames             []RenderedFrameRef         `json:"renderedFrames"`
+	InteractionManifest        AssetRef                   `json:"interactionManifest"`
+	FixtureBundle              AssetRef                   `json:"fixtureBundle"`
+	TokenManifest              AssetRef                   `json:"tokenManifest"`
+	ComponentMapping           AssetRef                   `json:"componentMapping"`
+	TraceMatrix                AssetRef                   `json:"traceMatrix"`
+	AcceptanceManifest         AssetRef                   `json:"acceptanceManifest"`
+	Assumptions                []string                   `json:"assumptions"`
+	Waivers                    []string                   `json:"waivers"`
+	CreatedBy                  string                     `json:"createdBy"`
+	CreatedAt                  time.Time                  `json:"createdAt"`
+	ManifestHash               string                     `json:"contentHash"`
+}
+
+type WorkbenchContextRevision struct {
+	Kind     string     `json:"kind"`
+	Revision VersionRef `json:"revision"`
+}
+
+// ApplicationBuildContext preserves the trusted workflow-level meaning that
+// cannot be reconstructed from artifact revisions alone. It is injected only
+// by the registered ManifestCompiler adapter and is immutable with the bundle.
+type ApplicationBuildContext struct {
+	Definition       domain.WorkflowDefinitionRef       `json:"definition"`
+	ExecutionProfile domain.WorkflowExecutionProfileRef `json:"executionProfile"`
+	InputManifest    domain.InputManifest               `json:"inputManifest"`
+	DeliverySliceID  string                             `json:"deliverySliceId,omitempty"`
+	RunScope         json.RawMessage                    `json:"runScope,omitempty"`
+	OutputContract   *domain.WorkflowOutputContract     `json:"outputContract,omitempty"`
+}
+
+func (c ApplicationBuildContext) MarshalJSON() ([]byte, error) {
+	type wire ApplicationBuildContext
+	encoded, err := json.Marshal(wire(c))
+	if err != nil || !c.ExecutionProfile.IsZero() {
+		return encoded, err
+	}
+	var object map[string]any
+	if err := json.Unmarshal(encoded, &object); err != nil {
+		return nil, err
+	}
+	delete(object, "executionProfile")
+	return json.Marshal(object)
+}
+
+const (
+	legacyWorkflowExecutionProfileVersion = "legacy-pre-pin/v0"
+	legacyWorkflowExecutionProfileHash    = "bee729c4921a93fd2e229cd610314359ca420610c195ada00a201507bfd7a14c"
+)
+
+func legacyApplicationBuildContext(value ApplicationBuildContext) bool {
+	return value.ExecutionProfile.IsZero() && value.Definition.ExecutionProfile.IsZero()
 }
 
 type CreateWorkbenchBundleInput struct {
-	PrototypeRevision VersionRef `json:"prototypeRevision"`
-	WorkflowRunID     *string    `json:"workflowRunId,omitempty"`
-	ManifestGroupKey  *string    `json:"manifestGroupKey,omitempty"`
-	RootOrdinal       *int       `json:"rootOrdinal,omitempty"`
-	DeliverySliceID   *string    `json:"deliverySliceId,omitempty"`
-	AllowStale        bool       `json:"allowStale,omitempty"`
-	OverrideReason    string     `json:"overrideReason,omitempty"`
+	PrototypeRevision          VersionRef `json:"prototypeRevision"`
+	WorkflowRunID              *string    `json:"workflowRunId,omitempty"`
+	ManifestGroupKey           *string    `json:"manifestGroupKey,omitempty"`
+	RootOrdinal                *int       `json:"rootOrdinal,omitempty"`
+	DeliverySliceID            *string    `json:"deliverySliceId,omitempty"`
+	AllowStale                 bool       `json:"allowStale,omitempty"`
+	OverrideReason             string     `json:"overrideReason,omitempty"`
+	workflowContext            *ApplicationBuildContext
+	allowLegacyWorkflowContext bool
+}
+
+// NewWorkflowWorkbenchBundleInput is the trusted internal constructor used by
+// the workflow ManifestCompiler. workflowContext is deliberately not a JSON
+// field on CreateWorkbenchBundleInput, so HTTP clients cannot forge it.
+func NewWorkflowWorkbenchBundleInput(
+	input CreateWorkbenchBundleInput,
+	workflowContext ApplicationBuildContext,
+) CreateWorkbenchBundleInput {
+	copy := workflowContext
+	input.workflowContext = &copy
+	return input
+}
+
+// NewLegacyWorkflowWorkbenchBundleInput is used only by the exact registered
+// pre-pin workflow execution bundle. The compatibility bit is private and the
+// service still verifies both persisted rows carry the frozen legacy profile;
+// HTTP callers and current-profile runs cannot opt into this path.
+func NewLegacyWorkflowWorkbenchBundleInput(
+	input CreateWorkbenchBundleInput,
+	workflowContext ApplicationBuildContext,
+) CreateWorkbenchBundleInput {
+	copy := workflowContext
+	input.workflowContext = &copy
+	input.allowLegacyWorkflowContext = true
+	return input
+}
+
+// TrustedWorkflowContext returns a defensive copy for internal adapters and
+// tests. There is intentionally no public setter.
+func (input CreateWorkbenchBundleInput) TrustedWorkflowContext() *ApplicationBuildContext {
+	return cloneApplicationBuildContext(input.workflowContext)
 }
 
 type RebaseWorkbenchBundleInput struct {
@@ -102,11 +178,12 @@ type WorkbenchLineageState struct {
 }
 
 type WorkbenchService struct {
-	database *gorm.DB
-	contents content.Store
-	access   *AccessControl
-	trace    *TraceService
-	now      func() time.Time
+	database             *gorm.DB
+	contents             content.Store
+	access               *AccessControl
+	trace                *TraceService
+	now                  func() time.Time
+	maxUpstreamRevisions int
 }
 
 func NewWorkbenchService(database *gorm.DB, contents content.Store, access *AccessControl) (*WorkbenchService, error) {
@@ -114,7 +191,7 @@ func NewWorkbenchService(database *gorm.DB, contents content.Store, access *Acce
 		return nil, errors.New("workbench database, content store and access control are required")
 	}
 	trace, _ := NewTraceService(database, access, contents)
-	return &WorkbenchService{database: database, contents: contents, access: access, trace: trace, now: time.Now}, nil
+	return &WorkbenchService{database: database, contents: contents, access: access, trace: trace, now: time.Now, maxUpstreamRevisions: 10_000}, nil
 }
 
 func (s *WorkbenchService) CreateBundle(ctx context.Context, projectID, actorID string, input CreateWorkbenchBundleInput) (WorkbenchBundle, error) {
@@ -125,16 +202,35 @@ func (s *WorkbenchService) CreateBundle(ctx context.Context, projectID, actorID 
 	if err != nil {
 		return WorkbenchBundle{}, err
 	}
+	if input.DeliverySliceID != nil {
+		deliverySliceID := strings.TrimSpace(*input.DeliverySliceID)
+		if deliverySliceID == "" || len(deliverySliceID) > 512 {
+			return WorkbenchBundle{}, fmt.Errorf("%w: delivery slice id", ErrInvalidInput)
+		}
+		input.DeliverySliceID = &deliverySliceID
+	}
 	var workflowRunID *uuid.UUID
+	var workflowContext *ApplicationBuildContext
+	if input.workflowContext != nil {
+		workflowContext, err = normalizeApplicationBuildContextForCreation(
+			input.workflowContext,
+			input.allowLegacyWorkflowContext,
+		)
+		if err != nil {
+			return WorkbenchBundle{}, err
+		}
+		input.workflowContext = workflowContext
+	}
 	if input.WorkflowRunID != nil {
 		parsed, err := uuid.Parse(*input.WorkflowRunID)
 		if err != nil || input.RootOrdinal == nil || *input.RootOrdinal < 0 || input.ManifestGroupKey == nil ||
-			strings.TrimSpace(*input.ManifestGroupKey) == "" || len(strings.TrimSpace(*input.ManifestGroupKey)) > 200 {
-			return WorkbenchBundle{}, fmt.Errorf("%w: workflow run, manifest group and root ordinal", ErrInvalidInput)
+			strings.TrimSpace(*input.ManifestGroupKey) == "" || len(strings.TrimSpace(*input.ManifestGroupKey)) > 200 ||
+			input.DeliverySliceID == nil {
+			return WorkbenchBundle{}, fmt.Errorf("%w: workflow run, manifest group, root ordinal and delivery slice", ErrInvalidInput)
 		}
 		workflowRunID = &parsed
 		var run storage.WorkflowRunModel
-		if err := s.database.WithContext(ctx).Select("id", "project_id", "started_by").
+		if err := s.database.WithContext(ctx).
 			Where("id = ?", parsed).Take(&run).Error; err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
 				return WorkbenchBundle{}, ErrConflict
@@ -143,6 +239,11 @@ func (s *WorkbenchService) CreateBundle(ctx context.Context, projectID, actorID 
 		}
 		if run.ProjectID != projectUUID || run.StartedBy != actorUUID {
 			return WorkbenchBundle{}, ErrConflict
+		}
+		if workflowContext != nil {
+			if err := s.validateApplicationBuildContextForRun(ctx, run, input.DeliverySliceID, *workflowContext); err != nil {
+				return WorkbenchBundle{}, err
+			}
 		}
 		manifestGroupID, err := uuid.Parse(strings.TrimSpace(*input.ManifestGroupKey))
 		if err != nil {
@@ -165,6 +266,8 @@ func (s *WorkbenchService) CreateBundle(ctx context.Context, projectID, actorID 
 		input.ManifestGroupKey = &manifestGroupKey
 	} else if input.RootOrdinal != nil || input.ManifestGroupKey != nil {
 		return WorkbenchBundle{}, fmt.Errorf("%w: manifest group and root ordinal require a workflow run", ErrInvalidInput)
+	} else if workflowContext != nil {
+		return WorkbenchBundle{}, fmt.Errorf("%w: workflow context requires a workflow run", ErrInvalidInput)
 	}
 	if workflowRunID != nil {
 		existing, found, err := s.findExistingWorkflowRootBundle(
@@ -175,6 +278,9 @@ func (s *WorkbenchService) CreateBundle(ctx context.Context, projectID, actorID 
 		}
 		if found {
 			return existing, nil
+		}
+		if workflowContext == nil {
+			return WorkbenchBundle{}, fmt.Errorf("%w: new workflow bundles require trusted application build context", ErrInvalidInput)
 		}
 	}
 	prototypeArtifactID, prototypeRevisionID, err := s.trace.validateRef(ctx, projectUUID, input.PrototypeRevision)
@@ -196,11 +302,11 @@ func (s *WorkbenchService) CreateBundle(ctx context.Context, projectID, actorID 
 	if err := s.database.WithContext(ctx).Where("artifact_id = ?", prototypeArtifactID).Take(&health).Error; err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
 		return WorkbenchBundle{}, err
 	}
-	formal := prototypeRevision.WorkflowStatus == "approved" && health.SyncStatus != "needs_sync" && health.SyncStatus != "blocked"
+	formal := formalPrototypeWorkbenchInput(prototypeArtifact, prototypeRevision, health)
 	waivers := []string{}
 	if !formal {
 		if !input.AllowStale || strings.TrimSpace(input.OverrideReason) == "" {
-			return WorkbenchBundle{}, fmt.Errorf("%w: prototype must be approved and current", ErrBlockingGate)
+			return WorkbenchBundle{}, prototypeWorkbenchFormalGateError()
 		}
 		if _, err := s.access.Authorize(ctx, projectID, actorID, ActionAdmin); err != nil {
 			return WorkbenchBundle{}, err
@@ -219,30 +325,28 @@ func (s *WorkbenchService) CreateBundle(ctx context.Context, projectID, actorID 
 		return WorkbenchBundle{}, fmt.Errorf("%w: exploratory prototypes cannot be formal build input", ErrBlockingGate)
 	}
 
-	upstream, err := s.collectUpstream(ctx, projectUUID, prototypeRevisionID)
+	frozenSources, err := s.collectFrozenRevisionSources(ctx, projectUUID, prototypeRevisionID)
 	if err != nil {
 		return WorkbenchBundle{}, err
 	}
-	if pageRef, ok := versionRefFromValue(prototype["pageSpecRevision"]); ok {
-		upstream = appendUniqueRef(upstream, pageRef)
-		_, pageRevisionID, validationErr := s.trace.validateRef(ctx, projectUUID, pageRef)
-		if validationErr != nil {
-			return WorkbenchBundle{}, validationErr
-		}
-		pageUpstream, collectErr := s.collectUpstream(ctx, projectUUID, pageRevisionID)
-		if collectErr != nil {
-			return WorkbenchBundle{}, collectErr
-		}
-		for _, reference := range pageUpstream {
-			upstream = appendUniqueRef(upstream, reference)
-		}
+	pageRef, pageRefOK := versionRefFromValue(prototype["pageSpecRevision"])
+	if !pageRefOK || !hasFrozenWorkbenchSource(frozenSources, "page_spec", true, pageRef) {
+		return WorkbenchBundle{}, fmt.Errorf("%w: Prototype pageSpecRevision is not its exact immutable required source", ErrBlockingGate)
 	}
+	upstream := frozenWorkbenchSourceRefs(frozenSources)
 	classified, err := s.classifyAndValidateRefs(ctx, projectUUID, upstream)
 	if err != nil {
 		return WorkbenchBundle{}, err
 	}
 	if len(classified.pageSpecs) != 1 || len(classified.blueprints) != 1 || len(classified.requirements) == 0 {
 		return WorkbenchBundle{}, fmt.Errorf("%w: bundle needs one PageSpec, one Blueprint, and at least one approved requirement revision", ErrBlockingGate)
+	}
+	if len(waivers) == 0 {
+		if err := s.validateFormalPrototypeWorkbenchSemantics(
+			ctx, s.database, projectUUID, prototypeRevisionID, prototypeStored.Payload,
+		); err != nil {
+			return WorkbenchBundle{}, err
+		}
 	}
 	workspaceRef, err := s.latestApprovedRefByKind(ctx, projectUUID, "workspace")
 	if err != nil && !errors.Is(err, ErrNotFound) {
@@ -268,6 +372,7 @@ func (s *WorkbenchService) CreateBundle(ctx context.Context, projectID, actorID 
 		PrototypeRevision: input.PrototypeRevision, RequirementRevisions: classified.requirements,
 		BlueprintRevision: classified.blueprints[0], ContractRevisions: classified.contracts,
 		DesignSystemRevisions: classified.designSystems, CurrentWorkspaceRevision: workspaceRef,
+		ContextRevisions: classified.contexts, WorkflowContext: cloneApplicationBuildContext(workflowContext),
 		RenderedFrames: renderedFrames, Assumptions: stringSlice(prototype["assumptions"]),
 		Waivers: waivers, CreatedBy: actorID, CreatedAt: now,
 	}
@@ -301,6 +406,7 @@ func (s *WorkbenchService) CreateBundle(ctx context.Context, projectID, actorID 
 		ID: bundleID, ProjectID: projectUUID, RootManifestID: bundleID,
 		WorkflowRunID:    workflowRunID,
 		ManifestGroupKey: input.ManifestGroupKey,
+		DeliverySliceID:  input.DeliverySliceID,
 		SchemaVersion:    1, ContentStore: "mongo", ContentRef: contentRef.ID,
 		ContentHash: contentRef.ContentHash, ManifestHash: bundle.ManifestHash,
 		Status: "frozen", CreatedBy: actorUUID, CreatedAt: now,
@@ -314,6 +420,29 @@ func (s *WorkbenchService) CreateBundle(ctx context.Context, projectID, actorID 
 		model.WorkspaceRevisionID = &workspaceRevisionID
 	}
 	err = s.database.WithContext(ctx).Transaction(func(transaction *gorm.DB) error {
+		// The initial eligibility check gives callers a fast failure, while this
+		// locked check closes the approval/health race before the immutable
+		// manifest is committed. Explicit stale waivers intentionally bypass the
+		// formal-input lock after their separate admin authorization above.
+		if len(waivers) == 0 {
+			locks, err := lockArtifactApprovalSourceClosure(
+				ctx, transaction, projectUUID, prototypeArtifactID, prototypeRevisionID,
+			)
+			if err != nil {
+				return err
+			}
+			artifact, artifactOK := locks.artifacts[prototypeArtifactID]
+			revision, revisionOK := locks.revisions[prototypeRevisionID]
+			health, healthOK := locks.health[prototypeArtifactID]
+			if !artifactOK || !revisionOK || !healthOK || !formalPrototypeWorkbenchInput(artifact, revision, health) {
+				return prototypeWorkbenchFormalGateError()
+			}
+			if err := s.validateFormalPrototypeWorkbenchSemantics(
+				ctx, transaction, projectUUID, prototypeRevisionID, prototypeStored.Payload,
+			); err != nil {
+				return err
+			}
+		}
 		if err := transaction.Create(&model).Error; err != nil {
 			return err
 		}
@@ -361,6 +490,94 @@ func (s *WorkbenchService) CreateBundle(ctx context.Context, projectID, actorID 
 	return bundle, nil
 }
 
+func (s *WorkbenchService) validateFormalPrototypeWorkbenchSemantics(
+	ctx context.Context,
+	database *gorm.DB,
+	projectID uuid.UUID,
+	prototypeRevisionID uuid.UUID,
+	payload json.RawMessage,
+) error {
+	var sourceModels []storage.ArtifactRevisionSourceModel
+	if err := database.WithContext(ctx).Where("revision_id = ?", prototypeRevisionID).
+		Order("ordinal ASC").Find(&sourceModels).Error; err != nil {
+		return err
+	}
+	artifacts := &ArtifactService{contents: s.contents}
+	if err := artifacts.validateArtifactLineageForReview(
+		ctx, database, projectID, "prototype", payload, sourceInputsFromRevisionModels(sourceModels),
+	); err != nil {
+		return err
+	}
+	if report := ValidateArtifactContent("prototype", payload); !report.Valid {
+		encoded, _ := json.Marshal(report.Findings)
+		return fmt.Errorf("%w: Prototype validation findings %s", ErrBlockingGate, encoded)
+	}
+	return nil
+}
+
+func formalPrototypeWorkbenchInput(
+	artifact storage.ArtifactModel,
+	revision storage.ArtifactRevisionModel,
+	health storage.ArtifactHealthModel,
+) bool {
+	return artifact.ID != uuid.Nil &&
+		artifact.Kind == "prototype" &&
+		artifact.Lifecycle == "active" &&
+		artifact.LatestApprovedRevisionID != nil &&
+		revision.ID != uuid.Nil &&
+		*artifact.LatestApprovedRevisionID == revision.ID &&
+		revision.ArtifactID == artifact.ID &&
+		revision.WorkflowStatus == "approved" &&
+		health.ArtifactID == artifact.ID &&
+		health.SyncStatus == "current"
+}
+
+func prototypeWorkbenchFormalGateError() error {
+	return fmt.Errorf(
+		"%w: prototype artifact must be active, the selected revision must be its exact latest approved revision, and dependency health must be current",
+		ErrBlockingGate,
+	)
+}
+
+func lockFormalPrototypeWorkbenchInput(
+	transaction *gorm.DB,
+	projectID uuid.UUID,
+	artifactID uuid.UUID,
+	revisionID uuid.UUID,
+) error {
+	var artifact storage.ArtifactModel
+	if err := transaction.Clauses(clause.Locking{Strength: "UPDATE"}).
+		Where("id = ? AND project_id = ? AND kind = 'prototype'", artifactID, projectID).
+		Take(&artifact).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return prototypeWorkbenchFormalGateError()
+		}
+		return err
+	}
+	var revision storage.ArtifactRevisionModel
+	if err := transaction.Clauses(clause.Locking{Strength: "UPDATE"}).
+		Where("id = ? AND artifact_id = ?", revisionID, artifactID).
+		Take(&revision).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return prototypeWorkbenchFormalGateError()
+		}
+		return err
+	}
+	var health storage.ArtifactHealthModel
+	if err := transaction.Clauses(clause.Locking{Strength: "UPDATE"}).
+		Where("artifact_id = ?", artifactID).
+		Take(&health).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return prototypeWorkbenchFormalGateError()
+		}
+		return err
+	}
+	if !formalPrototypeWorkbenchInput(artifact, revision, health) {
+		return prototypeWorkbenchFormalGateError()
+	}
+	return nil
+}
+
 func (s *WorkbenchService) findExistingWorkflowRootBundle(
 	ctx context.Context,
 	projectID uuid.UUID,
@@ -385,7 +602,8 @@ func (s *WorkbenchService) findExistingWorkflowRootBundle(
 	model := models[0]
 	if model.RootManifestID != model.ID || model.DerivedFromID != nil || model.WorkflowRunID == nil ||
 		*model.WorkflowRunID != workflowRunID || model.RootOrdinal == nil || *model.RootOrdinal != rootOrdinal ||
-		!optionalStringsEqual(model.ManifestGroupKey, input.ManifestGroupKey) {
+		!optionalStringsEqual(model.ManifestGroupKey, input.ManifestGroupKey) ||
+		!optionalStringsEqual(model.DeliverySliceID, input.DeliverySliceID) {
 		return WorkbenchBundle{}, false, ErrConflict
 	}
 	bundle, err := s.loadBundleContent(ctx, model)
@@ -396,6 +614,7 @@ func (s *WorkbenchService) findExistingWorkflowRootBundle(
 		!sameWorkflowRunID(bundle.WorkflowRunID, workflowRunID) ||
 		!optionalStringsEqual(bundle.ManifestGroupKey, input.ManifestGroupKey) ||
 		!optionalStringsEqual(bundle.DeliverySliceID, input.DeliverySliceID) ||
+		!applicationBuildContextsEqual(bundle.WorkflowContext, input.workflowContext) ||
 		!exactWorkbenchVersionRef(bundle.PrototypeRevision, input.PrototypeRevision) {
 		return WorkbenchBundle{}, false, ErrConflict
 	}
@@ -426,6 +645,170 @@ func exactWorkbenchVersionRef(left, right VersionRef) bool {
 		left.ContentHash == right.ContentHash && stringPointerEqual(left.AnchorID, right.AnchorID)
 }
 
+func normalizeApplicationBuildContext(value *ApplicationBuildContext) (*ApplicationBuildContext, error) {
+	return normalizeApplicationBuildContextForCreation(value, false)
+}
+
+func normalizeApplicationBuildContextForCreation(
+	value *ApplicationBuildContext,
+	allowLegacy bool,
+) (*ApplicationBuildContext, error) {
+	if value == nil {
+		return nil, nil
+	}
+	result := *value
+	legacy := allowLegacy && legacyApplicationBuildContext(result)
+	if legacy {
+		if strings.TrimSpace(result.Definition.ID) == "" || result.Definition.Version < 1 || !domain.IsCanonicalHash(result.Definition.Hash) {
+			return nil, fmt.Errorf("%w: historical workflow definition context", ErrInvalidInput)
+		}
+	} else {
+		if err := result.Definition.Validate(); err != nil {
+			return nil, fmt.Errorf("%w: workflow definition context", ErrInvalidInput)
+		}
+		if err := result.ExecutionProfile.Validate(); err != nil || result.Definition.ExecutionProfile != result.ExecutionProfile {
+			return nil, fmt.Errorf("%w: workflow execution profile context", ErrInvalidInput)
+		}
+	}
+	if err := result.InputManifest.Validate(); err != nil {
+		return nil, fmt.Errorf("%w: workflow input manifest context", ErrInvalidInput)
+	}
+	result.DeliverySliceID = strings.TrimSpace(result.DeliverySliceID)
+	if result.DeliverySliceID == "" {
+		return nil, fmt.Errorf("%w: workflow delivery-slice context", ErrInvalidInput)
+	}
+	canonicalManifest, err := domain.CanonicalJSON(result.InputManifest)
+	if err != nil {
+		return nil, fmt.Errorf("%w: workflow input manifest context", ErrInvalidInput)
+	}
+	if err := json.Unmarshal(canonicalManifest, &result.InputManifest); err != nil {
+		return nil, fmt.Errorf("%w: workflow input manifest context", ErrInvalidInput)
+	}
+	runScope := result.RunScope
+	if len(runScope) == 0 {
+		runScope = json.RawMessage(`{}`)
+	}
+	canonicalRunScope, err := domain.CanonicalJSON(runScope)
+	if err != nil {
+		return nil, fmt.Errorf("%w: workflow run scope", ErrInvalidInput)
+	}
+	result.RunScope = canonicalRunScope
+	if result.OutputContract == nil || result.OutputContract.Validate() != nil {
+		return nil, fmt.Errorf("%w: workflow output contract context", ErrInvalidInput)
+	}
+	outputContract := *result.OutputContract
+	outputContract.ProducedArtifactKinds = append([]string(nil), result.OutputContract.ProducedArtifactKinds...)
+	result.OutputContract = &outputContract
+	return &result, nil
+}
+
+func cloneApplicationBuildContext(value *ApplicationBuildContext) *ApplicationBuildContext {
+	if value == nil {
+		return nil
+	}
+	copy := *value
+	copy.RunScope = append(json.RawMessage(nil), value.RunScope...)
+	if canonicalManifest, err := domain.CanonicalJSON(value.InputManifest); err == nil {
+		_ = json.Unmarshal(canonicalManifest, &copy.InputManifest)
+	}
+	if value.OutputContract != nil {
+		outputContract := *value.OutputContract
+		outputContract.ProducedArtifactKinds = append([]string(nil), value.OutputContract.ProducedArtifactKinds...)
+		copy.OutputContract = &outputContract
+	}
+	return &copy
+}
+
+func applicationBuildContextsEqual(left, right *ApplicationBuildContext) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	leftCanonical, leftErr := domain.CanonicalJSON(left)
+	rightCanonical, rightErr := domain.CanonicalJSON(right)
+	return leftErr == nil && rightErr == nil && string(leftCanonical) == string(rightCanonical)
+}
+
+func (s *WorkbenchService) validateApplicationBuildContextForRun(
+	ctx context.Context,
+	run storage.WorkflowRunModel,
+	deliverySliceID *string,
+	buildContext ApplicationBuildContext,
+) error {
+	if deliverySliceID == nil || strings.TrimSpace(*deliverySliceID) != buildContext.DeliverySliceID {
+		return fmt.Errorf("%w: workflow delivery slice context drifted", ErrConflict)
+	}
+	var version storage.WorkflowDefinitionVersionModel
+	if err := s.database.WithContext(ctx).Where("id = ?", run.DefinitionVersionID).Take(&version).Error; err != nil {
+		return err
+	}
+	rowProfile := domain.WorkflowExecutionProfileRef{Version: version.ExecutionProfileVersion, Hash: version.ExecutionProfileHash}
+	runProfile := domain.WorkflowExecutionProfileRef{Version: run.ExecutionProfileVersion, Hash: run.ExecutionProfileHash}
+	if legacyApplicationBuildContext(buildContext) {
+		legacy := domain.WorkflowExecutionProfileRef{Version: legacyWorkflowExecutionProfileVersion, Hash: legacyWorkflowExecutionProfileHash}
+		if rowProfile != legacy || runProfile != legacy {
+			return fmt.Errorf("%w: historical workflow context is not backed by a legacy execution profile", ErrConflict)
+		}
+	} else if buildContext.ExecutionProfile != rowProfile || buildContext.ExecutionProfile != runProfile || buildContext.Definition.ExecutionProfile != rowProfile {
+		return fmt.Errorf("%w: workflow execution profile context drifted", ErrConflict)
+	}
+	var definition domain.WorkflowDefinition
+	if err := json.Unmarshal(version.Content, &definition); err != nil {
+		return ErrConflict
+	}
+	if version.ContentHash != buildContext.Definition.Hash || definition.Ref() != buildContext.Definition || definition.OutputContract == nil ||
+		!applicationBuildOutputContractsEqual(definition.OutputContract, buildContext.OutputContract) {
+		return fmt.Errorf("%w: workflow definition context drifted", ErrConflict)
+	}
+	if run.InputManifestID == nil || run.InputManifestID.String() != buildContext.InputManifest.ID {
+		return fmt.Errorf("%w: workflow input manifest context drifted", ErrConflict)
+	}
+	var manifestModel storage.InputManifestModel
+	if err := s.database.WithContext(ctx).Where(
+		"id = ? AND project_id = ?", *run.InputManifestID, run.ProjectID,
+	).Take(&manifestModel).Error; err != nil {
+		return err
+	}
+	if manifestModel.ManifestHash != buildContext.InputManifest.Hash || manifestModel.Kind != buildContext.InputManifest.JobType {
+		return fmt.Errorf("%w: workflow input manifest identity drifted", ErrConflict)
+	}
+	stored, err := s.contents.Get(ctx, manifestModel.ContentRef, manifestModel.ContentHash)
+	if err != nil {
+		return err
+	}
+	var manifest domain.InputManifest
+	if err := json.Unmarshal(stored.Payload, &manifest); err != nil || manifest.Validate() != nil {
+		return ErrConflict
+	}
+	if !applicationBuildInputManifestsEqual(manifest, buildContext.InputManifest) {
+		return fmt.Errorf("%w: workflow input manifest semantics drifted", ErrConflict)
+	}
+	if !canonicalJSONEqual(run.Scope, buildContext.RunScope) {
+		return fmt.Errorf("%w: workflow run scope drifted", ErrConflict)
+	}
+	return nil
+}
+
+func applicationBuildOutputContractsEqual(left, right *domain.WorkflowOutputContract) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	leftCanonical, leftErr := domain.CanonicalJSON(left)
+	rightCanonical, rightErr := domain.CanonicalJSON(right)
+	return leftErr == nil && rightErr == nil && string(leftCanonical) == string(rightCanonical)
+}
+
+func applicationBuildInputManifestsEqual(left, right domain.InputManifest) bool {
+	leftCanonical, leftErr := domain.CanonicalJSON(left)
+	rightCanonical, rightErr := domain.CanonicalJSON(right)
+	return leftErr == nil && rightErr == nil && string(leftCanonical) == string(rightCanonical)
+}
+
+func canonicalJSONEqual(left, right json.RawMessage) bool {
+	leftCanonical, leftErr := domain.CanonicalJSON(left)
+	rightCanonical, rightErr := domain.CanonicalJSON(right)
+	return leftErr == nil && rightErr == nil && string(leftCanonical) == string(rightCanonical)
+}
+
 func (s *WorkbenchService) GetBundle(ctx context.Context, bundleID, actorID string) (WorkbenchBundle, error) {
 	id, err := uuid.Parse(bundleID)
 	if err != nil {
@@ -439,6 +822,9 @@ func (s *WorkbenchService) GetBundle(ctx context.Context, bundleID, actorID stri
 		return WorkbenchBundle{}, err
 	}
 	if _, err := s.access.Authorize(ctx, model.ProjectID.String(), actorID, ActionView); err != nil {
+		return WorkbenchBundle{}, err
+	}
+	if err := ensureWorkflowManifestGroupActivated(ctx, s.database, model); err != nil {
 		return WorkbenchBundle{}, err
 	}
 	return s.loadBundleContent(ctx, model)
@@ -457,6 +843,9 @@ func (s *WorkbenchService) GetBundleForGeneration(ctx context.Context, bundleID,
 		return WorkbenchBundle{}, err
 	}
 	if _, err := s.access.Authorize(ctx, model.ProjectID.String(), actorID, ActionEdit); err != nil {
+		return WorkbenchBundle{}, err
+	}
+	if err := ensureWorkflowManifestGroupActivated(ctx, s.database, model); err != nil {
 		return WorkbenchBundle{}, err
 	}
 	if model.Status != "frozen" {
@@ -576,6 +965,9 @@ func (s *WorkbenchService) GetLineageState(ctx context.Context, rootID, actorID 
 	if _, err := s.access.Authorize(ctx, requested.ProjectID.String(), actorID, ActionView); err != nil {
 		return WorkbenchLineageState{}, err
 	}
+	if err := ensureWorkflowManifestGroupActivated(ctx, s.database, requested); err != nil {
+		return WorkbenchLineageState{}, err
+	}
 	rootManifestID := requested.RootManifestID
 	if rootManifestID == uuid.Nil {
 		rootManifestID = requested.ID
@@ -631,7 +1023,8 @@ func (s *WorkbenchService) GetLineageState(ctx context.Context, rootID, actorID 
 	var appliedProposal *ImplementationProposal
 	var appliedManifestID uuid.UUID
 	for _, model := range models {
-		if !optionalUUIDsEqual(model.WorkflowRunID, root.WorkflowRunID) {
+		if !optionalUUIDsEqual(model.WorkflowRunID, root.WorkflowRunID) ||
+			!optionalStringsEqual(model.DeliverySliceID, root.DeliverySliceID) {
 			return WorkbenchLineageState{}, ErrConflict
 		}
 		if root.WorkflowRunID == nil {
@@ -803,10 +1196,14 @@ func (s *WorkbenchService) latestNonStaleLineageProposal(
 	if err := json.Unmarshal(stored.Payload, &proposal); err != nil {
 		return nil, err
 	}
+	normalizeLegacyImplementationExecution(&proposal, model)
 	payloadHash, err := implementationPayloadHash(proposal)
 	if err != nil || payloadHash != proposal.PayloadHash || payloadHash != model.PayloadHash ||
 		proposal.ID != model.ID.String() || proposal.ProjectID != model.ProjectID.String() ||
-		proposal.BuildManifestID != model.BuildManifestID.String() || proposal.Status != model.Status || proposal.Version != model.Version {
+		proposal.BuildManifestID != model.BuildManifestID.String() || proposal.Status != model.Status || proposal.Version != model.Version ||
+		string(proposal.ExecutionSource) != model.ExecutionSource || !optionalStringMatchesUUID(proposal.ConversationCommandID, model.ConversationCommandID) ||
+		!optionalStringMatchesUUID(proposal.SupersedesProposalID, model.SupersedesProposalID) ||
+		proposal.InstructionHash != stringValue(model.InstructionHash) || proposal.AIProvider != stringValue(model.AIProvider) || proposal.AIModel != stringValue(model.AIModel) {
 		return nil, ErrConflict
 	}
 	return &proposal, nil
@@ -821,8 +1218,12 @@ func validateBuildManifestModelLineage(
 ) error {
 	visited := map[uuid.UUID]bool{}
 	current := manifest
+	expectedDeliverySliceID := manifest.DeliverySliceID
 	for {
 		if current.ID == uuid.Nil || current.ProjectID != projectID || visited[current.ID] {
+			return ErrConflict
+		}
+		if !optionalStringsEqual(current.DeliverySliceID, expectedDeliverySliceID) {
 			return ErrConflict
 		}
 		visited[current.ID] = true
@@ -870,6 +1271,9 @@ func (s *WorkbenchService) Rebase(ctx context.Context, bundleID, actorID string,
 	if _, err := s.access.Authorize(ctx, authorizationModel.ProjectID.String(), actorID, ActionEdit); err != nil {
 		return WorkbenchBundle{}, err
 	}
+	if err := ensureWorkflowManifestGroupActivated(ctx, s.database, authorizationModel); err != nil {
+		return WorkbenchBundle{}, err
+	}
 	actorUUID, err := uuid.Parse(actorID)
 	if err != nil {
 		return WorkbenchBundle{}, fmt.Errorf("%w: actor id", ErrInvalidInput)
@@ -901,6 +1305,31 @@ func (s *WorkbenchService) Rebase(ctx context.Context, bundleID, actorID string,
 		}
 		if root.RootManifestID != uuid.Nil && root.RootManifestID != root.ID {
 			return ErrConflict
+		}
+		now := s.now().UTC()
+		var liveGenerationClaims int64
+		if err := transaction.Model(&storage.ImplementationGenerationClaimModel{}).Where(
+			"project_id = ? AND root_manifest_id = ? AND status = 'processing' AND claim_expires_at >= ?",
+			authorizationModel.ProjectID, rootID, now,
+		).Count(&liveGenerationClaims).Error; err != nil {
+			return err
+		}
+		if liveGenerationClaims != 0 {
+			return fmt.Errorf("%w: Workbench generation is active for this manifest root", ErrConflict)
+		}
+		var pendingConversationProposals int64
+		if err := transaction.Table("implementation_proposals AS proposals").
+			Joins("JOIN application_build_manifests AS manifests ON manifests.id = proposals.build_manifest_id").
+			Joins("JOIN conversation_commands AS commands ON commands.id = proposals.conversation_command_id").
+			Where(
+				"proposals.project_id = ? AND manifests.root_manifest_id = ? AND proposals.execution_source = ? AND proposals.status IN ? AND commands.status = ?",
+				authorizationModel.ProjectID, rootID, ImplementationSourceConversationCommand,
+				[]string{"open", "reviewing", "ready"}, "pending",
+			).Count(&pendingConversationProposals).Error; err != nil {
+			return err
+		}
+		if pendingConversationProposals != 0 {
+			return fmt.Errorf("%w: a conversation command is finalizing this manifest root", ErrConflict)
 		}
 		var parent storage.ApplicationBuildManifestModel
 		if rootID == parentID {
@@ -977,7 +1406,7 @@ func (s *WorkbenchService) Rebase(ctx context.Context, bundleID, actorID string,
 			return ErrConflict
 		}
 
-		now := s.now().UTC()
+		now = s.now().UTC()
 		rebasedID := uuid.New()
 		result, err = deriveWorkbenchBundle(
 			parentBundle, rebasedID, rootID, parent.ID, input.WorkspaceRevision, actorID, now,
@@ -1000,6 +1429,7 @@ func (s *WorkbenchService) Rebase(ctx context.Context, bundleID, actorID string,
 		model := storage.ApplicationBuildManifestModel{
 			ID: rebasedID, ProjectID: parent.ProjectID, WorkflowRunID: parent.WorkflowRunID,
 			ManifestGroupKey: parent.ManifestGroupKey,
+			DeliverySliceID:  parent.DeliverySliceID,
 			RootManifestID:   rootID, DerivedFromID: &derivedFromID, WorkspaceRevisionID: &workspaceRevision.ID,
 			RootOrdinal:   parent.RootOrdinal,
 			SchemaVersion: parent.SchemaVersion, ContentStore: parent.ContentStore, ContentRef: contentRef.ID,
@@ -1158,6 +1588,7 @@ func deriveWorkbenchBundle(
 	result.RootBuildManifestID = rootID.String()
 	result.DerivedFromBuildManifestID = &derivedFromID
 	result.CurrentWorkspaceRevision = cloneVersionRef(&workspaceRevision)
+	result.WorkflowContext = cloneApplicationBuildContext(parent.WorkflowContext)
 	result.CreatedBy = actorID
 	result.CreatedAt = createdAt
 	result.ManifestHash = ""
@@ -1190,6 +1621,20 @@ func (s *WorkbenchService) loadBundleContent(ctx context.Context, model storage.
 			return WorkbenchBundle{}, ErrConflict
 		}
 	} else if !sameWorkflowRunID(bundle.WorkflowRunID, *model.WorkflowRunID) {
+		return WorkbenchBundle{}, ErrConflict
+	}
+	if model.WorkflowRunID != nil && bundle.WorkflowContext != nil {
+		var run storage.WorkflowRunModel
+		if err := s.database.WithContext(ctx).Where("id = ?", *model.WorkflowRunID).Take(&run).Error; err != nil {
+			return WorkbenchBundle{}, err
+		}
+		if err := s.validateApplicationBuildContextForRun(ctx, run, bundle.DeliverySliceID, *bundle.WorkflowContext); err != nil {
+			return WorkbenchBundle{}, err
+		}
+	}
+	legacyUnpinnedSlice := model.DeliverySliceID == nil &&
+		(model.WorkflowRunID == nil || model.ManifestGroupKey != nil && *model.ManifestGroupKey == "legacy")
+	if !legacyUnpinnedSlice && !optionalStringsEqual(bundle.DeliverySliceID, model.DeliverySliceID) {
 		return WorkbenchBundle{}, ErrConflict
 	}
 	if bundle.RootBuildManifestID != "" && bundle.RootBuildManifestID != model.RootManifestID.String() {
@@ -1280,6 +1725,7 @@ type classifiedRefs struct {
 	pageSpecs     []VersionRef
 	contracts     []VersionRef
 	designSystems []VersionRef
+	contexts      []WorkbenchContextRevision
 }
 
 func (s *WorkbenchService) classifyAndValidateRefs(ctx context.Context, projectID uuid.UUID, refs []VersionRef) (classifiedRefs, error) {
@@ -1311,6 +1757,10 @@ func (s *WorkbenchService) classifyAndValidateRefs(ctx context.Context, projectI
 			result.contracts = appendUniqueRef(result.contracts, ref)
 		case "design_system", "token_set", "component_registry":
 			result.designSystems = appendUniqueRef(result.designSystems, ref)
+		case "decision_record", "glossary_policy", "reference_source", "change_request", "prototype_flow", "fixture_bundle":
+			result.contexts = appendUniqueWorkbenchContext(result.contexts, WorkbenchContextRevision{Kind: artifact.Kind, Revision: ref})
+		default:
+			return result, fmt.Errorf("%w: unsupported Workbench context artifact kind %q", ErrBlockingGate, artifact.Kind)
 		}
 	}
 	return result, nil
@@ -1320,11 +1770,18 @@ func (s *WorkbenchService) collectUpstream(ctx context.Context, projectID, start
 	queue := []uuid.UUID{startRevision}
 	visited := map[uuid.UUID]bool{}
 	refs := []VersionRef{}
-	for len(queue) > 0 && len(visited) < 10_000 {
+	limit := s.maxUpstreamRevisions
+	if limit <= 0 {
+		limit = 10_000
+	}
+	for len(queue) > 0 {
 		current := queue[0]
 		queue = queue[1:]
 		if visited[current] {
 			continue
+		}
+		if len(visited) >= limit {
+			return nil, fmt.Errorf("%w: Workbench upstream dependency graph exceeds %d revisions", ErrBlockingGate, limit)
 		}
 		visited[current] = true
 		var dependencies []storage.ArtifactDependencyModel
@@ -1343,6 +1800,130 @@ func (s *WorkbenchService) collectUpstream(ctx context.Context, projectID, start
 		}
 	}
 	return refs, nil
+}
+
+type frozenWorkbenchSource struct {
+	Ref      VersionRef
+	Purpose  string
+	Required bool
+}
+
+func (s *WorkbenchService) collectFrozenRevisionSources(
+	ctx context.Context,
+	projectID uuid.UUID,
+	startRevision uuid.UUID,
+) ([]frozenWorkbenchSource, error) {
+	frontier := []uuid.UUID{startRevision}
+	visited := map[uuid.UUID]bool{}
+	seenSources := map[string]bool{}
+	identityHashes := map[string]string{}
+	result := make([]frozenWorkbenchSource, 0)
+	limit := s.maxUpstreamRevisions
+	if limit <= 0 {
+		limit = 10_000
+	}
+	for len(frontier) > 0 {
+		frontier = stableUniqueApprovalUUIDs(frontier)
+		unvisited := make([]uuid.UUID, 0, len(frontier))
+		for _, revisionID := range frontier {
+			if visited[revisionID] {
+				continue
+			}
+			if len(visited) >= limit {
+				return nil, fmt.Errorf("%w: Workbench frozen source graph exceeds %d revisions", ErrBlockingGate, limit)
+			}
+			visited[revisionID] = true
+			unvisited = append(unvisited, revisionID)
+		}
+		if len(unvisited) == 0 {
+			break
+		}
+		var sources []storage.ArtifactRevisionSourceModel
+		if err := s.database.WithContext(ctx).
+			Where("revision_id IN ?", unvisited).
+			Order("revision_id ASC, ordinal ASC, source_revision_id ASC, purpose ASC").
+			Find(&sources).Error; err != nil {
+			return nil, err
+		}
+		next := make([]uuid.UUID, 0, len(sources))
+		for _, source := range sources {
+			purpose := strings.TrimSpace(source.Purpose)
+			if source.SourceArtifactID == uuid.Nil || source.SourceRevisionID == uuid.Nil ||
+				strings.TrimSpace(source.SourceContentHash) == "" || purpose == "" {
+				return nil, fmt.Errorf("%w: Workbench frozen revision source is incomplete", ErrBlockingGate)
+			}
+			ref := VersionRef{
+				ArtifactID: source.SourceArtifactID.String(), RevisionID: source.SourceRevisionID.String(),
+				ContentHash: source.SourceContentHash, AnchorID: cloneStringPointer(source.SourceAnchorID),
+			}
+			identityKey := ref.ArtifactID + "\x00" + ref.RevisionID + "\x00" + dereferenceString(ref.AnchorID)
+			if frozenHash, exists := identityHashes[identityKey]; exists && frozenHash != ref.ContentHash {
+				return nil, fmt.Errorf("%w: Workbench frozen source identity has conflicting content hashes", ErrBlockingGate)
+			}
+			identityHashes[identityKey] = ref.ContentHash
+			key := ref.ArtifactID + "\x00" + ref.RevisionID + "\x00" + ref.ContentHash + "\x00" +
+				dereferenceString(ref.AnchorID) + "\x00" + purpose + "\x00" + fmt.Sprintf("%t", source.Required)
+			if !seenSources[key] {
+				if len(result) >= limit {
+					return nil, fmt.Errorf("%w: Workbench frozen source graph exceeds %d source records", ErrBlockingGate, limit)
+				}
+				seenSources[key] = true
+				result = append(result, frozenWorkbenchSource{Ref: ref, Purpose: purpose, Required: source.Required})
+			}
+			next = append(next, source.SourceRevisionID)
+		}
+		frontier = next
+	}
+	sort.Slice(result, func(left, right int) bool {
+		leftValue, rightValue := result[left], result[right]
+		leftKey := leftValue.Ref.ArtifactID + "\x00" + leftValue.Ref.RevisionID + "\x00" +
+			dereferenceString(leftValue.Ref.AnchorID) + "\x00" + leftValue.Purpose + "\x00" +
+			fmt.Sprintf("%t", leftValue.Required)
+		rightKey := rightValue.Ref.ArtifactID + "\x00" + rightValue.Ref.RevisionID + "\x00" +
+			dereferenceString(rightValue.Ref.AnchorID) + "\x00" + rightValue.Purpose + "\x00" +
+			fmt.Sprintf("%t", rightValue.Required)
+		return leftKey < rightKey
+	})
+	for _, source := range result {
+		if _, _, err := s.trace.validateRef(ctx, projectID, source.Ref); err != nil {
+			return nil, err
+		}
+	}
+	return result, nil
+}
+
+func frozenWorkbenchSourceRefs(sources []frozenWorkbenchSource) []VersionRef {
+	refs := make([]VersionRef, 0, len(sources))
+	for _, source := range sources {
+		refs = appendUniqueRef(refs, source.Ref)
+	}
+	return refs
+}
+
+func hasFrozenWorkbenchSource(
+	sources []frozenWorkbenchSource,
+	purpose string,
+	required bool,
+	ref VersionRef,
+) bool {
+	for _, source := range sources {
+		if source.Purpose == purpose && source.Required == required && exactWorkbenchVersionRef(source.Ref, ref) {
+			return true
+		}
+	}
+	return false
+}
+
+func appendUniqueWorkbenchContext(
+	values []WorkbenchContextRevision,
+	candidate WorkbenchContextRevision,
+) []WorkbenchContextRevision {
+	for _, value := range values {
+		if value.Kind == candidate.Kind && exactWorkbenchVersionRef(value.Revision, candidate.Revision) {
+			return values
+		}
+	}
+	return append(values, candidate)
 }
 
 func (s *WorkbenchService) latestApprovedRefByKind(ctx context.Context, projectID uuid.UUID, kind string) (*VersionRef, error) {
@@ -1384,25 +1965,6 @@ func valueAsset(revision storage.ArtifactRevisionModel, value any, name, fragmen
 	}
 }
 
-func renderedFrameRefs(prototype map[string]any) []RenderedFrameRef {
-	frames := objectSlice(prototype["renderedFrames"])
-	result := make([]RenderedFrameRef, 0, len(frames))
-	for _, frame := range frames {
-		assetID := firstString(frame, "assetId")
-		hash := firstString(frame, "contentHash")
-		stateID := firstString(frame, "stateId")
-		breakpointID := firstString(frame, "breakpointId")
-		if assetID == "" || hash == "" || stateID == "" || breakpointID == "" {
-			continue
-		}
-		result = append(result, RenderedFrameRef{
-			AssetRef: AssetRef{AssetID: assetID, ContentHash: hash, MediaType: firstString(frame, "mediaType"), Name: firstString(frame, "name")},
-			StateID:  stateID, BreakpointID: breakpointID,
-		})
-	}
-	return result
-}
-
 func (s *WorkbenchService) renderedFrameAssets(
 	ctx context.Context,
 	projectID string,
@@ -1410,9 +1972,6 @@ func (s *WorkbenchService) renderedFrameAssets(
 	revision storage.ArtifactRevisionModel,
 	prototype map[string]any,
 ) ([]RenderedFrameRef, []string, error) {
-	if existing := renderedFrameRefs(prototype); len(existing) > 0 {
-		return existing, nil, nil
-	}
 	frames := objectSlice(prototype["frames"])
 	if len(frames) == 0 {
 		return nil, nil, fmt.Errorf("%w: prototype has no renderable frames", ErrBlockingGate)
@@ -1425,13 +1984,16 @@ func (s *WorkbenchService) renderedFrameAssets(
 	for _, state := range objectSlice(prototype["states"]) {
 		states[firstString(state, "id")] = state
 	}
+	layers := prototypeCanonicalLayerObjects(prototype)
 	results := make([]RenderedFrameRef, 0, len(frames))
 	pending := make([]string, 0, len(frames))
 	for _, frame := range frames {
 		frameID := firstString(frame, "id")
 		stateID := firstString(frame, "stateId")
 		breakpointID := firstString(frame, "breakpointId")
-		if frameID == "" || stateID == "" || breakpointID == "" || breakpoints[breakpointID] == nil || states[stateID] == nil {
+		rootLayerID := firstString(frame, "rootLayerId")
+		if frameID == "" || stateID == "" || breakpointID == "" || rootLayerID == "" ||
+			breakpoints[breakpointID] == nil || states[stateID] == nil || layers[rootLayerID] == nil {
 			for _, contentID := range pending {
 				_ = s.contents.Abort(context.Background(), contentID)
 			}
@@ -1486,11 +2048,8 @@ func renderPrototypeFrameSVG(frame, breakpoint, state, prototype map[string]any)
 	builder.WriteString(` · `)
 	builder.WriteString(html.EscapeString(firstString(state, "title", "key", "id")))
 	builder.WriteString(`</text>`)
-	layersByID := prototypeLayerObjects(prototype["layers"])
-	layerIDs := make([]string, 0, len(layersByID))
-	for id := range layersByID {
-		layerIDs = append(layerIDs, id)
-	}
+	layersByID := prototypeCanonicalLayerObjects(prototype)
+	layerIDs := reachablePrototypeLayerIDs(firstString(frame, "rootLayerId"), layersByID)
 	sort.Strings(layerIDs)
 	for index, id := range layerIDs {
 		layer := layersByID[id]
@@ -1537,6 +2096,40 @@ func prototypeLayerObjects(value any) map[string]map[string]any {
 		if id := firstString(layer, "id", "layerId"); id != "" {
 			result[id] = layer
 		}
+	}
+	return result
+}
+
+func prototypeCanonicalLayerObjects(prototype map[string]any) map[string]map[string]any {
+	layers := prototypeLayerObjects(prototype["layers"])
+	if len(layers) > 0 {
+		return layers
+	}
+	if scene, ok := prototype["scene"].(map[string]any); ok {
+		return prototypeLayerObjects(scene["layers"])
+	}
+	return layers
+}
+
+func reachablePrototypeLayerIDs(rootLayerID string, layers map[string]map[string]any) []string {
+	rootLayerID = strings.TrimSpace(rootLayerID)
+	if rootLayerID == "" || layers[rootLayerID] == nil {
+		return nil
+	}
+	visited := map[string]bool{}
+	queue := []string{rootLayerID}
+	result := make([]string, 0, len(layers))
+	for len(queue) > 0 {
+		current := queue[0]
+		queue = queue[1:]
+		if visited[current] || layers[current] == nil {
+			continue
+		}
+		visited[current] = true
+		result = append(result, current)
+		children := append([]string(nil), stringSlice(layers[current]["childIds"])...)
+		sort.Strings(children)
+		queue = append(queue, children...)
 	}
 	return result
 }

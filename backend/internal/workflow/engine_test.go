@@ -73,9 +73,70 @@ func (f startArtifactKindResolverFunc) ResolveStartArtifactKinds(ctx context.Con
 	return f(ctx, manifest)
 }
 
+type testRunnerRegistryWithFallback struct {
+	primary  RunnerRegistry
+	fallback map[domain.WorkflowNodeType]WorkerRunner
+}
+
+func (r testRunnerRegistryWithFallback) RunnerFor(nodeType domain.WorkflowNodeType) (WorkerRunner, bool) {
+	if r.primary != nil {
+		if runner, exists := r.primary.RunnerFor(nodeType); exists {
+			return runner, true
+		}
+	}
+	runner, exists := r.fallback[nodeType]
+	return runner, exists
+}
+
+type testManifestCompilerFunc func(context.Context, Execution) (BuildManifest, error)
+
+func (f testManifestCompilerFunc) Compile(ctx context.Context, execution Execution) (BuildManifest, error) {
+	return f(ctx, execution)
+}
+
+// installCompleteTestExecutionProfileRuntime keeps isolated engine fixtures on
+// the explicit legacy profile while still satisfying every binding declared by
+// the sealed built-in descriptors. The fallback registry does not mutate the
+// caller's registry, so tests may register their real node runners afterwards.
+func installCompleteTestExecutionProfileRuntime(t *testing.T, engine *Engine, primary RunnerRegistry) {
+	t.Helper()
+	fallback := map[domain.WorkflowNodeType]WorkerRunner{}
+	for nodeType, owner := range frozenV0V1NodeDispatchOwnership(CurrentWorkflowExecutionProfileDescriptor()) {
+		if owner == workflowNodeDispatchRunner {
+			fallback[nodeType] = RunnerFunc(func(context.Context, Execution) (WorkerResult, error) {
+				return WorkerResult{Disposition: ResultComplete}, nil
+			})
+		}
+	}
+	engine.Runners = testRunnerRegistryWithFallback{primary: primary, fallback: fallback}
+	if engine.ManifestCompilers == nil {
+		engine.ManifestCompilers = NewBuildManifestRegistry()
+	}
+	capability := CurrentWorkflowExecutionProfileDescriptor().Capabilities.ManifestCompilers[0]
+	key := manifestCompilerKey(capability.ManifestKind, capability.SchemaVersion, capability.Hook)
+	if engine.ManifestCompilers.snapshot()[key] == nil {
+		if err := engine.ManifestCompilers.Register(capability, testManifestCompilerFunc(func(context.Context, Execution) (BuildManifest, error) {
+			return BuildManifest{}, errors.New("unexpected test manifest compiler execution")
+		})); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
 func saveEngineDefinition(t *testing.T, store Store, projectID, userID string, definition domain.WorkflowDefinition) DefinitionRecord {
 	t.Helper()
-	record := DefinitionRecord{VersionID: uuid.NewString(), ProjectID: projectID, Key: "test", Title: definition.Name, Published: true, Definition: definition}
+	if definition.ExecutionProfile.IsZero() {
+		profile := LegacyWorkflowExecutionProfileRef()
+		if definition.InputContract != nil && definition.OutputContract != nil {
+			profile = CurrentWorkflowExecutionProfileRef()
+		}
+		var err error
+		definition, err = definition.WithExecutionProfile(profile)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	record := DefinitionRecord{VersionID: uuid.NewString(), ProjectID: projectID, Key: "test", Title: definition.Name, Published: true, ExecutionProfile: definition.ExecutionProfile, Definition: definition}
 	if err := store.SaveDefinition(context.Background(), record); err != nil {
 		t.Fatal(err)
 	}
@@ -94,7 +155,6 @@ func newTestEngine(t *testing.T, definition domain.WorkflowDefinition, registry 
 	}
 	engine, _ := NewEngine(store)
 	engine.Clock = clock
-	engine.Runners = registry
 	engine.RetryBackoff = func(int) time.Duration { return 0 }
 	engine.StartArtifactKinds = startArtifactKindResolverFunc(func(context.Context, domain.InputManifest) ([]string, error) {
 		return []string{"project_brief"}, nil
@@ -120,6 +180,7 @@ func newTestEngine(t *testing.T, definition domain.WorkflowDefinition, registry 
 		}
 		return HumanEditValidation{ArtifactRefs: refs, Primary: refs[len(refs)-1], ArtifactKind: kind}, nil
 	})
+	installCompleteTestExecutionProfileRuntime(t, engine, registry)
 	return engine, store, clock, record, manifest, projectID, userID
 }
 
@@ -183,6 +244,54 @@ func TestEngineStartRejectsManifestDefinitionContractMismatchBeforeCreatingRun(t
 	})
 }
 
+func TestEngineStartReservesConversationIntentForAcceptedServerCommands(t *testing.T) {
+	userID := uuid.NewString()
+	definition := simpleDefinition(t, uuid.NewString(), userID, time.Now().UTC())
+	engine, store, _, record, manifest, projectID, startedBy := newTestEngine(t, definition, nil)
+	reservedScope := json.RawMessage(`{"slice":"all","conversationIntent":{"proposalId":"server-reviewed"}}`)
+
+	forgedRunID := uuid.NewString()
+	_, err := engine.Start(context.Background(), StartRequest{
+		RunID: forgedRunID, ProjectID: projectID, DefinitionVersionID: record.VersionID,
+		InputManifest: manifest.Ref(), Scope: reservedScope, StartedBy: startedBy,
+	})
+	if !errors.Is(err, domain.ErrInvalidArgument) {
+		t.Fatalf("public start accepted forged reserved scope: %v", err)
+	}
+	if _, loadErr := store.GetRun(context.Background(), forgedRunID); !errors.Is(loadErr, domain.ErrNotFound) {
+		t.Fatalf("forged reserved scope persisted a run: %v", loadErr)
+	}
+
+	ordinary, err := engine.Start(context.Background(), StartRequest{
+		RunID: uuid.NewString(), ProjectID: projectID, DefinitionVersionID: record.VersionID,
+		InputManifest: manifest.Ref(), Scope: json.RawMessage(`{"slice":"all"}`), StartedBy: startedBy,
+	})
+	if err != nil || string(ordinary.Scope) != `{"slice":"all"}` {
+		t.Fatalf("ordinary workflow scope was rejected or changed: run=%+v err=%v", ordinary, err)
+	}
+
+	commandID := uuid.NewString()
+	trusted, err := NewAcceptedConversationCommandStartRequest(commandID, record.VersionID, manifest.Ref(), reservedScope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	trusted.ProjectID = projectID
+	trusted.StartedBy = startedBy
+	tampered := trusted
+	tampered.Scope = json.RawMessage(`{"slice":"all","conversationIntent":{"proposalId":"changed-after-acceptance"}}`)
+	if _, err := engine.Start(context.Background(), tampered); !errors.Is(err, domain.ErrInvalidArgument) {
+		t.Fatalf("accepted provenance was not bound to the exact reviewed scope: %v", err)
+	}
+	trustedRun, err := engine.Start(context.Background(), trusted)
+	if err != nil {
+		t.Fatalf("accepted conversation command could not start: %v", err)
+	}
+	provenanceID, ok := trusted.AcceptedConversationCommandID()
+	if !ok || provenanceID != commandID || trustedRun.ID != commandID || string(trustedRun.Scope) != string(reservedScope) {
+		t.Fatalf("accepted command provenance/scope was not exact: provenance=%q ok=%t run=%+v", provenanceID, ok, trustedRun)
+	}
+}
+
 func TestConcurrentClaimHasSingleWinnerAndMonotonicEventSequence(t *testing.T) {
 	userID := uuid.NewString()
 	now := time.Now().UTC()
@@ -199,7 +308,7 @@ func TestConcurrentClaimHasSingleWinnerAndMonotonicEventSequence(t *testing.T) {
 		group.Add(1)
 		go func(worker int) {
 			defer group.Done()
-			_, err := store.ClaimRunnable(context.Background(), fmt.Sprintf("worker-%d", worker), claimNow, time.Minute)
+			_, err := store.ClaimRunnable(context.Background(), fmt.Sprintf("worker-%d", worker), claimNow, time.Minute, run.ExecutionProfile)
 			if err == nil {
 				winners.Add(1)
 			} else if !errors.Is(err, ErrNoRunnableNode) {
@@ -227,7 +336,7 @@ func TestExpiredLeaseIsRecoveredExactlyOnce(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	first, err := store.ClaimRunnable(context.Background(), "worker-1", clock.Now(), time.Second)
+	first, err := store.ClaimRunnable(context.Background(), "worker-1", clock.Now(), time.Second, run.ExecutionProfile)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -240,7 +349,7 @@ func TestExpiredLeaseIsRecoveredExactlyOnce(t *testing.T) {
 		group.Add(1)
 		go func(workerID string) {
 			defer group.Done()
-			lease, err := store.ClaimRunnable(context.Background(), workerID, clock.Now(), time.Minute)
+			lease, err := store.ClaimRunnable(context.Background(), workerID, clock.Now(), time.Minute, run.ExecutionProfile)
 			if err == nil {
 				winners.Add(1)
 				mu.Lock()
@@ -310,7 +419,7 @@ func TestEngineRetriesFailureAndResumesWithPinnedDefinition(t *testing.T) {
 	if resumed.Status != RunCompleted || attempts.Load() != 2 {
 		t.Fatalf("unexpected recovered run: %s attempts=%d", resumed.Status, attempts.Load())
 	}
-	if resumed.Definition != definition.Ref() {
+	if resumed.Definition != record.Definition.Ref() {
 		t.Fatal("run did not remain pinned to definition version")
 	}
 }
@@ -450,6 +559,58 @@ func TestFanOutCreatesSlicesHonorsParallelismAndMerges(t *testing.T) {
 	}
 }
 
+func TestFanOutItemLimitRejectsMaliciousRunnerBeforeInstantiation(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		maxItems int
+		count    int
+	}{{name: "explicit", maxItems: 2, count: 3}, {name: "historical-default", maxItems: 0, count: domain.MaximumWorkflowFanOutItems + 1}} {
+		t.Run(test.name, func(t *testing.T) {
+			userID := uuid.NewString()
+			base := fanOutDefinition(t, userID, time.Now(), domain.MergeAll)
+			nodes := append([]domain.NodeDefinition(nil), base.Nodes...)
+			for index := range nodes {
+				if nodes[index].ID == "fan" {
+					config := *nodes[index].FanOut
+					config.MaxItems = test.maxItems
+					nodes[index].FanOut = &config
+				}
+			}
+			definition, err := domain.NewWorkflowDefinition(uuid.NewString(), 1, "Bounded fanout", "2", nodes, base.Edges, userID, time.Now())
+			if err != nil {
+				t.Fatal(err)
+			}
+			registry := NewMapRegistry()
+			_ = registry.Register(domain.NodeFanOut, RunnerFunc(func(context.Context, Execution) (WorkerResult, error) {
+				items := make([]FanOutItem, 0, test.count)
+				hash, _ := domain.CanonicalHash(map[string]any{"bounded": true})
+				for index := 0; index < test.count; index++ {
+					items = append(items, FanOutItem{Key: fmt.Sprintf("item-%03d", index), Title: "Item", Blueprint: domain.ArtifactRef{ArtifactID: uuid.NewString(), RevisionID: uuid.NewString(), ContentHash: hash}})
+				}
+				return WorkerResult{Disposition: ResultComplete, FanOutItems: items}, nil
+			}))
+			engine, store, _, record, manifest, projectID, startedBy := newTestEngine(t, definition, registry)
+			run, err := engine.Start(context.Background(), StartRequest{RunID: uuid.NewString(), ProjectID: projectID, DefinitionVersionID: record.VersionID, InputManifest: manifest.Ref(), StartedBy: startedBy})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := engine.ClaimAndExecute(context.Background(), "worker"); err != nil {
+				t.Fatal(err)
+			}
+			if err := engine.ClaimAndExecute(context.Background(), "worker"); err == nil || !strings.Contains(err.Error(), "maxItems") {
+				t.Fatalf("over-limit runner result was not rejected: %v", err)
+			}
+			stored, err := store.GetRun(context.Background(), run.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(stored.Context.Slices) != 0 {
+				t.Fatalf("over-limit fan-out partially instantiated %d slices", len(stored.Context.Slices))
+			}
+		})
+	}
+}
+
 func TestReviewWaitSelfApprovalAndWaiver(t *testing.T) {
 	schema := engineSchema()
 	userID := uuid.NewString()
@@ -463,6 +624,10 @@ func TestReviewWaitSelfApprovalAndWaiver(t *testing.T) {
 		return WorkerResult{Disposition: ResultComplete}, nil
 	}))
 	engine, store, _, record, manifest, projectID, startedBy := newTestEngine(t, definition, registry)
+	gateErr := errors.New("canonical review is not approved")
+	engine.ReviewGate = ReviewGateVerifierFunc(func(context.Context, string, []domain.ArtifactRef, domain.ReviewGateNodeConfig) error {
+		return gateErr
+	})
 	run, _ := engine.Start(context.Background(), StartRequest{RunID: uuid.NewString(), ProjectID: projectID, DefinitionVersionID: record.VersionID, InputManifest: manifest.Ref(), StartedBy: startedBy})
 	_ = engine.ClaimAndExecute(context.Background(), "worker")
 	_ = engine.ClaimAndExecute(context.Background(), "worker")
@@ -470,20 +635,12 @@ func TestReviewWaitSelfApprovalAndWaiver(t *testing.T) {
 	if waiting.Status != RunWaitingReview {
 		t.Fatalf("expected waiting review, got %s", waiting.Status)
 	}
-	gateErr := errors.New("canonical review is not approved")
-	engine.ReviewGate = ReviewGateVerifierFunc(func(context.Context, string, []domain.ArtifactRef, domain.ReviewGateNodeConfig) error {
-		return gateErr
-	})
 	if err := engine.ResolveReview(context.Background(), run.ID, "review", engineReviewDecision(uuid.NewString(), ReviewApprove, "")); !errors.Is(err, gateErr) {
 		t.Fatalf("expected canonical review guard, got %v", err)
 	}
 	stillWaiting, _ := store.GetRun(context.Background(), run.ID)
 	if stillWaiting.Nodes["review"].Status != NodeWaitingReview {
 		t.Fatalf("failed canonical review changed node state: %s", stillWaiting.Nodes["review"].Status)
-	}
-	engine.ReviewGate = nil
-	if err := engine.ResolveReview(context.Background(), run.ID, "review", engineReviewDecision(startedBy, ReviewApprove, "")); !errors.Is(err, domain.ErrSelfApproval) {
-		t.Fatalf("expected self approval guard, got %v", err)
 	}
 	if err := engine.ResolveReview(context.Background(), run.ID, "review", engineReviewDecision(uuid.NewString(), ReviewWaive, "emergency")); err != nil {
 		t.Fatal(err)

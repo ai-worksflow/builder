@@ -2,6 +2,7 @@ package core
 
 import (
 	"encoding/json"
+	"fmt"
 	"testing"
 
 	"github.com/worksflow/builder/backend/internal/domain"
@@ -154,7 +155,7 @@ func TestBlueprintGateAcceptsCanonicalFrontendIR(t *testing.T) {
 	report := ValidateArtifactContent("blueprint", json.RawMessage(`{
   "nodes": [
     {"id":"feature-orders","key":"FEATURE-ORDERS","kind":"feature"},
-    {"id":"page-orders","key":"PAGE-ORDERS","kind":"page","route":"/orders","userGoal":"Review open orders.","requirementIds":["REQ-001"]}
+	    {"id":"page-orders","key":"PAGE-ORDERS","kind":"page","title":"Orders","route":"/orders","userGoal":"Review open orders.","requirementIds":["REQ-001"]}
   ],
   "edges": [
     {"id":"edge-orders","sourceNodeId":"feature-orders","targetNodeId":"page-orders","kind":"contains","required":true}
@@ -162,6 +163,129 @@ func TestBlueprintGateAcceptsCanonicalFrontendIR(t *testing.T) {
 }`))
 	if !report.Valid {
 		t.Fatalf("expected canonical frontend Blueprint IR to pass: %#v", report.Findings)
+	}
+}
+
+func TestBlueprintGateAndRuntimeShareNestedPageSpecSchema(t *testing.T) {
+	t.Parallel()
+	payload := json.RawMessage(`{
+  "nodes":[
+    {"id":"feature-home","key":"FEATURE-HOME","kind":"feature"},
+	    {"id":"page-home","key":"PAGE-HOME","type":"Page","requirementIds":["REQ-001"],
+      "spec":{"title":"Home","route":"/home","goal":"Understand status"}}
+  ],
+  "edges":[{"id":"contains-home","sourceNodeId":"feature-home","targetNodeId":"page-home","kind":"contains"}]
+}`)
+	if report := ValidateArtifactContent("blueprint", payload); !report.Valid {
+		t.Fatalf("nested canonical Page spec failed approval: %#v", report.Findings)
+	}
+	pages, err := DecodeBlueprintPages(payload)
+	if err != nil || len(pages) != 1 || pages[0].Kind != "page" || pages[0].Route != "/home" || pages[0].UserGoal != "Understand status" {
+		t.Fatalf("runtime decoder drifted from approval schema: pages=%#v err=%v", pages, err)
+	}
+}
+
+func TestBlueprintCanonicalDecoderRejectsConflictingAliases(t *testing.T) {
+	t.Parallel()
+	for name, payload := range map[string]json.RawMessage{
+		"kind": json.RawMessage(`{
+  "nodes":[{"id":"page-a","key":"PAGE-A","type":"page","kind":"feature","title":"A","route":"/a","userGoal":"Use A","requirementIds":["REQ-A"]}],
+  "edges":[]
+}`),
+		"spec route": json.RawMessage(`{
+  "nodes":[{"id":"page-a","key":"PAGE-A","kind":"page","title":"A","route":"/a","userGoal":"Use A","requirementIds":["REQ-A"],"spec":{"route":"/other"}}],
+  "edges":[]
+}`),
+	} {
+		if _, _, err := DecodeBlueprintSemanticGraph(payload); err == nil {
+			t.Fatalf("conflicting Blueprint %s aliases were accepted", name)
+		}
+		if report := ValidateArtifactContent("blueprint", payload); report.Valid {
+			t.Fatalf("conflicting Blueprint %s aliases passed approval", name)
+		}
+	}
+}
+
+func TestBlueprintPageCountMatchesWorkflowFanOutLimit(t *testing.T) {
+	t.Parallel()
+	payload := func(count int) json.RawMessage {
+		nodes := make([]map[string]any, 0, count)
+		for index := 0; index < count; index++ {
+			nodes = append(nodes, map[string]any{
+				"id": fmt.Sprintf("page-%03d", index), "key": fmt.Sprintf("PAGE-%03d", index),
+				"kind": "page", "title": fmt.Sprintf("Page %d", index), "route": fmt.Sprintf("/page-%d", index),
+				"userGoal": "Complete the page task", "requirementIds": []string{"REQ-001"},
+			})
+		}
+		encoded, err := json.Marshal(map[string]any{"nodes": nodes, "edges": []any{}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return encoded
+	}
+	pages, err := DecodeBlueprintPages(payload(domain.MaximumWorkflowFanOutItems))
+	if err != nil || len(pages) != domain.MaximumWorkflowFanOutItems {
+		t.Fatalf("legal %d-page Blueprint was rejected: pages=%d err=%v", domain.MaximumWorkflowFanOutItems, len(pages), err)
+	}
+	overLimit := payload(domain.MaximumWorkflowFanOutItems + 1)
+	if _, err := DecodeBlueprintPages(overLimit); err == nil {
+		t.Fatal("over-limit Blueprint was accepted by canonical decoder")
+	}
+	if report := ValidateArtifactContent("blueprint", overLimit); report.Valid || !hasFinding(report, "blueprint.application_pages") {
+		t.Fatalf("over-limit Blueprint passed approval: %#v", report.Findings)
+	}
+}
+
+func TestBlueprintDualRepresentationsMustBeCanonicalAndIdentical(t *testing.T) {
+	t.Parallel()
+	aliases := json.RawMessage(`{
+  "nodes":[
+    {"id":"feature","key":"FEATURE","kind":"feature"},
+    {"id":"page","key":"PAGE","kind":"page","requirementIds":["REQ-1"],"spec":{"title":"Home","route":"/home","goal":"Open home"}}
+  ],
+  "edges":[{"id":"contains","sourceNodeId":"feature","targetNodeId":"page","kind":"contains"}],
+  "semantic":{"nodes":[
+    {"id":"feature","businessKey":"FEATURE","type":"Feature"},
+    {"id":"page","businessKey":"PAGE","type":"Page","title":"Home","route":"/home","userGoal":"Open home","requirementIds":["REQ-1"]}
+  ],"edges":[{"id":"contains","from":"feature","to":"page","type":"contains"}]}
+}`)
+	if report := ValidateArtifactContent("blueprint", aliases); !report.Valid {
+		t.Fatalf("equivalent alias representations were rejected: %#v", report.Findings)
+	}
+	for name, payload := range map[string]json.RawMessage{
+		"page fields": json.RawMessage(`{
+  "nodes":[{"id":"feature","key":"FEATURE","kind":"feature"},{"id":"page","key":"PAGE","kind":"page","title":"Home","route":"/home","userGoal":"Open home","requirementIds":["REQ-1"]}],
+  "edges":[{"id":"contains","sourceNodeId":"feature","targetNodeId":"page","kind":"contains"}],
+  "semantic":{"nodes":[{"id":"feature","key":"FEATURE","kind":"feature"},{"id":"page","key":"PAGE","kind":"page","title":"Admin","route":"/admin","userGoal":"Open admin","requirementIds":["REQ-1"]}],"edges":[{"id":"contains","sourceNodeId":"feature","targetNodeId":"page","kind":"contains"}]}
+}`),
+		"missing edge": json.RawMessage(`{
+  "nodes":[{"id":"feature","key":"FEATURE","kind":"feature"},{"id":"page","key":"PAGE","kind":"page","title":"Home","route":"/home","userGoal":"Open home","requirementIds":["REQ-1"]}],
+  "edges":[{"id":"contains","sourceNodeId":"feature","targetNodeId":"page","kind":"contains"}],
+  "semantic":{"nodes":[{"id":"feature","key":"FEATURE","kind":"feature"},{"id":"page","key":"PAGE","kind":"page","title":"Home","route":"/home","userGoal":"Open home","requirementIds":["REQ-1"]}],"edges":[]}
+}`),
+		"permission bypass": json.RawMessage(`{
+  "nodes":[{"id":"feature","key":"FEATURE","kind":"feature"},{"id":"page","key":"PAGE","kind":"page","title":"Home","route":"/home","userGoal":"Open home","requirementIds":["REQ-1"]},{"id":"api","key":"API","kind":"apiOperation","method":"GET","path":"/orders"},{"id":"permission","key":"PERMISSION","kind":"permission"}],
+  "edges":[{"id":"contains","sourceNodeId":"feature","targetNodeId":"page","kind":"contains"},{"id":"requires","sourceNodeId":"api","targetNodeId":"permission","kind":"requires"}],
+  "semantic":{"nodes":[{"id":"feature","key":"FEATURE","kind":"feature"},{"id":"page","key":"PAGE","kind":"page","title":"Home","route":"/home","userGoal":"Open home","requirementIds":["REQ-1"]},{"id":"api","key":"API","kind":"apiOperation","method":"GET","path":"/orders"},{"id":"permission","key":"PERMISSION","kind":"permission"}],"edges":[{"id":"contains","sourceNodeId":"feature","targetNodeId":"page","kind":"contains"}]}
+}`),
+	} {
+		if _, _, err := DecodeBlueprintSemanticGraph(payload); err == nil {
+			t.Fatalf("dual Blueprint %s drift was accepted by runtime decoder", name)
+		}
+		if report := ValidateArtifactContent("blueprint", payload); report.Valid {
+			t.Fatalf("dual Blueprint %s drift passed approval", name)
+		}
+	}
+}
+
+func TestBlueprintGateRejectsFeatureOnlyApplicationBlueprint(t *testing.T) {
+	t.Parallel()
+	report := ValidateArtifactContent("blueprint", json.RawMessage(`{
+  "nodes":[{"id":"feature-only","key":"FEATURE-ONLY","kind":"feature"}],
+  "edges":[]
+}`))
+	if report.Valid || !hasFinding(report, "blueprint.application_pages") {
+		t.Fatalf("feature-only Blueprint passed application approval: %#v", report.Findings)
 	}
 }
 
@@ -175,11 +299,16 @@ func TestBlueprintGateRequiresPermissionForAPIOperations(t *testing.T) {
 		t.Fatalf("expected unprotected API operation to fail: %#v", withoutPermission.Findings)
 	}
 	withPermission := ValidateArtifactContent("blueprint", json.RawMessage(`{
-  "nodes":[
-    {"id":"api-orders","key":"API-ORDERS","kind":"apiOperation","method":"GET","path":"/orders"},
-    {"id":"permission-orders","key":"PERMISSION-ORDERS","kind":"permission"}
-  ],
-  "edges":[{"id":"edge-permission","sourceNodeId":"api-orders","targetNodeId":"permission-orders","kind":"requires"}]
+	  "nodes":[
+	    {"id":"api-orders","key":"API-ORDERS","kind":"apiOperation","method":"GET","path":"/orders"},
+	    {"id":"permission-orders","key":"PERMISSION-ORDERS","kind":"permission"},
+	    {"id":"feature-orders","key":"FEATURE-ORDERS","kind":"feature"},
+	    {"id":"page-orders","key":"PAGE-ORDERS","kind":"page","title":"Orders","route":"/orders","userGoal":"Review orders","requirementIds":["REQ-001"]}
+	  ],
+	  "edges":[
+	    {"id":"edge-permission","sourceNodeId":"api-orders","targetNodeId":"permission-orders","kind":"requires"},
+	    {"id":"edge-page","sourceNodeId":"feature-orders","targetNodeId":"page-orders","kind":"contains"}
+	  ]
 }`))
 	if !withPermission.Valid {
 		t.Fatalf("expected protected API operation to pass: %#v", withPermission.Findings)
@@ -194,10 +323,10 @@ func TestPageSpecGateAcceptsCompleteContent(t *testing.T) {
   "route":"/orders",
   "goal":"List orders",
   "states":[
-    {"id":"state-ready","key":"ready","title":"Ready"},
-    {"id":"state-loading","key":"loading","title":"Loading"},
-    {"id":"state-empty","key":"empty","title":"Empty"},
-    {"id":"state-error","key":"error","title":"Error"}
+    {"id":"state-ready","key":"ready","title":"Ready","required":true},
+    {"id":"state-loading","key":"loading","title":"Loading","required":true},
+    {"id":"state-empty","key":"empty","title":"Empty","required":true},
+    {"id":"state-error","key":"error","title":"Error","required":true}
   ],
   "acceptanceCriterionIds":["AC-001"]
 }`))
@@ -214,10 +343,10 @@ func TestPageSpecGateUsesStableStateKeysInsteadOfServerIDs(t *testing.T) {
   "blueprintPageNodeId":"page-orders",
   "userGoal":"List orders",
   "states":[
-    {"id":"state-a","key":"ready","title":"Ready"},
-    {"id":"state-b","key":"loading","title":"Loading"},
-    {"id":"state-c","key":"empty","title":"Empty"},
-    {"id":"state-d","key":"error","title":"Error"}
+    {"id":"state-a","key":"ready","title":"Ready","required":true},
+    {"id":"state-b","key":"loading","title":"Loading","required":true},
+    {"id":"state-c","key":"empty","title":"Empty","required":true},
+    {"id":"state-d","key":"error","title":"Error","required":true}
   ],
   "acceptanceCriterionIds":["AC-001"]
 }`))
@@ -266,6 +395,37 @@ func TestPrototypeGateRejectsExecutableInteractionAction(t *testing.T) {
 }`))
 	if report.Valid || !hasFinding(report, "prototype.invalid_action") {
 		t.Fatalf("expected executable prototype action to fail: %#v", report.Findings)
+	}
+}
+
+func TestPrototypeGateRejectsNonObjectArrayEntries(t *testing.T) {
+	t.Parallel()
+	report := ValidateArtifactContent("prototype", json.RawMessage(`{
+  "pageSpecRevision":{"artifactId":"page-spec-1","revisionId":"revision-1","contentHash":"sha256:page-spec"},
+  "states":[{"id":"state-ready","key":"ready","title":"Ready","required":true,"fixtureIds":[]}],
+  "breakpoints":[{"id":"desktop","name":"desktop"},{"id":"tablet","name":"tablet"},{"id":"mobile","name":"mobile"}],
+  "layers":{"root":{"id":"root","kind":"frame","childIds":[]}},
+  "frames":[
+    {"id":"desktop","stateId":"state-ready","breakpointId":"desktop","rootLayerId":"root"},
+    {"id":"tablet","stateId":"state-ready","breakpointId":"tablet","rootLayerId":"root"},
+    {"id":"mobile","stateId":"state-ready","breakpointId":"mobile","rootLayerId":"root"}
+  ],
+  "fixtures":[],"interactions":[17]
+}`))
+	if report.Valid || !hasFinding(report, "prototype.array_contract") {
+		t.Fatalf("Prototype ignored a non-object interaction entry: %#v", report.Findings)
+	}
+}
+
+func TestPrototypeFixtureDTORequiresExactIntegerFields(t *testing.T) {
+	t.Parallel()
+	fixture := map[string]any{
+		"name": "Orders", "response": map[string]any{}, "statusCode": 200.5,
+		"latencyMs": 10.25, "sanitized": true,
+		"contentHash": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+	}
+	if err := validatePrototypeFixtureDTO(fixture); err == nil {
+		t.Fatal("fractional fixture status/latency fields satisfied the exact DTO")
 	}
 }
 

@@ -53,6 +53,19 @@ func (r *BuildManifestRegistry) Compile(ctx context.Context, execution Execution
 	return compiler.Compile(ctx, execution)
 }
 
+func (r *BuildManifestRegistry) snapshot() map[string]BuildManifestHook {
+	result := map[string]BuildManifestHook{}
+	if r == nil {
+		return result
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	for key, hook := range r.hooks {
+		result[key] = hook
+	}
+	return result
+}
+
 type MapRegistry struct {
 	mu      sync.RWMutex
 	runners map[domain.WorkflowNodeType]WorkerRunner
@@ -162,12 +175,15 @@ func (w Worker) RunOnce(ctx context.Context) error {
 	if w.Engine == nil || w.Engine.Store == nil || w.WorkerID == "" {
 		return fmt.Errorf("engine and worker ID are required")
 	}
+	if err := w.Engine.SealExecutionProfiles(); err != nil {
+		return err
+	}
 	leaseDuration := w.Engine.leaseDuration()
 	heartbeat := w.Heartbeat
 	if heartbeat <= 0 || heartbeat >= leaseDuration {
 		heartbeat = leaseDuration / 3
 	}
-	lease, err := w.Engine.Store.ClaimRunnable(ctx, w.WorkerID, w.Engine.now(), leaseDuration)
+	lease, err := w.Engine.Store.ClaimRunnable(ctx, w.WorkerID, w.Engine.now(), leaseDuration, w.Engine.supportedExecutionProfiles()...)
 	if err != nil {
 		return err
 	}

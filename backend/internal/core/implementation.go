@@ -29,6 +29,15 @@ const (
 	ImplementationApplied  ImplementationDecision = "applied"
 )
 
+type ImplementationExecutionSource string
+
+const (
+	ImplementationSourceManualSubmission    ImplementationExecutionSource = "manual_submission"
+	ImplementationSourceManualGeneration    ImplementationExecutionSource = "manual_generation"
+	ImplementationSourceWorkflowRunner      ImplementationExecutionSource = "workflow_runner"
+	ImplementationSourceConversationCommand ImplementationExecutionSource = "conversation_command"
+)
+
 type FileOperation struct {
 	ID           string                 `json:"id"`
 	Kind         string                 `json:"kind"`
@@ -46,26 +55,32 @@ type FileOperation struct {
 }
 
 type ImplementationProposal struct {
-	ID                    string              `json:"id"`
-	ProjectID             string              `json:"projectId"`
-	BuildManifestID       string              `json:"buildManifestId"`
-	BaseWorkspaceRevision *VersionRef         `json:"baseWorkspaceRevision,omitempty"`
-	Operations            []FileOperation     `json:"operations"`
-	Routes                []json.RawMessage   `json:"routes"`
-	APIs                  []json.RawMessage   `json:"apis"`
-	Migrations            []json.RawMessage   `json:"migrations"`
-	Tests                 []json.RawMessage   `json:"tests"`
-	Previews              []json.RawMessage   `json:"previews"`
-	TraceLinks            []json.RawMessage   `json:"traceLinks"`
-	Diagnostics           []ValidationFinding `json:"diagnostics"`
-	Assumptions           []string            `json:"assumptions"`
-	UnimplementedItems    []string            `json:"unimplementedItems"`
-	Status                string              `json:"status"`
-	Version               uint64              `json:"version"`
-	PayloadHash           string              `json:"payloadHash"`
-	CreatedBy             string              `json:"createdBy"`
-	CreatedAt             time.Time           `json:"createdAt"`
-	AppliedAt             *time.Time          `json:"appliedAt,omitempty"`
+	ID                    string                        `json:"id"`
+	ProjectID             string                        `json:"projectId"`
+	BuildManifestID       string                        `json:"buildManifestId"`
+	BaseWorkspaceRevision *VersionRef                   `json:"baseWorkspaceRevision,omitempty"`
+	ExecutionSource       ImplementationExecutionSource `json:"executionSource"`
+	ConversationCommandID *string                       `json:"conversationCommandId,omitempty"`
+	SupersedesProposalID  *string                       `json:"supersedesProposalId,omitempty"`
+	InstructionHash       string                        `json:"instructionHash,omitempty"`
+	AIProvider            string                        `json:"aiProvider,omitempty"`
+	AIModel               string                        `json:"aiModel,omitempty"`
+	Operations            []FileOperation               `json:"operations"`
+	Routes                []json.RawMessage             `json:"routes"`
+	APIs                  []json.RawMessage             `json:"apis"`
+	Migrations            []json.RawMessage             `json:"migrations"`
+	Tests                 []json.RawMessage             `json:"tests"`
+	Previews              []json.RawMessage             `json:"previews"`
+	TraceLinks            []json.RawMessage             `json:"traceLinks"`
+	Diagnostics           []ValidationFinding           `json:"diagnostics"`
+	Assumptions           []string                      `json:"assumptions"`
+	UnimplementedItems    []string                      `json:"unimplementedItems"`
+	Status                string                        `json:"status"`
+	Version               uint64                        `json:"version"`
+	PayloadHash           string                        `json:"payloadHash"`
+	CreatedBy             string                        `json:"createdBy"`
+	CreatedAt             time.Time                     `json:"createdAt"`
+	AppliedAt             *time.Time                    `json:"appliedAt,omitempty"`
 }
 
 type CreateImplementationProposalInput struct {
@@ -80,6 +95,23 @@ type CreateImplementationProposalInput struct {
 	Diagnostics        []ValidationFinding `json:"diagnostics,omitempty"`
 	Assumptions        []string            `json:"assumptions,omitempty"`
 	UnimplementedItems []string            `json:"unimplementedItems,omitempty"`
+}
+
+// GeneratedImplementationIdentity is server-only execution provenance. It is
+// never decoded from the public CreateImplementationProposalInput contract.
+// ClaimToken fences the AI worker at the PostgreSQL checkpoint after the
+// potentially long provider call.
+type GeneratedImplementationIdentity struct {
+	ProposalID                    string
+	RequestKey                    string
+	ExecutionSource               ImplementationExecutionSource
+	ConversationCommandID         *string
+	ExpectedActiveProposalID      *string
+	ExpectedActiveProposalVersion uint64
+	InstructionHash               string
+	AIProvider                    string
+	AIModel                       string
+	ClaimToken                    string
 }
 
 type DecideImplementationInput struct {
@@ -110,6 +142,24 @@ func NewImplementationService(database *gorm.DB, contents content.Store, access 
 }
 
 func (s *ImplementationService) Create(ctx context.Context, projectID, actorID string, input CreateImplementationProposalInput) (ImplementationProposal, error) {
+	return s.create(ctx, projectID, actorID, input, nil)
+}
+
+func (s *ImplementationService) CreateGenerated(
+	ctx context.Context,
+	projectID, actorID string,
+	input CreateImplementationProposalInput,
+	identity GeneratedImplementationIdentity,
+) (ImplementationProposal, error) {
+	return s.create(ctx, projectID, actorID, input, &identity)
+}
+
+func (s *ImplementationService) create(
+	ctx context.Context,
+	projectID, actorID string,
+	input CreateImplementationProposalInput,
+	identity *GeneratedImplementationIdentity,
+) (ImplementationProposal, error) {
 	if _, err := s.access.Authorize(ctx, projectID, actorID, ActionEdit); err != nil {
 		return ImplementationProposal{}, err
 	}
@@ -128,11 +178,60 @@ func (s *ImplementationService) Create(ctx context.Context, projectID, actorID s
 		return ImplementationProposal{}, err
 	}
 	proposalID := uuid.New()
+	executionSource := ImplementationSourceManualSubmission
+	var conversationCommandID, supersedesProposalID *uuid.UUID
+	var instructionHash, aiProvider, aiModel string
+	var requestKey, claimToken uuid.UUID
+	if identity != nil {
+		proposalID, requestKey, claimToken, conversationCommandID, supersedesProposalID, err = validateGeneratedImplementationIdentity(*identity)
+		if err != nil {
+			return ImplementationProposal{}, err
+		}
+		executionSource = identity.ExecutionSource
+		instructionHash = identity.InstructionHash
+		aiProvider = strings.TrimSpace(identity.AIProvider)
+		aiModel = strings.TrimSpace(identity.AIModel)
+	}
 	now := s.now().UTC()
+	var supersededProposal ImplementationProposal
+	var supersededModel storage.ImplementationProposalModel
+	var supersededContentRef content.Reference
+	if supersedesProposalID != nil {
+		supersededProposal, supersededModel, err = s.load(ctx, supersedesProposalID.String())
+		if err != nil {
+			return ImplementationProposal{}, err
+		}
+		if identity == nil || identity.ExpectedActiveProposalVersion == 0 ||
+			supersededModel.ProjectID != projectUUID || supersededModel.BuildManifestID.String() != input.BuildManifestID ||
+			supersededProposal.Version != identity.ExpectedActiveProposalVersion || supersededProposal.Status != "open" ||
+			supersededModel.AcceptedCount != 0 || supersededModel.RejectedCount != 0 || supersededModel.AppliedAt != nil {
+			return ImplementationProposal{}, ErrConflict
+		}
+		for _, operation := range supersededProposal.Operations {
+			if operation.Decision != ImplementationPending {
+				return ImplementationProposal{}, ErrConflict
+			}
+		}
+		supersededProposal.Status = "stale"
+		supersededProposal.Version++
+		stalePayload, marshalErr := json.Marshal(supersededProposal)
+		if marshalErr != nil {
+			return ImplementationProposal{}, marshalErr
+		}
+		supersededContentRef, err = s.contents.PutPending(
+			ctx, projectID, "implementation_proposal", supersededProposal.ID, 1, stalePayload,
+		)
+		if err != nil {
+			return ImplementationProposal{}, err
+		}
+	}
 	proposal := ImplementationProposal{
 		ID: proposalID.String(), ProjectID: projectID, BuildManifestID: input.BuildManifestID,
 		BaseWorkspaceRevision: cloneVersionRef(bundle.CurrentWorkspaceRevision),
-		Operations:            cloneFileOperations(input.Operations), Routes: cloneRawMessages(input.Routes),
+		ExecutionSource:       executionSource, ConversationCommandID: uuidStringPointer(conversationCommandID),
+		SupersedesProposalID: uuidStringPointer(supersedesProposalID),
+		InstructionHash:      instructionHash, AIProvider: aiProvider, AIModel: aiModel,
+		Operations: cloneFileOperations(input.Operations), Routes: cloneRawMessages(input.Routes),
 		APIs: cloneRawMessages(input.APIs), Migrations: cloneRawMessages(input.Migrations),
 		Tests: cloneRawMessages(input.Tests), Previews: cloneRawMessages(input.Previews),
 		TraceLinks: cloneRawMessages(input.TraceLinks), Diagnostics: append([]ValidationFinding(nil), input.Diagnostics...),
@@ -157,6 +256,9 @@ func (s *ImplementationService) Create(ctx context.Context, projectID, actorID s
 	defer func() {
 		if abortPending {
 			_ = s.contents.Abort(context.Background(), contentRef.ID)
+			if supersededContentRef.ID != "" {
+				_ = s.contents.Abort(context.Background(), supersededContentRef.ID)
+			}
 		}
 	}()
 	buildManifestUUID := uuid.MustParse(input.BuildManifestID)
@@ -168,6 +270,9 @@ func (s *ImplementationService) Create(ctx context.Context, projectID, actorID s
 	model := storage.ImplementationProposalModel{
 		ID: proposalID, ProjectID: projectUUID, BuildManifestID: buildManifestUUID,
 		BaseWorkspaceRevisionID: baseRevisionID, Status: proposal.Status, Version: proposal.Version,
+		ExecutionSource: string(executionSource), ConversationCommandID: conversationCommandID,
+		SupersedesProposalID: supersedesProposalID,
+		InstructionHash:      nonEmptyStringPointer(instructionHash), AIProvider: nonEmptyStringPointer(aiProvider), AIModel: nonEmptyStringPointer(aiModel),
 		ContentStore: "mongo", ContentRef: contentRef.ID, ContentHash: contentRef.ContentHash,
 		PayloadHash: proposal.PayloadHash, OperationCount: len(proposal.Operations),
 		CreatedBy: actorUUID, CreatedAt: now,
@@ -183,21 +288,96 @@ func (s *ImplementationService) Create(ctx context.Context, projectID, actorID s
 		if err := ensureWorkflowManifestOrdinalReady(ctx, transaction, manifest); err != nil {
 			return err
 		}
+		if identity != nil {
+			if err := validateImplementationGenerationClaim(
+				transaction, model, requestKey, claimToken, executionSource, conversationCommandID,
+				supersedesProposalID, identity.ExpectedActiveProposalVersion, instructionHash, actorUUID, now,
+			); err != nil {
+				return err
+			}
+		}
+		if supersedesProposalID != nil {
+			result := transaction.Model(&storage.ImplementationProposalModel{}).Where(
+				"id = ? AND project_id = ? AND build_manifest_id = ? AND version = ? AND status = 'open' AND accepted_count = 0 AND rejected_count = 0 AND applied_at IS NULL",
+				*supersedesProposalID, projectUUID, buildManifestUUID, identity.ExpectedActiveProposalVersion,
+			).Updates(map[string]any{
+				"status": "stale", "version": identity.ExpectedActiveProposalVersion + 1,
+				"content_ref": supersededContentRef.ID, "content_hash": supersededContentRef.ContentHash,
+			})
+			if result.Error != nil {
+				return result.Error
+			}
+			if result.RowsAffected != 1 {
+				return ErrConflict
+			}
+			if err := insertAudit(transaction, projectUUID, actorUUID, "implementation.proposal_superseded", "implementation_proposal", supersedesProposalID.String(), map[string]any{
+				"replacementProposalId": proposal.ID, "buildManifestId": input.BuildManifestID,
+				"expectedVersion": identity.ExpectedActiveProposalVersion,
+			}); err != nil {
+				return err
+			}
+			if err := enqueue(transaction, "implementation_proposal", supersedesProposalID.String(), "implementation.proposal_superseded", "worksflow.implementation.proposal.superseded", map[string]any{
+				"projectId": projectID, "proposalId": supersedesProposalID.String(), "replacementProposalId": proposal.ID,
+			}); err != nil {
+				return err
+			}
+		}
+		var activeProposalCount int64
+		if err := transaction.Model(&storage.ImplementationProposalModel{}).Where(
+			"build_manifest_id = ? AND status IN ?", buildManifestUUID, []string{"open", "reviewing", "ready"},
+		).Count(&activeProposalCount).Error; err != nil {
+			return err
+		}
+		if activeProposalCount != 0 {
+			return ErrConflict
+		}
 		if err := transaction.Create(&model).Error; err != nil {
 			return err
 		}
-		if err := insertAudit(transaction, projectUUID, actorUUID, "implementation.proposal_created", "implementation_proposal", proposal.ID, map[string]any{"buildManifestId": input.BuildManifestID}); err != nil {
+		if identity != nil {
+			result := transaction.Model(&storage.ImplementationGenerationClaimModel{}).Where(
+				"request_key = ? AND build_manifest_id = ? AND claim_token = ? AND status = 'processing' AND claim_expires_at >= ?",
+				requestKey, buildManifestUUID, claimToken, now,
+			).Updates(map[string]any{
+				"status": "completed", "completed_proposal_id": proposalID,
+				"claim_token": nil, "claim_expires_at": nil,
+				"last_failure": nil, "last_failed_at": nil, "updated_at": now,
+			})
+			if result.Error != nil {
+				return result.Error
+			}
+			if result.RowsAffected != 1 {
+				return ErrConflict
+			}
+		}
+		auditMetadata := map[string]any{
+			"buildManifestId": input.BuildManifestID, "executionSource": executionSource,
+			"instructionHash": instructionHash, "conversationCommandId": uuidStringPointer(conversationCommandID),
+			"supersedesProposalId": uuidStringPointer(supersedesProposalID),
+		}
+		if err := insertAudit(transaction, projectUUID, actorUUID, "implementation.proposal_created", "implementation_proposal", proposal.ID, auditMetadata); err != nil {
 			return err
 		}
 		return enqueue(transaction, "implementation_proposal", proposal.ID, "implementation.proposal_created", "worksflow.implementation.proposal.created", map[string]any{
 			"projectId": projectID, "proposalId": proposal.ID, "buildManifestId": input.BuildManifestID,
+			"executionSource": executionSource, "instructionHash": instructionHash,
 		})
 	})
 	if err != nil {
 		return ImplementationProposal{}, err
 	}
 	abortPending = false
-	if err := s.contents.Finalize(ctx, contentRef.ID); err != nil {
+	finalizeIDs := []string{contentRef.ID}
+	if supersededContentRef.ID != "" {
+		finalizeIDs = append(finalizeIDs, supersededContentRef.ID)
+	}
+	var finalizeErrors []error
+	for _, contentID := range finalizeIDs {
+		if err := s.contents.Finalize(ctx, contentID); err != nil {
+			finalizeErrors = append(finalizeErrors, err)
+		}
+	}
+	if err := errors.Join(finalizeErrors...); err != nil {
 		return ImplementationProposal{}, fmt.Errorf("%w: %v", ErrContentNotReady, err)
 	}
 	return proposal, nil
@@ -227,6 +407,9 @@ func (s *ImplementationService) Decide(ctx context.Context, proposalID, actorID 
 	}
 	if proposal.Version != input.Version || proposal.Status == "applied" || proposal.Status == "partially_applied" || proposal.Status == "stale" {
 		return ImplementationProposal{}, ErrConflict
+	}
+	if err := ensureConversationProposalCommandExecuted(s.database.WithContext(ctx), model, false); err != nil {
+		return ImplementationProposal{}, err
 	}
 	// Lineage staleness is authoritative for every interaction with an otherwise
 	// mutable proposal. Persist it before validating the requested operation so a
@@ -282,6 +465,9 @@ func (s *ImplementationService) Decide(ctx context.Context, proposalID, actorID 
 	actorUUID := uuid.MustParse(actorID)
 	now := s.now().UTC()
 	err = s.database.WithContext(ctx).Transaction(func(transaction *gorm.DB) error {
+		if err := ensureConversationProposalCommandExecuted(transaction, model, true); err != nil {
+			return err
+		}
 		if err := ensureManifestRootHasNoAppliedProposal(transaction, model); err != nil {
 			if errors.Is(err, ErrBlockingGate) || errors.Is(err, ErrConflict) {
 				return ErrProposalStale
@@ -354,6 +540,9 @@ func (s *ImplementationService) Apply(ctx context.Context, proposalID, actorID s
 	}
 	if proposal.Version != input.Version || proposal.Status != "ready" {
 		return ArtifactRevision{}, ErrConflict
+	}
+	if err := ensureConversationProposalCommandExecuted(s.database.WithContext(ctx), proposalModel, false); err != nil {
+		return ArtifactRevision{}, err
 	}
 	staleProposal := proposal
 	staleProposal.Operations = append([]FileOperation(nil), proposal.Operations...)
@@ -432,6 +621,9 @@ func (s *ImplementationService) Apply(ctx context.Context, proposalID, actorID s
 	var revision storage.ArtifactRevisionModel
 	var frozenSources []ArtifactSource
 	err = s.database.WithContext(ctx).Transaction(func(transaction *gorm.DB) error {
+		if err := ensureConversationProposalCommandExecuted(transaction, proposalModel, true); err != nil {
+			return err
+		}
 		if workspaceArtifact.ID == uuid.Nil {
 			var project storage.ProjectModel
 			if err := transaction.Clauses(clause.Locking{Strength: "UPDATE"}).
@@ -590,6 +782,41 @@ func (s *ImplementationService) Apply(ctx context.Context, proposalID, actorID s
 	return revisionFromModel(revision, workspacePayload, frozenSources), nil
 }
 
+// A conversation-owned proposal becomes reviewable only after the command
+// receipt has been committed. This closes the crash window where generation
+// succeeded but the accepted command was still pending and could otherwise be
+// reviewed/applied (or even rejected) as if it had never produced a result.
+func ensureConversationProposalCommandExecuted(
+	database *gorm.DB,
+	proposal storage.ImplementationProposalModel,
+	lock bool,
+) error {
+	if proposal.ExecutionSource != string(ImplementationSourceConversationCommand) {
+		return nil
+	}
+	if proposal.ConversationCommandID == nil || proposal.ID != *proposal.ConversationCommandID {
+		return ErrConflict
+	}
+	query := database
+	if lock {
+		query = query.Clauses(clause.Locking{Strength: "SHARE"})
+	}
+	var command storage.ConversationCommandModel
+	if err := query.Select("id", "project_id", "kind", "status").Where(
+		"id = ? AND project_id = ? AND kind = ? AND status = ?",
+		*proposal.ConversationCommandID,
+		proposal.ProjectID,
+		"workbench_instruction",
+		"executed",
+	).Take(&command).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return ErrConflict
+		}
+		return err
+	}
+	return nil
+}
+
 func ensureManifestRootHasNoAppliedProposal(
 	transaction *gorm.DB,
 	proposal storage.ImplementationProposalModel,
@@ -624,6 +851,114 @@ func ensureManifestRootHasNoAppliedProposal(
 		return fmt.Errorf("%w: build manifest root already has an applied proposal", ErrBlockingGate)
 	}
 	return nil
+}
+
+func validateGeneratedImplementationIdentity(
+	identity GeneratedImplementationIdentity,
+) (uuid.UUID, uuid.UUID, uuid.UUID, *uuid.UUID, *uuid.UUID, error) {
+	proposalID, err := uuid.Parse(strings.TrimSpace(identity.ProposalID))
+	if err != nil {
+		return uuid.Nil, uuid.Nil, uuid.Nil, nil, nil, fmt.Errorf("%w: reserved implementation proposal id", ErrInvalidInput)
+	}
+	requestKey, err := uuid.Parse(strings.TrimSpace(identity.RequestKey))
+	if err != nil {
+		return uuid.Nil, uuid.Nil, uuid.Nil, nil, nil, fmt.Errorf("%w: implementation generation request key", ErrInvalidInput)
+	}
+	claimToken, err := uuid.Parse(strings.TrimSpace(identity.ClaimToken))
+	if err != nil {
+		return uuid.Nil, uuid.Nil, uuid.Nil, nil, nil, fmt.Errorf("%w: implementation generation claim token", ErrInvalidInput)
+	}
+	if !validSHA256(identity.InstructionHash) || strings.TrimSpace(identity.AIProvider) == "" || strings.TrimSpace(identity.AIModel) == "" {
+		return uuid.Nil, uuid.Nil, uuid.Nil, nil, nil, fmt.Errorf("%w: implementation generation provenance", ErrInvalidInput)
+	}
+	var conversationCommandID *uuid.UUID
+	if identity.ConversationCommandID != nil {
+		parsed, parseErr := uuid.Parse(strings.TrimSpace(*identity.ConversationCommandID))
+		if parseErr != nil {
+			return uuid.Nil, uuid.Nil, uuid.Nil, nil, nil, fmt.Errorf("%w: conversation command id", ErrInvalidInput)
+		}
+		conversationCommandID = &parsed
+	}
+	var supersedesProposalID *uuid.UUID
+	if identity.ExpectedActiveProposalID != nil {
+		parsed, parseErr := uuid.Parse(strings.TrimSpace(*identity.ExpectedActiveProposalID))
+		if parseErr != nil || identity.ExpectedActiveProposalVersion == 0 {
+			return uuid.Nil, uuid.Nil, uuid.Nil, nil, nil, fmt.Errorf("%w: expected active implementation proposal", ErrInvalidInput)
+		}
+		supersedesProposalID = &parsed
+	} else if identity.ExpectedActiveProposalVersion != 0 {
+		return uuid.Nil, uuid.Nil, uuid.Nil, nil, nil, fmt.Errorf("%w: expected active implementation proposal version", ErrInvalidInput)
+	}
+	switch identity.ExecutionSource {
+	case ImplementationSourceManualGeneration, ImplementationSourceWorkflowRunner:
+		if conversationCommandID != nil {
+			return uuid.Nil, uuid.Nil, uuid.Nil, nil, nil, fmt.Errorf("%w: non-conversation generation command", ErrInvalidInput)
+		}
+	case ImplementationSourceConversationCommand:
+		if conversationCommandID == nil || requestKey != *conversationCommandID || proposalID != *conversationCommandID {
+			return uuid.Nil, uuid.Nil, uuid.Nil, nil, nil, fmt.Errorf("%w: conversation generation identity", ErrInvalidInput)
+		}
+	default:
+		return uuid.Nil, uuid.Nil, uuid.Nil, nil, nil, fmt.Errorf("%w: implementation execution source", ErrInvalidInput)
+	}
+	return proposalID, requestKey, claimToken, conversationCommandID, supersedesProposalID, nil
+}
+
+func validateImplementationGenerationClaim(
+	transaction *gorm.DB,
+	proposal storage.ImplementationProposalModel,
+	requestKey, claimToken uuid.UUID,
+	executionSource ImplementationExecutionSource,
+	conversationCommandID *uuid.UUID,
+	expectedActiveProposalID *uuid.UUID,
+	expectedActiveProposalVersion uint64,
+	instructionHash string,
+	actorID uuid.UUID,
+	now time.Time,
+) error {
+	var claim storage.ImplementationGenerationClaimModel
+	if err := transaction.Clauses(clause.Locking{Strength: "UPDATE"}).Where(
+		"request_key = ? AND build_manifest_id = ? AND project_id = ?", requestKey, proposal.BuildManifestID, proposal.ProjectID,
+	).Take(&claim).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return ErrConflict
+		}
+		return err
+	}
+	if claim.Status != "processing" || claim.ClaimToken == nil || *claim.ClaimToken != claimToken ||
+		claim.ClaimExpiresAt == nil || claim.ClaimExpiresAt.Before(now) || claim.RequestKey != requestKey ||
+		claim.ReservedProposalID != proposal.ID || claim.ExecutionSource != string(executionSource) ||
+		claim.InstructionHash != instructionHash || claim.ActorID != actorID ||
+		!optionalUUIDsEqual(claim.ConversationCommandID, conversationCommandID) ||
+		!optionalUUIDsEqual(claim.ExpectedActiveProposalID, expectedActiveProposalID) ||
+		optionalUint64Value(claim.ExpectedActiveProposalVersion) != expectedActiveProposalVersion {
+		return ErrConflict
+	}
+	return nil
+}
+
+func optionalUint64Value(value *uint64) uint64 {
+	if value == nil {
+		return 0
+	}
+	return *value
+}
+
+func validSHA256(value string) bool {
+	const prefix = "sha256:"
+	if !strings.HasPrefix(value, prefix) || len(value) != len(prefix)+64 {
+		return false
+	}
+	_, err := hex.DecodeString(strings.TrimPrefix(value, prefix))
+	return err == nil
+}
+
+func nonEmptyStringPointer(value string) *string {
+	if strings.TrimSpace(value) == "" {
+		return nil
+	}
+	copy := value
+	return &copy
 }
 
 func lockFrozenManifestLeaf(
@@ -670,11 +1005,41 @@ func (s *ImplementationService) load(ctx context.Context, proposalID string) (Im
 	if err := json.Unmarshal(stored.Payload, &proposal); err != nil {
 		return ImplementationProposal{}, model, err
 	}
+	normalizeLegacyImplementationExecution(&proposal, model)
 	hash, err := implementationPayloadHash(proposal)
-	if err != nil || hash != proposal.PayloadHash || hash != model.PayloadHash || proposal.Version != model.Version || proposal.Status != model.Status {
+	if err != nil || hash != proposal.PayloadHash || hash != model.PayloadHash || proposal.Version != model.Version || proposal.Status != model.Status ||
+		proposal.ID != model.ID.String() || proposal.ProjectID != model.ProjectID.String() || proposal.BuildManifestID != model.BuildManifestID.String() ||
+		string(proposal.ExecutionSource) != model.ExecutionSource || !optionalStringMatchesUUID(proposal.ConversationCommandID, model.ConversationCommandID) ||
+		!optionalStringMatchesUUID(proposal.SupersedesProposalID, model.SupersedesProposalID) ||
+		proposal.InstructionHash != stringValue(model.InstructionHash) || proposal.AIProvider != stringValue(model.AIProvider) || proposal.AIModel != stringValue(model.AIModel) {
 		return ImplementationProposal{}, model, ErrConflict
 	}
 	return proposal, model, nil
+}
+
+func normalizeLegacyImplementationExecution(proposal *ImplementationProposal, model storage.ImplementationProposalModel) {
+	// Rows created before migration 015 have immutable content without the new
+	// presentation fields. The migration classifies only those rows as manual
+	// submissions, so no generated provenance can be hidden by this bridge.
+	if proposal.ExecutionSource == "" && model.ExecutionSource == string(ImplementationSourceManualSubmission) &&
+		model.ConversationCommandID == nil && model.SupersedesProposalID == nil && model.InstructionHash == nil && model.AIProvider == nil && model.AIModel == nil {
+		proposal.ExecutionSource = ImplementationSourceManualSubmission
+	}
+}
+
+func optionalStringMatchesUUID(value *string, expected *uuid.UUID) bool {
+	if value == nil || expected == nil {
+		return value == nil && expected == nil
+	}
+	parsed, err := uuid.Parse(*value)
+	return err == nil && parsed == *expected
+}
+
+func stringValue(value *string) string {
+	if value == nil {
+		return ""
+	}
+	return *value
 }
 
 func (s *ImplementationService) loadWorkspace(ctx context.Context, projectID uuid.UUID, expected *VersionRef) (map[string]any, storage.ArtifactModel, storage.ArtifactRevisionModel, error) {
@@ -1130,6 +1495,17 @@ func buildManifestSources(bundle WorkbenchBundle) []VersionRef {
 			values = appendUniqueRef(values, reference)
 		}
 	}
+	for _, contextRevision := range bundle.ContextRevisions {
+		values = appendUniqueRef(values, contextRevision.Revision)
+	}
+	if bundle.WorkflowContext != nil {
+		if bundle.WorkflowContext.InputManifest.BaseRevision != nil {
+			values = appendUniqueRef(values, versionRefFromArtifactReference(*bundle.WorkflowContext.InputManifest.BaseRevision))
+		}
+		for _, source := range bundle.WorkflowContext.InputManifest.Sources {
+			values = appendUniqueRef(values, versionRefFromArtifactReference(source.Ref))
+		}
+	}
 	return values
 }
 
@@ -1148,12 +1524,43 @@ func implementationRevisionLineageSources(bundle WorkbenchBundle) []SystemRevisi
 	for _, source := range bundle.DesignSystemRevisions {
 		result = append(result, SystemRevisionSource{Ref: source, Purpose: "design_system", Required: true, Relation: "implemented_by"})
 	}
+	for _, source := range bundle.ContextRevisions {
+		result = append(result, SystemRevisionSource{
+			Ref: source.Revision, Purpose: "context_" + source.Kind, Required: true, Relation: "implemented_by",
+		})
+	}
+	if bundle.WorkflowContext != nil {
+		if bundle.WorkflowContext.InputManifest.BaseRevision != nil {
+			result = append(result, SystemRevisionSource{
+				Ref:     versionRefFromArtifactReference(*bundle.WorkflowContext.InputManifest.BaseRevision),
+				Purpose: "workflow_input_base", Required: true, Relation: "implemented_by",
+			})
+		}
+		for _, source := range bundle.WorkflowContext.InputManifest.Sources {
+			result = append(result, SystemRevisionSource{
+				Ref: versionRefFromArtifactReference(source.Ref), Purpose: "workflow_input:" + source.Purpose,
+				Required: true, Relation: "implemented_by",
+			})
+		}
+	}
 	if bundle.CurrentWorkspaceRevision != nil {
 		result = append(result, SystemRevisionSource{
 			Ref: *bundle.CurrentWorkspaceRevision, Purpose: "workspace_base", Required: true, Relation: "derives_from",
 		})
 	}
 	return result
+}
+
+func versionRefFromArtifactReference(reference domain.ArtifactRef) VersionRef {
+	var anchorID *string
+	if strings.TrimSpace(reference.AnchorID) != "" {
+		value := reference.AnchorID
+		anchorID = &value
+	}
+	return VersionRef{
+		ArtifactID: reference.ArtifactID, RevisionID: reference.RevisionID,
+		ContentHash: reference.ContentHash, AnchorID: anchorID,
+	}
 }
 
 func hashText(value string) string {

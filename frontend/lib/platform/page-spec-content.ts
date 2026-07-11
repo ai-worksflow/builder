@@ -33,8 +33,8 @@ export function normalizePageSpecContent(content: PageSpecContentDto): PageSpecC
       id: interaction.id,
       trigger: interaction.trigger ?? '',
       outcome: interaction.outcome ?? '',
-      ...(interaction.targetPageSpecId
-        ? { targetPageSpecId: interaction.targetPageSpecId }
+      ...(interaction.targetPageNodeId || interaction.targetPageSpecId
+        ? { targetPageNodeId: interaction.targetPageNodeId ?? interaction.targetPageSpecId }
         : {}),
       acceptanceCriterionIds: uniqueStrings(interaction.acceptanceCriterionIds ?? []),
     })),

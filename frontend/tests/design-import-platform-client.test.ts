@@ -14,6 +14,7 @@ const importRecord = {
   id: 'import-1',
   projectId: 'project-1',
   status: 'open',
+  pipelineStage: 'proposal_ready',
   version: 4,
   etag: '"design-import:import-1:4"',
   snapshot: {

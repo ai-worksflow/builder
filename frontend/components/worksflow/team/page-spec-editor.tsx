@@ -462,7 +462,7 @@ function InteractionsEditor({ interactions, readOnly, onChange }: { interactions
           <div className="mt-2 grid gap-2 md:grid-cols-2">
             <Field label="Trigger"><input value={interaction.trigger} readOnly={readOnly} onChange={(event) => update(index, { trigger: event.target.value })} className={inputClass(readOnly)} placeholder="Click checkout" /></Field>
             <Field label="Outcome"><input value={interaction.outcome} readOnly={readOnly} onChange={(event) => update(index, { outcome: event.target.value })} className={inputClass(readOnly)} placeholder="Navigate to checkout" /></Field>
-            <Field label="Target PageSpec ID"><input value={interaction.targetPageSpecId ?? ''} readOnly={readOnly} onChange={(event) => update(index, { targetPageSpecId: event.target.value })} className={inputClass(readOnly)} /></Field>
+            <Field label="Target Blueprint page node ID"><input value={interaction.targetPageNodeId ?? interaction.targetPageSpecId ?? ''} readOnly={readOnly} onChange={(event) => update(index, { targetPageNodeId: event.target.value, targetPageSpecId: undefined })} className={inputClass(readOnly)} placeholder="page-checkout" /></Field>
             <Field label="Acceptance criterion IDs"><input value={interaction.acceptanceCriterionIds.join(', ')} readOnly={readOnly} onChange={(event) => update(index, { acceptanceCriterionIds: commaList(event.target.value) })} className={inputClass(readOnly)} /></Field>
           </div>
         </article>

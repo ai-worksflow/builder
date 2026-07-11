@@ -189,7 +189,7 @@ export function FlowPanel() {
                   >
                     {flow.definitionVersions.map((version) => (
                       <option key={version.versionId} value={version.versionId}>
-                        v{version.version} · {version.contentHash.slice(0, 12)}{version.published ? ' · published' : ''}
+                        v{version.version} · {version.contentHash.slice(0, 12)}{version.executionProfile?.version ? ` · ${version.executionProfile.version}` : ' · legacy profile'}{version.published ? ' · published' : ''}
                       </option>
                     ))}
                   </select>
@@ -203,6 +203,15 @@ export function FlowPanel() {
                     <UploadCloud className="size-3" /> Publish
                   </button>
                 </div>
+
+                {selectedVersion?.executionProfile && (
+                  <p className="mt-1 truncate font-mono text-[8px] text-faint-foreground" title={selectedVersion.executionProfile.hash}>
+                    execution {selectedVersion.executionProfile.version} · {selectedVersion.executionProfile.hash.slice(0, 12)}
+                    {flow.capabilities?.analysisLimits
+                      ? ` · registry v${flow.capabilities.version} · semantic max ${flow.capabilities.analysisLimits.maxSemanticPathStates}`
+                      : ''}
+                  </p>
+                )}
 
                 {can('admin') && (
                   <div className="mt-2 grid grid-cols-2 gap-1.5">
@@ -343,7 +352,7 @@ function RunNodeCard({ node }: { node: WorkflowNodeRunDto }) {
   const [revisionKey, setRevisionKey] = useState('')
   const [reason, setReason] = useState('')
   const [selectionError, setSelectionError] = useState<string | null>(null)
-  const definitionNode = flow.selectedDefinition?.definition.nodes.find(
+  const definitionNode = flow.runDefinition?.definition.nodes.find(
     (item) => item.id === node.definitionNodeId,
   )
   const candidateResolution = useMemo(
