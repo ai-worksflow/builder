@@ -83,37 +83,57 @@ func TestLocalStaticProviderServesSafeDirectoryIndexes(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	serve := func(method, asset string) *httptest.ResponseRecorder {
+	serve := func(method, asset, rawQuery string, headers map[string]string) *httptest.ResponseRecorder {
 		t.Helper()
 		response := httptest.NewRecorder()
-		provider.ServeAsset(response, httptest.NewRequest(method, "/published", nil), deploymentID, versionID, asset)
+		target := "/published/" + deploymentID + "/" + versionID + "/" + asset
+		if rawQuery != "" {
+			target += "?" + rawQuery
+		}
+		request := httptest.NewRequest(method, target, nil)
+		for name, value := range headers {
+			request.Header.Set(name, value)
+		}
+		provider.ServeAsset(response, request, deploymentID, versionID, asset)
 		return response
 	}
 
-	withoutSlash := serve(http.MethodGet, "closure/lineage")
-	withSlash := serve(http.MethodGet, "closure/lineage/")
-	for asset, response := range map[string]*httptest.ResponseRecorder{
-		"closure/lineage":  withoutSlash,
-		"closure/lineage/": withSlash,
-	} {
-		if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "lineage-index") {
-			t.Fatalf("directory index %q was not served: status=%d body=%q", asset, response.Code, response.Body.String())
-		}
-		if !strings.HasPrefix(response.Header().Get("Content-Type"), "text/html") {
-			t.Fatalf("directory index %q content type = %q", asset, response.Header().Get("Content-Type"))
-		}
-		csp := response.Header().Get("Content-Security-Policy")
-		if !strings.Contains(csp, "sandbox") || !strings.Contains(csp, "connect-src 'self' https://api.example.test;") {
-			t.Fatalf("directory index %q CSP = %q", asset, csp)
-		}
+	canonicalLocation := "/published/" + deploymentID + "/" + versionID + "/closure/lineage/"
+	withoutSlash := serve(http.MethodGet, "closure/lineage", "", nil)
+	if withoutSlash.Code != http.StatusPermanentRedirect || withoutSlash.Header().Get("Location") != canonicalLocation || withoutSlash.Body.Len() != 0 {
+		t.Fatalf("directory URL was not canonicalized: status=%d location=%q body=%q", withoutSlash.Code, withoutSlash.Header().Get("Location"), withoutSlash.Body.String())
 	}
-	if withoutSlash.Header().Get("ETag") == "" || withoutSlash.Header().Get("ETag") != withSlash.Header().Get("ETag") {
-		t.Fatalf("directory URL variants did not resolve the same immutable asset: %q %q", withoutSlash.Header().Get("ETag"), withSlash.Header().Get("ETag"))
+	if withoutSlash.Header().Get("ETag") != "" || withoutSlash.Header().Get("Content-Security-Policy") != "" {
+		t.Fatalf("directory redirect exposed index response headers: %v", withoutSlash.Header())
 	}
 
-	head := serve(http.MethodHead, "closure/lineage/")
-	if head.Code != http.StatusOK || head.Body.Len() != 0 || head.Header().Get("ETag") != withoutSlash.Header().Get("ETag") ||
-		head.Header().Get("Content-Length") != withoutSlash.Header().Get("Content-Length") {
+	withSlash := serve(http.MethodGet, "closure/lineage/", "", nil)
+	if withSlash.Code != http.StatusOK || !strings.Contains(withSlash.Body.String(), "lineage-index") {
+		t.Fatalf("directory index was not served: status=%d body=%q", withSlash.Code, withSlash.Body.String())
+	}
+	if !strings.HasPrefix(withSlash.Header().Get("Content-Type"), "text/html") {
+		t.Fatalf("directory index content type = %q", withSlash.Header().Get("Content-Type"))
+	}
+	csp := withSlash.Header().Get("Content-Security-Policy")
+	if !strings.Contains(csp, "sandbox") || !strings.Contains(csp, "connect-src 'self' https://api.example.test;") {
+		t.Fatalf("directory index CSP = %q", csp)
+	}
+	if withSlash.Header().Get("ETag") == "" {
+		t.Fatal("directory index did not include an immutable ETag")
+	}
+
+	redirectHead := serve(http.MethodHead, "closure/lineage", "", nil)
+	if redirectHead.Code != http.StatusPermanentRedirect || redirectHead.Header().Get("Location") != canonicalLocation || redirectHead.Body.Len() != 0 {
+		t.Fatalf("directory HEAD was not canonicalized: status=%d headers=%v body=%q", redirectHead.Code, redirectHead.Header(), redirectHead.Body.String())
+	}
+	queryRedirect := serve(http.MethodGet, "closure/lineage", "state=error&from=review", map[string]string{"If-None-Match": withSlash.Header().Get("ETag")})
+	if queryRedirect.Code != http.StatusPermanentRedirect || queryRedirect.Header().Get("Location") != canonicalLocation+"?state=error&from=review" {
+		t.Fatalf("directory redirect did not preserve query or beat conditional handling: status=%d location=%q", queryRedirect.Code, queryRedirect.Header().Get("Location"))
+	}
+
+	head := serve(http.MethodHead, "closure/lineage/", "", nil)
+	if head.Code != http.StatusOK || head.Body.Len() != 0 || head.Header().Get("ETag") != withSlash.Header().Get("ETag") ||
+		head.Header().Get("Content-Length") != withSlash.Header().Get("Content-Length") {
 		t.Fatalf("directory index HEAD response differs from GET: status=%d headers=%v body=%q", head.Code, head.Header(), head.Body.String())
 	}
 
@@ -121,8 +141,9 @@ func TestLocalStaticProviderServesSafeDirectoryIndexes(t *testing.T) {
 		"closure/no-index", "closure/no-index/", "closure/file.txt/", ".worksflow/",
 		"closure//lineage", "closure/../lineage", "closure/lineage//",
 	} {
-		if response := serve(http.MethodGet, asset); response.Code != http.StatusNotFound {
-			t.Fatalf("unsafe or non-index asset %q returned %d", asset, response.Code)
+		response := serve(http.MethodGet, asset, "", nil)
+		if response.Code != http.StatusNotFound || response.Header().Get("Location") != "" {
+			t.Fatalf("unsafe or non-index asset %q returned status=%d location=%q", asset, response.Code, response.Header().Get("Location"))
 		}
 	}
 
@@ -130,7 +151,7 @@ func TestLocalStaticProviderServesSafeDirectoryIndexes(t *testing.T) {
 	if err := os.Symlink("lineage", filepath.Join(versionRoot, "closure", "linked")); err != nil {
 		t.Fatal(err)
 	}
-	if response := serve(http.MethodGet, "closure/linked"); response.Code != http.StatusNotFound {
+	if response := serve(http.MethodGet, "closure/linked", "", nil); response.Code != http.StatusNotFound || response.Header().Get("Location") != "" {
 		t.Fatalf("symlinked directory index returned %d", response.Code)
 	}
 	if err := os.Mkdir(filepath.Join(versionRoot, "closure", "linked-index"), 0o700); err != nil {
@@ -139,14 +160,26 @@ func TestLocalStaticProviderServesSafeDirectoryIndexes(t *testing.T) {
 	if err := os.Symlink("../lineage/index.html", filepath.Join(versionRoot, "closure", "linked-index", "index.html")); err != nil {
 		t.Fatal(err)
 	}
-	if response := serve(http.MethodGet, "closure/linked-index"); response.Code != http.StatusNotFound {
+	if response := serve(http.MethodGet, "closure/linked-index", "", nil); response.Code != http.StatusNotFound || response.Header().Get("Location") != "" {
 		t.Fatalf("symlinked index file returned %d", response.Code)
 	}
 	if err := os.MkdirAll(filepath.Join(versionRoot, "closure", "non-regular", "index.html"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if response := serve(http.MethodGet, "closure/non-regular"); response.Code != http.StatusNotFound {
+	if response := serve(http.MethodGet, "closure/non-regular", "", nil); response.Code != http.StatusNotFound || response.Header().Get("Location") != "" {
 		t.Fatalf("non-regular directory index returned %d", response.Code)
+	}
+
+	absolute, err := NewLocalStaticProvider(root, "https://apps.example.test/published")
+	if err != nil {
+		t.Fatal(err)
+	}
+	absoluteResponse := httptest.NewRecorder()
+	absoluteRequest := httptest.NewRequest(http.MethodGet, "https://evil.example/published/"+deploymentID+"/"+versionID+"/closure/lineage?state=error", nil)
+	absolute.ServeAsset(absoluteResponse, absoluteRequest, deploymentID, versionID, "closure/lineage")
+	expectedAbsolute := "https://apps.example.test/published/" + deploymentID + "/" + versionID + "/closure/lineage/?state=error"
+	if absoluteResponse.Code != http.StatusPermanentRedirect || absoluteResponse.Header().Get("Location") != expectedAbsolute {
+		t.Fatalf("absolute redirect trusted request host: status=%d location=%q", absoluteResponse.Code, absoluteResponse.Header().Get("Location"))
 	}
 }
 

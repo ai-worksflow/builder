@@ -255,6 +255,8 @@ func (p *LocalStaticProvider) ServeAsset(response http.ResponseWriter, request *
 		http.NotFound(response, request)
 		return
 	}
+	redirectDirectory := !directoryRequest && info.IsDir()
+	directoryPath := path
 	if directoryRequest || info.IsDir() {
 		if !info.IsDir() {
 			http.NotFound(response, request)
@@ -274,6 +276,19 @@ func (p *LocalStaticProvider) ServeAsset(response http.ResponseWriter, request *
 	}
 	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
 		http.NotFound(response, request)
+		return
+	}
+	if redirectDirectory {
+		location, err := url.Parse(p.baseURL + "/" + deploymentID + "/" + versionID + "/" + escapeAssetPath(directoryPath) + "/")
+		if err != nil {
+			http.NotFound(response, request)
+			return
+		}
+		location.RawQuery = request.URL.RawQuery
+		location.ForceQuery = request.URL.ForceQuery
+		response.Header().Set("Location", location.String())
+		response.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+		response.WriteHeader(http.StatusPermanentRedirect)
 		return
 	}
 	contents, err := os.ReadFile(target)
