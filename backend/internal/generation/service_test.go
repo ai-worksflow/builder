@@ -421,7 +421,11 @@ func TestArtifactProposalInstructionsIncludeCanonicalReviewContracts(t *testing.
 		"derive_requirements":  {"top-level summary, blocks, requirements, and acceptanceCriteria", "sourceBlockIds", "acceptanceCriterionIds", "every Must requirement ID"},
 		"decompose_pages":      {"at least one application Page", "contains edge from a Feature", "requires edge to a Permission"},
 		"generate_page_spec":   {"blueprintPageNodeId", "ready, loading, empty, and error", "acceptance-criterion trace"},
-		"generate_prototype":   {"pageSpecRevision", "desktop, tablet, and mobile", "every required state and breakpoint pair"},
+		"generate_prototype": {
+			"pageSpecRevision", "state set exactly", "fixtureIds arrays that exactly match", "Never invent a fixture or interaction",
+			"integer HTTP statusCode", "sanitized true", "declarative action", "semantic layer object record",
+			"desktop, tablet, and mobile", "every required state and breakpoint pair",
+		},
 	}
 	for jobType, required := range tests {
 		jobType, required := jobType, required
