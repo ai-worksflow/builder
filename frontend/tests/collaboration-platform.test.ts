@@ -1,7 +1,5 @@
 import assert from 'node:assert/strict'
-import {
-  PlatformCollaborationGateway,
-} from '../lib/collaboration/platform-adapter'
+import { PlatformCollaborationGateway } from '../lib/collaboration/platform-adapter'
 import type { CollaborationVersionRef } from '../lib/collaboration/types'
 import { PlatformClient } from '../lib/platform/client'
 import { PlatformNetworkError, type FetchLike } from '../lib/platform/http'
@@ -36,6 +34,7 @@ function project(role: 'owner' | 'admin' | 'editor' | 'commenter' | 'viewer' = '
     id: 'project-1',
     name: 'Platform project',
     lifecycle: 'active',
+    governanceMode: 'team' as const,
     currentUserRole: role,
     memberCount: 1,
     createdBy: 'user-1',
@@ -135,6 +134,7 @@ test('project rename and archive use server ETags and never mutate a browser cat
     updatedAt: '2026-07-10T00:00:00Z',
     memberCount: 1,
     role: 'owner' as const,
+    governanceMode: 'team' as const,
     etag: '"project-1"',
   }
   const renamed = await gateway.renameProject(target, 'Renamed project')
@@ -244,6 +244,51 @@ test('review requests pin a revision and assign explicit reviewers without self-
   })
 })
 
+test('solo review requests and decisions send explicit self-approval intent', async () => {
+  const calls: Array<{ path: string; body: unknown }> = []
+  const client = new PlatformClient({
+    http: {
+      baseUrl: 'https://platform.example.test',
+      fetch: (async (input, init) => {
+        calls.push({
+          path: new URL(input.toString()).pathname,
+          body: typeof init?.body === 'string' ? JSON.parse(init.body) as unknown : undefined,
+        })
+        return json({ id: 'review-1' }, 200)
+      }) as FetchLike,
+    },
+  })
+  const gateway = new PlatformCollaborationGateway(client)
+  const target: CollaborationVersionRef = {
+    artifactId: 'artifact-1',
+    revisionId: 'revision-4',
+    contentHash: 'sha256:def456',
+  }
+
+  await gateway.requestReview('project-1', target, 'Solo review', ['owner-1'], true)
+  await gateway.decideReview('review-1', 'approve', 'Checked locally', '"review:1"', true)
+
+  assert.deepEqual(calls, [
+    {
+      path: '/v1/projects/project-1/reviews',
+      body: {
+        target,
+        summary: 'Solo review',
+        requiredReviewerIds: ['owner-1'],
+        allowSelfApproval: true,
+      },
+    },
+    {
+      path: '/v1/reviews/review-1/decision',
+      body: {
+        decision: 'approved',
+        summary: 'Checked locally',
+        soloReviewConfirmed: true,
+      },
+    },
+  ])
+})
+
 test('canonical backend comment threads and review requests map without legacy fields', async () => {
   const client = new PlatformClient({
     http: {
@@ -309,6 +354,8 @@ test('canonical backend comment threads and review requests map without legacy f
               reviewerIds: ['user-1'],
               minimumApprovals: 1,
               prohibitSelfReview: true,
+              governanceMode: 'solo',
+              soloSelfReviewOwnerId: 'user-1',
             },
             requestedBy: 'user-1',
             requestedAt: '2026-07-10T01:10:00Z',
@@ -358,6 +405,10 @@ test('canonical backend comment threads and review requests map without legacy f
   assert.equal(snapshot.reviews[0].state, 'pending')
   assert.equal(snapshot.reviews[0].etag, '"review-request:review-1:1"')
   assert.deepEqual(snapshot.reviews[0].requiredReviewerIds, ['user-1'])
+  assert.deepEqual(snapshot.reviews[0].policy, {
+    governanceMode: 'solo',
+    soloSelfReviewOwnerId: 'user-1',
+  })
   assert.equal(snapshot.reviewTargets[0].title, 'Requirements')
 })
 
@@ -460,8 +511,29 @@ test('project WebSocket events invalidate server state and update presence direc
       },
     },
   })
+  sockets[0].message({
+    type: 'event',
+    event: {
+      id: 'event-review-approved',
+      type: 'artifact.revision_approved',
+      cursor: 'cursor-3',
+      subscriptionId: 'project:project-1',
+      projectId: 'project-1',
+      occurredAt: '2026-07-10T00:00:02Z',
+      payload: {
+        projectId: 'project-1',
+        artifactId: 'artifact-1',
+        revisionId: 'revision-1',
+        reviewId: 'review-1',
+      },
+    },
+  })
+  sockets[0].message({
+    type: 'cursor.reset',
+    subscriptionId: 'project:project-1',
+  })
 
-  assert.deepEqual(invalidations, ['members'])
+  assert.deepEqual(invalidations, ['members', 'all', 'all'])
   assert.deepEqual(presence, ['user-1:active'])
   unsubscribe()
   gateway.disconnectRealtime()

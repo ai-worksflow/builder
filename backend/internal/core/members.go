@@ -135,6 +135,33 @@ func (s *MemberService) AddExisting(ctx context.Context, projectID, actorID, ema
 		JoinedAt: now, UpdatedAt: now,
 	}
 	err = s.database.WithContext(ctx).Transaction(func(transaction *gorm.DB) error {
+		if err := lockProjectMembershipSet(transaction, projectUUID); err != nil {
+			return err
+		}
+		currentRole, err := (&AccessControl{database: transaction}).Authorize(ctx, projectID, actorID, ActionAdmin)
+		if err != nil {
+			return err
+		}
+		if role == RoleOwner {
+			if currentRole != RoleOwner {
+				return ErrForbidden
+			}
+			governance, err := LoadProjectGovernance(ctx, transaction, projectUUID)
+			if err != nil {
+				return err
+			}
+			if governance.Mode == GovernanceModeSolo {
+				var alreadyOwner int64
+				if err := transaction.Model(&storage.ProjectMemberModel{}).
+					Where("project_id = ? AND user_id = ? AND role = ?", projectUUID, user.ID, RoleOwner).
+					Count(&alreadyOwner).Error; err != nil {
+					return err
+				}
+				if alreadyOwner == 0 {
+					return ErrSoloOwnerInvariant
+				}
+			}
+		}
 		if err := transaction.Clauses(clause.OnConflict{DoNothing: true}).Create(&member).Error; err != nil {
 			return err
 		}
@@ -238,6 +265,18 @@ func (s *MemberService) AcceptInvitation(ctx context.Context, actorID, token str
 			}
 			return err
 		}
+		if err := lockProjectMembershipSet(transaction, invitation.ProjectID); err != nil {
+			return err
+		}
+		if Role(invitation.Role) == RoleOwner {
+			governance, err := LoadProjectGovernance(ctx, transaction, invitation.ProjectID)
+			if err != nil {
+				return err
+			}
+			if governance.Mode == GovernanceModeSolo {
+				return ErrSoloOwnerInvariant
+			}
+		}
 		if err := transaction.Where("id = ? AND disabled_at IS NULL", actorUUID).Take(&user).Error; err != nil {
 			return err
 		}
@@ -296,6 +335,10 @@ func (s *MemberService) UpdateRole(ctx context.Context, projectID, actorID, memb
 		if err := lockProjectMembershipSet(transaction, projectUUID); err != nil {
 			return err
 		}
+		currentRole, err := (&AccessControl{database: transaction}).Authorize(ctx, projectID, actorID, ActionAdmin)
+		if err != nil {
+			return err
+		}
 		if err := transaction.Clauses(clause.Locking{Strength: "UPDATE"}).
 			Where("project_id = ? AND user_id = ?", projectUUID, memberUUID).Take(&member).Error; err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
@@ -306,8 +349,20 @@ func (s *MemberService) UpdateRole(ctx context.Context, projectID, actorID, memb
 		if expectedETag == "" || memberETag(member.ProjectID, member.UserID, member.Role, member.UpdatedAt) != expectedETag {
 			return ErrConflict
 		}
+		if Role(member.Role) != RoleOwner && role == RoleOwner {
+			if currentRole != RoleOwner {
+				return ErrForbidden
+			}
+			governance, err := LoadProjectGovernance(ctx, transaction, projectUUID)
+			if err != nil {
+				return err
+			}
+			if governance.Mode == GovernanceModeSolo {
+				return ErrSoloOwnerInvariant
+			}
+		}
 		if Role(member.Role) == RoleOwner && role != RoleOwner {
-			if actorRole != RoleOwner {
+			if currentRole != RoleOwner {
 				return ErrForbidden
 			}
 			if err := ensureAnotherOwner(transaction, projectUUID, memberUUID); err != nil {
@@ -341,7 +396,7 @@ func (s *MemberService) UpdateRole(ctx context.Context, projectID, actorID, memb
 }
 
 func (s *MemberService) Remove(ctx context.Context, projectID, actorID, memberID, expectedETag string) error {
-	actorRole, err := s.access.Authorize(ctx, projectID, actorID, ActionAdmin)
+	_, err := s.access.Authorize(ctx, projectID, actorID, ActionAdmin)
 	if err != nil {
 		return err
 	}
@@ -357,6 +412,10 @@ func (s *MemberService) Remove(ctx context.Context, projectID, actorID, memberID
 		if err := lockProjectMembershipSet(transaction, projectUUID); err != nil {
 			return err
 		}
+		currentRole, err := (&AccessControl{database: transaction}).Authorize(ctx, projectID, actorID, ActionAdmin)
+		if err != nil {
+			return err
+		}
 		var member storage.ProjectMemberModel
 		if err := transaction.Clauses(clause.Locking{Strength: "UPDATE"}).
 			Where("project_id = ? AND user_id = ?", projectUUID, memberUUID).Take(&member).Error; err != nil {
@@ -369,7 +428,7 @@ func (s *MemberService) Remove(ctx context.Context, projectID, actorID, memberID
 			return ErrConflict
 		}
 		if Role(member.Role) == RoleOwner {
-			if actorRole != RoleOwner {
+			if currentRole != RoleOwner {
 				return ErrForbidden
 			}
 			if err := ensureAnotherOwner(transaction, projectUUID, memberUUID); err != nil {

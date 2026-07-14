@@ -188,6 +188,7 @@ func (s *GORMStore) DecideSummaryCheckpoint(
 		return ConversationSummaryCheckpoint{}, err
 	}
 	var checkpoint storage.ConversationSummaryCheckpointModel
+	soloSelfReview := false
 	err = s.database.WithContext(ctx).Transaction(func(transaction *gorm.DB) error {
 		conversation, err := lockActiveConversation(transaction, projectID, conversationID)
 		if err != nil {
@@ -205,7 +206,18 @@ func (s *GORMStore) DecideSummaryCheckpoint(
 			return core.ErrConflict
 		}
 		if checkpoint.CreatedBy == actorID {
-			return core.ErrSelfApproval
+			governance, err := core.LockProjectGovernance(ctx, transaction, projectID)
+			if err != nil {
+				return err
+			}
+			var member storage.ProjectMemberModel
+			if err := transaction.Where("project_id = ? AND user_id = ?", projectID, actorID).Take(&member).Error; err != nil {
+				return mapNotFound(err)
+			}
+			if err := core.RequireSoloSelfReview(governance, core.Role(member.Role), input.SoloReviewConfirmed, input.Reason); err != nil {
+				return err
+			}
+			soloSelfReview = true
 		}
 		now := s.now().UTC()
 		status := SummaryCheckpointRejected
@@ -281,15 +293,22 @@ func (s *GORMStore) DecideSummaryCheckpoint(
 				return err
 			}
 		}
-		if err := conversationAudit(transaction, projectID, actorID, "conversation.summary_checkpoint.decided", "conversation_summary_checkpoint", checkpoint.ID.String(), map[string]any{
+		auditMetadata := map[string]any{
 			"conversationId": conversationID.String(), "decision": input.Decision, "status": status,
 			"throughSequence": checkpoint.ThroughSequence, "prefixHash": sha256Ref(checkpoint.PrefixHash),
-		}); err != nil {
+			"reason": input.Reason, "subjectAuthorId": checkpoint.CreatedBy.String(),
+		}
+		if soloSelfReview {
+			auditMetadata["soloSelfReview"] = true
+			auditMetadata["governanceMode"] = core.GovernanceModeSolo
+		}
+		if err := conversationAudit(transaction, projectID, actorID, "conversation.summary_checkpoint.decided", "conversation_summary_checkpoint", checkpoint.ID.String(), auditMetadata); err != nil {
 			return err
 		}
 		return conversationOutbox(transaction, "conversation_summary_checkpoint", checkpoint.ID.String(), "conversation.summary_checkpoint.decided", map[string]any{
 			"projectId": projectID.String(), "conversationId": conversationID.String(),
 			"checkpointId": checkpoint.ID.String(), "decision": input.Decision, "status": status,
+			"soloSelfReview": soloSelfReview,
 		})
 	})
 	if err != nil {

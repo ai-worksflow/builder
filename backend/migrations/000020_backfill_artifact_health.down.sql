@@ -1,0 +1,3 @@
+-- Artifact health is part of the canonical artifact state. Rows created by the
+-- backfill are intentionally retained because they cannot be distinguished
+-- safely from rows recomputed after this migration was applied.

@@ -3,6 +3,7 @@ import {
   ArtifactWorkspaceConflictError,
   ArtifactWorkspaceGateway,
   approvedRequirementBaselineSources,
+  artifactWorkspaceEventRequiresRefresh,
   createEmptyPageSpecContent,
   createEmptyPrototypeContent,
   documentReviewIssues,
@@ -34,6 +35,21 @@ const tests: TestCase[] = []
 function test(name: string, run: TestCase['run']) {
   tests.push({ name, run })
 }
+
+test('workspace refreshes for canonical Proposal and artifact projection events', () => {
+  for (const type of [
+    'proposal.created',
+    'proposal.operation_decided',
+    'proposal.applied',
+    'artifact.revision_created',
+    'review.submitted',
+    'review.decision_recorded',
+    'artifact.revision_approved',
+  ]) {
+    assert.equal(artifactWorkspaceEventRequiresRefresh(type), true, type)
+  }
+  assert.equal(artifactWorkspaceEventRequiresRefresh('presence.updated'), false)
+})
 
 function json(data: unknown, status = 200, headers?: HeadersInit) {
   return Response.json(data, { status, headers })
@@ -205,6 +221,91 @@ test('workspace loading uses only the six platform artifact collections', async 
     '/v1/projects/project-1/prototypes',
     '/v1/projects/project-1/traces',
   ])
+})
+
+test('workspace trace loading paginates within the platform limit', async () => {
+  const traceUrls: URL[] = []
+  const client = new PlatformClient({
+    http: {
+      baseUrl: 'https://platform.example.test',
+      fetch: (async (input) => {
+        const url = new URL(input.toString())
+        if (!url.pathname.endsWith('/traces')) return json({ items: [] })
+
+        traceUrls.push(url)
+        const page = traceUrls.length
+        const offset = (page - 1) * 200
+        return json({
+          items: Array.from({ length: 200 }, (_, index) => ({ id: `trace-${offset + index}` })),
+          nextCursor: `trace-page-${page + 1}`,
+        })
+      }) as FetchLike,
+    },
+  })
+
+  const snapshot = await new ArtifactWorkspaceGateway(client).load('project-1')
+  assert.equal(snapshot.traces.length, 500)
+  assert.equal(snapshot.traces[499]?.id, 'trace-499')
+  assert.deepEqual(traceUrls.map((url) => url.searchParams.get('limit')), ['200', '200', '100'])
+  assert.deepEqual(
+    traceUrls.map((url) => url.searchParams.get('cursor')),
+    [null, 'trace-page-2', 'trace-page-3'],
+  )
+})
+
+test('workspace proposal loading follows every pagination cursor', async () => {
+  const proposalUrls: URL[] = []
+  const client = new PlatformClient({
+    http: {
+      baseUrl: 'https://platform.example.test',
+      fetch: (async (input) => {
+        const url = new URL(input.toString())
+        if (!url.pathname.endsWith('/output-proposals')) return json({ items: [] })
+
+        proposalUrls.push(url)
+        if (proposalUrls.length === 1) {
+          return json({
+            items: Array.from({ length: 200 }, (_, index) => ({ id: `proposal-${index}` })),
+            nextCursor: 'proposal-page-2',
+          })
+        }
+        return json({ items: [{ id: 'proposal-200' }] })
+      }) as FetchLike,
+    },
+  })
+
+  const snapshot = await new ArtifactWorkspaceGateway(client).load('project-1')
+  assert.equal(snapshot.proposals.length, 201)
+  assert.equal(snapshot.proposals[200]?.id, 'proposal-200')
+  assert.deepEqual(proposalUrls.map((url) => url.searchParams.get('limit')), ['200', '200'])
+  assert.deepEqual(
+    proposalUrls.map((url) => url.searchParams.get('cursor')),
+    [null, 'proposal-page-2'],
+  )
+})
+
+test('workspace proposal loading rejects a repeated pagination cursor', async () => {
+  let proposalRequests = 0
+  const client = new PlatformClient({
+    http: {
+      baseUrl: 'https://platform.example.test',
+      fetch: (async (input) => {
+        const url = new URL(input.toString())
+        if (!url.pathname.endsWith('/output-proposals')) return json({ items: [] })
+        proposalRequests += 1
+        return json({
+          items: [{ id: `proposal-${proposalRequests}` }],
+          nextCursor: 'repeated-proposal-cursor',
+        })
+      }) as FetchLike,
+    },
+  })
+
+  await assert.rejects(
+    new ArtifactWorkspaceGateway(client).load('project-1'),
+    /Proposal pagination returned a repeated cursor/,
+  )
+  assert.equal(proposalRequests, 2)
 })
 
 test('document autosave sends the draft ETag and stable structured IDs', async () => {

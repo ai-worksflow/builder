@@ -26,6 +26,7 @@ import type {
 import {
   ArtifactWorkspaceGateway,
   approvedRequirementBaselineSources,
+  artifactWorkspaceEventRequiresRefresh,
   createEmptyPageSpecContent,
   createEmptyPrototypeContent,
   replaceArtifactWorkspaceSnapshotResource,
@@ -188,18 +189,13 @@ export function ArtifactWorkspaceProvider({ children }: { children: ReactNode })
 
   useEffect(() => {
     if (!session.signedIn || !project) return
-    const unsubscribe = platformClient.websocket.subscribeProject(project.id, (event) => {
-      if (
-        event.type === 'artifact.updated' ||
-        event.type === 'revision.created' ||
-        event.type === 'document.updated' ||
-        event.type === 'blueprint.updated' ||
-        event.type === 'pageSpec.updated' ||
-        event.type === 'prototype.updated' ||
-        event.type === 'proposal.updated' ||
-        event.type === 'trace.updated'
-      ) void refreshRef.current()
-    })
+    const unsubscribe = platformClient.websocket.subscribeProject(
+      project.id,
+      (event) => {
+        if (artifactWorkspaceEventRequiresRefresh(event.type)) void refreshRef.current()
+      },
+      () => void refreshRef.current(),
+    )
     platformClient.websocket.connect()
     return unsubscribe
   }, [platformClient.websocket, project, session.signedIn])

@@ -241,15 +241,22 @@ export class PlatformFlowClient {
     nodeKey: string,
     resolution: 'approve' | 'changes_requested' | 'waive',
     reason = '',
+    soloReviewConfirmed = false,
     options?: ClientMutationOptions,
   ) {
     return this.http.post<void, {
       readonly nodeKey: string
       readonly resolution: typeof resolution
       readonly reason: string
+      readonly soloReviewConfirmed?: boolean
     }>(
       `/v1/projects/${segment(projectId)}/workflow-runs/${segment(runId)}/approve`,
-      { nodeKey, resolution, reason },
+      {
+        nodeKey,
+        resolution,
+        reason,
+        ...(soloReviewConfirmed ? { soloReviewConfirmed: true } : {}),
+      },
       mutationOptions(options),
     )
   }

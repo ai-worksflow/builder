@@ -27,6 +27,7 @@ import type {
   CommentReply,
   CommentThread,
   ProjectAction,
+  ProjectGovernanceMode,
   ProjectMember,
   ProjectPresence,
   ProjectReview,
@@ -80,6 +81,7 @@ export interface CollaborationProjectSnapshot {
 }
 
 export type CollaborationInvalidation =
+  | 'all'
   | 'project'
   | 'members'
   | 'comments'
@@ -126,6 +128,7 @@ function projectRecord(project: ProjectDto): CollaborationProject {
     updatedAt: project.updatedAt,
     memberCount: project.memberCount ?? 0,
     role: project.currentUserRole,
+    governanceMode: project.governanceMode ?? 'team',
     etag: project.etag,
   }
 }
@@ -202,6 +205,11 @@ function reviewRecord(
       : review.status === 'approved' ? 'approved' : 'pending',
     summary: latestDecision?.summary ?? 'Review requested for this immutable revision.',
     requiredReviewerIds: review.policy.reviewerIds,
+    requestedById: review.requestedBy,
+    policy: {
+      governanceMode: review.policy.governanceMode ?? 'team',
+      soloSelfReviewOwnerId: review.policy.soloSelfReviewOwnerId,
+    },
     reviewer,
     target: {
       artifactId: review.artifactId,
@@ -312,6 +320,21 @@ export class PlatformCollaborationGateway {
     const response = await this.client.projects.update(
       project.id,
       { name },
+      { ifMatch: project.etag, idempotencyKey: true },
+    )
+    return projectRecord(response.data)
+  }
+
+  async updateGovernanceMode(
+    project: CollaborationProject,
+    governanceMode: ProjectGovernanceMode,
+  ) {
+    if (!project.etag) {
+      throw new PlatformProtocolError('Refresh the project before changing its review mode.')
+    }
+    const response = await this.client.projects.update(
+      project.id,
+      { governanceMode },
       { ifMatch: project.etag, idempotencyKey: true },
     )
     return projectRecord(response.data)
@@ -442,19 +465,28 @@ export class PlatformCollaborationGateway {
     target: VersionRefDto,
     summary: string,
     requiredReviewerIds: readonly string[],
+    allowSelfApproval = false,
   ) {
     const pinnedTarget = exactVersionRef(target)
     return this.client.reviews.create(projectId, {
       target: pinnedTarget,
       summary,
       requiredReviewerIds,
+      ...(allowSelfApproval ? { allowSelfApproval: true } : {}),
     })
   }
 
-  async decideReview(reviewId: string, decision: ReviewDecision, summary: string, etag: string) {
+  async decideReview(
+    reviewId: string,
+    decision: ReviewDecision,
+    summary: string,
+    etag: string,
+    soloReviewConfirmed = false,
+  ) {
     return this.client.reviews.decide(reviewId, {
       decision: decision === 'approve' ? 'approved' : 'changesRequested',
       summary,
+      ...(soloReviewConfirmed ? { soloReviewConfirmed: true } : {}),
     }, { ifMatch: etag })
   }
 
@@ -471,14 +503,18 @@ export class PlatformCollaborationGateway {
     onInvalidate: (scope: CollaborationInvalidation) => void,
     onPresence: (presence: ProjectPresence) => void,
   ) {
-    const unsubscribe = this.client.websocket.subscribeProject(projectId, (event) => {
-      if (event.type === 'presence.updated') {
-        onPresence(presenceRecord(event.payload))
-        return
-      }
-      const scope = invalidationForEvent(event)
-      if (scope) onInvalidate(scope)
-    })
+    const unsubscribe = this.client.websocket.subscribeProject(
+      projectId,
+      (event) => {
+        if (event.type === 'presence.updated') {
+          onPresence(presenceRecord(event.payload))
+          return
+        }
+        const scope = invalidationForEvent(event)
+        if (scope) onInvalidate(scope)
+      },
+      () => onInvalidate('all'),
+    )
     this.client.websocket.connect()
     return unsubscribe
   }
@@ -493,6 +529,12 @@ function invalidationForEvent(event: PlatformDomainEvent): CollaborationInvalida
   if (event.type === 'member.updated') return 'members'
   if (event.type === 'comment.created' || event.type === 'comment.updated') return 'comments'
   if (event.type === 'review.updated') return 'reviews'
+  if (
+    event.type === 'review.submitted' ||
+    event.type === 'review.stale' ||
+    event.type === 'review.decision_recorded' ||
+    event.type === 'artifact.revision_approved'
+  ) return 'all'
   if (event.type === 'notification.updated') return 'notifications'
   if (
     event.type === 'artifact.updated' ||

@@ -100,6 +100,7 @@ export type ProjectProjectionEventType =
   | 'artifact.created'
   | 'artifact.draft_updated'
   | 'artifact.revision_created'
+  | 'artifact.revision_approved'
   | 'artifact.member_bindings_replaced'
   | 'dependency.created'
   | 'trace.created'
@@ -107,6 +108,9 @@ export type ProjectProjectionEventType =
   | 'proposal.created'
   | 'proposal.operation_decided'
   | 'proposal.applied'
+  | 'review.submitted'
+  | 'review.stale'
+  | 'review.decision_recorded'
   | 'workbench.bundle_created'
   | 'implementation.proposal_created'
   | 'implementation.operation_decided'
@@ -303,6 +307,7 @@ const DOMAIN_EVENT_TYPES = new Set<PlatformDomainEvent['type']>([
   'artifact.created',
   'artifact.draft_updated',
   'artifact.revision_created',
+  'artifact.revision_approved',
   'artifact.member_bindings_replaced',
   'dependency.created',
   'trace.created',
@@ -310,6 +315,9 @@ const DOMAIN_EVENT_TYPES = new Set<PlatformDomainEvent['type']>([
   'proposal.created',
   'proposal.operation_decided',
   'proposal.applied',
+  'review.submitted',
+  'review.stale',
+  'review.decision_recorded',
   'workbench.bundle_created',
   'implementation.proposal_created',
   'implementation.operation_decided',
@@ -385,6 +393,15 @@ interface SubscriptionRecord {
   readonly runId?: string
   count: number
   readonly listeners: Set<(event: PlatformDomainEvent) => void>
+  readonly resetListeners: Set<(subscription: WsSubscriptionReset) => void>
+}
+
+export interface WsSubscriptionReset {
+  readonly subscriptionId: string
+  readonly topic: SubscriptionRecord['topic']
+  readonly projectId: string
+  readonly artifactId?: string
+  readonly runId?: string
 }
 
 function subscriptionId(
@@ -510,40 +527,54 @@ export class PlatformWebSocketClient {
     return () => this.errorListeners.delete(listener)
   }
 
-  subscribeProject(projectId: string, listener?: (event: PlatformDomainEvent) => void) {
-    return this.subscribe({ topic: 'project', projectId }, listener)
+  subscribeProject(
+    projectId: string,
+    listener?: (event: PlatformDomainEvent) => void,
+    onReset?: (subscription: WsSubscriptionReset) => void,
+  ) {
+    return this.subscribe({ topic: 'project', projectId }, listener, onReset)
   }
 
   subscribeArtifact(
     projectId: string,
     artifactId: string,
     listener?: (event: PlatformDomainEvent) => void,
+    onReset?: (subscription: WsSubscriptionReset) => void,
   ) {
-    return this.subscribe({ topic: 'artifact', projectId, artifactId }, listener)
+    return this.subscribe({ topic: 'artifact', projectId, artifactId }, listener, onReset)
   }
 
   subscribeRun(
     projectId: string,
     runId: string,
     listener?: (event: PlatformDomainEvent) => void,
+    onReset?: (subscription: WsSubscriptionReset) => void,
   ) {
-    return this.subscribe({ topic: 'run', projectId, runId }, listener)
+    return this.subscribe({ topic: 'run', projectId, runId }, listener, onReset)
   }
 
   private subscribe(
     input: Pick<SubscriptionRecord, 'topic' | 'projectId' | 'artifactId' | 'runId'>,
     listener?: (event: PlatformDomainEvent) => void,
+    onReset?: (subscription: WsSubscriptionReset) => void,
   ) {
     const resourceId = input.artifactId ?? input.runId
     const id = subscriptionId(input.topic, input.projectId, resourceId)
     let record = this.subscriptions.get(id)
     if (!record) {
-      record = { ...input, id, count: 0, listeners: new Set() }
+      record = {
+        ...input,
+        id,
+        count: 0,
+        listeners: new Set(),
+        resetListeners: new Set(),
+      }
       this.subscriptions.set(id, record)
       if (this.stateValue === 'open') this.sendSubscription(record)
     }
     record.count += 1
     if (listener) record.listeners.add(listener)
+    if (onReset) record.resetListeners.add(onReset)
 
     let active = true
     return () => {
@@ -552,6 +583,7 @@ export class PlatformWebSocketClient {
       const current = this.subscriptions.get(id)
       if (!current) return
       if (listener) current.listeners.delete(listener)
+      if (onReset) current.resetListeners.delete(onReset)
       current.count -= 1
       if (current.count > 0) return
       this.subscriptions.delete(id)
@@ -688,7 +720,17 @@ export class PlatformWebSocketClient {
     if (message.type === 'cursor.reset') {
       this.cursorStore.remove(message.subscriptionId)
       const subscription = this.subscriptions.get(message.subscriptionId)
-      if (subscription && this.stateValue === 'open') this.sendSubscription(subscription)
+      if (subscription) {
+        const reset = {
+          subscriptionId: subscription.id,
+          topic: subscription.topic,
+          projectId: subscription.projectId,
+          ...(subscription.artifactId ? { artifactId: subscription.artifactId } : {}),
+          ...(subscription.runId ? { runId: subscription.runId } : {}),
+        } satisfies WsSubscriptionReset
+        for (const listener of subscription.resetListeners) listener(reset)
+        if (this.stateValue === 'open') this.sendSubscription(subscription)
+      }
       return
     }
     if (message.type === 'error') {

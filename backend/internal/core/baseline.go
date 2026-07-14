@@ -151,6 +151,9 @@ func (s *BaselineService) Compile(ctx context.Context, projectID, actorID string
 		if artifact.Kind != "requirement_baseline" {
 			return fmt.Errorf("%w: REQUIREMENT-BASELINE key belongs to a non-baseline artifact", ErrConflict)
 		}
+		if err := ensureArtifactHealthRow(transaction, artifact.ID, now); err != nil {
+			return err
+		}
 		var existing storage.ArtifactRevisionModel
 		err = transaction.Where(
 			"artifact_id = ? AND content_hash = ? AND workflow_status = 'approved'",

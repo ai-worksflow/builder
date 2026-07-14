@@ -176,14 +176,20 @@ export class PlatformConversationClient {
     checkpoint: Pick<ConversationSummaryCheckpointDto, 'id' | 'etag'>,
     decision: 'approve' | 'reject',
     reason = '',
+    soloReviewConfirmed = false,
     options?: ClientMutationOptions,
   ) {
     return this.http.post<ConversationSummaryCheckpointDto, {
       readonly decision: 'approve' | 'reject'
       readonly reason?: string
+      readonly soloReviewConfirmed?: boolean
     }>(
       `${this.base(projectId)}/${segment(conversationId)}/summary-checkpoints/${segment(checkpoint.id)}/decision`,
-      { decision, ...(reason.trim() ? { reason: reason.trim() } : {}) },
+      {
+        decision,
+        ...(reason.trim() ? { reason: reason.trim() } : {}),
+        ...(soloReviewConfirmed ? { soloReviewConfirmed: true } : {}),
+      },
       mutationOptions(options, checkpoint.etag),
     )
   }

@@ -40,16 +40,17 @@ type AuthSessionModel struct {
 func (AuthSessionModel) TableName() string { return "auth_sessions" }
 
 type ProjectModel struct {
-	ID          uuid.UUID `gorm:"type:uuid;primaryKey"`
-	Slug        *string
-	Name        string    `gorm:"not null"`
-	Description string    `gorm:"not null"`
-	Lifecycle   string    `gorm:"not null"`
-	Version     uint64    `gorm:"not null"`
-	CreatedBy   uuid.UUID `gorm:"type:uuid;not null"`
-	CreatedAt   time.Time
-	UpdatedAt   time.Time
-	ArchivedAt  *time.Time
+	ID             uuid.UUID `gorm:"type:uuid;primaryKey"`
+	Slug           *string
+	Name           string    `gorm:"not null"`
+	Description    string    `gorm:"not null"`
+	Lifecycle      string    `gorm:"not null"`
+	GovernanceMode string    `gorm:"not null;default:team"`
+	Version        uint64    `gorm:"not null"`
+	CreatedBy      uuid.UUID `gorm:"type:uuid;not null"`
+	CreatedAt      time.Time
+	UpdatedAt      time.Time
+	ArchivedAt     *time.Time
 }
 
 func (ProjectModel) TableName() string { return "projects" }
@@ -298,6 +299,7 @@ type ReviewDecisionModel struct {
 	ReviewerID      uuid.UUID `gorm:"type:uuid;not null"`
 	Decision        string    `gorm:"not null"`
 	Summary         string    `gorm:"not null"`
+	SoloSelfReview  bool      `gorm:"not null"`
 	CreatedAt       time.Time
 }
 
@@ -458,6 +460,7 @@ type WorkflowRunModel struct {
 	ExecutionProfileVersion string          `gorm:"not null"`
 	ExecutionProfileHash    string          `gorm:"not null"`
 	Status                  string          `gorm:"not null"`
+	GovernanceMode          string          `gorm:"not null;default:team"`
 	InputManifestID         *uuid.UUID      `gorm:"type:uuid"`
 	Scope                   json.RawMessage `gorm:"type:jsonb;not null"`
 	Context                 json.RawMessage `gorm:"type:jsonb;not null"`

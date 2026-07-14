@@ -28,7 +28,7 @@ type WorkflowAPI interface {
 	Resume(context.Context, string, string, string, string, json.RawMessage) error
 	AuthorizeExecution(context.Context, string, string, string, string) error
 	RecordProposal(context.Context, string, string, string, string, domain.ProposalRef) error
-	ResolveReview(context.Context, string, string, string, string, runtime.ReviewResolution, string) error
+	ResolveReview(context.Context, string, string, string, string, runtime.ReviewResolution, string, bool) error
 	Cancel(context.Context, string, string, string, string) error
 	Retry(context.Context, string, string, string, string, string) error
 	Waive(context.Context, string, string, string, string, string) error
@@ -126,9 +126,10 @@ type proposalWorkflowInput struct {
 	Proposal domain.ProposalRef `json:"proposal"`
 }
 type approveWorkflowInput struct {
-	NodeKey    string                   `json:"nodeKey"`
-	Resolution runtime.ReviewResolution `json:"resolution"`
-	Reason     string                   `json:"reason,omitempty"`
+	NodeKey             string                   `json:"nodeKey"`
+	Resolution          runtime.ReviewResolution `json:"resolution"`
+	Reason              string                   `json:"reason,omitempty"`
+	SoloReviewConfirmed bool                     `json:"soloReviewConfirmed,omitempty"`
 }
 type reasonWorkflowInput struct {
 	NodeKey string `json:"nodeKey,omitempty"`
@@ -344,7 +345,7 @@ func (h *WorkflowHandler) approve(c *gin.Context) {
 	if !ok {
 		return
 	}
-	if err := h.facade.ResolveReview(c.Request.Context(), c.Param("projectId"), c.Param("runId"), input.NodeKey, actor, input.Resolution, input.Reason); err != nil {
+	if err := h.facade.ResolveReview(c.Request.Context(), c.Param("projectId"), c.Param("runId"), input.NodeKey, actor, input.Resolution, input.Reason, input.SoloReviewConfirmed); err != nil {
 		writeWorkflowError(c, err)
 		return
 	}
@@ -403,7 +404,7 @@ func runResponse(run *runtime.RunRecord) gin.H {
 	for _, node := range run.Nodes {
 		nodes = append(nodes, node)
 	}
-	return gin.H{"id": run.ID, "projectId": run.ProjectID, "definitionVersionId": run.DefinitionVersionID, "definition": run.Definition, "executionProfile": run.ExecutionProfile, "inputManifest": run.InputManifest, "status": run.Status, "scope": run.Scope, "context": run.Context, "eventCursor": run.EventCursor, "startedBy": run.StartedBy, "startedAt": run.StartedAt, "completedAt": run.CompletedAt, "cancelledAt": run.CancelledAt, "failure": run.Failure, "createdAt": run.CreatedAt, "updatedAt": run.UpdatedAt, "nodes": nodes}
+	return gin.H{"id": run.ID, "projectId": run.ProjectID, "definitionVersionId": run.DefinitionVersionID, "definition": run.Definition, "executionProfile": run.ExecutionProfile, "inputManifest": run.InputManifest, "status": run.Status, "governanceMode": run.GovernanceMode, "scope": run.Scope, "context": run.Context, "eventCursor": run.EventCursor, "startedBy": run.StartedBy, "startedAt": run.StartedAt, "completedAt": run.CompletedAt, "cancelledAt": run.CancelledAt, "failure": run.Failure, "createdAt": run.CreatedAt, "updatedAt": run.UpdatedAt, "nodes": nodes}
 }
 func writeWorkflowError(c *gin.Context, err error) {
 	switch {
@@ -415,6 +416,8 @@ func writeWorkflowError(c *gin.Context, err error) {
 		problem.Write(c, problem.New(http.StatusConflict, "workflow_conflict", "Workflow conflict", "The workflow changed or its lease is no longer valid."))
 	case errors.Is(err, domain.ErrSelfApproval), errors.Is(err, core.ErrSelfApproval):
 		problem.Write(c, problem.New(http.StatusConflict, "self_approval", "Self approval is not allowed", "The workflow starter cannot approve this gate."))
+	case errors.Is(err, core.ErrSoloReviewConfirmation):
+		problem.Write(c, problem.New(http.StatusConflict, "solo_review_confirmation_required", "Solo self-review confirmation required", "Confirm the solo self-review and provide a review reason."))
 	case errors.Is(err, domain.ErrInvalidArgument), errors.Is(err, domain.ErrValidation), errors.Is(err, domain.ErrInvalidTransition):
 		problem.Write(c, problem.New(http.StatusUnprocessableEntity, "invalid_workflow_transition", "Workflow transition is invalid", err.Error()))
 	default:

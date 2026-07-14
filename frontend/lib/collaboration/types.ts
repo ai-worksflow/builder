@@ -8,6 +8,8 @@ export const PROJECT_ROLES = [
 
 export type ProjectRole = (typeof PROJECT_ROLES)[number]
 
+export type ProjectGovernanceMode = 'solo' | 'team'
+
 export const PROJECT_ACTIONS = [
   'view',
   'comment',
@@ -49,6 +51,7 @@ export interface CollaborationProject {
   readonly updatedAt: string
   readonly memberCount: number
   readonly role: ProjectRole
+  readonly governanceMode: ProjectGovernanceMode
   readonly etag?: string
 }
 
@@ -85,6 +88,11 @@ export interface ProjectReview {
   readonly state?: 'pending' | 'approved' | 'changesRequested'
   readonly summary: string
   readonly requiredReviewerIds?: readonly string[]
+  readonly requestedById?: string
+  readonly policy: {
+    readonly governanceMode: ProjectGovernanceMode
+    readonly soloSelfReviewOwnerId?: string
+  }
   readonly reviewer: CollaborationUser
   readonly target?: CollaborationVersionRef
   readonly createdAt: string

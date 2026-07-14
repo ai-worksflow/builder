@@ -6,6 +6,7 @@ import type {
   JsonValue,
   PageDto,
   ProblemDetailsDto,
+  ProjectGovernanceMode,
   ValidationResultDto,
 } from './dto'
 
@@ -444,6 +445,8 @@ export interface WorkflowRunDto {
   readonly definition: { readonly id: string; readonly version: number; readonly hash: string; readonly executionProfile: WorkflowExecutionProfileRefDto }
   readonly executionProfile: WorkflowExecutionProfileRefDto
   readonly inputManifest?: ManifestRefDto
+  /** Review policy frozen when this run started. */
+  readonly governanceMode?: ProjectGovernanceMode
   readonly status: WorkflowRunStatus
   readonly scope?: JsonValue
   readonly context: WorkflowRunContextDto
@@ -464,6 +467,7 @@ export interface WorkflowRunSummaryDto {
   readonly projectId: string
   readonly definitionVersionId: string
   readonly executionProfile: WorkflowExecutionProfileRefDto
+  readonly governanceMode?: ProjectGovernanceMode
   readonly status: WorkflowRunStatus
   readonly eventCursor: number
   readonly startedBy: string

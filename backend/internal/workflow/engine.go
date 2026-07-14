@@ -155,6 +155,7 @@ type StartRequest struct {
 	InputManifest       domain.ManifestRef
 	Scope               json.RawMessage
 	StartedBy           string
+	GovernanceMode      core.GovernanceMode
 	provenance          startRequestProvenance
 }
 
@@ -317,7 +318,11 @@ func (e *Engine) Start(ctx context.Context, request StartRequest) (*RunRecord, e
 	if err != nil {
 		return nil, err
 	}
-	run := &RunRecord{ID: runID, ProjectID: request.ProjectID, DefinitionVersionID: request.DefinitionVersionID, Definition: definitionRecord.Definition.RefForExecutionProfile(selectedProfile), ExecutionProfile: selectedProfile, InputManifest: &request.InputManifest, Status: RunRunning, Scope: cloneRaw(request.Scope), Context: contextState, StartedBy: request.StartedBy, StartedAt: timePointer(now), CreatedAt: now, UpdatedAt: now, Nodes: map[string]*NodeRecord{}}
+	governanceMode := request.GovernanceMode
+	if governanceMode == "" {
+		governanceMode = core.GovernanceModeTeam
+	}
+	run := &RunRecord{ID: runID, ProjectID: request.ProjectID, DefinitionVersionID: request.DefinitionVersionID, Definition: definitionRecord.Definition.RefForExecutionProfile(selectedProfile), ExecutionProfile: selectedProfile, InputManifest: &request.InputManifest, Status: RunRunning, GovernanceMode: governanceMode, Scope: cloneRaw(request.Scope), Context: contextState, StartedBy: request.StartedBy, StartedAt: timePointer(now), CreatedAt: now, UpdatedAt: now, Nodes: map[string]*NodeRecord{}}
 	if len(run.Scope) == 0 {
 		run.Scope = json.RawMessage(`{}`)
 	}
@@ -342,7 +347,7 @@ func (e *Engine) Start(ctx context.Context, request StartRequest) (*RunRecord, e
 	if err := run.Validate(); err != nil {
 		return nil, err
 	}
-	events := []Event{{ID: e.id(), RunID: run.ID, Type: "run.started", Payload: mustJSON(map[string]any{"definitionVersionId": request.DefinitionVersionID, "manifestId": request.InputManifest.ID, "executionProfile": selectedProfile}), ActorID: request.StartedBy, CreatedAt: now}}
+	events := []Event{{ID: e.id(), RunID: run.ID, Type: "run.started", Payload: mustJSON(map[string]any{"definitionVersionId": request.DefinitionVersionID, "manifestId": request.InputManifest.ID, "executionProfile": selectedProfile, "governanceMode": governanceMode}), ActorID: request.StartedBy, CreatedAt: now}}
 	if entryNode := run.Nodes[entry]; entryNode != nil && entryNode.Status == NodeWaitingInput {
 		events = append(events, Event{ID: e.id(), RunID: run.ID, Type: "node.execution_authorization_required", NodeKey: entry, Payload: json.RawMessage(`{}`), CreatedAt: now})
 	}
@@ -1093,7 +1098,12 @@ func (e *Engine) ResolveReview(ctx context.Context, runID, nodeKey string, decis
 		}
 		canonicalReviewVerified = true
 	}
-	if prohibitSelf && !canonicalReviewVerified && actorID == run.StartedBy {
+	if decision.SoloSelfReview {
+		if resolution != ReviewApprove || actorID != run.StartedBy || run.GovernanceMode != core.GovernanceModeSolo || decision.GovernanceMode != core.GovernanceModeSolo {
+			return core.ErrForbidden
+		}
+	}
+	if prohibitSelf && !canonicalReviewVerified && actorID == run.StartedBy && !decision.SoloSelfReview {
 		return domain.ErrSelfApproval
 	}
 	if (resolution == ReviewChanges || resolution == ReviewWaive) && strings.TrimSpace(reason) == "" {
@@ -1203,6 +1213,8 @@ func (e *Engine) ResolveReview(ctx context.Context, runID, nodeKey string, decis
 	builder.mark(node, expected, "")
 	reviewPayload := provenanceEventPayload(reviewActor)
 	reviewPayload["reason"] = reason
+	reviewPayload["soloSelfReview"] = decision.SoloSelfReview
+	reviewPayload["governanceMode"] = run.GovernanceMode
 	builder.event("node.review_"+string(resolution), node.Key, reviewPayload, actorID)
 	e.reconcile(run, record.Definition, builder)
 	e.refreshRunStatus(run, record.Definition, now)

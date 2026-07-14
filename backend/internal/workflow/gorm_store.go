@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/worksflow/builder/backend/internal/core"
 	"github.com/worksflow/builder/backend/internal/domain"
 	storage "github.com/worksflow/builder/backend/internal/storage/postgres"
 	"gorm.io/gorm"
@@ -139,6 +140,7 @@ type runRow struct {
 	ExecutionProfileVersion string
 	ExecutionProfileHash    string
 	Status                  string
+	GovernanceMode          string
 	InputManifestID         *uuid.UUID      `gorm:"type:uuid"`
 	Scope                   json.RawMessage `gorm:"type:jsonb"`
 	Context                 json.RawMessage `gorm:"type:jsonb"`
@@ -677,6 +679,18 @@ func (s *GORMStore) CreateRun(ctx context.Context, run *RunRecord, events []Even
 	runModel.EventCursor = uint64(len(eventModels))
 	run.EventCursor = runModel.EventCursor
 	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if run.GovernanceMode != "" {
+			var project struct {
+				GovernanceMode string `gorm:"column:governance_mode"`
+			}
+			if err := tx.Table("projects").Clauses(clause.Locking{Strength: "UPDATE"}).
+				Select("governance_mode").Where("id = ?", runModel.ProjectID).Take(&project).Error; err != nil {
+				return mapGORMError(err)
+			}
+			if project.GovernanceMode != string(run.GovernanceMode) {
+				return core.ErrConflict
+			}
+		}
 		if err := tx.Create(&runModel).Error; err != nil {
 			return err
 		}
@@ -728,7 +742,11 @@ func (s *GORMStore) runToRows(run *RunRecord) (runRow, []nodeRunRow, error) {
 	if len(scope) == 0 {
 		scope = json.RawMessage(`{}`)
 	}
-	row := runRow{ID: id, ProjectID: projectID, DefinitionVersionID: versionID, ExecutionProfileVersion: run.ExecutionProfile.Version, ExecutionProfileHash: run.ExecutionProfile.Hash, Status: string(run.Status), InputManifestID: manifestID, Scope: scope, Context: contextJSON, EventCursor: run.EventCursor, StartedBy: startedBy, StartedAt: run.StartedAt, CompletedAt: run.CompletedAt, CancelledAt: run.CancelledAt, Failure: run.Failure, CreatedAt: run.CreatedAt, UpdatedAt: run.UpdatedAt}
+	governanceMode := run.GovernanceMode
+	if governanceMode == "" {
+		governanceMode = core.GovernanceModeTeam
+	}
+	row := runRow{ID: id, ProjectID: projectID, DefinitionVersionID: versionID, ExecutionProfileVersion: run.ExecutionProfile.Version, ExecutionProfileHash: run.ExecutionProfile.Hash, Status: string(run.Status), GovernanceMode: string(governanceMode), InputManifestID: manifestID, Scope: scope, Context: contextJSON, EventCursor: run.EventCursor, StartedBy: startedBy, StartedAt: run.StartedAt, CompletedAt: run.CompletedAt, CancelledAt: run.CancelledAt, Failure: run.Failure, CreatedAt: run.CreatedAt, UpdatedAt: run.UpdatedAt}
 	nodes := make([]nodeRunRow, 0, len(run.Nodes))
 	for _, node := range run.Nodes {
 		converted, err := nodeToRow(node)
@@ -814,7 +832,7 @@ func (s *GORMStore) GetRun(ctx context.Context, id string) (*RunRecord, error) {
 	if err := s.db.WithContext(ctx).Where("run_id = ?", runID).Find(&nodeRows).Error; err != nil {
 		return nil, err
 	}
-	run := &RunRecord{ID: row.ID.String(), ProjectID: row.ProjectID.String(), DefinitionVersionID: row.DefinitionVersionID.String(), Definition: definition.Definition.RefForExecutionProfile(profile), ExecutionProfile: profile, InputManifest: manifestRef, Status: RunStatus(row.Status), Scope: row.Scope, Context: runContext, EventCursor: row.EventCursor, StartedBy: row.StartedBy.String(), StartedAt: row.StartedAt, CompletedAt: row.CompletedAt, CancelledAt: row.CancelledAt, Failure: row.Failure, CreatedAt: row.CreatedAt, UpdatedAt: row.UpdatedAt, Nodes: map[string]*NodeRecord{}}
+	run := &RunRecord{ID: row.ID.String(), ProjectID: row.ProjectID.String(), DefinitionVersionID: row.DefinitionVersionID.String(), Definition: definition.Definition.RefForExecutionProfile(profile), ExecutionProfile: profile, InputManifest: manifestRef, Status: RunStatus(row.Status), GovernanceMode: core.GovernanceMode(row.GovernanceMode), Scope: row.Scope, Context: runContext, EventCursor: row.EventCursor, StartedBy: row.StartedBy.String(), StartedAt: row.StartedAt, CompletedAt: row.CompletedAt, CancelledAt: row.CancelledAt, Failure: row.Failure, CreatedAt: row.CreatedAt, UpdatedAt: row.UpdatedAt, Nodes: map[string]*NodeRecord{}}
 	for _, nodeRow := range nodeRows {
 		node, err := s.rowToNode(ctx, nodeRow, runContext)
 		if err != nil {
@@ -860,7 +878,8 @@ func summaryFromRow(row runRow) RunSummary {
 	return RunSummary{
 		ID: row.ID.String(), ProjectID: row.ProjectID.String(), DefinitionVersionID: row.DefinitionVersionID.String(),
 		ExecutionProfile: domain.WorkflowExecutionProfileRef{Version: row.ExecutionProfileVersion, Hash: row.ExecutionProfileHash},
-		Status:           RunStatus(row.Status), EventCursor: row.EventCursor, StartedBy: row.StartedBy.String(),
+		Status:           RunStatus(row.Status), GovernanceMode: core.GovernanceMode(row.GovernanceMode),
+		EventCursor: row.EventCursor, StartedBy: row.StartedBy.String(),
 		StartedAt: row.StartedAt, CompletedAt: row.CompletedAt, CancelledAt: row.CancelledAt,
 		Failure: cloneRaw(row.Failure), CreatedAt: row.CreatedAt, UpdatedAt: row.UpdatedAt,
 	}
@@ -981,6 +1000,9 @@ func (s *GORMStore) Commit(ctx context.Context, mutation RunMutation) error {
 		return err
 	}
 	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := validateSoloSelfReviewMutationTx(ctx, tx, runID, mutation.Events); err != nil {
+			return err
+		}
 		newCursor := mutation.ExpectedCursor + uint64(len(mutation.Events))
 		result := tx.Model(&runRow{}).Where("id = ? AND event_cursor = ?", runID, mutation.ExpectedCursor).Updates(map[string]any{"status": mutation.Status, "context": contextJSON, "event_cursor": newCursor, "failure": nullableJSON(mutation.Failure), "completed_at": mutation.CompletedAt, "cancelled_at": mutation.CancelledAt, "updated_at": mutation.UpdatedAt})
 		if result.Error != nil {
@@ -1051,6 +1073,47 @@ func (s *GORMStore) Commit(ctx context.Context, mutation RunMutation) error {
 		}
 		return s.enqueueEventRowsTx(tx, identity.ProjectID, runID, events)
 	})
+}
+
+func validateSoloSelfReviewMutationTx(ctx context.Context, transaction *gorm.DB, runID uuid.UUID, events []Event) error {
+	for _, event := range events {
+		if event.Type != "node.review_approve" {
+			continue
+		}
+		var payload struct {
+			SoloSelfReview bool   `json:"soloSelfReview"`
+			Reason         string `json:"reason"`
+		}
+		if err := json.Unmarshal(event.Payload, &payload); err != nil {
+			return err
+		}
+		if !payload.SoloSelfReview {
+			continue
+		}
+		actorID, err := parseUUID("review.actorId", event.ActorID)
+		if err != nil {
+			return err
+		}
+		var run runRow
+		if err := transaction.Select("id", "project_id", "governance_mode").Where("id = ?", runID).Take(&run).Error; err != nil {
+			return mapGORMError(err)
+		}
+		governance, err := core.LockProjectGovernance(ctx, transaction, run.ProjectID)
+		if err != nil {
+			return err
+		}
+		var member storage.ProjectMemberModel
+		if err := transaction.Where("project_id = ? AND user_id = ?", run.ProjectID, actorID).Take(&member).Error; err != nil {
+			return mapGORMError(err)
+		}
+		if run.GovernanceMode != string(core.GovernanceModeSolo) {
+			return core.ErrSelfApproval
+		}
+		if err := core.RequireSoloSelfReview(governance, core.Role(member.Role), true, payload.Reason); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *GORMStore) ListEvents(ctx context.Context, runID string, after uint64, limit int) ([]Event, error) {

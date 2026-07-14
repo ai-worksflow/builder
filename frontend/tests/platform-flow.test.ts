@@ -235,6 +235,14 @@ test('human resume, privileged execution, and review commands target a project-s
   })
   await client.authorizeExecution('project-1', 'run-1', 'quality')
   await client.resolveReview('project-1', 'run-1', 'prototype-review:slice-a', 'approve')
+  await client.resolveReview(
+    'project-1',
+    'run-1',
+    'prototype-review:slice-a',
+    'approve',
+    'Solo review completed',
+    true,
+  )
 
   assert.deepEqual(calls, [
     {
@@ -254,6 +262,15 @@ test('human resume, privileged execution, and review commands target a project-s
         nodeKey: 'prototype-review:slice-a',
         resolution: 'approve',
         reason: '',
+      },
+    },
+    {
+      path: '/v1/projects/project-1/workflow-runs/run-1/approve',
+      body: {
+        nodeKey: 'prototype-review:slice-a',
+        resolution: 'approve',
+        reason: 'Solo review completed',
+        soloReviewConfirmed: true,
       },
     },
   ])
@@ -550,6 +567,24 @@ test('Human Edit resolves one proposal pin propagated through a Condition and re
     artifactSnapshot({ documents: [target], proposals: [linkedProposal] }) as never,
   )
   assert.deepEqual(resolution.candidates.map((candidate) => candidate.artifactId), ['requirements-pin'])
+
+  const unavailable = revisionCandidates(
+    definitionNode as never,
+    node as never,
+    run as never,
+    artifactSnapshot({ documents: [target], proposals: [] }) as never,
+  )
+  assert.match(unavailable.error ?? '', /not available in the current workspace snapshot/i)
+  const hashMismatch = revisionCandidates(
+    definitionNode as never,
+    node as never,
+    run as never,
+    artifactSnapshot({
+      documents: [target],
+      proposals: [{ ...linkedProposal, payloadHash: 'different-payload-hash' }],
+    }) as never,
+  )
+  assert.match(hashMismatch.error ?? '', /does not match the payload hash pinned/i)
 
   const multi = workflowRun(node, [lineageBinding([], undefined, [], [pin, { ...pin, producerNodeKey: 'requirements-ai-2' }])])
   assert.match(revisionCandidates(definitionNode as never, node as never, multi as never, artifactSnapshot({ documents: [target], proposals: [linkedProposal] }) as never).error ?? '', /exactly one proposal producer/i)

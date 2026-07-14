@@ -205,19 +205,12 @@ func (s *ArtifactService) loadReviewGateApproval(transaction *gorm.DB, artifact 
 			Order("created_at ASC, id ASC").Find(&decisions).Error; err != nil {
 			return fmt.Errorf("load artifact review approvals: %w", err)
 		}
-		assigned := make(map[string]struct{}, len(policy.ReviewerIDs))
-		for _, reviewerID := range policy.ReviewerIDs {
-			assigned[reviewerID] = struct{}{}
-		}
 		approvals := 0
 		for _, decision := range decisions {
-			if policy.ProhibitSelfReview && decision.ReviewerID == revision.CreatedBy {
+			if !CanonicalReviewApprovalDecision(
+				policy, decision.ReviewerID.String(), revision.CreatedBy.String(), decision.SoloSelfReview,
+			) {
 				continue
-			}
-			if len(assigned) > 0 {
-				if _, ok := assigned[decision.ReviewerID.String()]; !ok {
-					continue
-				}
 			}
 			approvals++
 		}

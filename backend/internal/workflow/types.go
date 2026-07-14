@@ -216,6 +216,7 @@ type RunRecord struct {
 	ExecutionProfile    domain.WorkflowExecutionProfileRef `json:"executionProfile"`
 	InputManifest       *domain.ManifestRef                `json:"inputManifest,omitempty"`
 	Status              RunStatus                          `json:"status"`
+	GovernanceMode      core.GovernanceMode                `json:"governanceMode"`
 	Scope               json.RawMessage                    `json:"scope"`
 	Context             RunContext                         `json:"context"`
 	EventCursor         uint64                             `json:"eventCursor"`
@@ -237,6 +238,7 @@ type RunSummary struct {
 	DefinitionVersionID string                             `json:"definitionVersionId"`
 	ExecutionProfile    domain.WorkflowExecutionProfileRef `json:"executionProfile"`
 	Status              RunStatus                          `json:"status"`
+	GovernanceMode      core.GovernanceMode                `json:"governanceMode"`
 	EventCursor         uint64                             `json:"eventCursor"`
 	StartedBy           string                             `json:"startedBy"`
 	StartedAt           *time.Time                         `json:"startedAt,omitempty"`

@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import { collectConversationPages, PlatformConversationClient } from '../lib/platform/conversation-client'
 import type {
   ConversationCommandDto,
+  ConversationSummaryCheckpointDto,
   WorkflowIntentProposalDto,
 } from '../lib/platform/conversation-contract'
 import { HttpClient, PlatformHttpError, type FetchLike } from '../lib/platform/http'
@@ -79,6 +80,18 @@ async function main() {
     failure: { code: 'ai_unavailable', message: 'Retry safely.' },
   } as ConversationCommandDto
   await client.executeCommand('project/1', 'conversation/1', refreshedRetryCommand)
+  const summaryCheckpoint = {
+    id: 'summary-checkpoint/1',
+    etag: '"conversation-summary-checkpoint:1"',
+  } as ConversationSummaryCheckpointDto
+  await client.decideSummaryCheckpoint(
+    'project/1',
+    'conversation/1',
+    summaryCheckpoint,
+    'approve',
+    'Verified the exact immutable source prefix.',
+    true,
+  )
 
   assert.deepEqual(calls.map((call) => [call.method, call.path]), [
     ['POST', '/v1/projects/project%2F1/conversations'],
@@ -88,6 +101,7 @@ async function main() {
     ['POST', '/v1/projects/project%2F1/conversations/conversation%2F1/commands/start-command%2F1/execute'],
     ['POST', '/v1/projects/project%2F1/conversations/conversation%2F1/commands/command%2F1/execute'],
     ['POST', '/v1/projects/project%2F1/conversations/conversation%2F1/commands/command%2F1/execute'],
+    ['POST', '/v1/projects/project%2F1/conversations/conversation%2F1/summary-checkpoints/summary-checkpoint%2F1/decision'],
   ])
   for (const call of calls) {
     assert.ok(call.headers.get('idempotency-key'), `${call.path} omitted Idempotency-Key`)
@@ -110,6 +124,12 @@ async function main() {
   assert.deepEqual(calls[5].body, {})
   assert.equal(calls[6].headers.get('if-match'), '"conversation-command:2"')
   assert.deepEqual(calls[6].body, {})
+  assert.equal(calls[7].headers.get('if-match'), '"conversation-summary-checkpoint:1"')
+  assert.deepEqual(calls[7].body, {
+    decision: 'approve',
+    reason: 'Verified the exact immutable source prefix.',
+    soloReviewConfirmed: true,
+  })
 
   const conflictClient = new PlatformConversationClient(new HttpClient({
     baseUrl: 'https://platform.example.test',

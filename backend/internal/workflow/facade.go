@@ -19,9 +19,14 @@ import (
 // Facade is the transport-facing authorization boundary. Workers use Engine
 // directly, while every user-driven transition passes through project RBAC.
 type Facade struct {
-	Engine *Engine
-	Store  Store
-	Access PublishAuthorizer
+	Engine     *Engine
+	Store      Store
+	Access     PublishAuthorizer
+	Governance ProjectGovernanceResolver
+}
+
+type ProjectGovernanceResolver interface {
+	Governance(context.Context, string) (core.ProjectGovernance, error)
 }
 
 type CreateDefinitionInput struct {
@@ -386,6 +391,14 @@ func (f Facade) Start(ctx context.Context, projectID, actorID string, request St
 	}
 	request.ProjectID = projectID
 	request.StartedBy = actorID
+	request.GovernanceMode = core.GovernanceModeTeam
+	if f.Governance != nil {
+		governance, err := f.Governance.Governance(ctx, projectID)
+		if err != nil {
+			return nil, err
+		}
+		request.GovernanceMode = governance.Mode
+	}
 	if request.DefinitionVersionID == "" {
 		definitions, err := f.ensureMinimumLoop(ctx, projectID, actorID)
 		if err != nil {
@@ -569,7 +582,7 @@ func (f Facade) RecordProposal(ctx context.Context, projectID, runID, nodeKey, a
 	}
 	return f.Engine.RecordProposal(ctx, runID, nodeKey, proposal, actorID)
 }
-func (f Facade) ResolveReview(ctx context.Context, projectID, runID, nodeKey, actorID string, resolution ReviewResolution, reason string) error {
+func (f Facade) ResolveReview(ctx context.Context, projectID, runID, nodeKey, actorID string, resolution ReviewResolution, reason string, soloReviewConfirmed bool) error {
 	if err := f.validate(); err != nil {
 		return err
 	}
@@ -593,6 +606,20 @@ func (f Facade) ResolveReview(ctx context.Context, projectID, runID, nodeKey, ac
 		Resolution: resolution, Reason: reason,
 		Actor:                   ActorProvenance{ActorID: actorID, Role: role, Action: action, Source: ActorSourceAuthenticatedCommand, AuthorizedAt: now},
 		ExecutionAuthorizations: map[string]ActorProvenance{},
+	}
+	if resolution == ReviewApprove && actorID == run.StartedBy && run.GovernanceMode == core.GovernanceModeSolo {
+		governance := core.ProjectGovernance{Mode: core.GovernanceModeTeam}
+		if f.Governance != nil {
+			governance, err = f.Governance.Governance(ctx, projectID)
+			if err != nil {
+				return err
+			}
+		}
+		if err := core.RequireSoloSelfReview(governance, role, soloReviewConfirmed, reason); err != nil {
+			return err
+		}
+		decision.SoloSelfReview = true
+		decision.GovernanceMode = core.GovernanceModeSolo
 	}
 	if resolution == ReviewApprove || resolution == ReviewWaive {
 		node, definition, loadErr := f.nodeDefinition(ctx, run, nodeKey)

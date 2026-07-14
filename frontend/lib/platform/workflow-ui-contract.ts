@@ -828,8 +828,11 @@ export function revisionCandidates(
   const proposalTargetIds = new Set<string>()
   const appliedProposalIds = new Set<string>()
   for (const proposalRef of proposalRefs) {
-    const proposal = artifacts.proposals.find((item) => item.id === proposalRef.id && item.payloadHash === proposalRef.payloadHash)
-    if (!proposal) return { candidates: [], error: `Proposal ${proposalRef.id} from the typed input lineage is unavailable or has a different payload hash.` }
+    const proposal = artifacts.proposals.find((item) => item.id === proposalRef.id)
+    if (!proposal) return { candidates: [], error: `Proposal ${proposalRef.id} from the typed input lineage is not available in the current workspace snapshot.` }
+    if (proposal.payloadHash !== proposalRef.payloadHash) {
+      return { candidates: [], error: `Proposal ${proposalRef.id} does not match the payload hash pinned by the typed input lineage.` }
+    }
     if (!exactRef(proposal.baseRevision) || proposal.baseRevision.artifactId !== proposal.artifactId) {
       return { candidates: [], error: `Proposal ${proposalRef.id} has an invalid target revision.` }
     }

@@ -16,17 +16,20 @@ import (
 )
 
 type ReviewPolicy struct {
-	ReviewerIDs        []string `json:"reviewerIds"`
-	MinimumApprovals   int      `json:"minimumApprovals"`
-	ProhibitSelfReview bool     `json:"prohibitSelfReview"`
+	ReviewerIDs           []string       `json:"reviewerIds"`
+	MinimumApprovals      int            `json:"minimumApprovals"`
+	ProhibitSelfReview    bool           `json:"prohibitSelfReview"`
+	GovernanceMode        GovernanceMode `json:"governanceMode"`
+	SoloSelfReviewOwnerID string         `json:"soloSelfReviewOwnerId,omitempty"`
 }
 
 type ReviewDecision struct {
-	ID         string    `json:"id"`
-	ReviewerID string    `json:"reviewerId"`
-	Decision   string    `json:"decision"`
-	Summary    string    `json:"summary"`
-	CreatedAt  time.Time `json:"createdAt"`
+	ID             string    `json:"id"`
+	ReviewerID     string    `json:"reviewerId"`
+	Decision       string    `json:"decision"`
+	Summary        string    `json:"summary"`
+	SoloSelfReview bool      `json:"soloSelfReview,omitempty"`
+	CreatedAt      time.Time `json:"createdAt"`
 }
 
 type ReviewRequest struct {
@@ -52,8 +55,9 @@ type SubmitReviewInput struct {
 }
 
 type DecideReviewInput struct {
-	Decision string `json:"decision"`
-	Summary  string `json:"summary"`
+	Decision            string `json:"decision"`
+	Summary             string `json:"summary"`
+	SoloReviewConfirmed bool   `json:"soloReviewConfirmed,omitempty"`
 }
 
 type ReviewService struct {
@@ -96,22 +100,31 @@ func (s *ReviewService) Submit(ctx context.Context, projectID, artifactID, actor
 	if len(reviewerIDs) > 0 && input.MinimumApprovals > len(reviewerIDs) {
 		return ReviewRequest{}, fmt.Errorf("%w: minimum approvals exceed assigned reviewers", ErrInvalidInput)
 	}
-	// Self approval is a platform invariant. The input field is accepted only so
-	// clients receive an explicit rejection rather than silently weakening policy.
-	if input.AllowSelfApproval {
-		return ReviewRequest{}, ErrForbidden
-	}
-	policy := ReviewPolicy{ReviewerIDs: reviewerIDs, MinimumApprovals: input.MinimumApprovals, ProhibitSelfReview: true}
-	policyPayload, err := json.Marshal(policy)
-	if err != nil {
-		return ReviewRequest{}, err
-	}
+	var policy ReviewPolicy
 	now := s.now().UTC()
 	requestModel := storage.ReviewRequestModel{
 		ID: uuid.New(), ProjectID: projectUUID, ArtifactID: artifactUUID, RevisionID: revisionUUID,
-		Status: "open", Policy: policyPayload, RequestedBy: actorUUID, RequestedAt: now,
+		Status: "open", RequestedBy: actorUUID, RequestedAt: now,
 	}
 	err = s.database.WithContext(ctx).Transaction(func(transaction *gorm.DB) error {
+		governance, err := LockProjectGovernance(ctx, transaction, projectUUID)
+		if err != nil {
+			return err
+		}
+		policy = ReviewPolicy{
+			ReviewerIDs: reviewerIDs, MinimumApprovals: input.MinimumApprovals,
+			ProhibitSelfReview: true, GovernanceMode: governance.Mode,
+		}
+		if input.AllowSelfApproval {
+			_, authorizeErr := s.accessWithDatabase(transaction).Authorize(ctx, projectID, actorID, ActionEdit)
+			if authorizeErr != nil {
+				return authorizeErr
+			}
+			if governance.Mode != GovernanceModeSolo || governance.OwnerCount != 1 || governance.SoleOwnerID == "" ||
+				!containsString(reviewerIDs, governance.SoleOwnerID) {
+				return ErrForbidden
+			}
+		}
 		var artifact storage.ArtifactModel
 		if err := transaction.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id = ?", artifactUUID).Take(&artifact).Error; err != nil {
 			return err
@@ -133,6 +146,14 @@ func (s *ReviewService) Submit(ctx context.Context, projectID, artifactID, actor
 		if revision.WorkflowStatus != "draft" && revision.WorkflowStatus != "changes_requested" {
 			return ErrConflict
 		}
+		if input.AllowSelfApproval && revision.CreatedBy.String() == governance.SoleOwnerID {
+			policy.SoloSelfReviewOwnerID = governance.SoleOwnerID
+		}
+		policyPayload, err := json.Marshal(policy)
+		if err != nil {
+			return err
+		}
+		requestModel.Policy = policyPayload
 		requestModel.ContentHash = revision.ContentHash
 		if err := transaction.Create(&requestModel).Error; err != nil {
 			if isUniqueViolation(err) {
@@ -227,7 +248,22 @@ func (s *ReviewService) DecideIfMatch(ctx context.Context, reviewID, actorID, ex
 	var request storage.ReviewRequestModel
 	var policy ReviewPolicy
 	stale := false
+	soloSelfReview := false
+	var requestProject struct {
+		ProjectID uuid.UUID `gorm:"column:project_id"`
+	}
+	if err := s.database.WithContext(ctx).Model(&storage.ReviewRequestModel{}).
+		Select("project_id").Where("id = ?", reviewUUID).Take(&requestProject).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return ReviewRequest{}, ErrNotFound
+		}
+		return ReviewRequest{}, err
+	}
 	err = s.database.WithContext(ctx).Transaction(func(transaction *gorm.DB) error {
+		governance, err := LockProjectGovernance(ctx, transaction, requestProject.ProjectID)
+		if err != nil {
+			return err
+		}
 		if err := transaction.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id = ?", reviewUUID).Take(&request).Error; err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
 				return ErrNotFound
@@ -246,7 +282,8 @@ func (s *ReviewService) DecideIfMatch(ctx context.Context, reviewID, actorID, ex
 				return ErrConflict
 			}
 		}
-		if _, err := s.accessWithDatabase(transaction).Authorize(ctx, request.ProjectID.String(), actorID, ActionReview); err != nil {
+		role, err := s.accessWithDatabase(transaction).Authorize(ctx, request.ProjectID.String(), actorID, ActionReview)
+		if err != nil {
 			return err
 		}
 		policy, err = decodeReviewPolicy(request.Policy)
@@ -302,7 +339,13 @@ func (s *ReviewService) DecideIfMatch(ctx context.Context, reviewID, actorID, ex
 		}
 		if input.Decision == "approve" {
 			if policy.ProhibitSelfReview && revision.CreatedBy == actorUUID {
-				return ErrSelfApproval
+				if policy.GovernanceMode != GovernanceModeSolo || policy.SoloSelfReviewOwnerID != actorID {
+					return ErrSelfApproval
+				}
+				if err := RequireSoloSelfReview(governance, role, input.SoloReviewConfirmed, input.Summary); err != nil {
+					return err
+				}
+				soloSelfReview = true
 			}
 			if err := s.checkApprovalGates(ctx, transaction, artifact, revision); err != nil {
 				return err
@@ -310,11 +353,12 @@ func (s *ReviewService) DecideIfMatch(ctx context.Context, reviewID, actorID, ex
 		}
 		decision := storage.ReviewDecisionModel{
 			ID: uuid.New(), ReviewRequestID: request.ID, ReviewerID: actorUUID,
-			Decision: input.Decision, Summary: input.Summary, CreatedAt: now,
+			Decision: input.Decision, Summary: input.Summary,
+			SoloSelfReview: soloSelfReview, CreatedAt: now,
 		}
 		if err := transaction.Clauses(clause.OnConflict{
 			Columns:   []clause.Column{{Name: "review_request_id"}, {Name: "reviewer_id"}},
-			DoUpdates: clause.AssignmentColumns([]string{"decision", "summary", "created_at"}),
+			DoUpdates: clause.AssignmentColumns([]string{"decision", "summary", "solo_self_review", "created_at"}),
 		}).Create(&decision).Error; err != nil {
 			return err
 		}
@@ -358,7 +402,15 @@ func (s *ReviewService) DecideIfMatch(ctx context.Context, reviewID, actorID, ex
 				}
 			}
 		}
-		if err := insertAudit(transaction, request.ProjectID, actorUUID, "review.decided", "review_request", reviewID, map[string]any{"decision": input.Decision}); err != nil {
+		auditMetadata := map[string]any{
+			"decision": input.Decision, "summary": input.Summary,
+			"subjectAuthorId": revision.CreatedBy.String(),
+		}
+		if soloSelfReview {
+			auditMetadata["soloSelfReview"] = true
+			auditMetadata["governanceMode"] = GovernanceModeSolo
+		}
+		if err := insertAudit(transaction, request.ProjectID, actorUUID, "review.decided", "review_request", reviewID, auditMetadata); err != nil {
 			return err
 		}
 		if request.RequestedBy != actorUUID {
@@ -374,6 +426,7 @@ func (s *ReviewService) DecideIfMatch(ctx context.Context, reviewID, actorID, ex
 			"projectId": request.ProjectID.String(), "artifactId": request.ArtifactID.String(),
 			"revisionId": request.RevisionID.String(), "reviewId": reviewID,
 			"decision": input.Decision, "status": request.Status,
+			"soloSelfReview": soloSelfReview, "governanceMode": policy.GovernanceMode,
 		})
 	})
 	if err != nil {
@@ -520,7 +573,7 @@ func (s *ReviewService) listDecisions(ctx context.Context, requestID uuid.UUID) 
 	for _, model := range models {
 		result = append(result, ReviewDecision{
 			ID: model.ID.String(), ReviewerID: model.ReviewerID.String(), Decision: model.Decision,
-			Summary: model.Summary, CreatedAt: model.CreatedAt,
+			Summary: model.Summary, SoloSelfReview: model.SoloSelfReview, CreatedAt: model.CreatedAt,
 		})
 	}
 	return result, nil
@@ -533,6 +586,12 @@ func decodeReviewPolicy(value json.RawMessage) (ReviewPolicy, error) {
 	}
 	if policy.MinimumApprovals < 1 {
 		return ReviewPolicy{}, errors.New("stored review policy is invalid")
+	}
+	if policy.GovernanceMode == "" {
+		policy.GovernanceMode = GovernanceModeTeam
+	}
+	if !ValidGovernanceMode(policy.GovernanceMode) {
+		return ReviewPolicy{}, errors.New("stored review policy governance mode is invalid")
 	}
 	return policy, nil
 }
@@ -577,4 +636,15 @@ func containsString(values []string, expected string) bool {
 		}
 	}
 	return false
+}
+
+func CanonicalReviewApprovalDecision(policy ReviewPolicy, reviewerID, authorID string, soloSelfReview bool) bool {
+	if len(policy.ReviewerIDs) > 0 && !containsString(policy.ReviewerIDs, reviewerID) {
+		return false
+	}
+	if reviewerID != authorID {
+		return true
+	}
+	return policy.ProhibitSelfReview && policy.GovernanceMode == GovernanceModeSolo &&
+		policy.SoloSelfReviewOwnerID == reviewerID && soloSelfReview
 }

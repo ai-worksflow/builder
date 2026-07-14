@@ -658,6 +658,9 @@ func (s *ImplementationService) Apply(ctx context.Context, proposalID, actorID s
 			}
 			workspaceArtifact = locked
 		}
+		if err := ensureArtifactHealthRow(transaction, workspaceArtifact.ID, now); err != nil {
+			return err
+		}
 		if err := ensureManifestRootHasNoAppliedProposal(transaction, proposalModel); err != nil {
 			if errors.Is(err, ErrBlockingGate) || errors.Is(err, ErrConflict) {
 				return ErrProposalStale

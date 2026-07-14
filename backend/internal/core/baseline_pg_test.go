@@ -176,6 +176,13 @@ func TestBaselineCompilePersistsOnlyCanonicalFinalPayload(t *testing.T) {
 	if revision.WorkflowStatus != "approved" || store.putCalls != 1 || store.finalizeCalls != 1 || store.abortCalls != 0 {
 		t.Fatalf("unexpected valid compile result: status=%q put=%d finalize=%d abort=%d", revision.WorkflowStatus, store.putCalls, store.finalizeCalls, store.abortCalls)
 	}
+	var baselineHealth storage.ArtifactHealthModel
+	if err := database.Where("artifact_id = ?", revision.ArtifactID).Take(&baselineHealth).Error; err != nil {
+		t.Fatalf("load Requirement Baseline health: %v", err)
+	}
+	if baselineHealth.SyncStatus != "current" || baselineHealth.DeliveryStatus != "incomplete" {
+		t.Fatalf("unexpected Requirement Baseline health: %#v", baselineHealth)
+	}
 	if report := ValidateArtifactContent("requirement_baseline", revision.Content); !report.Valid {
 		t.Fatalf("persisted baseline failed its own gate: %#v", report.Findings)
 	}

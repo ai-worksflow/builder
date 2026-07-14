@@ -63,6 +63,7 @@ export interface SessionSignUpInputDto {
 
 export type ProjectRole = 'owner' | 'admin' | 'editor' | 'commenter' | 'viewer'
 export type ProjectLifecycle = 'active' | 'archived'
+export type ProjectGovernanceMode = 'solo' | 'team'
 
 export interface ProjectDto {
   readonly id: EntityId
@@ -70,6 +71,7 @@ export interface ProjectDto {
   readonly description?: string
   readonly teamId?: EntityId
   readonly lifecycle: ProjectLifecycle
+  readonly governanceMode: ProjectGovernanceMode
   readonly currentUserRole: ProjectRole
   readonly memberCount?: number
   readonly createdBy: EntityId
@@ -88,6 +90,7 @@ export interface UpdateProjectInputDto {
   readonly name?: string
   readonly description?: string
   readonly lifecycle?: ProjectLifecycle
+  readonly governanceMode?: ProjectGovernanceMode
 }
 
 export interface ProjectMemberDto {
@@ -689,6 +692,8 @@ export interface ReviewDto {
     readonly reviewerIds: readonly EntityId[]
     readonly minimumApprovals: number
     readonly prohibitSelfReview: boolean
+    readonly governanceMode?: ProjectGovernanceMode
+    readonly soloSelfReviewOwnerId?: EntityId
   }
   readonly requestedBy: EntityId
   readonly requestedAt: IsoDateTime
@@ -701,11 +706,13 @@ export interface CreateReviewInputDto {
   readonly target: VersionRefDto
   readonly summary: string
   readonly requiredReviewerIds: readonly EntityId[]
+  readonly allowSelfApproval?: boolean
 }
 
 export interface DecideReviewInputDto {
   readonly decision: 'approved' | 'changesRequested'
   readonly summary: string
+  readonly soloReviewConfirmed?: boolean
 }
 
 export interface CommentAnchorDto {

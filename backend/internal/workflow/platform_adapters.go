@@ -1024,6 +1024,24 @@ func (v CoreReviewGateVerifier) VerifyApproval(
 			if config.ProhibitSelfReview && !policy.ProhibitSelfReview {
 				continue
 			}
+			var decisions []storage.ReviewDecisionModel
+			if err := v.Database.WithContext(ctx).
+				Where("review_request_id = ? AND decision = 'approve'", request.ID).
+				Order("created_at ASC, id ASC").Find(&decisions).Error; err != nil {
+				return err
+			}
+			validApprovals := 0
+			for _, decision := range decisions {
+				if !core.CanonicalReviewApprovalDecision(
+					policy, decision.ReviewerID.String(), revision.CreatedBy.String(), decision.SoloSelfReview,
+				) {
+					continue
+				}
+				validApprovals++
+			}
+			if validApprovals < config.MinimumApprovals || validApprovals < policy.MinimumApprovals {
+				continue
+			}
 			policySatisfied = true
 			break
 		}

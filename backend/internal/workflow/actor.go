@@ -12,6 +12,8 @@ type ReviewDecision struct {
 	Reason                  string
 	Actor                   ActorProvenance
 	ExecutionAuthorizations map[string]ActorProvenance
+	SoloSelfReview          bool
+	GovernanceMode          core.GovernanceMode
 }
 
 func nodeExecutionPolicy(node domain.NodeDefinition) (core.Action, core.Role, bool) {

@@ -121,7 +121,7 @@ func (f *fakeWorkflowAPI) AuthorizeExecution(_ context.Context, _, _ string, nod
 func (f *fakeWorkflowAPI) RecordProposal(context.Context, string, string, string, string, domain.ProposalRef) error {
 	return nil
 }
-func (f *fakeWorkflowAPI) ResolveReview(context.Context, string, string, string, string, runtime.ReviewResolution, string) error {
+func (f *fakeWorkflowAPI) ResolveReview(context.Context, string, string, string, string, runtime.ReviewResolution, string, bool) error {
 	return f.approveErr
 }
 func (f *fakeWorkflowAPI) Cancel(context.Context, string, string, string, string) error { return nil }

@@ -66,8 +66,9 @@ type CreateSummaryCheckpointInput struct {
 }
 
 type DecideSummaryCheckpointInput struct {
-	Decision SummaryCheckpointDecision `json:"decision"`
-	Reason   string                    `json:"reason,omitempty"`
+	Decision            SummaryCheckpointDecision `json:"decision"`
+	Reason              string                    `json:"reason,omitempty"`
+	SoloReviewConfirmed bool                      `json:"soloReviewConfirmed,omitempty"`
 }
 
 type SummaryCheckpointPage struct {

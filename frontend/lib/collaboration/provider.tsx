@@ -12,6 +12,7 @@ import {
 } from 'react'
 import { PlatformClient } from '@/lib/platform/client'
 import { useWorksflow } from '@/lib/worksflow/store'
+import { allowsSoloSelfApprovalRequest } from '@/lib/worksflow/project-governance'
 import {
   collaborationBackendUnavailable,
   collaborationErrorMessage,
@@ -27,6 +28,7 @@ import type {
   CollaborationVersionRef,
   CommentThread,
   ProjectAction,
+  ProjectGovernanceMode,
   ProjectMember,
   ProjectPresence,
   ProjectReview,
@@ -73,6 +75,7 @@ interface CollaborationContextState {
   refresh: () => Promise<void>
   createProject: (name: string, description?: string) => Promise<string | null>
   renameProject: (projectId: string, name: string) => Promise<boolean>
+  updateProjectGovernanceMode: (governanceMode: ProjectGovernanceMode) => Promise<boolean>
   archiveProject: (projectId: string) => Promise<boolean>
   selectProject: (projectId: string) => Promise<boolean>
   addComment: (
@@ -95,6 +98,7 @@ interface CollaborationContextState {
     reviewId: string,
     decision: ReviewDecision,
     summary: string,
+    soloReviewConfirmed?: boolean,
   ) => Promise<boolean>
   addMember: (input: { name: string; email: string; role: ProjectRole }) => Promise<boolean>
   updateMemberRole: (userId: string, role: ProjectRole) => Promise<boolean>
@@ -438,6 +442,30 @@ export function CollaborationProvider({
     }
   }, [applyProjectSnapshot, gateway, project?.id, projects])
 
+  const updateProjectGovernanceMode = useCallback(async (
+    governanceMode: ProjectGovernanceMode,
+  ) => {
+    if (!project || project.governanceMode === governanceMode) return Boolean(project)
+    if (project.role !== 'owner') {
+      setError('Only the project owner can change the governance mode.')
+      return false
+    }
+    setLoading(true)
+    setError(null)
+    try {
+      const updated = await gateway.updateGovernanceMode(project, governanceMode)
+      setProjects((current) => current.map((item) => item.id === updated.id ? updated : item))
+      await applyProjectSnapshot(updated.id)
+      return true
+    } catch (cause) {
+      setBackendStatus(collaborationBackendUnavailable(cause) ? 'error' : 'online')
+      setError(collaborationErrorMessage(cause, 'Unable to change the project governance mode.'))
+      return false
+    } finally {
+      setLoading(false)
+    }
+  }, [applyProjectSnapshot, gateway, project])
+
   const archiveProject = useCallback(async (projectId: string) => {
     const target = projects.find((item) => item.id === projectId)
     if (!target) return false
@@ -521,6 +549,7 @@ export function CollaborationProvider({
     refresh,
     createProject,
     renameProject,
+    updateProjectGovernanceMode,
     archiveProject,
     selectProject,
     addComment: (body, parentId, target = reviewTargets[0]) => {
@@ -544,29 +573,52 @@ export function CollaborationProvider({
         setError('Create a versioned artifact before requesting a review.')
         return Promise.resolve(false)
       }
-      const reviewer = members.find((member) =>
-        (!session.signedIn || member.user.id !== session.user.id) &&
-        ['owner', 'admin', 'editor'].includes(member.role),
-      )
+      const reviewer = project?.governanceMode === 'solo'
+        ? members.find((member) => member.role === 'owner')
+        : members.find((member) =>
+            (!session.signedIn || member.user.id !== session.user.id) &&
+            ['owner', 'admin', 'editor'].includes(member.role),
+          )
       if (!reviewer) {
         setError('Assign another owner, admin, or editor before requesting a review.')
         return Promise.resolve(false)
       }
-      return mutate('edit', (projectId) =>
-        gateway.requestReview(projectId, target, summary, [reviewer.user.id]),
-      )
+      const reviewerIds = [reviewer.user.id]
+      return mutate('edit', (projectId) => gateway.requestReview(
+        projectId,
+        target,
+        summary,
+        reviewerIds,
+        allowsSoloSelfApprovalRequest(project?.governanceMode ?? 'team', members, reviewerIds),
+      ))
     },
-    requestReview: (summary, target, requiredReviewerIds) =>
-      mutate('edit', (projectId) =>
-        gateway.requestReview(projectId, target, summary, requiredReviewerIds),
-      ),
-    decideReview: (reviewId, decision, summary) => {
+    requestReview: (summary, target, requiredReviewerIds) => {
+      const allowSelfApproval = allowsSoloSelfApprovalRequest(
+        project?.governanceMode ?? 'team',
+        members,
+        requiredReviewerIds,
+      )
+      return mutate('edit', (projectId) => gateway.requestReview(
+        projectId,
+        target,
+        summary,
+        requiredReviewerIds,
+        allowSelfApproval,
+      ))
+    },
+    decideReview: (reviewId, decision, summary, soloReviewConfirmed = false) => {
       const review = reviews.find((item) => item.id === reviewId)
       if (!review?.etag) {
         setError('Refresh reviews before recording a decision.')
         return Promise.resolve(false)
       }
-      return mutate('edit', () => gateway.decideReview(reviewId, decision, summary, review.etag))
+      return mutate('edit', () => gateway.decideReview(
+        reviewId,
+        decision,
+        summary,
+        review.etag,
+        soloReviewConfirmed,
+      ))
     },
     addMember: (input) => mutate('admin', (projectId) => gateway.addMember(projectId, input)),
     updateMemberRole: (userId, role) => {
@@ -626,6 +678,7 @@ export function CollaborationProvider({
     refresh,
     restoreSession,
     renameProject,
+    updateProjectGovernanceMode,
     reviewTargets,
     reviews,
     selectProject,

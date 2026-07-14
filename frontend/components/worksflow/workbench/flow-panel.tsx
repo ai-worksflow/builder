@@ -40,6 +40,7 @@ import {
   workflowRoleSatisfies,
 } from '@/lib/platform/workflow-ui-contract'
 import { cn } from '@/lib/utils'
+import { requiresSoloReviewConfirmation } from '@/lib/worksflow/project-governance'
 import { WorkflowGraphEditor } from './workflow-graph-editor'
 
 type EditorMode = 'closed' | 'create' | 'version'
@@ -351,6 +352,7 @@ function RunNodeCard({ node }: { node: WorkflowNodeRunDto }) {
   const { can, project } = useCollaboration()
   const [revisionKey, setRevisionKey] = useState('')
   const [reason, setReason] = useState('')
+  const [soloReviewConfirmed, setSoloReviewConfirmed] = useState(false)
   const [selectionError, setSelectionError] = useState<string | null>(null)
   const definitionNode = flow.runDefinition?.definition.nodes.find(
     (item) => item.id === node.definitionNodeId,
@@ -369,6 +371,22 @@ function RunNodeCard({ node }: { node: WorkflowNodeRunDto }) {
   const active = ['waiting_input', 'waiting_review', 'failed'].includes(node.status)
   const reviewRequiredRole = definitionNode?.reviewGate?.requiredRole ?? 'editor'
   const canApproveReview = Boolean(project && workflowRoleSatisfies(project.role, reviewRequiredRole))
+  const soloApprovalRequiresConfirmation = project
+    ? requiresSoloReviewConfirmation(flow.run?.governanceMode ?? project.governanceMode, 'approve')
+    : false
+
+  async function approveReview() {
+    const approved = await flow.resolveReview(
+      node,
+      'approve',
+      reason.trim(),
+      soloReviewConfirmed,
+    )
+    if (approved) {
+      setReason('')
+      setSoloReviewConfirmed(false)
+    }
+  }
 
   function submitSelectedRevision() {
     setSelectionError(null)
@@ -476,6 +494,23 @@ function RunNodeCard({ node }: { node: WorkflowNodeRunDto }) {
 
       {node.status === 'waiting_review' && (
         <div className="mt-2 border-t border-border pt-2">
+          {soloApprovalRequiresConfirmation && (
+            <div role="alert" className="mb-2 rounded border border-warning/35 bg-warning/10 p-2 text-[9px] leading-relaxed text-warning">
+              <div className="flex items-start gap-1.5">
+                <CircleAlert className="mt-0.5 size-3 shrink-0" />
+                <span>This approval is a Solo self-review. The platform records your identity, reason, and decision in the audit log.</span>
+              </div>
+              <label className="mt-2 flex cursor-pointer items-start gap-1.5 text-foreground">
+                <input
+                  type="checkbox"
+                  checked={soloReviewConfirmed}
+                  onChange={(event) => setSoloReviewConfirmed(event.target.checked)}
+                  className="mt-0.5"
+                />
+                <span>I confirm this Solo self-review.</span>
+              </label>
+            </div>
+          )}
           <input
             value={reason}
             onChange={(event) => setReason(event.target.value)}
@@ -483,7 +518,7 @@ function RunNodeCard({ node }: { node: WorkflowNodeRunDto }) {
             className="h-7 w-full rounded border border-border bg-panel px-2 text-[9px] text-foreground outline-none placeholder:text-faint-foreground"
           />
           <div className="mt-1.5 grid grid-cols-2 gap-1">
-            <button type="button" onClick={() => void flow.resolveReview(node, 'approve', reason)} disabled={!canApproveReview || flow.busy} className="inline-flex h-7 items-center justify-center gap-1 rounded bg-success/15 text-[9px] font-medium text-success disabled:opacity-35">
+            <button type="button" onClick={() => void approveReview()} disabled={!canApproveReview || flow.busy || !reason.trim() || (soloApprovalRequiresConfirmation && !soloReviewConfirmed)} className="inline-flex h-7 items-center justify-center gap-1 rounded bg-success/15 text-[9px] font-medium text-success disabled:opacity-35">
               <Check className="size-3" /> Approve
             </button>
             <button type="button" onClick={() => void flow.resolveReview(node, 'changes_requested', reason || 'Changes requested in Workbench')} disabled={!can('edit') || flow.busy} className="inline-flex h-7 items-center justify-center gap-1 rounded bg-warning/15 text-[9px] font-medium text-warning disabled:opacity-35">

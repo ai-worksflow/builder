@@ -137,6 +137,7 @@ interface PlatformFlowContextState {
     node: WorkflowNodeRunDto,
     resolution: 'approve' | 'changes_requested' | 'waive',
     reason?: string,
+    soloReviewConfirmed?: boolean,
   ) => Promise<boolean>
   readonly retryNode: (node: WorkflowNodeRunDto, reason?: string) => Promise<boolean>
   readonly cancelRun: (reason?: string) => Promise<boolean>
@@ -1119,12 +1120,20 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
     node: WorkflowNodeRunDto,
     resolution: 'approve' | 'changes_requested' | 'waive',
     reason = '',
+    soloReviewConfirmed = false,
   ) => {
     if (!projectId || !run) return false
     setBusy(true)
     setError(null)
     try {
-      await client.resolveReview(projectId, run.id, node.key, resolution, reason)
+      await client.resolveReview(
+        projectId,
+        run.id,
+        node.key,
+        resolution,
+        reason,
+        soloReviewConfirmed,
+      )
       await loadRun(run.id)
       return true
     } catch (cause) {

@@ -268,6 +268,14 @@ func TestMultiBundleSequentialRebasePostgres(t *testing.T) {
 	if err != nil {
 		t.Fatalf("apply bundle A proposal at W0: %v", err)
 	}
+	var workspaceHealth storage.ArtifactHealthModel
+	if err := fixture.database.Where("artifact_id = ?", workspaceW1.ArtifactID).Take(&workspaceHealth).Error; err != nil {
+		t.Fatalf("load applied workspace health: %v", err)
+	}
+	if workspaceHealth.SyncStatus != "current" || workspaceHealth.DeliveryStatus != "incomplete" ||
+		workspaceHealth.FindingCount != 0 || workspaceHealth.BlockingCount != 0 || string(workspaceHealth.Report) != "{}" {
+		t.Fatalf("unexpected initial workspace health: %#v", workspaceHealth)
+	}
 	assertMultiBundleWorkspaceFile(t, workspaceW1.Content, "package.json", packageA)
 	workspaceW1Ref := VersionRef{
 		ArtifactID: workspaceW1.ArtifactID, RevisionID: workspaceW1.ID, ContentHash: workspaceW1.ContentHash,

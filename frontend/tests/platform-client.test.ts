@@ -485,10 +485,70 @@ test('WebSocket subscriptions dispatch discriminated events and persist cursors'
   assert.equal(received[0].type, 'project.updated')
   assert.equal(cursors.get('project:project-1'), 'cursor-after')
 
+  const canonicalReviewTypes = [
+    'review.submitted',
+    'review.stale',
+    'review.decision_recorded',
+    'artifact.revision_approved',
+  ] as const
+  canonicalReviewTypes.forEach((type, index) => {
+    fake.sockets[0].message({
+      type: 'event',
+      event: {
+        id: `event-review-${index}`,
+        type,
+        cursor: `review-cursor-${index}`,
+        subscriptionId: 'project:project-1',
+        projectId: 'project-1',
+        occurredAt: '2026-07-10T00:00:00Z',
+        payload: { projectId: 'project-1', reviewId: 'review-1' },
+      },
+    })
+  })
+  assert.deepEqual(received.slice(1).map((item) => item.type), canonicalReviewTypes)
+
   fake.sockets[0].message({ type: 'heartbeat', sentAt: '2026-07-10T00:00:00Z' })
   assert.deepEqual(fake.sockets[0].sent.at(-1), {
     type: 'heartbeat.ack',
     sentAt: '2026-07-10T00:00:00Z',
+  })
+  client.destroy()
+})
+
+test('WebSocket cursor reset clears replay state, notifies the projection, and resubscribes', async () => {
+  const fake = fakeSocketFactory()
+  const cursors = new FakeCursorStore()
+  cursors.set('project:project-1', 'cursor-before')
+  const client = new PlatformWebSocketClient({
+    url: 'wss://platform.example.test/v1/ws',
+    webSocketFactory: fake.factory,
+    cursorStore: cursors,
+    requestIdFactory: () => 'ws-request',
+  })
+  const resets: unknown[] = []
+  client.subscribeProject('project-1', undefined, (subscription) => resets.push(subscription))
+  client.connect()
+  fake.sockets[0].open()
+  await Promise.resolve()
+  fake.sockets[0].message({ type: 'auth.ack', connectionId: 'connection-1' })
+
+  fake.sockets[0].message({
+    type: 'cursor.reset',
+    subscriptionId: 'project:project-1',
+  })
+
+  assert.equal(cursors.get('project:project-1'), undefined)
+  assert.deepEqual(resets, [{
+    subscriptionId: 'project:project-1',
+    topic: 'project',
+    projectId: 'project-1',
+  }])
+  assert.deepEqual(fake.sockets[0].sent.at(-1), {
+    type: 'subscribe',
+    requestId: 'ws-request',
+    subscriptionId: 'project:project-1',
+    topic: 'project',
+    projectId: 'project-1',
   })
   client.destroy()
 })

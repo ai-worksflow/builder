@@ -304,7 +304,7 @@ func Run(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 		return fmt.Errorf("create workflow engine: %w", err)
 	}
 	workflowEngine.LeaseDuration = cfg.Workflow.LeaseDuration
-	workflowFacade := workflowruntime.Facade{Engine: workflowEngine, Store: workflowStore, Access: accessControl}
+	workflowFacade := workflowruntime.Facade{Engine: workflowEngine, Store: workflowStore, Access: accessControl, Governance: projectService}
 	workflowHandler, err := transport.NewWorkflowHandler(transport.WorkflowDependencies{Facade: workflowFacade, MaxJSONBodyBytes: cfg.HTTP.MaxJSONBodyBytes})
 	if err != nil {
 		return fmt.Errorf("create workflow transport: %w", err)

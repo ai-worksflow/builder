@@ -7,6 +7,7 @@ import type {
   ProjectRole,
   ReviewDecision,
 } from '@/lib/collaboration/types'
+import { reviewCandidatesForGovernance } from '@/lib/worksflow/project-governance'
 import { cn } from '@/lib/utils'
 import {
   Bell,
@@ -222,6 +223,14 @@ function SignedInCollaboration() {
     ?? reviewTargets[0]
   const selectedCommentTarget = reviewTargets.find((target) => target.revisionId === commentTargetId)
     ?? reviewTargets[0]
+  const reviewCandidates = reviewCandidatesForGovernance(
+    members,
+    session.user.id,
+    project?.governanceMode ?? 'team',
+  )
+  const effectiveReviewerId = project?.governanceMode === 'solo'
+    ? reviewCandidates[0]?.user.id ?? ''
+    : reviewerId
 
   async function submitProject(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
@@ -352,18 +361,16 @@ function SignedInCollaboration() {
                 selectedTarget={selectedReviewTarget}
                 onTargetChange={setReviewTargetId}
                 canReview={can('edit')}
-                reviewers={members.filter((member) =>
-                  member.user.id !== session.user.id &&
-                  ['owner', 'admin', 'editor'].includes(member.role),
-                )}
-                reviewerId={reviewerId}
+                reviewers={reviewCandidates}
+                reviewerId={effectiveReviewerId}
                 summary={reviewSummary}
                 onReviewerChange={setReviewerId}
                 onSummaryChange={setReviewSummary}
                 onSubmit={async () => {
                   if (
                     selectedReviewTarget &&
-                    await requestReview(reviewSummary, selectedReviewTarget, [reviewerId])
+                    effectiveReviewerId &&
+                    await requestReview(reviewSummary, selectedReviewTarget, [effectiveReviewerId])
                   ) {
                     setReviewSummary('')
                   }
@@ -526,9 +533,16 @@ function ReviewsTab({
   onReviewerChange: (userId: string) => void
   onSummaryChange: (summary: string) => void
   onSubmit: () => Promise<void>
-  onDecide: (reviewId: string, decision: ReviewDecision, summary: string) => Promise<boolean>
+  onDecide: (
+    reviewId: string,
+    decision: ReviewDecision,
+    summary: string,
+    soloReviewConfirmed?: boolean,
+  ) => Promise<boolean>
   currentUserId: string
 }) {
+  const [approvalSummaries, setApprovalSummaries] = useState<Readonly<Record<string, string>>>({})
+  const [soloConfirmations, setSoloConfirmations] = useState<ReadonlySet<string>>(() => new Set())
   return (
     <div className="space-y-2">
       {canReview && (
@@ -544,7 +558,67 @@ function ReviewsTab({
         <div key={review.id} className="rounded-md border border-border bg-card px-3 py-2">
           <div className="flex items-center gap-2"><span className="rounded bg-primary/10 px-1.5 py-0.5 text-[9px] text-primary-bright">{review.state ?? review.decision}</span><span className="text-[10px] font-medium text-foreground">{review.reviewer.name}</span><span className="ml-auto text-[9px] text-faint-foreground">{review.target ? versionDisplay(review.target) : 'revision unavailable'}</span></div>
           <p className="mt-1 text-[10px] text-muted-foreground">{review.summary}</p>
-          {review.state === 'pending' && canReview && review.requiredReviewerIds?.includes(currentUserId) && <div className="mt-2 flex gap-2"><button type="button" onClick={() => void onDecide(review.id, 'approve', 'Approved after reviewing this exact revision.')} className="text-[9px] text-success">Approve</button><button type="button" onClick={() => { const reason = window.prompt('Describe the required changes')?.trim(); if (reason) void onDecide(review.id, 'request_changes', reason) }} className="text-[9px] text-warning">Request changes</button></div>}
+          {review.state === 'pending' && canReview && review.requiredReviewerIds?.includes(currentUserId) && (
+            <div className="mt-2">
+              {review.policy.governanceMode === 'solo'
+                && review.policy.soloSelfReviewOwnerId === currentUserId && (
+                <label className="mb-2 flex items-start gap-1.5 rounded border border-warning/35 bg-warning/10 p-2 text-[9px] text-warning">
+                  <input
+                    type="checkbox"
+                    checked={soloConfirmations.has(review.id)}
+                    onChange={(event) => setSoloConfirmations((current) => {
+                      const next = new Set(current)
+                      if (event.target.checked) next.add(review.id)
+                      else next.delete(review.id)
+                      return next
+                    })}
+                  />
+                  <span>I confirm this Solo self-review will be recorded in the audit log.</span>
+                </label>
+              )}
+              <textarea
+                value={approvalSummaries[review.id] ?? ''}
+                onChange={(event) => setApprovalSummaries((current) => ({
+                  ...current,
+                  [review.id]: event.target.value,
+                }))}
+                rows={2}
+                maxLength={4000}
+                placeholder="Approval reason"
+                aria-label="Approval reason"
+                className="mb-2 w-full rounded border border-border bg-background p-2 text-[9px] text-foreground"
+              />
+              <div className="flex gap-2">
+                <button
+                  type="button"
+                  onClick={() => {
+                    const summary = (approvalSummaries[review.id] ?? '').trim()
+                    if (!summary) return
+                    void onDecide(
+                      review.id,
+                      'approve',
+                      summary,
+                      review.policy.governanceMode === 'solo'
+                        && review.policy.soloSelfReviewOwnerId === currentUserId
+                        && soloConfirmations.has(review.id),
+                    )
+                  }}
+                  disabled={
+                    !(approvalSummaries[review.id] ?? '').trim()
+                    || (
+                      review.policy.governanceMode === 'solo'
+                      && review.policy.soloSelfReviewOwnerId === currentUserId
+                      && !soloConfirmations.has(review.id)
+                    )
+                  }
+                  className="text-[9px] text-success disabled:opacity-40"
+                >
+                  Approve
+                </button>
+                <button type="button" onClick={() => { const reason = window.prompt('Describe the required changes')?.trim(); if (reason) void onDecide(review.id, 'request_changes', reason) }} className="text-[9px] text-warning">Request changes</button>
+              </div>
+            </div>
+          )}
         </div>
       ))}
     </div>

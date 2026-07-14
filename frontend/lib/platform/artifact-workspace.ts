@@ -16,6 +16,38 @@ import type {
 } from './dto'
 import { PlatformHttpError } from './http'
 
+const PLATFORM_PAGE_LIMIT = 200
+const WORKSPACE_TRACE_LIMIT = 500
+
+const ARTIFACT_WORKSPACE_REFRESH_EVENTS = new Set([
+  'artifact.updated',
+  'revision.created',
+  'document.updated',
+  'blueprint.updated',
+  'pageSpec.updated',
+  'prototype.updated',
+  'proposal.updated',
+  'trace.updated',
+  'artifact.created',
+  'artifact.draft_updated',
+  'artifact.revision_created',
+  'dependency.created',
+  'trace.created',
+  'proposal.created',
+  'proposal.operation_decided',
+  'proposal.applied',
+  'review.submitted',
+  'review.stale',
+  'review.decision_recorded',
+  'artifact.revision_approved',
+  'document.downstream_generated',
+  'document.sync_back_proposed',
+])
+
+export function artifactWorkspaceEventRequiresRefresh(type: string) {
+  return ARTIFACT_WORKSPACE_REFRESH_EVENTS.has(type)
+}
+
 export interface ArtifactWorkspaceSnapshot {
   readonly documents: readonly VersionedArtifactDto<DocumentContentDto>[]
   readonly blueprints: readonly VersionedArtifactDto<BlueprintContentDto>[]
@@ -271,6 +303,57 @@ function artifactStableId(prefix: string) {
   return `${prefix}-${id}`
 }
 
+async function loadWorkspaceTraces(
+  client: CollaborationPlatformClient,
+  projectId: string,
+): Promise<TraceLinkDto[]> {
+  const traces: TraceLinkDto[] = []
+  const cursors = new Set<string>()
+  let cursor: string | undefined
+
+  while (traces.length < WORKSPACE_TRACE_LIMIT) {
+    const remaining = WORKSPACE_TRACE_LIMIT - traces.length
+    const result = await client.traces.list(projectId, {
+      cursor,
+      limit: Math.min(PLATFORM_PAGE_LIMIT, remaining),
+    })
+    traces.push(...result.data.items.slice(0, remaining))
+
+    const nextCursor = result.data.nextCursor?.trim()
+    if (!nextCursor || result.data.items.length === 0) break
+    if (cursors.has(nextCursor)) throw new Error('Trace pagination returned a repeated cursor.')
+    cursors.add(nextCursor)
+    cursor = nextCursor
+  }
+
+  return traces
+}
+
+async function loadWorkspaceProposals(
+  client: CollaborationPlatformClient,
+  projectId: string,
+): Promise<ProposalDto[]> {
+  const proposals: ProposalDto[] = []
+  const cursors = new Set<string>()
+  let cursor: string | undefined
+
+  while (true) {
+    const result = await client.proposals.list(projectId, {}, {
+      cursor,
+      limit: PLATFORM_PAGE_LIMIT,
+    })
+    proposals.push(...result.data.items)
+
+    const nextCursor = result.data.nextCursor?.trim()
+    if (!nextCursor || result.data.items.length === 0) break
+    if (cursors.has(nextCursor)) throw new Error('Proposal pagination returned a repeated cursor.')
+    cursors.add(nextCursor)
+    cursor = nextCursor
+  }
+
+  return proposals
+}
+
 export class ArtifactWorkspaceConflictError<TContent> extends Error {
   readonly artifactId: string
   readonly localContent: TContent
@@ -296,16 +379,16 @@ export class ArtifactWorkspaceGateway {
       this.client.blueprints.list(projectId, { limit: 100 }),
       this.client.pageSpecs.list(projectId, { limit: 200 }),
       this.client.prototypes.list(projectId, { limit: 200 }),
-      this.client.proposals.list(projectId, {}, { limit: 200 }),
-      this.client.traces.list(projectId, { limit: 500 }),
+      loadWorkspaceProposals(this.client, projectId),
+      loadWorkspaceTraces(this.client, projectId),
     ])
     return {
       documents: documents.data.items,
       blueprints: blueprints.data.items,
       pageSpecs: pageSpecs.data.items,
       prototypes: prototypes.data.items,
-      proposals: proposals.data.items,
-      traces: traces.data.items,
+      proposals,
+      traces,
     }
   }
 

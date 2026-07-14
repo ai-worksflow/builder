@@ -543,6 +543,14 @@ func (s *QualityService) persistReport(ctx context.Context, report *QualityRepor
 				}
 			}
 		}
+		reportHealth := storage.ArtifactHealthModel{
+			ArtifactID: reportArtifactID, SyncStatus: "current", DeliveryStatus: deliveryStatus,
+			FindingCount: len(report.Diagnostics), BlockingCount: blockingCount,
+			Report: payload, ComputedAt: *report.CompletedAt,
+		}
+		if err := transaction.Create(&reportHealth).Error; err != nil {
+			return err
+		}
 		health := storage.ArtifactHealthModel{ArtifactID: workspaceArtifactID, SyncStatus: "current", DeliveryStatus: deliveryStatus, FindingCount: len(report.Diagnostics), BlockingCount: blockingCount, Report: payload, ComputedAt: *report.CompletedAt}
 		if err := transaction.Clauses(clause.OnConflict{
 			Columns:   []clause.Column{{Name: "artifact_id"}},

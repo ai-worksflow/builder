@@ -97,6 +97,26 @@ export function SettingsCenter() {
                   </button>
                 </div>
               </label>
+              <label className="mt-4 block text-[12px] text-muted-foreground">
+                Review governance
+                <select
+                  value={collaboration.project?.governanceMode ?? 'team'}
+                  onChange={(event) => void collaboration.updateProjectGovernanceMode(
+                    event.target.value as 'solo' | 'team',
+                  )}
+                  disabled={
+                    collaboration.loading
+                    || collaboration.project?.role !== 'owner'
+                  }
+                  className="mt-1.5 h-9 w-full rounded-md border border-border bg-background px-3 text-sm text-foreground disabled:opacity-50"
+                >
+                  <option value="team">Team — independent review required</option>
+                  <option value="solo">Solo — explicit self-review with audit evidence</option>
+                </select>
+                <span className="mt-1 block text-[10px] text-faint-foreground">
+                  Only the sole owner can enable Solo mode. The mode cannot change while a workflow run is active.
+                </span>
+              </label>
             </div>
 
             <CollaborationCenter />

@@ -242,7 +242,7 @@ func TestReviewApprovalAtomicallyHandsOffAuthorizedPublishActor(t *testing.T) {
 	if waiting.Nodes["review"].Status != NodeWaitingReview {
 		t.Fatalf("review status=%s", waiting.Nodes["review"].Status)
 	}
-	if err := facade.ResolveReview(context.Background(), manifest.ProjectID, run.ID, "review", adminID, ReviewApprove, ""); err != nil {
+	if err := facade.ResolveReview(context.Background(), manifest.ProjectID, run.ID, "review", adminID, ReviewApprove, "", false); err != nil {
 		t.Fatal(err)
 	}
 	authorized, _ := store.GetRun(context.Background(), run.ID)

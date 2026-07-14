@@ -12,19 +12,21 @@ import (
 	"github.com/worksflow/builder/backend/internal/storage/content"
 	storage "github.com/worksflow/builder/backend/internal/storage/postgres"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 type Project struct {
-	ID          string    `json:"id"`
-	Name        string    `json:"name"`
-	Description string    `json:"description"`
-	Lifecycle   string    `json:"lifecycle"`
-	Role        Role      `json:"role"`
-	Version     uint64    `json:"version"`
-	ETag        string    `json:"etag"`
-	CreatedBy   string    `json:"createdBy"`
-	CreatedAt   time.Time `json:"createdAt"`
-	UpdatedAt   time.Time `json:"updatedAt"`
+	ID             string         `json:"id"`
+	Name           string         `json:"name"`
+	Description    string         `json:"description"`
+	Lifecycle      string         `json:"lifecycle"`
+	GovernanceMode GovernanceMode `json:"governanceMode"`
+	Role           Role           `json:"role"`
+	Version        uint64         `json:"version"`
+	ETag           string         `json:"etag"`
+	CreatedBy      string         `json:"createdBy"`
+	CreatedAt      time.Time      `json:"createdAt"`
+	UpdatedAt      time.Time      `json:"updatedAt"`
 }
 
 type CreateProjectInput struct {
@@ -33,9 +35,10 @@ type CreateProjectInput struct {
 }
 
 type UpdateProjectInput struct {
-	Name        *string `json:"name,omitempty"`
-	Description *string `json:"description,omitempty"`
-	Lifecycle   *string `json:"lifecycle,omitempty"`
+	Name           *string         `json:"name,omitempty"`
+	Description    *string         `json:"description,omitempty"`
+	Lifecycle      *string         `json:"lifecycle,omitempty"`
+	GovernanceMode *GovernanceMode `json:"governanceMode,omitempty"`
 }
 
 type CreatedProject struct {
@@ -103,7 +106,8 @@ func (s *ProjectService) Create(ctx context.Context, actorID string, input Creat
 	now := s.now().UTC()
 	projectModel := storage.ProjectModel{
 		ID: projectID, Name: input.Name, Description: input.Description,
-		Lifecycle: "active", Version: 1, CreatedBy: actorUUID, CreatedAt: now, UpdatedAt: now,
+		Lifecycle: "active", GovernanceMode: string(GovernanceModeTeam), Version: 1,
+		CreatedBy: actorUUID, CreatedAt: now, UpdatedAt: now,
 	}
 	memberModel := storage.ProjectMemberModel{
 		ProjectID: projectID, UserID: actorUUID, Role: string(RoleOwner),
@@ -142,6 +146,9 @@ func (s *ProjectService) Create(ctx context.Context, actorID string, input Creat
 			return err
 		}
 		artifactModel.LatestDraftID = latestDraftID
+		if err := ensureArtifactHealthRow(transaction, artifactID, now); err != nil {
+			return err
+		}
 		for _, initializer := range s.initializers {
 			if err := initializer.InitializeProject(ctx, transaction, projectID, actorUUID, now); err != nil {
 				return err
@@ -216,12 +223,15 @@ func (s *ProjectService) Get(ctx context.Context, projectID, actorID string) (Pr
 
 func (s *ProjectService) Update(ctx context.Context, projectID, actorID string, expectedVersion uint64, input UpdateProjectInput) (Project, error) {
 	requiredAction := ActionEdit
-	if input.Lifecycle != nil {
+	if input.Lifecycle != nil || input.GovernanceMode != nil {
 		requiredAction = ActionAdmin
 	}
 	role, err := s.access.Authorize(ctx, projectID, actorID, requiredAction)
 	if err != nil {
 		return Project{}, err
+	}
+	if input.GovernanceMode != nil && role != RoleOwner {
+		return Project{}, ErrForbidden
 	}
 	projectUUID, actorUUID, err := parseProjectUser(projectID, actorID)
 	if err != nil {
@@ -253,10 +263,55 @@ func (s *ProjectService) Update(ctx context.Context, projectID, actorID string, 
 			updates["archived_at"] = nil
 		}
 	}
+	if input.GovernanceMode != nil {
+		if !ValidGovernanceMode(*input.GovernanceMode) {
+			return Project{}, fmt.Errorf("%w: project governance mode", ErrInvalidInput)
+		}
+		updates["governance_mode"] = string(*input.GovernanceMode)
+	}
 	if len(updates) == 2 {
 		return s.Get(ctx, projectID, actorID)
 	}
+	var oldGovernanceMode GovernanceMode
+	governanceChanged := false
 	err = s.database.WithContext(ctx).Transaction(func(transaction *gorm.DB) error {
+		if input.GovernanceMode != nil {
+			var current storage.ProjectModel
+			if err := transaction.Clauses(clause.Locking{Strength: "UPDATE"}).
+				Select("id", "governance_mode").Where("id = ?", projectUUID).Take(&current).Error; err != nil {
+				return err
+			}
+			oldGovernanceMode = normalizeGovernanceMode(current.GovernanceMode)
+			currentRole, err := (&AccessControl{database: transaction}).Authorize(ctx, projectID, actorID, ActionAdmin)
+			if err != nil {
+				return err
+			}
+			if currentRole != RoleOwner {
+				return ErrForbidden
+			}
+			if *input.GovernanceMode == GovernanceModeSolo {
+				var ownerCount int64
+				if err := transaction.Model(&storage.ProjectMemberModel{}).
+					Where("project_id = ? AND role = ?", projectUUID, RoleOwner).Count(&ownerCount).Error; err != nil {
+					return err
+				}
+				if ownerCount != 1 {
+					return ErrSoloOwnerInvariant
+				}
+			}
+			governanceChanged = oldGovernanceMode != *input.GovernanceMode
+			if governanceChanged {
+				var activeRuns int64
+				if err := transaction.Model(&storage.WorkflowRunModel{}).
+					Where("project_id = ? AND status NOT IN ?", projectUUID, []string{"completed", "cancelled", "stale"}).
+					Count(&activeRuns).Error; err != nil {
+					return err
+				}
+				if activeRuns > 0 {
+					return ErrActiveWorkflowRuns
+				}
+			}
+		}
 		result := transaction.Model(&storage.ProjectModel{}).
 			Where("id = ? AND version = ?", projectUUID, expectedVersion).Updates(updates)
 		if result.Error != nil {
@@ -265,12 +320,24 @@ func (s *ProjectService) Update(ctx context.Context, projectID, actorID string, 
 		if result.RowsAffected != 1 {
 			return ErrConflict
 		}
-		if err := insertAudit(transaction, projectUUID, actorUUID, "project.updated", "project", projectID, nil); err != nil {
+		action := "project.updated"
+		metadata := map[string]any{}
+		if governanceChanged {
+			action = "project.governance_mode_changed"
+			metadata["oldGovernanceMode"] = oldGovernanceMode
+			metadata["newGovernanceMode"] = *input.GovernanceMode
+		}
+		if err := insertAudit(transaction, projectUUID, actorUUID, action, "project", projectID, metadata); err != nil {
 			return err
 		}
-		return enqueue(transaction, "project", projectID, "project.updated", "worksflow.project.updated", map[string]any{
-			"projectId": projectID, "updatedBy": actorID,
-		})
+		payload := map[string]any{"projectId": projectID, "updatedBy": actorID}
+		eventType, subject := "project.updated", "worksflow.project.updated"
+		if governanceChanged {
+			eventType, subject = "project.governance_mode_changed", "worksflow.project.governance.mode.changed"
+			payload["oldGovernanceMode"] = oldGovernanceMode
+			payload["newGovernanceMode"] = *input.GovernanceMode
+		}
+		return enqueue(transaction, "project", projectID, eventType, subject, payload)
 	})
 	if err != nil {
 		return Project{}, err
@@ -283,10 +350,19 @@ func actorIDWithRole(actorID string, _ Role) string { return actorID }
 func projectFromModel(model storage.ProjectModel, role Role) Project {
 	return Project{
 		ID: model.ID.String(), Name: model.Name, Description: model.Description,
-		Lifecycle: model.Lifecycle, Role: role, Version: model.Version,
+		Lifecycle: model.Lifecycle, GovernanceMode: normalizeGovernanceMode(model.GovernanceMode),
+		Role: role, Version: model.Version,
 		ETag: projectETag(model.ID, model.Version), CreatedBy: model.CreatedBy.String(),
 		CreatedAt: model.CreatedAt, UpdatedAt: model.UpdatedAt,
 	}
+}
+
+func (s *ProjectService) Governance(ctx context.Context, projectID string) (ProjectGovernance, error) {
+	projectUUID, err := uuid.Parse(projectID)
+	if err != nil {
+		return ProjectGovernance{}, fmt.Errorf("%w: project id", ErrInvalidInput)
+	}
+	return LoadProjectGovernance(ctx, s.database, projectUUID)
 }
 
 func projectETag(projectID uuid.UUID, version uint64) string {

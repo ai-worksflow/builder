@@ -74,6 +74,12 @@ func WriteError(context *gin.Context, err error) {
 		Write(context, New(http.StatusConflict, "conflict", "Resource conflict", "The resource changed or conflicts with the requested operation."))
 	case errors.Is(err, core.ErrLastOwner):
 		Write(context, New(http.StatusConflict, "last_owner", "Owner required", "A project must retain at least one owner."))
+	case errors.Is(err, core.ErrActiveWorkflowRuns):
+		Write(context, New(http.StatusConflict, "active_workflow_runs", "Workflow run in progress", "Project governance mode cannot change while a workflow run is active."))
+	case errors.Is(err, core.ErrSoloOwnerInvariant):
+		Write(context, New(http.StatusConflict, "solo_owner_invariant", "Solo mode requires one owner", "Switch to team mode before adding another owner, or retain exactly one owner before enabling solo mode."))
+	case errors.Is(err, core.ErrSoloReviewConfirmation):
+		Write(context, New(http.StatusConflict, "solo_review_confirmation_required", "Solo self-review confirmation required", "Confirm the solo self-review and provide a review explanation."))
 	case errors.Is(err, core.ErrSelfApproval):
 		Write(context, New(http.StatusConflict, "self_approval", "Self approval is not allowed", "Authors cannot approve their own revision."))
 	case errors.Is(err, core.ErrBlockingGate):

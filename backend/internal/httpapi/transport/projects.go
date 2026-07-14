@@ -14,15 +14,16 @@ import (
 )
 
 type projectResponse struct {
-	ID              string    `json:"id"`
-	Name            string    `json:"name"`
-	Description     string    `json:"description,omitempty"`
-	Lifecycle       string    `json:"lifecycle"`
-	CurrentUserRole core.Role `json:"currentUserRole"`
-	CreatedBy       string    `json:"createdBy"`
-	CreatedAt       time.Time `json:"createdAt"`
-	UpdatedAt       time.Time `json:"updatedAt"`
-	ETag            string    `json:"etag"`
+	ID              string              `json:"id"`
+	Name            string              `json:"name"`
+	Description     string              `json:"description,omitempty"`
+	Lifecycle       string              `json:"lifecycle"`
+	GovernanceMode  core.GovernanceMode `json:"governanceMode"`
+	CurrentUserRole core.Role           `json:"currentUserRole"`
+	CreatedBy       string              `json:"createdBy"`
+	CreatedAt       time.Time           `json:"createdAt"`
+	UpdatedAt       time.Time           `json:"updatedAt"`
+	ETag            string              `json:"etag"`
 }
 
 type createProjectInput struct {
@@ -32,9 +33,10 @@ type createProjectInput struct {
 }
 
 type updateProjectInput struct {
-	Name        *string `json:"name,omitempty"`
-	Description *string `json:"description,omitempty"`
-	Lifecycle   *string `json:"lifecycle,omitempty"`
+	Name           *string              `json:"name,omitempty"`
+	Description    *string              `json:"description,omitempty"`
+	Lifecycle      *string              `json:"lifecycle,omitempty"`
+	GovernanceMode *core.GovernanceMode `json:"governanceMode,omitempty"`
 }
 
 func (s *Server) ListProjects(context *gin.Context) {
@@ -101,7 +103,12 @@ func (s *Server) UpdateProject(context *gin.Context) {
 	identity, _ := worksmiddleware.GetIdentity(context)
 	project, err := s.services.Projects.Update(context.Request.Context(), projectID, identity.Session.User.ID, expectedVersion, core.UpdateProjectInput{
 		Name: input.Name, Description: input.Description, Lifecycle: input.Lifecycle,
+		GovernanceMode: input.GovernanceMode,
 	})
+	if errors.Is(err, core.ErrActiveWorkflowRuns) {
+		problem.Write(context, problem.New(http.StatusConflict, "active_workflow_runs", "Workflow run in progress", "Project governance mode cannot change while a workflow run is active."))
+		return
+	}
 	if errors.Is(err, core.ErrConflict) {
 		problem.Write(context, problem.New(http.StatusPreconditionFailed, "etag_mismatch", "Precondition failed", "The project changed since it was loaded."))
 		return
@@ -174,8 +181,9 @@ func validProjectAction(action core.Action) bool {
 func projectDTO(project core.Project) projectResponse {
 	return projectResponse{
 		ID: project.ID, Name: project.Name, Description: project.Description,
-		Lifecycle: project.Lifecycle, CurrentUserRole: project.Role,
-		CreatedBy: project.CreatedBy, CreatedAt: project.CreatedAt, UpdatedAt: project.UpdatedAt,
+		Lifecycle: project.Lifecycle, GovernanceMode: project.GovernanceMode,
+		CurrentUserRole: project.Role,
+		CreatedBy:       project.CreatedBy, CreatedAt: project.CreatedAt, UpdatedAt: project.UpdatedAt,
 		ETag: project.ETag,
 	}
 }

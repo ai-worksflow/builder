@@ -34,6 +34,16 @@ var systemManagedArtifactKinds = map[string]struct{}{
 	"test_report":          {},
 }
 
+func ensureArtifactHealthRow(transaction *gorm.DB, artifactID uuid.UUID, computedAt time.Time) error {
+	return transaction.Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "artifact_id"}},
+		DoNothing: true,
+	}).Create(&storage.ArtifactHealthModel{
+		ArtifactID: artifactID, SyncStatus: "current", DeliveryStatus: "incomplete",
+		Report: json.RawMessage(`{}`), ComputedAt: computedAt,
+	}).Error
+}
+
 func IsSystemManagedArtifactKind(kind string) bool {
 	_, systemManaged := systemManagedArtifactKinds[strings.TrimSpace(kind)]
 	return systemManaged
@@ -425,10 +435,7 @@ func (s *ArtifactService) create(
 			return err
 		}
 		artifactModel.LatestDraftID = &draftID
-		if err := transaction.Create(&storage.ArtifactHealthModel{
-			ArtifactID: artifactID, SyncStatus: "current", DeliveryStatus: "incomplete",
-			Report: json.RawMessage(`{}`), ComputedAt: now,
-		}).Error; err != nil {
+		if err := ensureArtifactHealthRow(transaction, artifactID, now); err != nil {
 			return err
 		}
 		if err := insertAudit(transaction, projectUUID, actorUUID, "artifact.created", "artifact", artifactID.String(), map[string]any{"kind": input.Kind}); err != nil {
@@ -641,7 +648,8 @@ func (s *ArtifactService) UpdateDraft(ctx context.Context, draftID, actorID, exp
 			return err
 		}
 		return enqueue(transaction, "artifact", current.ArtifactID.String(), "artifact.draft_updated", "worksflow.artifact.draft.updated", map[string]any{
-			"artifactId": current.ArtifactID.String(), "draftId": draftID, "sequence": nextSequence,
+			"projectId": projectUUID.String(), "artifactId": current.ArtifactID.String(),
+			"draftId": draftID, "sequence": nextSequence,
 		})
 	})
 	if err != nil {
