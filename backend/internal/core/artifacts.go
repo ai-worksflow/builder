@@ -1197,7 +1197,7 @@ func (s *ArtifactService) validatePrototypePageSpecSource(
 	}
 	source := pageSpecs[0]
 	if !source.Input.Required ||
-		!artifactLineagePurpose(source.Input.Purpose, "page_spec", "delivery_slice_page_spec") ||
+		!prototypePageSpecLineagePurpose(source.Input.Purpose) ||
 		hasVersionAnchor(source.Input.Ref) {
 		return fmt.Errorf("%w: Prototype PageSpec source must be one required whole revision", ErrBlockingGate)
 	}
@@ -1254,6 +1254,16 @@ func artifactLineagePurpose(value string, allowed ...string) bool {
 		}
 	}
 	return false
+}
+
+func prototypePageSpecLineagePurpose(value string) bool {
+	value = strings.TrimSpace(value)
+	if artifactLineagePurpose(value, "page_spec", "delivery_slice_page_spec") {
+		return true
+	}
+	const workflowNodePrefix = "workflow_node:"
+	return strings.HasPrefix(value, workflowNodePrefix) &&
+		strings.TrimSpace(strings.TrimPrefix(value, workflowNodePrefix)) != ""
 }
 
 func (s *ArtifactService) validatePrototypeComponentRefs(

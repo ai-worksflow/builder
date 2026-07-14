@@ -502,6 +502,30 @@ func TestArtifactServicePrototypeLineageFormalAndExploratory(t *testing.T) {
 	); err != nil {
 		t.Fatalf("workflow delivery-slice PageSpec source was rejected at formal review: %v", err)
 	}
+	workflowReviewPageSpecSource := pageSpecSource
+	workflowReviewPageSpecSource.Purpose = "workflow_node:custom-page-review"
+	if err := service.validateArtifactLineageForReview(
+		ctx, database, projectID, "prototype", prototypeLineageCoveragePayload(t, pageSpecRef),
+		[]ArtifactSourceInput{workflowReviewPageSpecSource},
+	); err != nil {
+		t.Fatalf("custom workflow PageSpec review output was rejected at formal review: %v", err)
+	}
+	emptyWorkflowNodeSource := workflowReviewPageSpecSource
+	emptyWorkflowNodeSource.Purpose = "workflow_node:"
+	if err := service.validateArtifactLineageForReview(
+		ctx, database, projectID, "prototype", prototypeLineageCoveragePayload(t, pageSpecRef),
+		[]ArtifactSourceInput{emptyWorkflowNodeSource},
+	); !errors.Is(err, ErrBlockingGate) {
+		t.Fatalf("empty workflow-node purpose bypassed Prototype PageSpec authority gate: %v", err)
+	}
+	arbitraryPurposeSource := workflowReviewPageSpecSource
+	arbitraryPurposeSource.Purpose = "selected_page_spec"
+	if err := service.validateArtifactLineageForReview(
+		ctx, database, projectID, "prototype", prototypeLineageCoveragePayload(t, pageSpecRef),
+		[]ArtifactSourceInput{arbitraryPurposeSource},
+	); !errors.Is(err, ErrBlockingGate) {
+		t.Fatalf("arbitrary PageSpec purpose bypassed Prototype authority gate: %v", err)
+	}
 	if err := database.Model(&storage.ArtifactRevisionSourceModel{}).
 		Where("revision_id = ? AND purpose = ?", pageSpecRef.RevisionID, "blueprint").
 		Update("purpose", "delivery_slice_blueprint").Error; err != nil {
@@ -719,6 +743,95 @@ func TestArtifactRevisionFreezesAppliedOutputProposalIdentity(t *testing.T) {
 	}
 	if dependencyCount != 0 {
 		t.Fatalf("base-only transform generated %d self/phantom artifact dependencies", dependencyCount)
+	}
+}
+
+func TestPrototypeRevisionAcceptsAppliedProposalFromPageSpecReviewOutput(t *testing.T) {
+	database, cleanup := baselinePostgresDatabase(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	store, artifacts, projectID, userID := newArtifactLineageFixture(t, database)
+	pageSpecRef := seedArtifactSemanticPageSpecRevision(
+		t, database, store, projectID, userID, "approved", "current",
+		json.RawMessage(`{
+			"blueprintPageNodeId":"page-orders","title":"Orders","route":"/orders","userGoal":"Review orders",
+			"acceptanceCriterionIds":["AC-1"],"requiredRoles":["orders-reader"],
+			"states":[
+				{"id":"state-ready","key":"ready","title":"Ready","required":true,"fixtureIds":["fixture-ready"]},
+				{"id":"state-loading","key":"loading","title":"Loading","required":true,"fixtureIds":[]},
+				{"id":"state-empty","key":"empty","title":"Empty","required":true,"fixtureIds":[]},
+				{"id":"state-error","key":"error","title":"Error","required":true,"fixtureIds":[]}
+			],
+			"interactions":[{"id":"interaction-open","trigger":"click","outcome":"Open details"}],
+			"dataBindings":[{"id":"binding-orders","name":"Orders","source":"api","operationId":"api-orders","required":true}]
+		}`),
+	)
+	pageSpecSource := ArtifactSourceInput{Ref: pageSpecRef, Purpose: "page_spec", Required: true}
+	created, err := artifacts.Create(ctx, projectID.String(), userID.String(), CreateArtifactInput{
+		Kind: "prototype", Title: "Orders Prototype", Content: prototypeLineagePayload(t, pageSpecRef, false),
+		SourceVersions: []ArtifactSourceInput{pageSpecSource},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	base, err := artifacts.CreateRevision(
+		ctx, created.Artifact.ID, userID.String(), created.Draft.ETag,
+		CreateRevisionInput{ChangeSummary: "Initialize Prototype target", ChangeSource: "system"},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	access, err := NewAccessControl(database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proposals, err := NewProposalService(database, store, access)
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseRef := VersionRef{ArtifactID: base.ArtifactID, RevisionID: base.ID, ContentHash: base.ContentHash}
+	manifest, err := proposals.CreateManifest(ctx, projectID.String(), userID.String(), CreateManifestInput{
+		JobType: "generate_prototype", BaseRevision: &baseRef,
+		Sources:     []ManifestSourceInput{{Ref: pageSpecRef, Purpose: "workflow_node:custom-page-review"}},
+		Constraints: json.RawMessage(`{}`), OutputSchemaVersion: "prototype-proposal/v1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	proposal, err := proposals.CreateProposal(ctx, projectID.String(), userID.String(), CreateProposalInput{
+		ManifestID: manifest.ID, ArtifactID: created.Artifact.ID,
+		Operations: []domain.ProposalOperation{{
+			ID: "replace-prototype", Kind: domain.OperationReplace, Value: prototypeLineageCoveragePayload(t, pageSpecRef),
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	proposal, err = proposals.Decide(ctx, proposal.ID, userID.String(), DecideProposalInput{
+		OperationID: "replace-prototype", Decision: domain.DecisionAccepted, Version: proposal.Version,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	draft, err := proposals.Apply(ctx, proposal.ID, userID.String(), ApplyProposalInput{Version: proposal.Version})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(draft.SourceVersions) != 1 || draft.SourceVersions[0].Purpose != "workflow_node:custom-page-review" {
+		t.Fatalf("Proposal apply did not preserve the frozen PageSpec review source: %#v", draft.SourceVersions)
+	}
+	revision, err := artifacts.CreateRevision(
+		ctx, created.Artifact.ID, userID.String(), draft.ETag,
+		CreateRevisionInput{ChangeSummary: "Apply reviewed Prototype proposal", ChangeSource: "ai_proposal"},
+	)
+	if err != nil {
+		t.Fatalf("CreateRevision rejected the exact workflow PageSpec review source: %v", err)
+	}
+	if revision.ProposalID == nil || *revision.ProposalID != proposal.ID ||
+		revision.SourceManifestID == nil || *revision.SourceManifestID != manifest.ID ||
+		len(revision.SourceVersions) != 1 || revision.SourceVersions[0].Purpose != "workflow_node:custom-page-review" {
+		t.Fatalf("Prototype revision lost its Proposal/Manifest/PageSpec review lineage: %+v", revision)
 	}
 }
 
