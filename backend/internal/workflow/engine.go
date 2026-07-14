@@ -417,6 +417,7 @@ func (e *Engine) reloadOwnedLease(ctx context.Context, lease Lease) (*RunRecord,
 // twice or let a stale aggregate overwrite the sibling's state.
 func (e *Engine) applyCachedLeaseResult(ctx context.Context, profile WorkflowExecutionProfileBundle, lease Lease, run *RunRecord, node *NodeRecord, definition domain.WorkflowDefinition, execution Execution, result WorkerResult) error {
 	for {
+		node.Failure = nil
 		currentExecution := execution
 		currentExecution.Run = *run
 		currentExecution.Node = *node

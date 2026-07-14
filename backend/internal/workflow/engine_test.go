@@ -446,17 +446,23 @@ func commitConcurrentRunValue(ctx context.Context, store *MemoryStore, runID str
 func TestExecuteLeaseRebasesCachedOutcomeAfterRunCursorAdvance(t *testing.T) {
 	runnerFailure := errors.New("cached runner failure")
 	tests := []struct {
-		name       string
-		result     WorkerResult
-		runnerErr  error
-		wantStatus NodeStatus
+		name         string
+		result       WorkerResult
+		runnerErr    error
+		priorFailure bool
+		wantStatus   NodeStatus
 	}{
-		{name: "result", result: WorkerResult{Disposition: ResultComplete, Output: json.RawMessage(`{"payload":{}}`)}, wantStatus: NodeCompleted},
+		{name: "result", result: WorkerResult{Disposition: ResultComplete, Output: json.RawMessage(`{"payload":{}}`)}, priorFailure: true, wantStatus: NodeCompleted},
 		{name: "failure", runnerErr: runnerFailure, wantStatus: NodeReady},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			engine, store, clock, run, lease, calls := prepareTransformLease(t, test.result, test.runnerErr, time.Minute)
+			if test.priorFailure {
+				store.mu.Lock()
+				store.runs[run.ID].Nodes["transform"].Failure = mustJSON(map[string]any{"message": "prior attempt failed", "attempt": 0})
+				store.mu.Unlock()
+			}
 			engine.Store = &casInjectingStore{Store: store, inject: func(ctx context.Context) error {
 				return commitConcurrentRunValue(ctx, store, run.ID, clock.Now())
 			}}
@@ -484,6 +490,9 @@ func TestExecuteLeaseRebasesCachedOutcomeAfterRunCursorAdvance(t *testing.T) {
 			}
 			if test.runnerErr == nil && string(stored.Context.Nodes["transform"].Output) != `{"payload":{}}` {
 				t.Fatalf("cached runner output was not committed: %s", stored.Context.Nodes["transform"].Output)
+			}
+			if test.runnerErr == nil && len(node.Failure) != 0 {
+				t.Fatalf("successful CAS replay retained prior failure: %s", node.Failure)
 			}
 		})
 	}
@@ -553,8 +562,22 @@ func TestEngineRetriesFailureAndResumesWithPinnedDefinition(t *testing.T) {
 	if err := engine.ClaimAndExecute(context.Background(), "worker"); err == nil || err.Error() != "temporary" {
 		t.Fatalf("expected runner failure, got %v", err)
 	}
+	retrying, err := store.GetRun(context.Background(), run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retrying.Nodes["transform"].Status != NodeReady || !strings.Contains(string(retrying.Nodes["transform"].Failure), "temporary") {
+		t.Fatalf("automatic retry did not retain the current failure: %+v", retrying.Nodes["transform"])
+	}
 	if err := engine.ClaimAndExecute(context.Background(), "worker"); err != nil {
 		t.Fatal(err)
+	}
+	recovered, err := store.GetRun(context.Background(), run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recovered.Nodes["transform"].Status != NodeCompleted || len(recovered.Nodes["transform"].Failure) != 0 {
+		t.Fatalf("successful retry retained stale failure: %+v", recovered.Nodes["transform"])
 	}
 	authorizeTestExecution(t, engine, run.ID, "publish", core.RoleOwner, core.ActionPublish)
 	if err := engine.ClaimAndExecute(context.Background(), "worker"); err != nil {
