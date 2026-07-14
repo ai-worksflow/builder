@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -410,6 +411,89 @@ func TestGenerationSchemasAreValidJSON(t *testing.T) {
 	t.Parallel()
 	if !json.Valid(artifactProposalSchema) || !json.Valid(implementationProposalSchema) {
 		t.Fatal("generation schemas must remain valid JSON")
+	}
+}
+
+func TestArtifactProposalInstructionsIncludeCanonicalReviewContracts(t *testing.T) {
+	t.Parallel()
+	tests := map[string][]string{
+		"refine_project_brief": {"top-level summary", "goal block", "blocking open question"},
+		"derive_requirements":  {"top-level summary, blocks, requirements, and acceptanceCriteria", "sourceBlockIds", "acceptanceCriterionIds", "every Must requirement ID"},
+		"decompose_pages":      {"at least one application Page", "contains edge from a Feature", "requires edge to a Permission"},
+		"generate_page_spec":   {"blueprintPageNodeId", "ready, loading, empty, and error", "acceptance-criterion trace"},
+		"generate_prototype":   {"pageSpecRevision", "desktop, tablet, and mobile", "every required state and breakpoint pair"},
+	}
+	for jobType, required := range tests {
+		jobType, required := jobType, required
+		t.Run(jobType, func(t *testing.T) {
+			t.Parallel()
+			instructions := artifactProposalInstructions(jobType)
+			for _, fragment := range required {
+				if !strings.Contains(instructions, fragment) {
+					t.Fatalf("instructions for %s do not contain %q: %s", jobType, fragment, instructions)
+				}
+			}
+		})
+	}
+}
+
+func TestRequirementsProposalPreflightRejectsObservedDataOnlyAcceptanceLinks(t *testing.T) {
+	t.Parallel()
+	base := json.RawMessage(`{"schemaVersion":1,"kind":"productRequirements","blocks":[]}`)
+	operations := make([]domain.ProposalOperation, 0, 8)
+	for index := 1; index <= 4; index++ {
+		requirementID := fmt.Sprintf("REQ-%03d", index)
+		requirement, err := json.Marshal(map[string]any{
+			"id": requirementID, "type": "requirement", "priority": "must", "text": "Required outcome",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		criterion, err := json.Marshal(map[string]any{
+			"id": fmt.Sprintf("AC-%03d", index), "type": "acceptanceCriterion", "text": "Observable result",
+			"data": map[string]any{"relatedRequirementId": requirementID},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		operations = append(operations,
+			domain.ProposalOperation{ID: fmt.Sprintf("requirement-%d", index), Kind: domain.OperationAdd, Path: "/blocks/-", Value: requirement},
+			domain.ProposalOperation{ID: fmt.Sprintf("criterion-%d", index), Kind: domain.OperationAdd, Path: "/blocks/-", Value: criterion},
+		)
+	}
+	err := preflightGeneratedArtifactProposal("derive_requirements", base, operations)
+	if !errors.Is(err, ai.ErrInvalidOutput) {
+		t.Fatalf("preflight error = %v, want invalid AI output", err)
+	}
+	message := err.Error()
+	if !strings.Contains(message, "requirements.summary_required@$.summary") ||
+		strings.Count(message, "requirements.must_has_ac") != 4 {
+		t.Fatalf("preflight did not expose the observed gate failures: %s", message)
+	}
+}
+
+func TestRequirementsProposalPreflightAcceptsCanonicalBaselineInput(t *testing.T) {
+	t.Parallel()
+	base := json.RawMessage(`{"schemaVersion":1,"kind":"productRequirements","blocks":[]}`)
+	content := json.RawMessage(`{
+		"schemaVersion":1,
+		"kind":"productRequirements",
+		"summary":"Preserve exact immutable workflow lineage.",
+		"blocks":[{"id":"source-brief","type":"paragraph","text":"Reviewed Project Brief context."}],
+		"requirements":[{
+			"id":"REQ-001","statement":"Preserve exact Proposal and Revision lineage.","priority":"must",
+			"sourceBlockIds":["source-brief"],"acceptanceCriterionIds":["AC-001"]
+		}],
+		"acceptanceCriteria":[{"id":"AC-001","statement":"Every gate references the same immutable Revision hash."}]
+	}`)
+	operations := []domain.ProposalOperation{{
+		ID: "replace-root", Kind: domain.OperationReplace, Path: "", Value: content,
+	}}
+	if err := preflightGeneratedArtifactProposal("derive_requirements", base, operations); err != nil {
+		t.Fatalf("canonical requirements proposal failed preflight: %v", err)
+	}
+	if err := preflightGeneratedArtifactProposal("refine_project_brief", base, nil); err != nil {
+		t.Fatalf("focused requirements preflight changed another job: %v", err)
 	}
 }
 

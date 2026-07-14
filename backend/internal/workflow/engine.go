@@ -1103,7 +1103,8 @@ func (e *Engine) ResolveReview(ctx context.Context, runID, nodeKey string, decis
 			return core.ErrForbidden
 		}
 	}
-	if prohibitSelf && !canonicalReviewVerified && actorID == run.StartedBy && !decision.SoloSelfReview {
+	if (resolution == ReviewApprove || resolution == ReviewWaive) &&
+		prohibitSelf && !canonicalReviewVerified && actorID == run.StartedBy && !decision.SoloSelfReview {
 		return domain.ErrSelfApproval
 	}
 	if (resolution == ReviewChanges || resolution == ReviewWaive) && strings.TrimSpace(reason) == "" {

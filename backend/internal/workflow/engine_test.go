@@ -694,7 +694,9 @@ func TestChangesRequestedReopensHumanEditBeforeReviewCanContinue(t *testing.T) {
 	if err := engine.ClaimAndExecute(context.Background(), "worker"); err != nil {
 		t.Fatal(err)
 	}
-	if err := engine.ResolveReview(context.Background(), run.ID, "review", engineReviewDecision(uuid.NewString(), ReviewChanges, "Acceptance criteria are incomplete")); err != nil {
+	// Requesting changes is not an approval. The workflow starter must be able
+	// to reopen their own edit even when the gate prohibits self-approval.
+	if err := engine.ResolveReview(context.Background(), run.ID, "review", engineReviewDecision(startedBy, ReviewChanges, "Acceptance criteria are incomplete")); err != nil {
 		t.Fatal(err)
 	}
 	reopened, err := store.GetRun(context.Background(), run.ID)

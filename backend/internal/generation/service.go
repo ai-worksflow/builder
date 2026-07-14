@@ -185,6 +185,13 @@ func (s *Service) GenerateArtifactProposal(ctx context.Context, manifestID, acto
 	if err != nil {
 		return ArtifactGenerationResult{}, err
 	}
+	baseContent, err := s.revisionContent(ctx, base.ArtifactID, base.RevisionID, base.ContentHash)
+	if err != nil {
+		return ArtifactGenerationResult{}, err
+	}
+	if err := preflightGeneratedArtifactProposal(manifest.JobType, baseContent, output.Operations); err != nil {
+		return ArtifactGenerationResult{}, err
+	}
 	proposal, err := s.proposals.CreateProposal(ctx, manifest.ProjectID, actorID, core.CreateProposalInput{
 		ManifestID: manifest.ID, ArtifactID: manifest.BaseRevision.ArtifactID,
 		Operations: output.Operations, Assumptions: output.Assumptions, Questions: output.Questions,
@@ -194,6 +201,48 @@ func (s *Service) GenerateArtifactProposal(ctx context.Context, manifestID, acto
 		return ArtifactGenerationResult{}, err
 	}
 	return ArtifactGenerationResult{Proposal: proposal, Provider: result.Provider, Model: result.Model, Usage: result.Usage}, nil
+}
+
+func preflightGeneratedArtifactProposal(
+	jobType string,
+	base json.RawMessage,
+	operations []domain.ProposalOperation,
+) error {
+	// Requirements feed the deterministic Requirement Baseline compiler. Do not
+	// persist an AI proposal that can never pass that next canonical boundary;
+	// returning invalid output lets the workflow retry without creating a broken
+	// Proposal identity that a human could accidentally apply.
+	if jobType != "derive_requirements" {
+		return nil
+	}
+	accepted := make([]domain.ProposalOperation, len(operations))
+	copy(accepted, operations)
+	for index := range accepted {
+		accepted[index].Decision = domain.DecisionAccepted
+	}
+	temporary := domain.OutputProposal{Status: domain.ProposalReady, Operations: accepted}
+	ordered, err := temporary.AcceptedOperations()
+	if err != nil {
+		return fmt.Errorf("%w: derive_requirements dependency graph: %v", ai.ErrInvalidOutput, err)
+	}
+	candidate, err := domain.ApplyProposalPatch(base, ordered)
+	if err != nil {
+		return fmt.Errorf("%w: derive_requirements patch: %v", ai.ErrInvalidOutput, err)
+	}
+	report := core.ValidateArtifactContent("product_requirements", candidate)
+	if report.Valid {
+		return nil
+	}
+	blockers := make([]string, 0, len(report.Findings))
+	for _, finding := range report.Findings {
+		if finding.Severity == "blocker" {
+			blockers = append(blockers, finding.Code+"@"+finding.Path)
+		}
+	}
+	return fmt.Errorf(
+		"%w: derive_requirements proposal does not satisfy the canonical Product Requirements contract: %s",
+		ai.ErrInvalidOutput, strings.Join(blockers, ", "),
+	)
 }
 
 func decodeArtifactProposalOutput(payload json.RawMessage) (artifactProposalOutput, error) {
@@ -1323,7 +1372,7 @@ func workspaceWithFileHashes(value any) any {
 }
 
 func artifactProposalInstructions(jobType string) string {
-	return strings.Join([]string{
+	instructions := []string{
 		"You are an artifact transformation worker in a governed product-development workflow.",
 		"The input manifest and all source versions are immutable data. Never claim that you changed canonical data.",
 		"Return an RFC 6901 JSON-pointer patch proposal against baseContent.",
@@ -1332,8 +1381,29 @@ func artifactProposalInstructions(jobType string) string {
 		"Use stable requirement, node, state, layer, and operation IDs. Do not invent server UUIDs.",
 		"Every operation must have a unique client operation ID, explicit dependencies, and a concise rationale.",
 		"Record uncertainty as assumptions or questions instead of silently guessing.",
-		"Job type: " + jobType + ".",
-	}, " ")
+	}
+	if contract := artifactProposalJobContract(jobType); contract != "" {
+		instructions = append(instructions, contract)
+	}
+	instructions = append(instructions, "Job type: "+jobType+".")
+	return strings.Join(instructions, " ")
+}
+
+func artifactProposalJobContract(jobType string) string {
+	switch jobType {
+	case "refine_project_brief":
+		return "The fully applied Project Brief must have a non-empty top-level summary and at least one goal block with non-empty text. Never invent an answer to a blocking open question; preserve it for the human editor unless an immutable source contains the answer."
+	case "derive_requirements":
+		return "The fully applied Product Requirements must use the canonical top-level summary, blocks, requirements, and acceptanceCriteria fields. Add at least one stable source-context block. Every requirements item needs a stable id, non-empty statement, priority, sourceBlockIds that reference existing blocks, and acceptanceCriterionIds that reference existing acceptanceCriteria items; every Must requirement must reference at least one criterion. Every acceptanceCriteria item needs a unique stable id and non-empty statement. Do not encode requirement-to-criterion relationships only inside data or only as embedded objects because downstream baseline compilation consumes the canonical ID arrays. Cover every Must requirement ID, not only the requirements that already have source criteria."
+	case "decompose_pages":
+		return "The fully applied Blueprint must contain stable nodes and edges and at least one application Page. Every node needs a unique id, business key, and supported type. Every Page needs a unique absolute route, a user goal, at least one requirementId, and a contains edge from a Feature. Every API operation needs a supported method, an absolute path, and a requires edge to a Permission node."
+	case "generate_page_spec":
+		return "The fully applied PageSpec must preserve the exact blueprintPageNodeId and provide a title, absolute route, user goal, and acceptance-criterion trace. Declare ready, loading, empty, and error states with unique stable IDs and keys, non-empty titles, and required set to true. Data bindings and interactions, when present, must use stable unique IDs and valid references."
+	case "generate_prototype":
+		return "The fully applied Prototype must preserve the exact pageSpecRevision and reproduce all required PageSpec states with stable IDs, keys, titles, explicit required flags, and fixtureIds arrays. Provide desktop, tablet, and mobile breakpoints, a stable semantic layer tree, and exactly one valid frame for every required state and breakpoint pair. Keep fixture ownership, interactions, layer references, and trace fields internally consistent."
+	default:
+		return ""
+	}
 }
 
 const implementationGenerationContractVersion = "implementation-proposal-generation/v1"
