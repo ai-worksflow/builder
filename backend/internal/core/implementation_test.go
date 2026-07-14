@@ -126,6 +126,52 @@ func TestFileOperationsRequireExpectedHashForExistingFiles(t *testing.T) {
 	}
 }
 
+func TestFileOperationsHashExactStoredContent(t *testing.T) {
+	t.Parallel()
+
+	original := "  const value = 'original'\n\n"
+	replacement := "const value = 'replacement'\n"
+	for _, test := range []struct {
+		name      string
+		operation FileOperation
+	}{
+		{
+			name: "upsert",
+			operation: FileOperation{
+				ID: "upsert", Kind: "file.upsert", Path: "src/original.js",
+				Content: &replacement, ExpectedHash: hashText(original),
+			},
+		},
+		{
+			name: "delete",
+			operation: FileOperation{
+				ID: "delete", Kind: "file.delete", Path: "src/original.js",
+				ExpectedHash: hashText(original),
+			},
+		},
+		{
+			name: "rename",
+			operation: FileOperation{
+				ID: "rename", Kind: "file.rename", FromPath: "src/original.js", Path: "src/renamed.js",
+				ExpectedHash: hashText(original),
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			workspace := map[string]any{
+				"files": []any{map[string]any{
+					"path": "src/original.js", "content": original,
+					"language": "javascript", "revision": float64(1),
+				}},
+			}
+			if _, err := applyFileOperations(workspace, []FileOperation{test.operation}); err != nil {
+				t.Fatalf("expected the hash of the exact stored bytes to match: %v", err)
+			}
+		})
+	}
+}
+
 func TestFileOperationsApplyInDependencyOrder(t *testing.T) {
 	t.Parallel()
 	first := "one"

@@ -1337,7 +1337,7 @@ func applyFileOperations(workspace map[string]any, operations []FileOperation) (
 		case "file.upsert":
 			existing := files[operation.Path]
 			if existing != nil {
-				if operation.ExpectedHash == "" || operation.ExpectedHash != hashText(firstString(existing, "content")) {
+				if operation.ExpectedHash == "" || operation.ExpectedHash != hashText(workspaceFileContent(existing)) {
 					return nil, fmt.Errorf("%w: file %s changed", ErrProposalStale, operation.Path)
 				}
 			} else if operation.ExpectedHash != "" {
@@ -1353,13 +1353,13 @@ func applyFileOperations(workspace map[string]any, operations []FileOperation) (
 			}
 		case "file.delete":
 			existing := files[operation.Path]
-			if existing == nil || operation.ExpectedHash == "" || operation.ExpectedHash != hashText(firstString(existing, "content")) {
+			if existing == nil || operation.ExpectedHash == "" || operation.ExpectedHash != hashText(workspaceFileContent(existing)) {
 				return nil, fmt.Errorf("%w: file %s changed", ErrProposalStale, operation.Path)
 			}
 			delete(files, operation.Path)
 		case "file.rename":
 			existing := files[operation.FromPath]
-			if existing == nil || files[operation.Path] != nil || operation.ExpectedHash == "" || operation.ExpectedHash != hashText(firstString(existing, "content")) {
+			if existing == nil || files[operation.Path] != nil || operation.ExpectedHash == "" || operation.ExpectedHash != hashText(workspaceFileContent(existing)) {
 				return nil, fmt.Errorf("%w: rename source %s changed", ErrProposalStale, operation.FromPath)
 			}
 			delete(files, operation.FromPath)
@@ -1383,6 +1383,11 @@ func applyFileOperations(workspace map[string]any, operations []FileOperation) (
 		workspace["revision"] = 1
 	}
 	return workspace, nil
+}
+
+func workspaceFileContent(file map[string]any) string {
+	content, _ := file["content"].(string)
+	return content
 }
 
 func validateWorkspacePath(value string) error {
