@@ -373,7 +373,7 @@ func (e *Engine) ExecuteLease(ctx context.Context, lease Lease) error {
 	if err != nil {
 		return err
 	}
-	if node.Status != NodeRunning || node.LeaseOwner != lease.WorkerID || node.ID != lease.NodeID || node.Attempt != lease.Attempt {
+	if !nodeMatchesLease(node, lease) {
 		return ErrLeaseLost
 	}
 	profile, err := e.executionProfile(run.ExecutionProfile)
@@ -382,17 +382,75 @@ func (e *Engine) ExecuteLease(ctx context.Context, lease Lease) error {
 	}
 	inputs, err := profile.buildInputs(run, definitionRecord.Definition, node)
 	if err != nil {
-		return e.handleFailure(ctx, run, definitionRecord.Definition, node, lease, err)
+		return e.commitCachedLeaseFailure(ctx, lease, run, node, definitionRecord.Definition, err)
 	}
 	execution := Execution{Run: *run, Node: *node, Definition: definition, Workflow: definitionRecord.Definition, Lease: lease, Inputs: inputs}
 	if _, _, required := nodeExecutionPolicy(definition); required && run.Context.Nodes[node.Key].ExecutionActor == nil {
-		return profile.applyResult(ctx, e, run, definitionRecord.Definition, node, lease, execution, WorkerResult{Disposition: ResultWaitInput})
+		return e.applyCachedLeaseResult(ctx, profile, lease, run, node, definitionRecord.Definition, execution, WorkerResult{Disposition: ResultWaitInput})
 	}
 	result, runErr := profile.executeNode(ctx, e, execution)
 	if runErr != nil {
-		return e.handleFailure(ctx, run, definitionRecord.Definition, node, lease, runErr)
+		return e.commitCachedLeaseFailure(ctx, lease, run, node, definitionRecord.Definition, runErr)
 	}
-	return profile.applyResult(ctx, e, run, definitionRecord.Definition, node, lease, execution, result)
+	return e.applyCachedLeaseResult(ctx, profile, lease, run, node, definitionRecord.Definition, execution, result)
+}
+
+func nodeMatchesLease(node *NodeRecord, lease Lease) bool {
+	return node != nil && node.Status == NodeRunning && node.LeaseOwner == lease.WorkerID && node.ID == lease.NodeID && node.Attempt == lease.Attempt
+}
+
+func (e *Engine) reloadOwnedLease(ctx context.Context, lease Lease) (*RunRecord, *NodeRecord, error) {
+	run, err := e.Store.GetRun(ctx, lease.RunID)
+	if err != nil {
+		return nil, nil, err
+	}
+	node := run.Nodes[lease.NodeKey]
+	if !nodeMatchesLease(node, lease) {
+		return nil, nil, ErrLeaseLost
+	}
+	return run, node, nil
+}
+
+// applyCachedLeaseResult preserves the exact runner result and input envelope
+// across aggregate cursor conflicts. Only the current aggregate and leased node
+// are reloaded, so a sibling commit cannot force an external runner to execute
+// twice or let a stale aggregate overwrite the sibling's state.
+func (e *Engine) applyCachedLeaseResult(ctx context.Context, profile WorkflowExecutionProfileBundle, lease Lease, run *RunRecord, node *NodeRecord, definition domain.WorkflowDefinition, execution Execution, result WorkerResult) error {
+	for {
+		currentExecution := execution
+		currentExecution.Run = *run
+		currentExecution.Node = *node
+		err := profile.applyResult(ctx, e, run, definition, node, lease, currentExecution, result)
+		if !errors.Is(err, ErrCASConflict) {
+			return err
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		run, node, err = e.reloadOwnedLease(ctx, lease)
+		if err != nil {
+			return err
+		}
+	}
+}
+
+func (e *Engine) commitCachedLeaseFailure(ctx context.Context, lease Lease, run *RunRecord, node *NodeRecord, definition domain.WorkflowDefinition, failure error) error {
+	for {
+		err := e.commitFailure(ctx, run, definition, node, lease, failure)
+		if !errors.Is(err, ErrCASConflict) {
+			if err != nil {
+				return err
+			}
+			return failure
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		run, node, err = e.reloadOwnedLease(ctx, lease)
+		if err != nil {
+			return err
+		}
+	}
 }
 
 // executeNodeV0V1Frozen is the migration-cut interpreter shared by the two
@@ -694,6 +752,13 @@ func (e *Engine) validateResultV0V1Frozen(ctx context.Context, run *RunRecord, d
 }
 
 func (e *Engine) handleFailure(ctx context.Context, run *RunRecord, definition domain.WorkflowDefinition, node *NodeRecord, lease Lease, failure error) error {
+	if err := e.commitFailure(ctx, run, definition, node, lease, failure); err != nil {
+		return err
+	}
+	return failure
+}
+
+func (e *Engine) commitFailure(ctx context.Context, run *RunRecord, definition domain.WorkflowDefinition, node *NodeRecord, lease Lease, failure error) error {
 	now := e.now()
 	builder := newMutationBuilder(e, run, now)
 	expected := node.Status
@@ -718,10 +783,7 @@ func (e *Engine) handleFailure(ctx context.Context, run *RunRecord, definition d
 	builder.mark(node, expected, lease.WorkerID)
 	e.reconcile(run, definition, builder)
 	e.refreshRunStatus(run, definition, now)
-	if err := e.Store.Commit(ctx, builder.build()); err != nil {
-		return err
-	}
-	return failure
+	return e.Store.Commit(ctx, builder.build())
 }
 
 // AuthorizeNodeExecution records an actor minted by the authenticated Facade

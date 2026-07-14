@@ -28,6 +28,30 @@ func (c *mutableClock) Advance(duration time.Duration) {
 	c.mu.Unlock()
 }
 
+type casInjectingStore struct {
+	Store
+	mu       sync.Mutex
+	injected bool
+	inject   func(context.Context) error
+}
+
+func (s *casInjectingStore) Commit(ctx context.Context, mutation RunMutation) error {
+	s.mu.Lock()
+	if s.injected {
+		s.mu.Unlock()
+		return s.Store.Commit(ctx, mutation)
+	}
+	s.injected = true
+	inject := s.inject
+	s.mu.Unlock()
+	if inject != nil {
+		if err := inject(ctx); err != nil {
+			return err
+		}
+	}
+	return ErrCASConflict
+}
+
 func engineSchema() json.RawMessage {
 	return json.RawMessage(`{"type":"object","properties":{"payload":{"type":"object"}},"required":["payload"]}`)
 }
@@ -372,6 +396,127 @@ func TestExpiredLeaseIsRecoveredExactlyOnce(t *testing.T) {
 		if event.Sequence != uint64(index+1) {
 			t.Fatal("event sequence is not monotonic")
 		}
+	}
+}
+
+func prepareTransformLease(t *testing.T, result WorkerResult, runnerErr error, leaseDuration time.Duration) (*Engine, *MemoryStore, *mutableClock, *RunRecord, Lease, *atomic.Int32) {
+	t.Helper()
+	userID := uuid.NewString()
+	definition := simpleDefinition(t, uuid.NewString(), userID, time.Now())
+	registry := NewMapRegistry()
+	var calls atomic.Int32
+	if err := registry.Register(domain.NodeTransform, RunnerFunc(func(context.Context, Execution) (WorkerResult, error) {
+		calls.Add(1)
+		return result, runnerErr
+	})); err != nil {
+		t.Fatal(err)
+	}
+	engine, store, clock, record, manifest, projectID, startedBy := newTestEngine(t, definition, registry)
+	run, err := engine.Start(context.Background(), StartRequest{RunID: uuid.NewString(), ProjectID: projectID, DefinitionVersionID: record.VersionID, InputManifest: manifest.Ref(), StartedBy: startedBy})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := engine.ClaimAndExecute(context.Background(), "setup-worker"); err != nil {
+		t.Fatal(err)
+	}
+	lease, err := store.ClaimRunnable(context.Background(), "outcome-worker", clock.Now(), leaseDuration, run.ExecutionProfile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lease.NodeKey != "transform" {
+		t.Fatalf("claimed node = %q, want transform", lease.NodeKey)
+	}
+	return engine, store, clock, run, lease, &calls
+}
+
+func commitConcurrentRunValue(ctx context.Context, store *MemoryStore, runID string, now time.Time) error {
+	run, err := store.GetRun(ctx, runID)
+	if err != nil {
+		return err
+	}
+	run.Context.Values["concurrentCursorAdvance"] = json.RawMessage(`{"preserved":true}`)
+	return store.Commit(ctx, RunMutation{
+		RunID: run.ID, ExpectedCursor: run.EventCursor, Status: run.Status, Context: run.Context,
+		Failure: run.Failure, CompletedAt: run.CompletedAt, CancelledAt: run.CancelledAt,
+		Events:    []Event{{ID: uuid.NewString(), RunID: run.ID, Type: "test.concurrent_cursor_advanced", Payload: json.RawMessage(`{}`), CreatedAt: now}},
+		UpdatedAt: now,
+	})
+}
+
+func TestExecuteLeaseRebasesCachedOutcomeAfterRunCursorAdvance(t *testing.T) {
+	runnerFailure := errors.New("cached runner failure")
+	tests := []struct {
+		name       string
+		result     WorkerResult
+		runnerErr  error
+		wantStatus NodeStatus
+	}{
+		{name: "result", result: WorkerResult{Disposition: ResultComplete, Output: json.RawMessage(`{"payload":{}}`)}, wantStatus: NodeCompleted},
+		{name: "failure", runnerErr: runnerFailure, wantStatus: NodeReady},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			engine, store, clock, run, lease, calls := prepareTransformLease(t, test.result, test.runnerErr, time.Minute)
+			engine.Store = &casInjectingStore{Store: store, inject: func(ctx context.Context) error {
+				return commitConcurrentRunValue(ctx, store, run.ID, clock.Now())
+			}}
+
+			err := engine.ExecuteLease(context.Background(), lease)
+			if test.runnerErr == nil && err != nil {
+				t.Fatal(err)
+			}
+			if test.runnerErr != nil && !errors.Is(err, test.runnerErr) {
+				t.Fatalf("execution error = %v, want %v", err, test.runnerErr)
+			}
+			if calls.Load() != 1 {
+				t.Fatalf("runner calls = %d, want 1", calls.Load())
+			}
+			stored, err := store.GetRun(context.Background(), run.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			node := stored.Nodes["transform"]
+			if node.Status != test.wantStatus || node.Attempt != 1 {
+				t.Fatalf("rebased node = %+v", node)
+			}
+			if string(stored.Context.Values["concurrentCursorAdvance"]) != `{"preserved":true}` {
+				t.Fatalf("concurrent context was overwritten: %s", stored.Context.Values["concurrentCursorAdvance"])
+			}
+			if test.runnerErr == nil && string(stored.Context.Nodes["transform"].Output) != `{"payload":{}}` {
+				t.Fatalf("cached runner output was not committed: %s", stored.Context.Nodes["transform"].Output)
+			}
+		})
+	}
+}
+
+func TestExecuteLeaseCASRebaseRejectsLostLease(t *testing.T) {
+	result := WorkerResult{Disposition: ResultComplete, Output: json.RawMessage(`{"payload":{}}`)}
+	engine, store, clock, run, lease, calls := prepareTransformLease(t, result, nil, time.Second)
+	var replacement Lease
+	engine.Store = &casInjectingStore{Store: store, inject: func(ctx context.Context) error {
+		clock.Advance(2 * time.Second)
+		var err error
+		replacement, err = store.ClaimRunnable(ctx, "replacement-worker", clock.Now(), time.Minute, run.ExecutionProfile)
+		return err
+	}}
+
+	err := engine.ExecuteLease(context.Background(), lease)
+	if !errors.Is(err, ErrLeaseLost) {
+		t.Fatalf("execution error = %v, want ErrLeaseLost", err)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("runner calls = %d, want 1", calls.Load())
+	}
+	stored, err := store.GetRun(context.Background(), run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	node := stored.Nodes["transform"]
+	if replacement.NodeID != lease.NodeID || node.Status != NodeRunning || node.Attempt != 2 || node.LeaseOwner != "replacement-worker" {
+		t.Fatalf("replacement lease was not preserved: lease=%+v node=%+v", replacement, node)
+	}
+	if len(stored.Context.Nodes["transform"].Output) != 0 {
+		t.Fatalf("lost lease committed stale output: %s", stored.Context.Nodes["transform"].Output)
 	}
 }
 
