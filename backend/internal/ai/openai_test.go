@@ -11,6 +11,19 @@ import (
 	"time"
 )
 
+func TestOpenAIProviderDefaultsLeaveWorkbenchGenerationBudget(t *testing.T) {
+	t.Parallel()
+	provider, err := NewOpenAIProvider(OpenAIConfig{
+		APIKey: "test-key", BaseURL: "https://example.test/v1/responses", DefaultModel: "test-model",
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if provider.client.Timeout != 12*time.Minute || provider.config.MaxRetries != 0 {
+		t.Fatalf("provider timeout/retry defaults = timeout %s retries %d", provider.client.Timeout, provider.config.MaxRetries)
+	}
+}
+
 func TestOpenAIProviderStructuredOutput(t *testing.T) {
 	t.Parallel()
 	outputSchema := json.RawMessage(`{"type":"object","properties":{"ok":{"type":"boolean"}},"required":["ok"],"additionalProperties":false}`)

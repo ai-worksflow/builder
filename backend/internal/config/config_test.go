@@ -4,6 +4,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestLoadDefaults(t *testing.T) {
@@ -26,6 +27,9 @@ func TestLoadDefaults(t *testing.T) {
 	}
 	if cfg.AI.Provider != "openai" || !cfg.Workflow.WorkerEnabled || cfg.Idempotency.TTL <= cfg.Idempotency.LockTTL {
 		t.Fatalf("platform runtime defaults = AI %#v, workflow %#v, idempotency %#v", cfg.AI, cfg.Workflow, cfg.Idempotency)
+	}
+	if cfg.AI.Timeout != 12*time.Minute || cfg.AI.MaxRetries != 0 {
+		t.Fatalf("structured generation timeout/retry defaults = %#v", cfg.AI)
 	}
 	if _, err := parseEncryptionKey(cfg.Secrets.EncryptionKey); err != nil || cfg.GitHub.CredentialTTL <= 0 {
 		t.Fatalf("secret/integration defaults are invalid: secrets=%#v GitHub=%#v", cfg.Secrets, cfg.GitHub)

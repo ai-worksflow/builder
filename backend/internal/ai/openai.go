@@ -48,7 +48,7 @@ func NewOpenAIProvider(config OpenAIConfig, client *http.Client) (*OpenAIProvide
 		return nil, errors.New("OpenAI response URL must be HTTP(S)")
 	}
 	if config.Timeout <= 0 {
-		config.Timeout = 90 * time.Second
+		config.Timeout = 12 * time.Minute
 	}
 	if config.MaxInputBytes <= 0 {
 		config.MaxInputBytes = 4 << 20
