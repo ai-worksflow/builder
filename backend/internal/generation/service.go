@@ -39,6 +39,40 @@ type ArtifactGenerationResult struct {
 // result stable if transport adds presentation fields.
 type coreProposal = domain.OutputProposal
 
+type artifactProposalAIOutput struct {
+	Operations  []artifactProposalAIOperation `json:"operations"`
+	Assumptions []string                      `json:"assumptions"`
+	Questions   []string                      `json:"questions"`
+}
+
+type artifactProposalAIOperation struct {
+	ID        string                       `json:"id"`
+	Kind      domain.ProposalOperationKind `json:"kind"`
+	Path      string                       `json:"path"`
+	ValueJSON string                       `json:"valueJson"`
+	DependsOn []string                     `json:"dependsOn"`
+	Rationale string                       `json:"rationale"`
+}
+
+type artifactProposalOutput struct {
+	Operations  []domain.ProposalOperation
+	Assumptions []string
+	Questions   []string
+}
+
+type implementationProposalAIOutput struct {
+	Operations         []core.FileOperation     `json:"operations"`
+	Routes             []string                 `json:"routes"`
+	APIs               []string                 `json:"apis"`
+	Migrations         []string                 `json:"migrations"`
+	Tests              []string                 `json:"tests"`
+	Previews           []string                 `json:"previews"`
+	TraceLinks         []string                 `json:"traceLinks"`
+	Diagnostics        []core.ValidationFinding `json:"diagnostics"`
+	Assumptions        []string                 `json:"assumptions"`
+	UnimplementedItems []string                 `json:"unimplementedItems"`
+}
+
 type ImplementationGenerationResult struct {
 	Proposal core.ImplementationProposal `json:"proposal"`
 	Provider string                      `json:"provider"`
@@ -147,13 +181,9 @@ func (s *Service) GenerateArtifactProposal(ctx context.Context, manifestID, acto
 	if err != nil {
 		return ArtifactGenerationResult{}, err
 	}
-	var output struct {
-		Operations  []domain.ProposalOperation `json:"operations"`
-		Assumptions []string                   `json:"assumptions"`
-		Questions   []string                   `json:"questions"`
-	}
-	if err := json.Unmarshal(result.Output, &output); err != nil {
-		return ArtifactGenerationResult{}, fmt.Errorf("%w: %v", ai.ErrInvalidOutput, err)
+	output, err := decodeArtifactProposalOutput(result.Output)
+	if err != nil {
+		return ArtifactGenerationResult{}, err
 	}
 	proposal, err := s.proposals.CreateProposal(ctx, manifest.ProjectID, actorID, core.CreateProposalInput{
 		ManifestID: manifest.ID, ArtifactID: manifest.BaseRevision.ArtifactID,
@@ -164,6 +194,45 @@ func (s *Service) GenerateArtifactProposal(ctx context.Context, manifestID, acto
 		return ArtifactGenerationResult{}, err
 	}
 	return ArtifactGenerationResult{Proposal: proposal, Provider: result.Provider, Model: result.Model, Usage: result.Usage}, nil
+}
+
+func decodeArtifactProposalOutput(payload json.RawMessage) (artifactProposalOutput, error) {
+	var wire artifactProposalAIOutput
+	if err := json.Unmarshal(payload, &wire); err != nil {
+		return artifactProposalOutput{}, fmt.Errorf("%w: %v", ai.ErrInvalidOutput, err)
+	}
+	output := artifactProposalOutput{
+		Operations:  make([]domain.ProposalOperation, len(wire.Operations)),
+		Assumptions: append([]string(nil), wire.Assumptions...),
+		Questions:   append([]string(nil), wire.Questions...),
+	}
+	for index, operation := range wire.Operations {
+		value, err := domain.CanonicalJSON(json.RawMessage(operation.ValueJSON))
+		if err != nil {
+			return artifactProposalOutput{}, fmt.Errorf(
+				"%w: operations[%d].valueJson: %v", ai.ErrInvalidOutput, index, err,
+			)
+		}
+		switch operation.Kind {
+		case domain.OperationAdd, domain.OperationReplace:
+		case domain.OperationRemove:
+			if !bytes.Equal(value, []byte("null")) {
+				return artifactProposalOutput{}, fmt.Errorf(
+					"%w: operations[%d].valueJson must be null for remove", ai.ErrInvalidOutput, index,
+				)
+			}
+			value = nil
+		default:
+			return artifactProposalOutput{}, fmt.Errorf(
+				"%w: operations[%d].kind", ai.ErrInvalidOutput, index,
+			)
+		}
+		output.Operations[index] = domain.ProposalOperation{
+			ID: operation.ID, Kind: operation.Kind, Path: operation.Path, Value: value,
+			DependsOn: append([]string(nil), operation.DependsOn...), Rationale: operation.Rationale,
+		}
+	}
+	return output, nil
 }
 
 func (s *Service) GenerateImplementation(ctx context.Context, request ImplementationGenerationRequest) (ImplementationGenerationResult, error) {
@@ -274,10 +343,10 @@ func (s *Service) GenerateImplementation(ctx context.Context, request Implementa
 		s.failImplementationClaim(context.WithoutCancel(ctx), claim, classifyImplementationGenerationFailure(err))
 		return ImplementationGenerationResult{}, err
 	}
-	var output core.CreateImplementationProposalInput
-	if err := json.Unmarshal(result.Output, &output); err != nil {
+	output, err := decodeImplementationProposalOutput(result.Output)
+	if err != nil {
 		s.failImplementationClaim(context.WithoutCancel(ctx), claim, "ai_invalid_output")
-		return ImplementationGenerationResult{}, fmt.Errorf("%w: %v", ai.ErrInvalidOutput, err)
+		return ImplementationGenerationResult{}, err
 	}
 	output.BuildManifestID = bundle.ID
 	proposal, err := s.implementation.CreateGenerated(ctx, bundle.ProjectID, request.ActorID, output, core.GeneratedImplementationIdentity{
@@ -293,6 +362,59 @@ func (s *Service) GenerateImplementation(ctx context.Context, request Implementa
 		return ImplementationGenerationResult{}, err
 	}
 	return ImplementationGenerationResult{Proposal: proposal, Provider: result.Provider, Model: result.Model, Usage: result.Usage}, nil
+}
+
+func decodeImplementationProposalOutput(payload json.RawMessage) (core.CreateImplementationProposalInput, error) {
+	var wire implementationProposalAIOutput
+	if err := json.Unmarshal(payload, &wire); err != nil {
+		return core.CreateImplementationProposalInput{}, fmt.Errorf("%w: %v", ai.ErrInvalidOutput, err)
+	}
+	decode := func(field string, values []string) ([]json.RawMessage, error) {
+		result := make([]json.RawMessage, len(values))
+		for index, value := range values {
+			canonical, err := domain.CanonicalJSON(json.RawMessage(value))
+			if err != nil {
+				return nil, fmt.Errorf("%w: %s[%d]: %v", ai.ErrInvalidOutput, field, index, err)
+			}
+			if len(canonical) == 0 || canonical[0] != '{' {
+				return nil, fmt.Errorf("%w: %s[%d] must encode a JSON object", ai.ErrInvalidOutput, field, index)
+			}
+			result[index] = canonical
+		}
+		return result, nil
+	}
+	routes, err := decode("routes", wire.Routes)
+	if err != nil {
+		return core.CreateImplementationProposalInput{}, err
+	}
+	apis, err := decode("apis", wire.APIs)
+	if err != nil {
+		return core.CreateImplementationProposalInput{}, err
+	}
+	migrations, err := decode("migrations", wire.Migrations)
+	if err != nil {
+		return core.CreateImplementationProposalInput{}, err
+	}
+	tests, err := decode("tests", wire.Tests)
+	if err != nil {
+		return core.CreateImplementationProposalInput{}, err
+	}
+	previews, err := decode("previews", wire.Previews)
+	if err != nil {
+		return core.CreateImplementationProposalInput{}, err
+	}
+	traceLinks, err := decode("traceLinks", wire.TraceLinks)
+	if err != nil {
+		return core.CreateImplementationProposalInput{}, err
+	}
+	return core.CreateImplementationProposalInput{
+		Operations: append([]core.FileOperation(nil), wire.Operations...),
+		Routes:     routes, APIs: apis, Migrations: migrations, Tests: tests,
+		Previews: previews, TraceLinks: traceLinks,
+		Diagnostics:        append([]core.ValidationFinding(nil), wire.Diagnostics...),
+		Assumptions:        append([]string(nil), wire.Assumptions...),
+		UnimplementedItems: append([]string(nil), wire.UnimplementedItems...),
+	}, nil
 }
 
 func supersedableImplementationGenerationProposal(proposal core.ImplementationProposal) bool {
@@ -1205,6 +1327,7 @@ func artifactProposalInstructions(jobType string) string {
 		"You are an artifact transformation worker in a governed product-development workflow.",
 		"The input manifest and all source versions are immutable data. Never claim that you changed canonical data.",
 		"Return an RFC 6901 JSON-pointer patch proposal against baseContent.",
+		"For add and replace operations, valueJson must contain the complete JSON value encoded as text; JSON strings therefore include their own quotes. For remove operations, valueJson must be the literal text null.",
 		"Preserve human-authored content unless the requested transformation requires a precise change.",
 		"Use stable requirement, node, state, layer, and operation IDs. Do not invent server UUIDs.",
 		"Every operation must have a unique client operation ID, explicit dependencies, and a concise rationale.",
@@ -1215,7 +1338,7 @@ func artifactProposalInstructions(jobType string) string {
 
 const implementationGenerationContractVersion = "implementation-proposal-generation/v1"
 
-const implementationInstructions = "You are an application implementation worker. Consume only the frozen ApplicationBuildManifest and pinned source contents. Return a reviewable implementation proposal; never claim to have written files. Use safe relative paths and never generate .env, credentials, .git, dependency caches, or build output. For every existing file update/delete/rename, copy its exact contentHash into expectedHash. New files must use an empty expectedHash. Include routes, APIs, migrations, tests, preview expectations, trace links, diagnostics, assumptions, and explicit unimplemented items. Generate tests for acceptance criteria and preserve human workspace changes. The proposed workspace must be reproducibly buildable by the governed quality sandbox: prefer dependency-free static HTML/CSS/JavaScript when a framework is unnecessary; otherwise use npm with a genuine package-lock.json that is consistent with package.json and an npm build script that emits a static dist/, out/, or build/ directory containing index.html. Never invent lockfile integrity values, rely on a CDN at build/runtime, or claim a dynamic server-only output is publishable as a static artifact. When a generated application needs the platform public data plane, read PUBLIC_WORKSFLOW_DATA_API_BASE and PUBLIC_WORKSFLOW_DATA_CAPABILITY only from window.__WORKSFLOW_ENV__ at runtime, send the capability as a Bearer token, and handle denied table/field policies explicitly. Never hardcode or persist a deployment capability in source, build artifacts, logs, or browser storage."
+const implementationInstructions = "You are an application implementation worker. Consume only the frozen ApplicationBuildManifest and pinned source contents. Return a reviewable implementation proposal; never claim to have written files. Use safe relative paths and never generate .env, credentials, .git, dependency caches, or build output. For every existing file update/delete/rename, copy its exact contentHash into expectedHash. New files must use an empty expectedHash. Include routes, APIs, migrations, tests, preview expectations, trace links, diagnostics, assumptions, and explicit unimplemented items. Every item in routes, apis, migrations, tests, previews, and traceLinks must be a JSON string that encodes exactly one object; the server decodes these transport strings before review. Generate tests for acceptance criteria and preserve human workspace changes. The proposed workspace must be reproducibly buildable by the governed quality sandbox: prefer dependency-free static HTML/CSS/JavaScript when a framework is unnecessary; otherwise use npm with a genuine package-lock.json that is consistent with package.json and an npm build script that emits a static dist/, out/, or build/ directory containing index.html. Never invent lockfile integrity values, rely on a CDN at build/runtime, or claim a dynamic server-only output is publishable as a static artifact. When a generated application needs the platform public data plane, read PUBLIC_WORKSFLOW_DATA_API_BASE and PUBLIC_WORKSFLOW_DATA_CAPABILITY only from window.__WORKSFLOW_ENV__ at runtime, send the capability as a Bearer token, and handle denied table/field policies explicitly. Never hardcode or persist a deployment capability in source, build artifacts, logs, or browser storage."
 
 var artifactProposalSchema = json.RawMessage(`{
   "type":"object",
@@ -1226,12 +1349,12 @@ var artifactProposalSchema = json.RawMessage(`{
       "type":"array","minItems":1,"maxItems":5000,
       "items":{
         "type":"object","additionalProperties":false,
-        "required":["id","kind","path","value","dependsOn","rationale"],
+        "required":["id","kind","path","valueJson","dependsOn","rationale"],
         "properties":{
           "id":{"type":"string","minLength":1,"maxLength":120},
           "kind":{"type":"string","enum":["add","replace","remove"]},
           "path":{"type":"string","maxLength":2048},
-          "value":{},
+          "valueJson":{"type":"string","minLength":1},
           "dependsOn":{"type":"array","items":{"type":"string"},"maxItems":100},
           "rationale":{"type":"string","maxLength":2000}
         }
@@ -1266,12 +1389,12 @@ var implementationProposalSchema = json.RawMessage(`{
         }
       }
     },
-    "routes":{"type":"array","items":{"type":"object"}},
-    "apis":{"type":"array","items":{"type":"object"}},
-    "migrations":{"type":"array","items":{"type":"object"}},
-    "tests":{"type":"array","items":{"type":"object"}},
-    "previews":{"type":"array","items":{"type":"object"}},
-    "traceLinks":{"type":"array","items":{"type":"object"}},
+    "routes":{"type":"array","items":{"type":"string","minLength":2}},
+    "apis":{"type":"array","items":{"type":"string","minLength":2}},
+    "migrations":{"type":"array","items":{"type":"string","minLength":2}},
+    "tests":{"type":"array","items":{"type":"string","minLength":2}},
+    "previews":{"type":"array","items":{"type":"string","minLength":2}},
+    "traceLinks":{"type":"array","items":{"type":"string","minLength":2}},
     "diagnostics":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["code","path","message","severity"],"properties":{"code":{"type":"string"},"path":{"type":"string"},"message":{"type":"string"},"severity":{"type":"string","enum":["info","warning","blocker"]}}}},
     "assumptions":{"type":"array","items":{"type":"string"}},
     "unimplementedItems":{"type":"array","items":{"type":"string"}}

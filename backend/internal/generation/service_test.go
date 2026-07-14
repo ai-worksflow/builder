@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -410,4 +411,282 @@ func TestGenerationSchemasAreValidJSON(t *testing.T) {
 	if !json.Valid(artifactProposalSchema) || !json.Valid(implementationProposalSchema) {
 		t.Fatal("generation schemas must remain valid JSON")
 	}
+}
+
+func TestDecodeArtifactProposalOutputValueJSON(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name      string
+		kind      domain.ProposalOperationKind
+		valueJSON string
+		want      string
+		wantNil   bool
+	}{
+		{name: "object", kind: domain.OperationAdd, valueJSON: `{"b":2,"a":1}`, want: `{"a":1,"b":2}`},
+		{name: "array", kind: domain.OperationReplace, valueJSON: `[1,{"b":2}]`, want: `[1,{"b":2}]`},
+		{name: "string", kind: domain.OperationAdd, valueJSON: `"hello"`, want: `"hello"`},
+		{name: "number", kind: domain.OperationReplace, valueJSON: "42.5", want: "42.5"},
+		{name: "boolean", kind: domain.OperationAdd, valueJSON: "true", want: "true"},
+		{name: "null", kind: domain.OperationReplace, valueJSON: "null", want: "null"},
+		{name: "remove", kind: domain.OperationRemove, valueJSON: "null", wantNil: true},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			payload, err := json.Marshal(map[string]any{
+				"operations": []any{map[string]any{
+					"id": "op-1", "kind": test.kind, "path": "/title",
+					"valueJson": test.valueJSON, "dependsOn": []string{}, "rationale": "test",
+				}},
+				"assumptions": []string{"assumption"},
+				"questions":   []string{"question"},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			output, err := decodeArtifactProposalOutput(payload)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(output.Operations) != 1 {
+				t.Fatalf("operation count = %d, want 1", len(output.Operations))
+			}
+			value := output.Operations[0].Value
+			if test.wantNil {
+				if value != nil {
+					t.Fatalf("remove value = %s, want nil", value)
+				}
+			} else if string(value) != test.want {
+				t.Fatalf("decoded value = %s, want %s", value, test.want)
+			}
+			if len(output.Assumptions) != 1 || output.Assumptions[0] != "assumption" ||
+				len(output.Questions) != 1 || output.Questions[0] != "question" {
+				t.Fatalf("proposal metadata was not preserved: %#v", output)
+			}
+		})
+	}
+}
+
+func TestDecodeArtifactProposalOutputRejectsInvalidValueJSON(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name      string
+		kind      domain.ProposalOperationKind
+		valueJSON string
+	}{
+		{name: "malformed add", kind: domain.OperationAdd, valueJSON: "{"},
+		{name: "malformed replace", kind: domain.OperationReplace, valueJSON: "["},
+		{name: "remove non-null", kind: domain.OperationRemove, valueJSON: `{"unexpected":true}`},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			payload, err := json.Marshal(map[string]any{
+				"operations": []any{map[string]any{
+					"id": "op-1", "kind": test.kind, "path": "/title",
+					"valueJson": test.valueJSON, "dependsOn": []string{}, "rationale": "test",
+				}},
+				"assumptions": []string{},
+				"questions":   []string{},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := decodeArtifactProposalOutput(payload); !errors.Is(err, ai.ErrInvalidOutput) {
+				t.Fatalf("decode error = %v, want invalid AI output", err)
+			}
+		})
+	}
+}
+
+func TestDecodeImplementationProposalOutputObjectJSON(t *testing.T) {
+	t.Parallel()
+	payload, err := json.Marshal(map[string]any{
+		"operations":         []any{},
+		"routes":             []string{`{"method":"GET","path":"/"}`},
+		"apis":               []string{`{"name":"health"}`},
+		"migrations":         []string{`{"id":"001"}`},
+		"tests":              []string{`{"name":"smoke"}`},
+		"previews":           []string{`{"viewport":"desktop"}`},
+		"traceLinks":         []string{`{"source":"REQ-1"}`},
+		"diagnostics":        []any{},
+		"assumptions":        []string{"assumption"},
+		"unimplementedItems": []string{"later"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	output, err := decodeImplementationProposalOutput(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, test := range map[string]struct {
+		got  []json.RawMessage
+		want json.RawMessage
+	}{
+		"routes":     {got: output.Routes, want: json.RawMessage(`{"path":"/","method":"GET"}`)},
+		"apis":       {got: output.APIs, want: json.RawMessage(`{"name":"health"}`)},
+		"migrations": {got: output.Migrations, want: json.RawMessage(`{"id":"001"}`)},
+		"tests":      {got: output.Tests, want: json.RawMessage(`{"name":"smoke"}`)},
+		"previews":   {got: output.Previews, want: json.RawMessage(`{"viewport":"desktop"}`)},
+		"traceLinks": {got: output.TraceLinks, want: json.RawMessage(`{"source":"REQ-1"}`)},
+	} {
+		if len(test.got) != 1 || !jsonBytesEqual(test.got[0], test.want) {
+			t.Fatalf("%s = %s, want %s", name, test.got, test.want)
+		}
+	}
+	if len(output.Assumptions) != 1 || output.Assumptions[0] != "assumption" ||
+		len(output.UnimplementedItems) != 1 || output.UnimplementedItems[0] != "later" {
+		t.Fatalf("implementation metadata was not preserved: %#v", output)
+	}
+}
+
+func TestDecodeImplementationProposalOutputRejectsInvalidObjectJSON(t *testing.T) {
+	t.Parallel()
+	for name, test := range map[string]struct {
+		field string
+		value string
+	}{
+		"malformed":  {field: "routes", value: "{"},
+		"non-object": {field: "apis", value: `[]`},
+	} {
+		t.Run(name, func(t *testing.T) {
+			payload, err := json.Marshal(map[string]any{test.field: []string{test.value}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := decodeImplementationProposalOutput(payload); !errors.Is(err, ai.ErrInvalidOutput) {
+				t.Fatalf("decode error = %v, want invalid AI output", err)
+			}
+		})
+	}
+}
+
+func TestGenerationSchemasAreStrictStructuredOutputCompatible(t *testing.T) {
+	t.Parallel()
+	for name, payload := range map[string]json.RawMessage{
+		"artifact":       artifactProposalSchema,
+		"implementation": implementationProposalSchema,
+	} {
+		t.Run(name, func(t *testing.T) {
+			var schema any
+			if err := json.Unmarshal(payload, &schema); err != nil {
+				t.Fatal(err)
+			}
+			assertStrictGenerationSchema(t, name, schema)
+		})
+	}
+}
+
+func TestGenerationSchemasUseJSONTextAtOpenValueBoundaries(t *testing.T) {
+	t.Parallel()
+	var artifact map[string]any
+	if err := json.Unmarshal(artifactProposalSchema, &artifact); err != nil {
+		t.Fatal(err)
+	}
+	operationProperties := generationSchemaMapAt(t, artifact, "properties", "operations", "items", "properties")
+	if _, exists := operationProperties["value"]; exists {
+		t.Fatal("artifact AI schema must not expose an unconstrained value field")
+	}
+	valueJSON := generationSchemaMapAt(t, operationProperties, "valueJson")
+	if valueJSON["type"] != "string" {
+		t.Fatalf("valueJson schema = %#v, want string", valueJSON)
+	}
+
+	var implementation map[string]any
+	if err := json.Unmarshal(implementationProposalSchema, &implementation); err != nil {
+		t.Fatal(err)
+	}
+	for _, field := range []string{"routes", "apis", "migrations", "tests", "previews", "traceLinks"} {
+		item := generationSchemaMapAt(t, implementation, "properties", field, "items")
+		if item["type"] != "string" {
+			t.Fatalf("%s item schema = %#v, want JSON text string", field, item)
+		}
+	}
+}
+
+func assertStrictGenerationSchema(t *testing.T, path string, node any) {
+	t.Helper()
+	switch value := node.(type) {
+	case map[string]any:
+		if len(value) == 0 {
+			t.Fatalf("%s contains an empty schema", path)
+		}
+		if generationSchemaHasType(value["type"], "object") {
+			additional, ok := value["additionalProperties"].(bool)
+			if !ok || additional {
+				t.Fatalf("%s object must set additionalProperties=false", path)
+			}
+			properties, ok := value["properties"].(map[string]any)
+			if !ok {
+				t.Fatalf("%s object must declare properties", path)
+			}
+			requiredValues, ok := value["required"].([]any)
+			if !ok {
+				t.Fatalf("%s object must require every property", path)
+			}
+			required := make(map[string]struct{}, len(requiredValues))
+			for _, item := range requiredValues {
+				if name, ok := item.(string); ok {
+					required[name] = struct{}{}
+				}
+			}
+			for property := range properties {
+				if _, ok := required[property]; !ok {
+					t.Fatalf("%s property %s is not required", path, property)
+				}
+			}
+		}
+		if generationSchemaHasType(value["type"], "array") {
+			if _, ok := value["items"]; !ok {
+				t.Fatalf("%s array must declare items", path)
+			}
+		}
+		for key, child := range value {
+			assertStrictGenerationSchema(t, path+"."+key, child)
+		}
+	case []any:
+		for index, child := range value {
+			assertStrictGenerationSchema(t, fmt.Sprintf("%s[%d]", path, index), child)
+		}
+	}
+}
+
+func generationSchemaHasType(value any, expected string) bool {
+	switch typed := value.(type) {
+	case string:
+		return typed == expected
+	case []any:
+		for _, item := range typed {
+			if item == expected {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func generationSchemaMapAt(t *testing.T, root map[string]any, keys ...string) map[string]any {
+	t.Helper()
+	var current any = root
+	path := "schema"
+	for _, key := range keys {
+		object, ok := current.(map[string]any)
+		if !ok {
+			t.Fatalf("%s is not an object", path)
+		}
+		next, ok := object[key]
+		if !ok {
+			t.Fatalf("%s is missing %s", path, key)
+		}
+		current = next
+		path += "." + key
+	}
+	result, ok := current.(map[string]any)
+	if !ok {
+		t.Fatalf("%s is not an object", path)
+	}
+	return result
 }

@@ -6,12 +6,14 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"testing"
 	"time"
 )
 
 func TestOpenAIProviderStructuredOutput(t *testing.T) {
 	t.Parallel()
+	outputSchema := json.RawMessage(`{"type":"object","properties":{"ok":{"type":"boolean"}},"required":["ok"],"additionalProperties":false}`)
 	server := httptest.NewTLSServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		if request.Header.Get("Authorization") != "Bearer test-key" {
 			t.Fatal("missing authorization header")
@@ -23,6 +25,20 @@ func TestOpenAIProviderStructuredOutput(t *testing.T) {
 		text, _ := body["text"].(map[string]any)
 		if text["format"] == nil {
 			t.Fatal("expected structured output format")
+		}
+		format, ok := text["format"].(map[string]any)
+		if !ok {
+			t.Fatalf("unexpected structured output format: %#v", text["format"])
+		}
+		if strict, ok := format["strict"].(bool); !ok || !strict {
+			t.Fatalf("expected strict structured output, got %#v", format["strict"])
+		}
+		var expectedSchema any
+		if err := json.Unmarshal(outputSchema, &expectedSchema); err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(format["schema"], expectedSchema) {
+			t.Fatalf("schema mismatch: got %#v, want %#v", format["schema"], expectedSchema)
 		}
 		writer.Header().Set("Content-Type", "application/json")
 		_, _ = writer.Write([]byte(`{"id":"resp_1","model":"test-model","output_text":"{\"ok\":true}","usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}`))
@@ -36,7 +52,7 @@ func TestOpenAIProviderStructuredOutput(t *testing.T) {
 	}
 	result, err := provider.Generate(context.Background(), Request{
 		Input:            json.RawMessage(`{"manifest":"pinned"}`),
-		OutputSchema:     json.RawMessage(`{"type":"object","properties":{"ok":{"type":"boolean"}},"required":["ok"],"additionalProperties":false}`),
+		OutputSchema:     outputSchema,
 		OutputSchemaName: "test", MaxOutputTokens: 100,
 	})
 	if err != nil {
