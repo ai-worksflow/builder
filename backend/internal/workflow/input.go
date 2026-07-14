@@ -212,6 +212,16 @@ func nodeOutputReference(run *RunRecord, definition domain.NodeDefinition, sourc
 			reference.ArtifactRevisions = appendUniqueArtifactRef(reference.ArtifactRevisions, ref)
 		}
 		for _, ref := range storedInputs.SliceRefs() {
+			// Merge is the fan-out barrier. A historical merge input may have
+			// been frozen before a HumanEdit materialized PageSpec or Prototype
+			// fields into the same run-scoped slice. Fill only fields that were
+			// absent from that immutable input; never overwrite an exact pin that
+			// the merge already carried.
+			if definition.Type == domain.NodeMerge {
+				if current, exists := run.Context.Slices[ref.ID]; exists {
+					ref = enrichSliceRef(ref, workflowSliceRef(current))
+				}
+			}
 			reference.DeliverySliceRefs = appendUniqueSliceRef(reference.DeliverySliceRefs, ref)
 		}
 	}
@@ -224,7 +234,15 @@ func nodeOutputReference(run *RunRecord, definition domain.NodeDefinition, sourc
 		reference.SliceID = targetSliceID
 	}
 	if slice, exists := run.Context.Slices[sliceID]; exists {
-		reference.DeliverySliceRefs = appendUniqueSliceRef(reference.DeliverySliceRefs, workflowSliceRef(slice))
+		current := workflowSliceRef(slice)
+		if definition.Type == domain.NodeHumanEdit {
+			// HumanEdit is the operation that advances the exact PageSpec or
+			// Prototype pointer. Its post-submit run slice is authoritative for
+			// this output and must replace the pre-materialization input snapshot.
+			reference.DeliverySliceRefs = replaceSliceRef(reference.DeliverySliceRefs, current)
+		} else {
+			reference.DeliverySliceRefs = appendUniqueSliceRef(reference.DeliverySliceRefs, current)
+		}
 		for _, ref := range sliceArtifactRefs(slice) {
 			if producedArtifactIDs[ref.ArtifactID] {
 				continue
@@ -593,6 +611,35 @@ func appendUniqueSliceRef(refs []domain.WorkflowSliceRef, candidate domain.Workf
 		}
 	}
 	return append(refs, candidate)
+}
+
+func replaceSliceRef(refs []domain.WorkflowSliceRef, candidate domain.WorkflowSliceRef) []domain.WorkflowSliceRef {
+	for index, ref := range refs {
+		if ref.ID == candidate.ID && ref.FanOutNodeID == candidate.FanOutNodeID {
+			refs[index] = candidate
+			return refs
+		}
+	}
+	return append(refs, candidate)
+}
+
+func enrichSliceRef(ref, current domain.WorkflowSliceRef) domain.WorkflowSliceRef {
+	if ref.ID != current.ID || ref.Key != current.Key || ref.FanOutNodeID != current.FanOutNodeID {
+		return ref
+	}
+	if ref.Blueprint == nil && current.Blueprint != nil {
+		value := *current.Blueprint
+		ref.Blueprint = &value
+	}
+	if ref.PageSpec == nil && current.PageSpec != nil {
+		value := *current.PageSpec
+		ref.PageSpec = &value
+	}
+	if ref.Prototype == nil && current.Prototype != nil {
+		value := *current.Prototype
+		ref.Prototype = &value
+	}
+	return ref
 }
 
 func sliceArtifactRefs(slice SliceContext) []domain.ArtifactRef {

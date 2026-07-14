@@ -339,6 +339,195 @@ func TestHumanEditMaterializationPreventsReviewQuorumFromRevalidatingUpstreamArt
 	}
 }
 
+func TestPrototypeHumanEditRefreshesSliceLineageThroughReviewMergeAndCompiler(t *testing.T) {
+	now := time.Now().UTC()
+	actorID := uuid.NewString()
+	definition, err := MinimumLoopDefinition(uuid.NewString(), actorID, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := syntheticRun(definition, actorID)
+	inputManifest, err := domain.NewInputManifest(
+		uuid.NewString(), run.ProjectID, "workflow-test", "", nil,
+		[]domain.ManifestSource{{Ref: platformRef("prototype-refresh-source"), Purpose: "workflow_input"}},
+		json.RawMessage(`{"test":"prototype-refresh"}`), "workflow-test/v1", actorID, now,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run.InputManifest = ptrManifest(inputManifest.Ref())
+
+	slice := syntheticSlice("prototype-refresh", "pages")
+	prototype := *slice.Prototype
+	slice.Prototype = nil
+	run.Context.Slices[slice.ID] = slice
+
+	pageSpecReview := addSyntheticNode(run, instanceKey("page-spec-review", slice.ID), "page-spec-review", slice.ID, NodeCompleted)
+	run.Context.Nodes[pageSpecReview.Key] = NodeMetadata{
+		DefinitionNodeID: pageSpecReview.DefinitionNodeID,
+		SliceID:          slice.ID,
+		Output:           json.RawMessage(`{"payload":{"approved":true}}`),
+	}
+
+	prototypeAI := addSyntheticNode(run, instanceKey("prototype-ai", slice.ID), "prototype-ai", slice.ID, NodeRunning)
+	prototypeAIInputs, err := buildNodeInputEnvelope(run, definition, prototypeAI)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if refs := prototypeAIInputs.SliceRefs(); len(refs) != 1 || refs[0].Prototype != nil {
+		t.Fatalf("Prototype generation must begin from a slice without a Prototype revision: %+v", refs)
+	}
+	prototypeAI.Status = NodeCompleted
+	run.Context.Nodes[prototypeAI.Key] = NodeMetadata{
+		DefinitionNodeID: prototypeAI.DefinitionNodeID,
+		SliceID:          slice.ID,
+		Input:            prototypeAIInputs.Canonical(),
+		Output:           json.RawMessage(`{"payload":{"proposal":"ready"}}`),
+	}
+
+	prototypeEdit := addSyntheticNode(run, instanceKey("prototype-edit", slice.ID), "prototype-edit", slice.ID, NodeRunning)
+	prototypeEditInputs, err := buildNodeInputEnvelope(run, definition, prototypeEdit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if refs := prototypeEditInputs.SliceRefs(); len(refs) != 1 || refs[0].Prototype != nil {
+		t.Fatalf("HumanEdit input must retain its pre-materialization slice snapshot: %+v", refs)
+	}
+	prototypeEdit.Status = NodeCompleted
+	run.Context.Nodes[prototypeEdit.Key] = NodeMetadata{
+		DefinitionNodeID: prototypeEdit.DefinitionNodeID,
+		SliceID:          slice.ID,
+		Input:            prototypeEditInputs.Canonical(),
+		Output:           mustJSON(map[string]any{"artifactRevision": prototype}),
+	}
+	if err := applyHumanEditSliceLineage(run, slice.ID, HumanEditValidation{
+		ArtifactRefs: []domain.ArtifactRef{prototype}, Primary: prototype, ArtifactKind: "prototype",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	prototypeReview := addSyntheticNode(run, instanceKey("prototype-review", slice.ID), "prototype-review", slice.ID, NodeRunning)
+	prototypeReviewInputs, err := buildNodeInputEnvelope(run, definition, prototypeReview)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertSlicePrototype(t, prototypeReviewInputs.SliceRefs(), slice.ID, prototype)
+	prototypeReview.Status = NodeCompleted
+	run.Context.Nodes[prototypeReview.Key] = NodeMetadata{
+		DefinitionNodeID: prototypeReview.DefinitionNodeID,
+		SliceID:          slice.ID,
+		Input:            prototypeReviewInputs.Canonical(),
+	}
+
+	merge := addSyntheticNode(run, "pages-merged", "pages-merged", "", NodeRunning)
+	mergeInputs, err := buildNodeInputEnvelope(run, definition, merge)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertSlicePrototype(t, mergeInputs.SliceRefs(), slice.ID, prototype)
+	merge.Status = NodeCompleted
+	run.Context.Nodes[merge.Key] = NodeMetadata{DefinitionNodeID: merge.DefinitionNodeID, Input: mergeInputs.Canonical()}
+
+	compiler := addSyntheticNode(run, "compile-manifest", "compile-manifest", "", NodeRunning)
+	compilerInputs, err := buildNodeInputEnvelope(run, definition, compiler)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertSlicePrototype(t, compilerInputs.SliceRefs(), slice.ID, prototype)
+	compilerDefinition, _ := definition.FindNode("compile-manifest")
+	workbench := &fakeWorkbench{}
+	manifest, err := (CoreWorkbenchManifestHook{
+		Workbench: workbench, Proposals: &fakeCoreProposals{manifest: inputManifest},
+	}).Compile(context.Background(), Execution{
+		Run: *run, Node: *compiler, Definition: compilerDefinition, Workflow: definition, Inputs: compilerInputs,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if workbench.calls != 1 || len(workbench.prototypes) != 1 || workbench.prototypes[0].RevisionID != prototype.RevisionID ||
+		len(manifest.SliceIDs) != 1 || manifest.SliceIDs[0] != slice.ID {
+		t.Fatalf("compiler did not consume the resumed immutable Prototype: manifest=%+v prototypes=%+v", manifest, workbench.prototypes)
+	}
+}
+
+func TestCompilerRetryEnrichesCompletedMergeSliceLineage(t *testing.T) {
+	now := time.Now().UTC()
+	actorID := uuid.NewString()
+	definition, err := MinimumLoopDefinition(uuid.NewString(), actorID, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := syntheticRun(definition, actorID)
+	exact := syntheticSlice("compiler-retry", "pages")
+	stale := exact
+	stale.PageSpec = nil
+	stale.Prototype = nil
+	run.Context.Slices[stale.ID] = stale
+
+	review := addSyntheticNode(run, instanceKey("prototype-review", stale.ID), "prototype-review", stale.ID, NodeCompleted)
+	run.Context.Nodes[review.Key] = NodeMetadata{
+		DefinitionNodeID: review.DefinitionNodeID,
+		SliceID:          stale.ID,
+		Output:           json.RawMessage(`{"payload":{"approved":true}}`),
+	}
+	merge := addSyntheticNode(run, "pages-merged", "pages-merged", "", NodeRunning)
+	mergeInputs, err := buildNodeInputEnvelope(run, definition, merge)
+	if err != nil {
+		t.Fatal(err)
+	}
+	refs := mergeInputs.SliceRefs()
+	if len(refs) != 1 || refs[0].PageSpec != nil || refs[0].Prototype != nil {
+		t.Fatalf("test setup did not freeze the historical incomplete merge lineage: %+v", refs)
+	}
+	merge.Status = NodeCompleted
+	run.Context.Nodes[merge.Key] = NodeMetadata{
+		DefinitionNodeID: merge.DefinitionNodeID,
+		Input:            mergeInputs.Canonical(),
+	}
+
+	// This is the persisted state of a run whose HumanEdit submissions were
+	// accepted before the completed merge's old edge snapshot was compiled.
+	run.Context.Slices[exact.ID] = exact
+	compiler := addSyntheticNode(run, "compile-manifest", "compile-manifest", "", NodeRunning)
+	compilerInputs, err := buildNodeInputEnvelope(run, definition, compiler)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertSlicePrototype(t, compilerInputs.SliceRefs(), exact.ID, *exact.Prototype)
+	compilerRefs := compilerInputs.SliceRefs()
+	if compilerRefs[0].PageSpec == nil || !compilerRefs[0].PageSpec.Equal(*exact.PageSpec) {
+		t.Fatalf("compiler retry did not recover the exact PageSpec lineage: %+v", compilerRefs)
+	}
+}
+
+func TestSliceLineageEnrichmentDoesNotOverwriteExactOrConflictingIdentity(t *testing.T) {
+	storedSlice := syntheticSlice("stored", "pages")
+	stored := workflowSliceRef(storedSlice)
+	current := stored
+	replacement := platformRef("replacement-prototype")
+	current.Prototype = &replacement
+	enriched := enrichSliceRef(stored, current)
+	if enriched.Prototype == nil || !enriched.Prototype.Equal(*stored.Prototype) {
+		t.Fatalf("enrichment overwrote an exact immutable Prototype pin: stored=%+v current=%+v enriched=%+v", stored, current, enriched)
+	}
+
+	missing := stored
+	missing.Prototype = nil
+	conflictingIdentity := current
+	conflictingIdentity.Key = "different-slice-key"
+	enriched = enrichSliceRef(missing, conflictingIdentity)
+	if enriched.Prototype != nil {
+		t.Fatalf("enrichment accepted a conflicting slice identity: %+v", enriched)
+	}
+}
+
+func assertSlicePrototype(t *testing.T, refs []domain.WorkflowSliceRef, sliceID string, expected domain.ArtifactRef) {
+	t.Helper()
+	if len(refs) != 1 || refs[0].ID != sliceID || refs[0].Prototype == nil || !refs[0].Prototype.Equal(expected) {
+		t.Fatalf("slice %s lost exact Prototype %s: %+v", sliceID, expected.RevisionID, refs)
+	}
+}
+
 func TestHumanEditSameArtifactRevisionReplacesPriorGenerationBaseline(t *testing.T) {
 	b0 := platformRef("brief-b0")
 	b1 := platformRef("brief-b1")
