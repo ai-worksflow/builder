@@ -249,7 +249,7 @@ func (s *ContainerSandbox) Run(ctx context.Context, workspaceDirectory string, r
 func (s *ContainerSandbox) qualityRunArgs(name, workspace string, request SandboxRequest, image string, command []string) ([]string, error) {
 	args := s.baseRunArgs(name, "none", s.memory, s.cpus, s.pids)
 	args = append(args,
-		"--mount", "type=bind,src="+workspace+",dst=/workspace,rw",
+		"--mount", "type=bind,src="+workspace+",dst=/workspace",
 		"--workdir", "/workspace",
 		"--env", "HOME=/tmp", "--env", "CI=1", "--env", "NO_UPDATE_NOTIFIER=1",
 	)
@@ -328,7 +328,7 @@ func (s *ContainerSandbox) PrepareDependencies(ctx context.Context, dependencyDi
 func (s *ContainerSandbox) dependencyRunArgs(name, directory, ecosystem, image string, command []string) []string {
 	args := s.baseRunArgs(name, s.resolverNetwork, s.resolverMemory, s.resolverCPUs, s.resolverPIDs)
 	args = append(args,
-		"--mount", "type=bind,src="+directory+",dst=/resolver,rw",
+		"--mount", "type=bind,src="+directory+",dst=/resolver",
 		"--workdir", "/resolver", "--env", "HOME=/tmp", "--env", "CI=1",
 	)
 	if ecosystem == "node" {

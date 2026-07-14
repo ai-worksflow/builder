@@ -77,7 +77,8 @@ func TestResolverAndBuildContainerArgumentsKeepNetworkBoundary(t *testing.T) {
 	})
 	resolverText := strings.Join(resolverArgs, " ")
 	if !strings.Contains(resolverText, "--network resolver-egress") ||
-		!strings.Contains(resolverText, "src="+dependencies+",dst=/resolver,rw") ||
+		!strings.Contains(resolverText, "src="+dependencies+",dst=/resolver") ||
+		strings.Contains(resolverText, "dst=/resolver,rw") ||
 		!strings.Contains(resolverText, "--ignore-scripts") ||
 		strings.Contains(resolverText, workspace) {
 		t.Fatalf("resolver boundary is unsafe: %s", resolverText)
@@ -91,7 +92,8 @@ func TestResolverAndBuildContainerArgumentsKeepNetworkBoundary(t *testing.T) {
 	}
 	buildText := strings.Join(buildArgs, " ")
 	if !strings.Contains(buildText, "--network none") ||
-		!strings.Contains(buildText, "src="+workspace+",dst=/workspace,rw") ||
+		!strings.Contains(buildText, "src="+workspace+",dst=/workspace") ||
+		strings.Contains(buildText, "dst=/workspace,rw") ||
 		!strings.Contains(buildText, "src="+filepath.Join(dependencies, "node_modules")+",dst=/workspace/node_modules,readonly") ||
 		!strings.Contains(buildText, "npm_config_offline=true") ||
 		strings.Contains(buildText, "resolver-egress") {
