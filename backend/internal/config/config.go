@@ -371,8 +371,8 @@ func Load() (Config, error) {
 		AI: AIConfig{
 			Provider:       strings.ToLower(loader.string("AI_PROVIDER", "openai")),
 			APIKey:         loader.string("OPENAI_API_KEY", ""),
-			BaseURL:        loader.string("OPENAI_RESPONSES_URL", "https://api.openai.com/v1/responses"),
-			DefaultModel:   loader.string("AI_DEFAULT_MODEL", "gpt-5"),
+			BaseURL:        loader.openAIResponsesURL(),
+			DefaultModel:   loader.openAIDefaultModel(),
 			Timeout:        loader.duration("AI_TIMEOUT", 90*time.Second),
 			MaxInputBytes:  int64(loader.integer("AI_MAX_INPUT_BYTES", 4<<20)),
 			MaxOutputBytes: int64(loader.integer("AI_MAX_OUTPUT_BYTES", 16<<20)),
@@ -649,6 +649,37 @@ func (l *envLoader) string(key, fallback string) string {
 		return strings.TrimSpace(value)
 	}
 	return fallback
+}
+
+func (l *envLoader) openAIResponsesURL() string {
+	if value := l.string("OPENAI_RESPONSES_URL", ""); value != "" {
+		return value
+	}
+	base := l.string("OPENAI_BASE_URL", "")
+	if base == "" {
+		return "https://api.openai.com/v1/responses"
+	}
+	parsed, err := url.Parse(base)
+	if err != nil {
+		return base
+	}
+	path := strings.TrimRight(parsed.Path, "/")
+	if !strings.HasSuffix(path, "/responses") {
+		if !strings.HasSuffix(path, "/v1") {
+			path += "/v1"
+		}
+		path += "/responses"
+	}
+	parsed.Path = path
+	parsed.RawPath = ""
+	return parsed.String()
+}
+
+func (l *envLoader) openAIDefaultModel() string {
+	if value := l.string("OPENAI_DEFAULT_MODEL", ""); value != "" {
+		return value
+	}
+	return l.string("AI_DEFAULT_MODEL", "gpt-5")
 }
 
 func (l *envLoader) integer(key string, fallback int) int {

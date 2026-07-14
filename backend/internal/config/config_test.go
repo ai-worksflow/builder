@@ -150,6 +150,34 @@ func TestDeliveryResolverConfigurationFailsClosed(t *testing.T) {
 	}
 }
 
+func TestLoadOpenAICompatibilityAliases(t *testing.T) {
+	clearConfigEnvironment(t)
+	t.Setenv("OPENAI_BASE_URL", "https://gateway.example")
+	t.Setenv("OPENAI_RESPONSES_URL", "")
+	t.Setenv("OPENAI_DEFAULT_MODEL", "gateway-model")
+	t.Setenv("AI_DEFAULT_MODEL", "legacy-model")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.AI.BaseURL != "https://gateway.example/v1/responses" {
+		t.Fatalf("AI BaseURL = %q", cfg.AI.BaseURL)
+	}
+	if cfg.AI.DefaultModel != "gateway-model" {
+		t.Fatalf("AI DefaultModel = %q", cfg.AI.DefaultModel)
+	}
+
+	t.Setenv("OPENAI_RESPONSES_URL", "https://responses.example/custom")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.AI.BaseURL != "https://responses.example/custom" {
+		t.Fatalf("explicit AI BaseURL = %q", cfg.AI.BaseURL)
+	}
+}
+
 func clearConfigEnvironment(t *testing.T) {
 	t.Helper()
 	keys := []string{
@@ -175,7 +203,7 @@ func clearConfigEnvironment(t *testing.T) {
 		"OUTBOX_BATCH_SIZE", "OUTBOX_POLL_INTERVAL", "OUTBOX_CLAIM_TTL", "OUTBOX_MAX_ATTEMPTS",
 		"OUTBOX_PUBLISH_WAIT",
 		"IDEMPOTENCY_TTL", "IDEMPOTENCY_LOCK_TTL", "IDEMPOTENCY_MAX_RESPONSE_BYTES",
-		"AI_PROVIDER", "OPENAI_API_KEY", "OPENAI_RESPONSES_URL", "AI_DEFAULT_MODEL", "AI_TIMEOUT",
+		"AI_PROVIDER", "OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_RESPONSES_URL", "OPENAI_DEFAULT_MODEL", "AI_DEFAULT_MODEL", "AI_TIMEOUT",
 		"AI_MAX_INPUT_BYTES", "AI_MAX_OUTPUT_BYTES", "AI_MAX_RETRIES", "OPENAI_ORGANIZATION", "OPENAI_PROJECT",
 		"WORKFLOW_WORKER_ENABLED", "WORKFLOW_WORKER_ID", "WORKFLOW_POLL_INTERVAL", "WORKFLOW_LEASE_DURATION",
 		"WORKFLOW_HEARTBEAT",
