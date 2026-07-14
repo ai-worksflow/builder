@@ -562,9 +562,9 @@ func TestServerAIGenerationPersistsReviewableProvenanceWithoutExecution(t *testi
 		compatibleConversationDefinition(projectID, input.SuggestedDefinitionVersionID),
 	}}
 	output, err := platformdomain.CanonicalJSON(map[string]any{
-		"assistantContent": "I recommend the minimum loop for review.",
-		"kind":             IntentStartWorkflow, "suggestedDefinitionVersionId": input.SuggestedDefinitionVersionID,
-		"scope":                map[string]any{"slice": "all"},
+		"assistantContent":     "I recommend the minimum loop for review.",
+		"selectionKey":         "s0",
+		"scopeJson":            `{"slice":"all"}`,
 		"workbenchInstruction": map[string]any{"objective": "Build the reviewed application", "constraints": []string{"Keep exact traces"}},
 	})
 	if err != nil {
@@ -651,6 +651,174 @@ func TestServerAIGenerationPersistsReviewableProvenanceWithoutExecution(t *testi
 	}
 }
 
+func TestIntentProposalSchemaUsesStrictSelectionAndJSONTextBoundaries(t *testing.T) {
+	startID := uuid.NewString()
+	target := intentWorkbenchTargetContext{
+		DefinitionVersionID: uuid.NewString(), RunID: uuid.NewString(), RootBundleID: uuid.NewString(),
+		SliceKey: "CHECKOUT", SliceTitle: "Checkout",
+	}
+	schemaJSON, err := intentProposalSchema([]string{startID}, []intentWorkbenchTargetContext{target})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var schema any
+	if err := json.Unmarshal(schemaJSON, &schema); err != nil {
+		t.Fatal(err)
+	}
+	assertStrictIntentProposalSchema(t, "intent", schema)
+
+	root := schema.(map[string]any)
+	properties := root["properties"].(map[string]any)
+	if len(properties) != 4 || properties["scopeJson"].(map[string]any)["type"] != "string" {
+		t.Fatalf("intent schema did not use the closed JSON-text transport: %s", schemaJSON)
+	}
+	for _, forbidden := range []string{"kind", "suggestedDefinitionVersionId", "scope"} {
+		if _, exists := properties[forbidden]; exists {
+			t.Fatalf("model can still supply server-managed %s: %s", forbidden, schemaJSON)
+		}
+	}
+	selection := properties["selectionKey"].(map[string]any)
+	keys := selection["enum"].([]any)
+	if len(keys) != 2 || keys[0] != "s0" || keys[1] != "w0" {
+		t.Fatalf("selection key enum = %#v", keys)
+	}
+	for _, identity := range []string{startID, target.DefinitionVersionID, target.RunID, target.RootBundleID} {
+		if bytes.Contains(schemaJSON, []byte(identity)) {
+			t.Fatalf("exact identity %s leaked through the model output schema", identity)
+		}
+	}
+}
+
+func TestServerAIGenerationCanonicalizesScopeJSONAndRejectsInvalidScopes(t *testing.T) {
+	projectID, conversationID, actorID := uuid.NewString(), uuid.NewString(), uuid.NewString()
+	input, manifest := proposalInputWithManifest(t, projectID, actorID)
+	validOutput, err := platformdomain.CanonicalJSON(map[string]any{
+		"assistantContent": "Use the reviewed workflow.",
+		"selectionKey":     "s0",
+		"scopeJson":        ` { "z": 1, "a": { "y": 2, "x": 1 } } `,
+		"workbenchInstruction": map[string]any{
+			"objective": "Build the reviewed application", "constraints": []string{},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := &conversationStoreStub{}
+	provider := &generatedConversationProviderStub{result: ai.Result{Provider: "test", Model: "test", Output: validOutput}}
+	service, err := newService(
+		store, &conversationAccessStub{}, &conversationRuntimeStub{compatible: []runtime.DefinitionRecord{
+			compatibleConversationDefinition(projectID, input.SuggestedDefinitionVersionID),
+		}}, conversationManifestStub{manifest: manifest}, provider,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	generated, err := service.GenerateIntentProposal(context.Background(), projectID, conversationID, actorID, GenerateIntentProposalInput{
+		TriggerMessageID: input.TriggerMessageID, DesiredOutputCapability: platformdomain.WorkflowOutputApplication,
+		SourceRefs: input.SourceRefs, ManifestIntent: input.ManifestIntent,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := string(generated.Proposal.Scope), `{"a":{"x":1,"y":2},"z":1}`; got != want {
+		t.Fatalf("canonical generated scope = %s, want %s", got, want)
+	}
+
+	for _, test := range []struct {
+		name      string
+		scopeJSON string
+	}{
+		{name: "malformed", scopeJSON: `{`},
+		{name: "multiple values", scopeJSON: `{} {}`},
+		{name: "array", scopeJSON: `[]`},
+		{name: "null", scopeJSON: `null`},
+		{name: "reserved conversation intent", scopeJSON: `{"conversationIntent":{"proposalId":"forged"}}`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			output, err := platformdomain.CanonicalJSON(map[string]any{
+				"assistantContent": "Use the reviewed workflow.", "selectionKey": "s0", "scopeJson": test.scopeJSON,
+				"workbenchInstruction": map[string]any{"objective": "Build", "constraints": []string{}},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			caseStore := &conversationStoreStub{}
+			caseProvider := &generatedConversationProviderStub{result: ai.Result{Provider: "test", Model: "test", Output: output}}
+			caseService, err := newService(
+				caseStore, &conversationAccessStub{}, &conversationRuntimeStub{compatible: []runtime.DefinitionRecord{
+					compatibleConversationDefinition(projectID, input.SuggestedDefinitionVersionID),
+				}}, conversationManifestStub{manifest: manifest}, caseProvider,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = caseService.GenerateIntentProposal(context.Background(), projectID, conversationID, actorID, GenerateIntentProposalInput{
+				TriggerMessageID: input.TriggerMessageID, DesiredOutputCapability: platformdomain.WorkflowOutputApplication,
+				SourceRefs: input.SourceRefs, ManifestIntent: input.ManifestIntent,
+			})
+			if !errors.Is(err, ai.ErrInvalidOutput) {
+				t.Fatalf("invalid scope error = %v", err)
+			}
+			if caseStore.proposal.ID != "" {
+				t.Fatalf("invalid scope reached persistence: %+v", caseStore.proposal)
+			}
+		})
+	}
+}
+
+func assertStrictIntentProposalSchema(t *testing.T, path string, node any) {
+	t.Helper()
+	switch value := node.(type) {
+	case map[string]any:
+		for _, unsupported := range []string{"oneOf", "anyOf", "allOf", "not"} {
+			if _, exists := value[unsupported]; exists {
+				t.Fatalf("%s uses unsupported strict-schema combinator %s", path, unsupported)
+			}
+		}
+		if value["type"] == "object" {
+			if additional, ok := value["additionalProperties"].(bool); !ok || additional {
+				t.Fatalf("%s object must set additionalProperties=false", path)
+			}
+			properties, ok := value["properties"].(map[string]any)
+			if !ok {
+				t.Fatalf("%s object must declare properties", path)
+			}
+			requiredValues, ok := value["required"].([]any)
+			if !ok {
+				t.Fatalf("%s object must require every property", path)
+			}
+			required := make(map[string]struct{}, len(requiredValues))
+			for _, item := range requiredValues {
+				name, ok := item.(string)
+				if !ok {
+					t.Fatalf("%s has a non-string required entry", path)
+				}
+				required[name] = struct{}{}
+			}
+			if len(required) != len(properties) {
+				t.Fatalf("%s required/property count mismatch: required=%v properties=%v", path, required, properties)
+			}
+			for property := range properties {
+				if _, exists := required[property]; !exists {
+					t.Fatalf("%s property %s is optional", path, property)
+				}
+			}
+		}
+		if value["type"] == "array" {
+			if _, exists := value["items"]; !exists {
+				t.Fatalf("%s array must declare items", path)
+			}
+		}
+		for key, child := range value {
+			assertStrictIntentProposalSchema(t, path+"."+key, child)
+		}
+	case []any:
+		for index, child := range value {
+			assertStrictIntentProposalSchema(t, fmt.Sprintf("%s[%d]", path, index), child)
+		}
+	}
+}
+
 func TestServerAIGenerationCanSelectTwentyFirstCompatibleDefinitionFromCompactIndex(t *testing.T) {
 	projectID, conversationID, actorID := uuid.NewString(), uuid.NewString(), uuid.NewString()
 	input, manifest := proposalInputWithManifest(t, projectID, actorID)
@@ -661,8 +829,8 @@ func TestServerAIGenerationCanSelectTwentyFirstCompatibleDefinitionFromCompactIn
 	selectedID := compatible[20].VersionID
 	output, err := platformdomain.CanonicalJSON(map[string]any{
 		"assistantContent": "Use the twenty-first exact compatible workflow.",
-		"kind":             IntentStartWorkflow, "suggestedDefinitionVersionId": selectedID,
-		"scope": map[string]any{"slice": "all"},
+		"selectionKey":     "s20",
+		"scopeJson":        `{"slice":"all"}`,
 		"workbenchInstruction": map[string]any{
 			"objective": "Build the reviewed application", "constraints": []string{"Keep exact traces"},
 		},
@@ -690,18 +858,22 @@ func TestServerAIGenerationCanSelectTwentyFirstCompatibleDefinitionFromCompactIn
 	if err != nil {
 		t.Fatal(err)
 	}
-	if generated.Proposal.SuggestedDefinitionVersionID != selectedID || !bytes.Contains(provider.request.OutputSchema, []byte(selectedID)) {
+	if generated.Proposal.SuggestedDefinitionVersionID != selectedID ||
+		!bytes.Contains(provider.request.OutputSchema, []byte(`"s20"`)) ||
+		bytes.Contains(provider.request.OutputSchema, []byte(selectedID)) {
 		t.Fatalf("twenty-first compatible definition was omitted: proposal=%+v schema=%s", generated.Proposal, provider.request.OutputSchema)
 	}
 	var prompt struct {
 		StartCandidateDefinitionVersionIDs []string                      `json:"startCandidateDefinitionVersionIds"`
 		CandidateWorkflowDefinitions       []intentDefinitionPromptIndex `json:"candidateWorkflowDefinitions"`
+		SelectionOptions                   []intentSelectionOption       `json:"selectionOptions"`
 	}
 	if err := json.Unmarshal(provider.request.Input, &prompt); err != nil {
 		t.Fatal(err)
 	}
-	if len(prompt.StartCandidateDefinitionVersionIDs) != 21 || len(prompt.CandidateWorkflowDefinitions) != 21 ||
-		prompt.StartCandidateDefinitionVersionIDs[20] != selectedID {
+	if len(prompt.StartCandidateDefinitionVersionIDs) != 21 || len(prompt.CandidateWorkflowDefinitions) != 21 || len(prompt.SelectionOptions) != 21 ||
+		prompt.StartCandidateDefinitionVersionIDs[20] != selectedID || prompt.SelectionOptions[20].SelectionKey != "s20" ||
+		prompt.SelectionOptions[20].Kind != IntentStartWorkflow || prompt.SelectionOptions[20].DefinitionVersionID != selectedID {
 		t.Fatalf("compact candidate index was incomplete: ids=%d definitions=%d last=%q", len(prompt.StartCandidateDefinitionVersionIDs), len(prompt.CandidateWorkflowDefinitions), prompt.StartCandidateDefinitionVersionIDs[len(prompt.StartCandidateDefinitionVersionIDs)-1])
 	}
 	if bytes.Contains(provider.request.Input, []byte(secret)) || bytes.Contains(provider.request.Input, []byte(`"aiTransform"`)) {
@@ -758,11 +930,10 @@ func TestServerAIGenerationScansPastFirstHundredIneligibleWorkbenchTargets(t *te
 	}
 	output, err := platformdomain.CanonicalJSON(map[string]any{
 		"assistantContent": "Continue the later ready Workbench target.",
-		"kind":             IntentWorkbenchInstruction, "suggestedDefinitionVersionId": definitionVersionID,
-		"scope": map[string]any{"slice": "all"},
+		"selectionKey":     "w0",
+		"scopeJson":        `{"slice":"all"}`,
 		"workbenchInstruction": map[string]any{
 			"objective": "Continue the exact ready bundle", "constraints": []string{"Keep exact traces"},
-			"expectedRunId": ready.RunID, "expectedBundleId": ready.RootBundleID,
 		},
 	})
 	if err != nil {
@@ -940,11 +1111,10 @@ func TestServerAIGenerationUsesOnlySuppliedAuthoritativeWorkbenchTarget(t *testi
 	}
 	output, err := platformdomain.CanonicalJSON(map[string]any{
 		"assistantContent": "Continue the existing reviewed application run.",
-		"kind":             IntentWorkbenchInstruction, "suggestedDefinitionVersionId": target.DefinitionVersionID,
-		"scope": map[string]any{"slice": "all"},
+		"selectionKey":     "w0",
+		"scopeJson":        `{"slice":"all"}`,
 		"workbenchInstruction": map[string]any{
 			"objective": "Continue the exact active bundle", "constraints": []string{"Keep exact traces"},
-			"expectedRunId": target.RunID, "expectedBundleId": target.RootBundleID,
 		},
 	})
 	if err != nil {
@@ -979,18 +1149,26 @@ func TestServerAIGenerationUsesOnlySuppliedAuthoritativeWorkbenchTarget(t *testi
 		t.Fatalf("AI proposal lost the supplied target: %+v", generated.Proposal)
 	}
 	for _, exactID := range []string{target.DefinitionVersionID, target.RunID, target.RootBundleID, target.ActiveBundleID} {
-		if !bytes.Contains(provider.request.Input, []byte(exactID)) || !bytes.Contains(provider.request.OutputSchema, []byte(exactID)) && exactID != target.ActiveBundleID {
-			t.Fatalf("provider request omitted authoritative target identity %s", exactID)
+		if !bytes.Contains(provider.request.Input, []byte(exactID)) || bytes.Contains(provider.request.OutputSchema, []byte(exactID)) {
+			t.Fatalf("provider request did not keep identity %s behind a selection key", exactID)
 		}
 	}
 	var prompt struct {
-		StartCandidateDefinitionVersionIDs []string `json:"startCandidateDefinitionVersionIds"`
+		StartCandidateDefinitionVersionIDs []string                `json:"startCandidateDefinitionVersionIds"`
+		SelectionOptions                   []intentSelectionOption `json:"selectionOptions"`
 	}
 	if err := json.Unmarshal(provider.request.Input, &prompt); err != nil {
 		t.Fatal(err)
 	}
 	if len(prompt.StartCandidateDefinitionVersionIDs) != 1 || prompt.StartCandidateDefinitionVersionIDs[0] != input.SuggestedDefinitionVersionID {
 		t.Fatalf("active selection target leaked into start candidates: %+v", prompt.StartCandidateDefinitionVersionIDs)
+	}
+	if len(prompt.SelectionOptions) != 2 || prompt.SelectionOptions[0].SelectionKey != "s0" ||
+		prompt.SelectionOptions[1].SelectionKey != "w0" || prompt.SelectionOptions[1].Kind != IntentWorkbenchInstruction ||
+		prompt.SelectionOptions[1].DefinitionVersionID != target.DefinitionVersionID || prompt.SelectionOptions[1].RunID != target.RunID ||
+		prompt.SelectionOptions[1].RootBundleID != target.RootBundleID || prompt.SelectionOptions[1].SliceKey != target.SliceKey ||
+		prompt.SelectionOptions[1].SliceTitle != target.SliceTitle {
+		t.Fatalf("provider selection options lost the authoritative mapping: %+v", prompt.SelectionOptions)
 	}
 
 	commandID := uuid.NewString()
@@ -1036,8 +1214,8 @@ func TestServerAIGenerationUsesOnlySuppliedAuthoritativeWorkbenchTarget(t *testi
 
 	selectionStartOutput, _ := platformdomain.CanonicalJSON(map[string]any{
 		"assistantContent": "Start the selection definition incorrectly.",
-		"kind":             IntentStartWorkflow, "suggestedDefinitionVersionId": target.DefinitionVersionID,
-		"scope": map[string]any{},
+		"selectionKey":     "s0",
+		"scopeJson":        `{}`,
 		"workbenchInstruction": map[string]any{
 			"objective": "Start selection", "constraints": []string{},
 		},
@@ -1050,15 +1228,13 @@ func TestServerAIGenerationUsesOnlySuppliedAuthoritativeWorkbenchTarget(t *testi
 		t.Fatalf("selection target was accepted as a start candidate: %v", err)
 	}
 
-	hallucinated := target
-	hallucinated.RunID = uuid.NewString()
 	hallucinatedOutput, _ := platformdomain.CanonicalJSON(map[string]any{
 		"assistantContent": "Continue an invented run.",
-		"kind":             IntentWorkbenchInstruction, "suggestedDefinitionVersionId": target.DefinitionVersionID,
-		"scope": map[string]any{},
+		"selectionKey":     "w0",
+		"scopeJson":        `{}`,
 		"workbenchInstruction": map[string]any{
 			"objective": "Continue", "constraints": []string{},
-			"expectedRunId": hallucinated.RunID, "expectedBundleId": target.RootBundleID,
+			"expectedRunId": uuid.NewString(), "expectedBundleId": target.RootBundleID,
 		},
 	})
 	provider.result.Output = hallucinatedOutput
