@@ -190,4 +190,57 @@ func TestCreateWorkbenchBundleFormalPrototypeGatePostgres(t *testing.T) {
 			t.Fatalf("editor used the admin-only stale waiver: %v", err)
 		}
 	})
+
+	t.Run("workflow node PageSpec purpose reaches semantic validation", func(t *testing.T) {
+		resetFormalState(t)
+		pageSpec := fixture.rootA.PageSpecRevision
+		requirements := fixture.rootA.RequirementRevisions[0]
+		blueprint := fixture.rootA.BlueprintRevision
+		payload, err := json.Marshal(map[string]any{
+			"schemaVersion": 1,
+			"exploratory":   false,
+			"pageSpecRevision": map[string]any{
+				"artifactId": pageSpec.ArtifactID, "revisionId": pageSpec.RevisionID, "contentHash": pageSpec.ContentHash,
+			},
+			"states": []any{}, "breakpoints": []any{}, "frames": []any{},
+			"layers": map[string]any{}, "fixtures": []any{}, "interactions": []any{},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		workflowPrototype := seedMultiBundleApprovedRevision(
+			t, database, fixture.contents, fixture.projectID, fixture.ownerID, "prototype", payload, nil,
+		)
+		workflowPrototypeRevisionID := uuid.MustParse(workflowPrototype.RevisionID)
+		sources := []storage.ArtifactRevisionSourceModel{
+			{
+				RevisionID: workflowPrototypeRevisionID, Ordinal: 0,
+				SourceArtifactID: uuid.MustParse(pageSpec.ArtifactID), SourceRevisionID: uuid.MustParse(pageSpec.RevisionID),
+				SourceContentHash: pageSpec.ContentHash, Purpose: "workflow_node:page-spec-review", Required: true,
+				AddedBy: fixture.ownerID, AddedAt: now,
+			},
+			{
+				RevisionID: workflowPrototypeRevisionID, Ordinal: 1,
+				SourceArtifactID: uuid.MustParse(requirements.ArtifactID), SourceRevisionID: uuid.MustParse(requirements.RevisionID),
+				SourceContentHash: requirements.ContentHash, Purpose: "workflow_node:page-spec-review", Required: true,
+				AddedBy: fixture.ownerID, AddedAt: now,
+			},
+			{
+				RevisionID: workflowPrototypeRevisionID, Ordinal: 2,
+				SourceArtifactID: uuid.MustParse(blueprint.ArtifactID), SourceRevisionID: uuid.MustParse(blueprint.RevisionID),
+				SourceContentHash: blueprint.ContentHash, Purpose: "delivery_slice_blueprint", Required: true,
+				AddedBy: fixture.ownerID, AddedAt: now,
+			},
+		}
+		if err := database.Create(&sources).Error; err != nil {
+			t.Fatal(err)
+		}
+		_, err = fixture.workbench.CreateBundle(
+			ctx, fixture.projectID.String(), fixture.ownerID.String(),
+			CreateWorkbenchBundleInput{PrototypeRevision: workflowPrototype},
+		)
+		if err == nil || strings.Contains(err.Error(), "immutable required source") {
+			t.Fatalf("workflow node PageSpec purpose did not reach downstream semantic validation: %v", err)
+		}
+	})
 }

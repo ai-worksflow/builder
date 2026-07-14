@@ -330,7 +330,7 @@ func (s *WorkbenchService) CreateBundle(ctx context.Context, projectID, actorID 
 		return WorkbenchBundle{}, err
 	}
 	pageRef, pageRefOK := versionRefFromValue(prototype["pageSpecRevision"])
-	if !pageRefOK || !hasFrozenWorkbenchSource(frozenSources, "page_spec", true, pageRef) {
+	if !pageRefOK || !hasFrozenPrototypePageSpecSource(frozenSources, pageRef) {
 		return WorkbenchBundle{}, fmt.Errorf("%w: Prototype pageSpecRevision is not its exact immutable required source", ErrBlockingGate)
 	}
 	upstream := frozenWorkbenchSourceRefs(frozenSources)
@@ -1900,14 +1900,10 @@ func frozenWorkbenchSourceRefs(sources []frozenWorkbenchSource) []VersionRef {
 	return refs
 }
 
-func hasFrozenWorkbenchSource(
-	sources []frozenWorkbenchSource,
-	purpose string,
-	required bool,
-	ref VersionRef,
-) bool {
+func hasFrozenPrototypePageSpecSource(sources []frozenWorkbenchSource, ref VersionRef) bool {
 	for _, source := range sources {
-		if source.Purpose == purpose && source.Required == required && exactWorkbenchVersionRef(source.Ref, ref) {
+		if source.Required && prototypePageSpecLineagePurpose(source.Purpose) &&
+			exactWorkbenchVersionRef(source.Ref, ref) {
 			return true
 		}
 	}

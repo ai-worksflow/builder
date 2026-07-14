@@ -234,6 +234,44 @@ func TestFormalPrototypeWorkbenchInputRequiresExactCurrentApprovedRevision(t *te
 	}
 }
 
+func TestFrozenPrototypePageSpecSourceUsesCanonicalLineagePurposes(t *testing.T) {
+	t.Parallel()
+	pageSpec := VersionRef{
+		ArtifactID: uuid.NewString(), RevisionID: uuid.NewString(), ContentHash: "sha256:page-spec",
+	}
+	other := pageSpec
+	other.RevisionID = uuid.NewString()
+	wrongHash := pageSpec
+	wrongHash.ContentHash = "sha256:different-page-spec"
+	anchorID := "page-home"
+	anchored := pageSpec
+	anchored.AnchorID = &anchorID
+	tests := []struct {
+		name   string
+		source frozenWorkbenchSource
+		want   bool
+	}{
+		{name: "legacy page spec", source: frozenWorkbenchSource{Ref: pageSpec, Purpose: "page_spec", Required: true}, want: true},
+		{name: "delivery slice page spec", source: frozenWorkbenchSource{Ref: pageSpec, Purpose: "delivery_slice_page_spec", Required: true}, want: true},
+		{name: "workflow review node", source: frozenWorkbenchSource{Ref: pageSpec, Purpose: "workflow_node:page-spec-review", Required: true}, want: true},
+		{name: "empty workflow node", source: frozenWorkbenchSource{Ref: pageSpec, Purpose: "workflow_node:", Required: true}},
+		{name: "arbitrary purpose", source: frozenWorkbenchSource{Ref: pageSpec, Purpose: "reference_context", Required: true}},
+		{name: "optional page spec", source: frozenWorkbenchSource{Ref: pageSpec, Purpose: "page_spec"}},
+		{name: "different exact revision", source: frozenWorkbenchSource{Ref: other, Purpose: "workflow_node:page-spec-review", Required: true}},
+		{name: "different content hash", source: frozenWorkbenchSource{Ref: wrongHash, Purpose: "workflow_node:page-spec-review", Required: true}},
+		{name: "anchored source", source: frozenWorkbenchSource{Ref: anchored, Purpose: "workflow_node:page-spec-review", Required: true}},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			if got := hasFrozenPrototypePageSpecSource([]frozenWorkbenchSource{test.source}, pageSpec); got != test.want {
+				t.Fatalf("source acceptance = %t, want %t: %+v", got, test.want, test.source)
+			}
+		})
+	}
+}
+
 func TestRenderedFrameAssetsIgnorePrototypeSelfReportedAssets(t *testing.T) {
 	t.Parallel()
 	contents := newMultiBundleMemoryContentStore()
