@@ -208,11 +208,17 @@ func preflightGeneratedArtifactProposal(
 	base json.RawMessage,
 	operations []domain.ProposalOperation,
 ) error {
-	// Requirements feed the deterministic Requirement Baseline compiler. Do not
-	// persist an AI proposal that can never pass that next canonical boundary;
-	// returning invalid output lets the workflow retry without creating a broken
-	// Proposal identity that a human could accidentally apply.
-	if jobType != "derive_requirements" {
+	artifactKind := map[string]string{
+		"derive_requirements": "product_requirements",
+		"decompose_pages":     "blueprint",
+		"generate_page_spec":  "page_spec",
+		"generate_prototype":  "prototype",
+	}[jobType]
+	// Generated downstream artifacts feed deterministic lineage compilers and
+	// fan-out/runtime consumers. Do not persist a proposal that can never pass
+	// its next canonical boundary; invalid output lets the workflow retry without
+	// creating a broken Proposal identity that a human could accidentally apply.
+	if artifactKind == "" {
 		return nil
 	}
 	accepted := make([]domain.ProposalOperation, len(operations))
@@ -223,13 +229,13 @@ func preflightGeneratedArtifactProposal(
 	temporary := domain.OutputProposal{Status: domain.ProposalReady, Operations: accepted}
 	ordered, err := temporary.AcceptedOperations()
 	if err != nil {
-		return fmt.Errorf("%w: derive_requirements dependency graph: %v", ai.ErrInvalidOutput, err)
+		return fmt.Errorf("%w: %s dependency graph: %v", ai.ErrInvalidOutput, jobType, err)
 	}
 	candidate, err := domain.ApplyProposalPatch(base, ordered)
 	if err != nil {
-		return fmt.Errorf("%w: derive_requirements patch: %v", ai.ErrInvalidOutput, err)
+		return fmt.Errorf("%w: %s patch: %v", ai.ErrInvalidOutput, jobType, err)
 	}
-	report := core.ValidateArtifactContent("product_requirements", candidate)
+	report := core.ValidateArtifactContent(artifactKind, candidate)
 	if report.Valid {
 		return nil
 	}
@@ -240,8 +246,8 @@ func preflightGeneratedArtifactProposal(
 		}
 	}
 	return fmt.Errorf(
-		"%w: derive_requirements proposal does not satisfy the canonical Product Requirements contract: %s",
-		ai.ErrInvalidOutput, strings.Join(blockers, ", "),
+		"%w: %s proposal does not satisfy the canonical %s contract: %s",
+		ai.ErrInvalidOutput, jobType, artifactKind, strings.Join(blockers, ", "),
 	)
 }
 

@@ -497,6 +497,43 @@ func TestRequirementsProposalPreflightAcceptsCanonicalBaselineInput(t *testing.T
 	}
 }
 
+func TestBlueprintProposalPreflightRejectsPageFieldsOutsideCanonicalNodes(t *testing.T) {
+	t.Parallel()
+	base := json.RawMessage(`{"schemaVersion":1,"nodes":[],"edges":[],"pageSpecs":[]}`)
+	content := json.RawMessage(`{
+		"schemaVersion":1,
+		"nodes":[
+			{"id":"feature-closure","businessKey":"feature-closure","type":"Feature"},
+			{"id":"page-closure","businessKey":"page-closure","type":"Page","route":"/closure"}
+		],
+		"edges":[{"id":"contains-closure","from":"feature-closure","to":"page-closure","type":"contains"}],
+		"pageSpecs":[{"nodeId":"page-closure","userGoal":"Verify closure","requirementIds":["REQ-001"]}]
+	}`)
+	err := preflightGeneratedArtifactProposal("decompose_pages", base, []domain.ProposalOperation{{
+		ID: "replace-root", Kind: domain.OperationReplace, Path: "", Value: content,
+	}})
+	if !errors.Is(err, ai.ErrInvalidOutput) ||
+		!strings.Contains(err.Error(), "blueprint.page_spec") ||
+		!strings.Contains(err.Error(), "blueprint.page_requirement") {
+		t.Fatalf("Blueprint preflight did not reject fields stored only outside Page nodes: %v", err)
+	}
+
+	valid := json.RawMessage(`{
+		"schemaVersion":1,
+		"nodes":[
+			{"id":"feature-closure","businessKey":"feature-closure","type":"Feature","title":"Closure"},
+			{"id":"page-closure","businessKey":"page-closure","type":"Page","title":"Closure","route":"/closure","userGoal":"Verify closure","requirementIds":["REQ-001"]}
+		],
+		"edges":[{"id":"contains-closure","from":"feature-closure","to":"page-closure","type":"contains"}],
+		"pageSpecs":[]
+	}`)
+	if err := preflightGeneratedArtifactProposal("decompose_pages", base, []domain.ProposalOperation{{
+		ID: "replace-root", Kind: domain.OperationReplace, Path: "", Value: valid,
+	}}); err != nil {
+		t.Fatalf("canonical Blueprint proposal failed preflight: %v", err)
+	}
+}
+
 func TestDecodeArtifactProposalOutputValueJSON(t *testing.T) {
 	t.Parallel()
 	tests := []struct {

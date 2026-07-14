@@ -1127,7 +1127,9 @@ func (s *ArtifactService) validatePageSpecBlueprintSource(
 	if source.Input.Ref.AnchorID != nil {
 		anchor = strings.TrimSpace(*source.Input.Ref.AnchorID)
 	}
-	if !source.Input.Required || strings.TrimSpace(source.Input.Purpose) != "blueprint" || anchor != pageNodeID {
+	if !source.Input.Required ||
+		!artifactLineagePurpose(source.Input.Purpose, "blueprint", "delivery_slice_blueprint") ||
+		anchor != pageNodeID {
 		return fmt.Errorf("%w: PageSpec Blueprint source must be required and anchored to blueprintPageNodeId", ErrBlockingGate)
 	}
 	if source.Artifact.Lifecycle != "active" || source.Revision.WorkflowStatus != "approved" {
@@ -1194,7 +1196,9 @@ func (s *ArtifactService) validatePrototypePageSpecSource(
 		return fmt.Errorf("%w: Prototype requires exactly one PageSpec source", ErrBlockingGate)
 	}
 	source := pageSpecs[0]
-	if !source.Input.Required || strings.TrimSpace(source.Input.Purpose) != "page_spec" || hasVersionAnchor(source.Input.Ref) {
+	if !source.Input.Required ||
+		!artifactLineagePurpose(source.Input.Purpose, "page_spec", "delivery_slice_page_spec") ||
+		hasVersionAnchor(source.Input.Ref) {
 		return fmt.Errorf("%w: Prototype PageSpec source must be one required whole revision", ErrBlockingGate)
 	}
 	if hasVersionAnchor(content.PageSpecRevision) || !sameWholeVersionRef(source.Input.Ref, content.PageSpecRevision) {
@@ -1240,6 +1244,16 @@ func (s *ArtifactService) validatePrototypePageSpecSource(
 		return fmt.Errorf("%w: formal Prototype requires a current PageSpec source", ErrBlockingGate)
 	}
 	return nil
+}
+
+func artifactLineagePurpose(value string, allowed ...string) bool {
+	value = strings.TrimSpace(value)
+	for _, candidate := range allowed {
+		if value == candidate {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *ArtifactService) validatePrototypeComponentRefs(

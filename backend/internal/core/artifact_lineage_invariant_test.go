@@ -372,6 +372,14 @@ func TestPageSpecFormalReviewRequiresCurrentBlueprintSourcePostgres(t *testing.T
 	if err := service.validateArtifactLineageForReview(ctx, database, projectID, "page_spec", pageSpecPayload, sources); err != nil {
 		t.Fatalf("current Blueprint source was rejected at formal review: %v", err)
 	}
+	deliverySliceSources := []ArtifactSourceInput{{
+		Ref: blueprintRef, Purpose: "delivery_slice_blueprint", Required: true,
+	}}
+	if err := service.validateArtifactLineageForReview(
+		ctx, database, projectID, "page_spec", pageSpecPayload, deliverySliceSources,
+	); err != nil {
+		t.Fatalf("workflow delivery-slice Blueprint source was rejected at formal review: %v", err)
+	}
 	if err := database.Model(&storage.ArtifactHealthModel{}).
 		Where("artifact_id = ?", blueprintRef.ArtifactID).Update("sync_status", "needs_sync").Error; err != nil {
 		t.Fatal(err)
@@ -485,6 +493,14 @@ func TestArtifactServicePrototypeLineageFormalAndExploratory(t *testing.T) {
 		[]ArtifactSourceInput{pageSpecSource},
 	); err != nil {
 		t.Fatalf("strict review rejected complete PageSpec semantic coverage: %v", err)
+	}
+	deliverySlicePageSpecSource := pageSpecSource
+	deliverySlicePageSpecSource.Purpose = "delivery_slice_page_spec"
+	if err := service.validateArtifactLineageForReview(
+		ctx, database, projectID, "prototype", prototypeLineageCoveragePayload(t, pageSpecRef),
+		[]ArtifactSourceInput{deliverySlicePageSpecSource},
+	); err != nil {
+		t.Fatalf("workflow delivery-slice PageSpec source was rejected at formal review: %v", err)
 	}
 	if _, err := service.Create(ctx, projectID.String(), userID.String(), CreateArtifactInput{
 		Kind: "prototype", Title: "Duplicate PageSpec source", Content: formalPayload,
