@@ -1362,7 +1362,9 @@ func (s *ArtifactService) loadPrototypeSemanticAuthority(
 	if blueprint.Input.Ref.AnchorID != nil {
 		anchor = strings.TrimSpace(*blueprint.Input.Ref.AnchorID)
 	}
-	if !blueprint.Input.Required || strings.TrimSpace(blueprint.Input.Purpose) != "blueprint" || anchor != pageNodeID ||
+	if !blueprint.Input.Required ||
+		!artifactLineagePurpose(blueprint.Input.Purpose, "blueprint", "delivery_slice_blueprint") ||
+		anchor != pageNodeID ||
 		blueprint.Artifact.Lifecycle != "active" || blueprint.Revision.WorkflowStatus != "approved" {
 		return prototypeSemanticAuthority{}, fmt.Errorf("%w: formal Prototype PageSpec must pin one approved Blueprint Page source", ErrBlockingGate)
 	}

@@ -502,6 +502,22 @@ func TestArtifactServicePrototypeLineageFormalAndExploratory(t *testing.T) {
 	); err != nil {
 		t.Fatalf("workflow delivery-slice PageSpec source was rejected at formal review: %v", err)
 	}
+	if err := database.Model(&storage.ArtifactRevisionSourceModel{}).
+		Where("revision_id = ? AND purpose = ?", pageSpecRef.RevisionID, "blueprint").
+		Update("purpose", "delivery_slice_blueprint").Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := service.validateArtifactLineageForReview(
+		ctx, database, projectID, "prototype", prototypeLineageCoveragePayload(t, pageSpecRef),
+		[]ArtifactSourceInput{deliverySlicePageSpecSource},
+	); err != nil {
+		t.Fatalf("Prototype rejected a PageSpec frozen from a delivery-slice Blueprint source: %v", err)
+	}
+	if err := database.Model(&storage.ArtifactRevisionSourceModel{}).
+		Where("revision_id = ? AND purpose = ?", pageSpecRef.RevisionID, "delivery_slice_blueprint").
+		Update("purpose", "blueprint").Error; err != nil {
+		t.Fatal(err)
+	}
 	if _, err := service.Create(ctx, projectID.String(), userID.String(), CreateArtifactInput{
 		Kind: "prototype", Title: "Duplicate PageSpec source", Content: formalPayload,
 		SourceVersions: []ArtifactSourceInput{
