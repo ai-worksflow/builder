@@ -475,11 +475,13 @@ func findOperation(operations []ProposalOperation, id string) *ProposalOperation
 
 func topologicalOperations(operations []ProposalOperation, acceptedOnly bool) ([]ProposalOperation, error) {
 	selected := map[string]ProposalOperation{}
-	for _, operation := range operations {
+	order := map[string]int{}
+	for index, operation := range operations {
 		if acceptedOnly && operation.Decision != DecisionAccepted {
 			continue
 		}
 		selected[operation.ID] = operation
+		order[operation.ID] = index
 	}
 	indegree := map[string]int{}
 	dependents := map[string][]string{}
@@ -504,7 +506,7 @@ func topologicalOperations(operations []ProposalOperation, acceptedOnly bool) ([
 			queue = append(queue, id)
 		}
 	}
-	sort.Strings(queue)
+	sort.Slice(queue, func(i, j int) bool { return order[queue[i]] < order[queue[j]] })
 	ordered := make([]ProposalOperation, 0, len(selected))
 	for len(queue) > 0 {
 		id := queue[0]
@@ -514,7 +516,7 @@ func topologicalOperations(operations []ProposalOperation, acceptedOnly bool) ([
 			indegree[dependent]--
 			if indegree[dependent] == 0 {
 				queue = append(queue, dependent)
-				sort.Strings(queue)
+				sort.Slice(queue, func(i, j int) bool { return order[queue[i]] < order[queue[j]] })
 			}
 		}
 	}

@@ -91,6 +91,36 @@ func TestProposalAppliesAcceptedOperationsInDependencyOrder(t *testing.T) {
 	}
 }
 
+func TestProposalPreservesDeclaredOrderForIndependentArrayAdds(t *testing.T) {
+	proposal := testProposal(t, []ProposalOperation{
+		{ID: "add-requirement-0", Kind: OperationAdd, Path: "/requirements/0", Value: json.RawMessage(`"r0"`)},
+		{ID: "add-requirement-1", Kind: OperationAdd, Path: "/requirements/1", Value: json.RawMessage(`"r1"`)},
+		{ID: "add-requirement-2", Kind: OperationAdd, Path: "/requirements/2", Value: json.RawMessage(`"r2"`)},
+		{ID: "add-criterion-0", Kind: OperationAdd, Path: "/criteria/0", Value: json.RawMessage(`"c0"`), DependsOn: []string{"add-requirement-1"}},
+		{ID: "add-criterion-1", Kind: OperationAdd, Path: "/criteria/1", Value: json.RawMessage(`"c1"`), DependsOn: []string{"add-requirement-0"}},
+		{ID: "add-criterion-2", Kind: OperationAdd, Path: "/criteria/2", Value: json.RawMessage(`"c2"`), DependsOn: []string{"add-requirement-2"}},
+	})
+	for index, operation := range proposal.Operations {
+		if err := proposal.Decide(operation.ID, DecisionAccepted, "reviewer", "", uint64(index+1)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	operations, err := proposal.AcceptedOperations()
+	if err != nil {
+		t.Fatal(err)
+	}
+	patched, err := ApplyProposalPatch(
+		json.RawMessage(`{"criteria":[],"items":[1],"name":"old","requirements":[]}`),
+		operations,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(patched) != `{"criteria":["c0","c1","c2"],"items":[1],"name":"old","requirements":["r0","r1","r2"]}` {
+		t.Fatalf("unexpected patch output: %s", patched)
+	}
+}
+
 func TestProposalPartialApplyIsFinalAndDependencySafe(t *testing.T) {
 	proposal := testProposal(t, []ProposalOperation{
 		{ID: "rename", Kind: OperationReplace, Path: "/name", Value: json.RawMessage(`"new"`)},
