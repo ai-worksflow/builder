@@ -227,15 +227,20 @@ func (p *LocalStaticProvider) ServeAsset(response http.ResponseWriter, request *
 		return
 	}
 	asset = strings.TrimPrefix(asset, "/")
+	directoryRequest := strings.HasSuffix(asset, "/")
+	if directoryRequest {
+		asset = strings.TrimSuffix(asset, "/")
+	}
 	if asset == "" {
 		asset = "index.html"
-	}
-	if asset == ".worksflow" || strings.HasPrefix(asset, ".worksflow/") {
-		http.NotFound(response, request)
-		return
+		directoryRequest = false
 	}
 	path, err := SanitizePath(asset)
 	if err != nil {
+		http.NotFound(response, request)
+		return
+	}
+	if path == ".worksflow" || strings.HasPrefix(path, ".worksflow/") {
 		http.NotFound(response, request)
 		return
 	}
@@ -246,6 +251,27 @@ func (p *LocalStaticProvider) ServeAsset(response http.ResponseWriter, request *
 		return
 	}
 	info, err := os.Lstat(target)
+	if err != nil || info.Mode()&os.ModeSymlink != 0 {
+		http.NotFound(response, request)
+		return
+	}
+	if directoryRequest || info.IsDir() {
+		if !info.IsDir() {
+			http.NotFound(response, request)
+			return
+		}
+		path, err = SanitizePath(pathpkg.Join(path, "index.html"))
+		if err != nil {
+			http.NotFound(response, request)
+			return
+		}
+		target = filepath.Join(root, filepath.FromSlash(path))
+		if ensureContained(root, target) != nil {
+			http.NotFound(response, request)
+			return
+		}
+		info, err = os.Lstat(target)
+	}
 	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
 		http.NotFound(response, request)
 		return
