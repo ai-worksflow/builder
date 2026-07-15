@@ -81,21 +81,36 @@ export function replaceArtifactWorkspaceSnapshotResource<TContent>(
   } as ArtifactWorkspaceSnapshot
 }
 
+export function normalizeProposal(proposal: ProposalDto): ProposalDto {
+  const raw = proposal as ProposalDto & {
+    readonly operations?: unknown
+    readonly assumptions?: unknown
+    readonly questions?: unknown
+  }
+  return {
+    ...proposal,
+    operations: arrayValue(raw.operations) as ProposalDto['operations'],
+    assumptions: stringArray(raw.assumptions),
+    questions: stringArray(raw.questions),
+  }
+}
+
 export function mergeArtifactWorkspaceProposalApply<TDraft>(
   snapshot: ArtifactWorkspaceSnapshot,
   proposal: ProposalDto,
   draft: ArtifactDraftDto<TDraft>,
 ): ArtifactWorkspaceSnapshot {
-  if (proposal.artifactId !== draft.artifactId) {
+  const normalizedProposal = normalizeProposal(proposal)
+  if (normalizedProposal.artifactId !== draft.artifactId) {
     throw new Error('Proposal apply returned a draft for a different artifact.')
   }
 
-  const existingProposal = snapshot.proposals.find((item) => item.id === proposal.id)
+  const existingProposal = snapshot.proposals.find((item) => item.id === normalizedProposal.id)
   const proposals = existingProposal
     ? snapshot.proposals.map((item) =>
-        item.id === proposal.id && item.version <= proposal.version ? proposal : item,
+        item.id === normalizedProposal.id && item.version <= normalizedProposal.version ? normalizedProposal : item,
       )
-    : [...snapshot.proposals, proposal]
+    : [...snapshot.proposals, normalizedProposal]
   const resourcesWithDraft = <TContent,>(
     resources: readonly VersionedArtifactDto<TContent>[],
   ): readonly VersionedArtifactDto<TContent>[] => resources.map((resource) => {
@@ -487,7 +502,7 @@ async function loadWorkspaceProposals(
       cursor,
       limit: PLATFORM_PAGE_LIMIT,
     })
-    proposals.push(...result.data.items)
+    proposals.push(...result.data.items.map(normalizeProposal))
 
     const nextCursor = result.data.nextCursor?.trim()
     if (!nextCursor || result.data.items.length === 0) break
@@ -801,7 +816,7 @@ export class ArtifactWorkspaceGateway {
       input.model?.trim() || 'gpt-5',
       { idempotencyKey: true },
     )
-    return { ...generated, data: generated.data.proposal }
+    return { ...generated, data: normalizeProposal(generated.data.proposal) }
   }
 
   async applyProposal(
@@ -813,7 +828,7 @@ export class ArtifactWorkspaceGateway {
     } = {},
   ) {
     const accepted = new Set(acceptedOperationIds)
-    let current = (await this.client.proposals.get(proposalId)).data
+    let current = normalizeProposal((await this.client.proposals.get(proposalId)).data)
     for (const operation of current.operations) {
       if (operation.decision !== 'pending') continue
       const decision = accepted.has(operation.id) ? 'accepted' : 'rejected'
@@ -828,7 +843,7 @@ export class ArtifactWorkspaceGateway {
         ifMatch: proposalEtag(current),
         idempotencyKey: true,
       })
-      current = result.data
+      current = normalizeProposal(result.data)
     }
     if (current.status !== 'ready') {
       throw new Error(
@@ -858,13 +873,13 @@ export class ArtifactWorkspaceGateway {
     return { ...applied, appliedProposal }
   }
 
-  decideProposalOperation(
+  async decideProposalOperation(
     proposal: Pick<ProposalDto, 'id' | 'version'>,
     operationId: string,
     decision: 'accepted' | 'rejected',
     reason?: string,
   ) {
-    return this.client.proposals.decide(proposal.id, {
+    const result = await this.client.proposals.decide(proposal.id, {
       operationId,
       decision,
       ...(reason ? { reason } : {}),
@@ -873,6 +888,7 @@ export class ArtifactWorkspaceGateway {
       ifMatch: proposalEtag(proposal),
       idempotencyKey: true,
     })
+    return { ...result, data: normalizeProposal(result.data) }
   }
 
   impact(blueprintArtifactId: string): Promise<{ data: ImpactReportDto }> {

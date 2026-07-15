@@ -584,17 +584,20 @@ function ProposalEditor({ proposals, selected, onSelected, instruction, onInstru
         </div>
       )}
       {proposals.map((proposal) => {
+        const operations = proposal.operations ?? []
+        const assumptions = proposal.assumptions ?? []
+        const questions = proposal.questions ?? []
         const selectedIds = selected[proposal.id] ?? []
-        const hasAccepted = proposal.operations.some((operation) => operation.decision === 'accepted' || selectedIds.includes(operation.id))
+        const hasAccepted = operations.some((operation) => operation.decision === 'accepted' || selectedIds.includes(operation.id))
         const isLinked = !linkedProposalId || proposal.id === linkedProposalId
         return (
           <article key={proposal.id} className={cn('rounded-lg border bg-panel p-3', isLinked ? 'border-primary/35' : 'border-border opacity-70')}>
             <div className="flex flex-wrap items-center gap-2"><Wand2 className="size-3.5 text-primary-bright" /><span className="text-[10px] font-semibold text-foreground">{t('teamPlatform.pageSpec.manifest', { id: proposal.manifest.id.slice(0, 12) })}</span><span className="rounded bg-primary/10 px-1.5 py-0.5 text-[8px] text-primary-bright">{proposalStatusLabel(proposal.status, t)}</span>{linkedProposalId && isLinked && <span className="rounded bg-success/10 px-1.5 py-0.5 text-[8px] font-semibold text-success">{t('teamPlatform.pageSpec.workflowLinked')}</span>}<code className="ml-auto text-[8px] text-faint-foreground">{t('teamPlatform.pageSpec.baseHash', { hash: proposal.baseRevision.contentHash.slice(0, 12) })}</code></div>
             <code className="mt-1 block break-all text-[8px] text-faint-foreground">{proposal.id}</code>
-            {proposal.assumptions.length > 0 && <p className="mt-2 text-[9px] text-muted-foreground">{t('teamPlatform.pageSpec.assumptions', { values: proposal.assumptions.join(' · ') })}</p>}
-            {proposal.questions.length > 0 && <p className="mt-1 text-[9px] text-warning">{t('teamPlatform.pageSpec.questions', { values: proposal.questions.join(' · ') })}</p>}
+            {assumptions.length > 0 && <p className="mt-2 text-[9px] text-muted-foreground">{t('teamPlatform.pageSpec.assumptions', { values: assumptions.join(' · ') })}</p>}
+            {questions.length > 0 && <p className="mt-1 text-[9px] text-warning">{t('teamPlatform.pageSpec.questions', { values: questions.join(' · ') })}</p>}
             <div className="mt-2 space-y-1.5">
-              {proposal.operations.map((operation) => (
+              {operations.map((operation) => (
                 <label key={operation.id} className="flex gap-2 rounded border border-border bg-background p-2 text-[9px] text-muted-foreground">
                   <input type="checkbox" disabled={!isLinked || Boolean(proposalBusyId) || operation.decision !== 'pending'} checked={operation.decision === 'accepted' || operation.decision === 'applied' || selectedIds.includes(operation.id)} onChange={(event) => onSelected({ ...selected, [proposal.id]: event.target.checked ? [...selectedIds, operation.id] : selectedIds.filter((id) => id !== operation.id) })} />
                   <span className="min-w-0 flex-1"><code>{proposalOperationLabel(operation.kind, t)} {operation.path || '/'}</code><span className="ml-2 text-faint-foreground">{proposalDecisionLabel(operation.decision, t)}</span>{operation.rationale && <span className="mt-1 block">{operation.rationale}</span>}{operation.value !== undefined && <pre className="mt-1 max-h-36 overflow-auto whitespace-pre-wrap rounded bg-black/20 p-1.5 font-mono text-[8px]">{JSON.stringify(operation.value, null, 2)}</pre>}</span>

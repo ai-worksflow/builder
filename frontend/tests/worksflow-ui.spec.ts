@@ -5476,8 +5476,6 @@ function pageSpecArtifactProposal(id: string) {
       rationale: 'Make the reviewed workflow goal explicit.',
       decision: 'accepted' as const,
     }],
-    assumptions: [],
-    questions: [],
     version: 1,
     createdBy: user.id,
     createdAt: now,

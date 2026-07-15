@@ -9,6 +9,7 @@ import {
   documentReviewIssues,
   mergeArtifactWorkspaceProposalApply,
   normalizeDocumentContent,
+  normalizeProposal,
   replaceArtifactWorkspaceSnapshotResource,
   reviewGateReadyForRequest,
   type ArtifactWorkspaceSnapshot,
@@ -470,6 +471,17 @@ test('PageSpec snapshot updates replace only the targeted canonical resource', (
   assert.equal(next.pageSpecs[0].draft?.content.userGoal, replacement.draft?.content.userGoal)
   assert.equal(next.pageSpecs[0].draft?.etag, '"page-spec-draft-3"')
   assert.strictEqual(next.documents, documents)
+})
+
+test('Proposal compatibility normalization supplies omitted collection fields', () => {
+  const normalized = normalizeProposal({
+    id: 'proposal-with-omitted-arrays',
+    questions: null,
+  } as unknown as ProposalDto)
+
+  assert.deepEqual(normalized.operations, [])
+  assert.deepEqual(normalized.assumptions, [])
+  assert.deepEqual(normalized.questions, [])
 })
 
 test('Proposal apply response updates the local Proposal and returned draft atomically', () => {
