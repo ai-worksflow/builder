@@ -4064,6 +4064,69 @@ test('Blueprint PageSpec editor autosaves, versions, and requests exact revision
   )).toBe(true)
 })
 
+test('Blueprint type selects persist canonical values instead of translated labels', async ({ page }) => {
+  const state = await installPlatformMock(page, { authenticated: true })
+  await page.goto(`/team/acme/project/${project.id}/blueprint`)
+
+  const nodeKind = page.getByLabel('Kind')
+  const edgeKind = page.getByLabel('Edge type')
+  await expect(nodeKind.locator('option').filter({ hasText: 'Data Model' })).toHaveAttribute('value', 'dataEntity')
+  await expect(edgeKind.locator('option').filter({ hasText: 'navigates to' })).toHaveAttribute('value', 'navigates_to')
+
+  await page.getByLabel('Source').selectOption('feature-orders')
+  await edgeKind.selectOption('navigates_to')
+  await page.getByLabel('Target').selectOption('page-dashboard')
+  await page.getByRole('button', { name: 'Connect' }).click()
+
+  await expect.poll(() => state.requests.some((request) => {
+    if (request.method !== 'PATCH' || request.path !== `/v1/blueprints/${blueprint.artifact.id}/draft`) return false
+    const content = (request.body as { content?: typeof blueprintContent })?.content
+    return content?.semantic.edges.some((edge) => edge.kind === 'navigates_to')
+  })).toBe(true)
+})
+
+test('Blueprint revision creation repairs a localized legacy edge before freezing the draft', async ({ page }) => {
+  const state = await installPlatformMock(page, { authenticated: true })
+  const localizedContent = structuredClone(blueprintContent)
+  localizedContent.edges[0].kind = '包含'
+  localizedContent.semantic.edges[0].kind = '包含'
+  state.blueprintProposal = blueprintArtifactProposal('applied')
+  state.blueprint = {
+    ...state.blueprint,
+    draft: {
+      id: 'blueprint-draft-legacy-edge',
+      artifactId: blueprint.artifact.id,
+      baseRevisionId: blueprintRevision.revisionId,
+      sourceVersions: [],
+      revision: 37,
+      content: localizedContent,
+      contentHash: hash('7'),
+      updatedBy: user.id,
+      updatedAt: now,
+      etag: '"blueprint-draft:37"',
+    },
+  }
+  await page.goto(`/team/acme/project/${project.id}/blueprint`)
+
+  const nextStep = page.getByRole('status').filter({ hasText: /Proposal applied/i })
+  const createRevision = nextStep.getByRole('button', { name: 'Create immutable revision', exact: true })
+  await expect(createRevision).toBeEnabled()
+  await createRevision.click()
+  await expect.poll(() => state.blueprintCreatedRevision?.id).toBe('cccccccc-cccc-4ccc-8ccc-ccccccccccc3')
+
+  const draftPath = `/v1/blueprints/${blueprint.artifact.id}/draft`
+  const revisionPath = `/v1/blueprints/${blueprint.artifact.id}/revisions`
+  const patchIndex = state.requests.findIndex((request) => request.method === 'PATCH' && request.path === draftPath)
+  const revisionIndex = state.requests.findIndex((request) => request.method === 'POST' && request.path === revisionPath)
+  expect(patchIndex).toBeGreaterThanOrEqual(0)
+  expect(revisionIndex).toBeGreaterThan(patchIndex)
+  const savedContent = (state.requests[patchIndex].body as { content: typeof blueprintContent }).content
+  expect(savedContent.edges[0].kind).toBe('contains')
+  expect(savedContent.semantic.edges[0].kind).toBe('contains')
+  expect(state.requests[revisionIndex].headers['if-match']).toBe('"blueprint-draft:38"')
+  expect(state.blueprintCreatedRevision?.content.semantic.edges[0].kind).toBe('contains')
+})
+
 test('Blueprint autosave preserves newer input and background refresh keeps the editor mounted', async ({ page }) => {
   const realtime = await installProjectWebSocketMock(page)
   const state = await installPlatformMock(page, {

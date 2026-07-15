@@ -46,6 +46,30 @@ const SUPPORTED_HTTP_METHODS = new Set([
   'OPTIONS',
 ])
 
+const EDGE_KIND_ALIASES: Readonly<Record<string, BlueprintEdgeDto['kind']>> = {
+  '驱动': 'drives',
+  'satisfied by': 'satisfied_by',
+  '由…满足': 'satisfied_by',
+  '由其满足': 'satisfied_by',
+  '包含': 'contains',
+  'navigates to': 'navigates_to',
+  '导航到': 'navigates_to',
+  '使用': 'uses',
+  '调用': 'calls',
+  '读取': 'reads',
+  '写入': 'writes',
+  '需要': 'requires',
+  renders: 'realized_by',
+  '渲染': 'realized_by',
+  'realized by': 'realized_by',
+  '由…实现': 'realized_by',
+  implements: 'implemented_by',
+  'implemented by': 'implemented_by',
+  'verified by': 'verified_by',
+  '由…验证': 'verified_by',
+  '由其验证': 'verified_by',
+}
+
 export function blueprintGate(content: BlueprintContentDto) {
   const nodes = Array.isArray(content.semantic?.nodes)
     ? content.semantic.nodes
@@ -61,6 +85,7 @@ export function blueprintGate(content: BlueprintContentDto) {
   const ids = new Set(nodes.map((node) => node.id))
   if (edges.some((edge) => !ids.has(edge.sourceNodeId) || !ids.has(edge.targetNodeId))) issues.push('Every edge must reference existing semantic nodes.')
   const pages = nodes.filter((node) => node.kind === 'page')
+  if (pages.length === 0) issues.push('At least one semantic Page node is required.')
   if (pages.some((node) => (node.requirementIds?.length ?? 0) === 0)) issues.push('Every page node must trace to at least one stable requirement ID.')
   if (pages.some((node) => !node.route?.trim() || !node.userGoal?.trim())) issues.push('Every page node needs a route and user goal before review.')
   if (pages.some((page) => !edges.some((edge) => edge.kind === 'contains' && edge.targetNodeId === page.id && nodes.find((node) => node.id === edge.sourceNodeId)?.kind === 'feature'))) issues.push('Every page node must belong to a feature through a contains edge.')
@@ -194,12 +219,24 @@ function semanticEdge(edge: BlueprintEdgeWire): BlueprintEdgeDto {
 
 function canonicalNodeKind(kind: BlueprintNodeDto['kind'] | string): BlueprintNodeDto['kind'] {
   switch (kind.trim().toLowerCase()) {
+    case '功能':
+      return 'feature'
+    case '页面':
+      return 'page'
+    case '组件':
+      return 'component'
     case 'api':
+    case 'api operation':
     case 'apioperation':
       return 'apiOperation'
+    case 'data model':
+    case '数据模型':
+    case '数据实体':
     case 'dataentity':
     case 'datamodel':
       return 'dataEntity'
+    case '权限':
+      return 'permission'
     case 'workbenchtarget':
       return 'workbenchTarget'
     default:
@@ -209,9 +246,7 @@ function canonicalNodeKind(kind: BlueprintNodeDto['kind'] | string): BlueprintNo
 
 function canonicalEdgeKind(kind: BlueprintEdgeDto['kind'] | string): BlueprintEdgeDto['kind'] {
   const normalized = kind.trim().toLowerCase()
-  if (normalized === 'renders') return 'realized_by'
-  if (normalized === 'implements') return 'implemented_by'
-  return normalized as BlueprintEdgeDto['kind']
+  return EDGE_KIND_ALIASES[normalized] ?? (normalized as BlueprintEdgeDto['kind'])
 }
 
 function firstNonEmptyString(...values: readonly unknown[]) {

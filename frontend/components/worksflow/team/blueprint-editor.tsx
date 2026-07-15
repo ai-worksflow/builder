@@ -1048,7 +1048,7 @@ export function BlueprintEditor() {
                 <div className="mb-3 flex flex-wrap items-center gap-2">
                   <select onChange={(event) => addNode(event.target.value as BlueprintNodeKind)} value="" disabled={readOnly} aria-label={t('teamPlatform.blueprint.addSemanticNode')} className="h-8 rounded-md border border-border bg-panel px-2 text-[10px] text-foreground disabled:opacity-50"><option value="" disabled>{t('teamPlatform.blueprint.addSemanticNode')}</option>{NODE_KINDS.map((kind) => <option key={kind} value={kind}>{nodeKindLabel(kind, t)}</option>)}</select>
                   <select value={edgeSourceId} onChange={(event) => setEdgeSourceId(event.target.value)} aria-label={t('common.source')} className="h-8 rounded-md border border-border bg-panel px-2 text-[10px] text-foreground"><option value="">{t('common.source')}</option>{nodes.map((node) => <option key={node.id} value={node.id}>{node.title}</option>)}</select>
-                  <select value={edgeKind} onChange={(event) => setEdgeKind(event.target.value as BlueprintEdgeKind)} aria-label={t('blueprint.edgeType')} className="h-8 rounded-md border border-border bg-panel px-2 text-[10px] text-foreground">{EDGE_KINDS.map((kind) => <option key={kind}>{edgeKindLabel(kind, t)}</option>)}</select>
+                  <select value={edgeKind} onChange={(event) => setEdgeKind(event.target.value as BlueprintEdgeKind)} aria-label={t('blueprint.edgeType')} className="h-8 rounded-md border border-border bg-panel px-2 text-[10px] text-foreground">{EDGE_KINDS.map((kind) => <option key={kind} value={kind}>{edgeKindLabel(kind, t)}</option>)}</select>
                   <select value={edgeTargetId} onChange={(event) => setEdgeTargetId(event.target.value)} aria-label={t('common.target')} className="h-8 rounded-md border border-border bg-panel px-2 text-[10px] text-foreground"><option value="">{t('common.target')}</option>{nodes.map((node) => <option key={node.id} value={node.id}>{node.title}</option>)}</select>
                   <button type="button" onClick={addEdge} disabled={readOnly || !edgeSourceId || !edgeTargetId || edgeSourceId === edgeTargetId} className="h-8 rounded-md bg-primary px-3 text-[10px] font-semibold text-primary-foreground disabled:opacity-40"><Link2 className="mr-1 inline size-3" />{t('common.connect')}</button>
                 </div>
@@ -1161,7 +1161,7 @@ function NodeInspector({ node, position, readOnly, onChange, onMove, onDelete }:
       </div>
       <code className="block truncate text-[9px] text-faint-foreground">{node.id}</code>
       <label className="block text-[10px] text-muted-foreground">{t('teamPlatform.blueprint.stableBusinessKey')}<input value={node.key} readOnly={readOnly} onChange={(event) => onChange({ key: event.target.value })} className="mt-1 h-8 w-full rounded border border-border bg-background px-2 font-mono text-[10px] text-foreground" /></label>
-      <label className="block text-[10px] text-muted-foreground">{t('teamPlatform.blueprint.kind')}<select value={node.kind} disabled={readOnly} onChange={(event) => onChange({ kind: event.target.value as BlueprintNodeKind })} className="mt-1 h-8 w-full rounded border border-border bg-background px-2 text-[10px] text-foreground">{!NODE_KINDS.includes(node.kind) && <option value={node.kind}>{t('teamPlatform.blueprint.legacyKind', { kind: node.kind })}</option>}{NODE_KINDS.map((kind) => <option key={kind}>{nodeKindLabel(kind, t)}</option>)}</select></label>
+      <label className="block text-[10px] text-muted-foreground">{t('teamPlatform.blueprint.kind')}<select value={node.kind} disabled={readOnly} onChange={(event) => onChange({ kind: event.target.value as BlueprintNodeKind })} className="mt-1 h-8 w-full rounded border border-border bg-background px-2 text-[10px] text-foreground">{!NODE_KINDS.includes(node.kind) && <option value={node.kind}>{t('teamPlatform.blueprint.legacyKind', { kind: node.kind })}</option>}{NODE_KINDS.map((kind) => <option key={kind} value={kind}>{nodeKindLabel(kind, t)}</option>)}</select></label>
       <label className="block text-[10px] text-muted-foreground">{t('teamPlatform.blueprint.nodeTitle')}<input value={node.title} readOnly={readOnly} onChange={(event) => onChange({ title: event.target.value })} className="mt-1 h-8 w-full rounded border border-border bg-background px-2 text-[10px] text-foreground" /></label>
       <label className="block text-[10px] text-muted-foreground">{t('teamPlatform.blueprint.description')}<textarea value={node.description ?? ''} readOnly={readOnly} onChange={(event) => onChange({ description: event.target.value })} rows={4} className="mt-1 w-full rounded border border-border bg-background p-2 text-[10px] text-foreground" /></label>
       {node.kind === 'page' && <>
@@ -1205,11 +1205,35 @@ function GatePanel({ clientIssues, serverGate }: { clientIssues: string[]; serve
   const { locale, t } = useI18n()
   const serverErrors = serverGate?.checks
     .filter((check) => check.severity === 'error' && check.code !== 'canonical_review_approved')
-    .map((check) => check.message) ?? []
-  const issues = [...clientIssues, ...serverErrors]
-  const requestReady = issues.length === 0 && reviewGateReadyForRequest(serverGate)
+    ?? []
+  const requestReady = clientIssues.length === 0
+    && serverErrors.length === 0
+    && reviewGateReadyForRequest(serverGate)
   const approved = Boolean(serverGate?.passed)
-  return <div className={cn('rounded-lg border p-3', approved || requestReady ? 'border-success/30 bg-success/10' : 'border-warning/30 bg-warning/10')}><div className="flex items-center gap-2 text-[11px] font-semibold text-foreground">{approved || requestReady ? <CheckCircle2 className="size-4 text-success" /> : <AlertTriangle className="size-4 text-warning" />}{t('teamPlatform.blueprint.gateStatus', { status: approved ? t('doc.status.approved') : requestReady ? t('teamPlatform.blueprint.readyToRequest') : t('teamPlatform.graph.status.blocked') })}</div>{issues.map((issue) => <p key={issue} className="mt-1 text-[10px] text-muted-foreground">• {blueprintIssueLabel(issue, t)}</p>)}{requestReady && !approved && <p className="mt-1 text-[10px] text-success">{t('teamPlatform.editor.gateChecksPassed')}</p>}{serverGate && <p className="mt-2 text-[9px] text-faint-foreground">{t('teamPlatform.blueprint.traceCoverage', { percent: new Intl.NumberFormat(locale, { maximumFractionDigits: 0 }).format(serverGate.traceCoverage * 100), count: serverGate.unresolvedBlockingCommentIds.length.toLocaleString(locale) })}</p>}</div>
+  const revisionIsBehindDraft = serverErrors.some((check) => check.code === 'draft_matches_latest_revision')
+  return (
+    <div className={cn('rounded-lg border p-3', approved || requestReady ? 'border-success/30 bg-success/10' : 'border-warning/30 bg-warning/10')}>
+      <div className="flex items-center gap-2 text-[11px] font-semibold text-foreground">
+        {approved || requestReady ? <CheckCircle2 className="size-4 text-success" /> : <AlertTriangle className="size-4 text-warning" />}
+        {t('teamPlatform.blueprint.gateStatus', { status: approved ? t('doc.status.approved') : requestReady ? t('teamPlatform.blueprint.readyToRequest') : t('teamPlatform.graph.status.blocked') })}
+      </div>
+      {clientIssues.length > 0 && (
+        <div className="mt-2">
+          <p className="text-[9px] font-semibold uppercase text-faint-foreground">{t('teamPlatform.blueprint.currentDraftIssues')}</p>
+          {clientIssues.map((issue) => <p key={issue} className="mt-1 text-[10px] text-muted-foreground">• {blueprintIssueLabel(issue, t)}</p>)}
+        </div>
+      )}
+      {serverErrors.length > 0 && (
+        <div className="mt-2">
+          <p className="text-[9px] font-semibold uppercase text-faint-foreground">{t('teamPlatform.blueprint.latestRevisionIssues')}</p>
+          {revisionIsBehindDraft && <p className="mt-1 text-[9px] text-warning">{t('teamPlatform.blueprint.latestRevisionBehindDraft')}</p>}
+          {serverErrors.map((check, index) => <p key={`${check.code}:${check.path ?? ''}:${check.sourceId ?? ''}:${index}`} className="mt-1 text-[10px] text-muted-foreground">• {blueprintIssueLabel(check.message, t)}</p>)}
+        </div>
+      )}
+      {requestReady && !approved && <p className="mt-1 text-[10px] text-success">{t('teamPlatform.editor.gateChecksPassed')}</p>}
+      {serverGate && <p className="mt-2 text-[9px] text-faint-foreground">{t('teamPlatform.blueprint.traceCoverage', { percent: new Intl.NumberFormat(locale, { maximumFractionDigits: 0 }).format(serverGate.traceCoverage * 100), count: serverGate.unresolvedBlockingCommentIds.length.toLocaleString(locale) })}</p>}
+    </div>
+  )
 }
 
 function ProposalPanel({ proposals, selected, onSelected, instruction, onInstruction, canEdit, canCreate, onCreate, onApply }: { proposals: readonly ProposalDto[]; selected: Record<string, string[]>; onSelected: (next: Record<string, string[]>) => void; instruction: string; onInstruction: (value: string) => void; canEdit: boolean; canCreate: boolean; onCreate: () => void; onApply: (proposal: ProposalDto) => void }) {
@@ -1393,6 +1417,7 @@ function localizedModuleTemplate(template: BlueprintModuleTemplate, t: Translate
 function blueprintIssueLabel(issue: string, t: Translate) {
   const labels: Record<string, string> = {
     'At least one semantic node is required.': t('teamPlatform.blueprint.issue.nodeRequired'),
+    'At least one semantic Page node is required.': t('teamPlatform.blueprint.issue.pageRequired'),
     'Every node needs a stable ID, business key, and title.': t('teamPlatform.blueprint.issue.nodeIdentity'),
     'Every node business key must be unique.': t('teamPlatform.blueprint.issue.uniqueKey'),
     'Every semantic node needs a separate layout position.': t('teamPlatform.blueprint.issue.layoutPosition'),

@@ -908,6 +908,40 @@ test('Blueprint normalization canonicalizes backend wire aliases and nested Page
   assert.deepEqual(blueprintGate(normalized), [])
 })
 
+test('Blueprint normalization repairs localized node and edge values persisted by translated selects', () => {
+  const localized = {
+    nodes: [
+      {
+        id: 'feature-interview',
+        key: 'FEATURE-INTERVIEW',
+        kind: '功能',
+        title: 'AI 引导功能',
+      },
+      {
+        id: 'page-interview',
+        key: 'PAGE-INTERVIEW',
+        kind: '页面',
+        title: 'AI 访谈',
+        route: '/interview',
+        userGoal: '完成 AI 访谈。',
+        requirementIds: ['req-ai-interview-guidance'],
+      },
+    ],
+    edges: [{
+      id: 'edge-feature-page',
+      sourceNodeId: 'feature-interview',
+      targetNodeId: 'page-interview',
+      kind: '包含',
+      required: true,
+    }],
+  } as unknown as BlueprintContentDto
+
+  const normalized = normalizeBlueprintContent(localized)
+  assert.deepEqual(normalized.semantic?.nodes.map((node) => node.kind), ['feature', 'page'])
+  assert.equal(normalized.semantic?.edges[0]?.kind, 'contains')
+  assert.deepEqual(blueprintGate(normalized), [])
+})
+
 test('Blueprint normalization canonicalizes Permission role aliases', () => {
   const legacy: BlueprintContentDto = {
     nodes: [{
@@ -969,7 +1003,7 @@ test('Blueprint API operations require unique valid contracts and permission edg
     validation: [],
   }
   const valid = normalizeBlueprintContent(base)
-  assert.deepEqual(blueprintGate(valid), [])
+  assert.deepEqual(blueprintGate(valid), ['At least one semantic Page node is required.'])
 
   const duplicate = normalizeBlueprintContent({
     ...base,
