@@ -1356,7 +1356,8 @@ func (e *Engine) RetryNode(ctx context.Context, runID, nodeKey, actorID, reason 
 	builder := newMutationBuilder(e, run, now)
 	expected := node.Status
 	metadata := run.Context.Nodes[node.Key]
-	metadata.MaxAttempts = max(metadata.MaxAttempts, node.Attempt+1)
+	maxAttempts, _ := nodeLimits(definitionNode)
+	metadata.MaxAttempts = max(maxAttempts, 1)
 	_, _, requiresActor := nodeExecutionPolicy(definitionNode)
 	if requiresActor {
 		metadata.ExecutionActor = nil

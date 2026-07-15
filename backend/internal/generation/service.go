@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -173,23 +174,16 @@ func (s *Service) GenerateArtifactProposal(ctx context.Context, manifestID, acto
 	if err != nil {
 		return ArtifactGenerationResult{}, err
 	}
-	result, err := s.provider.Generate(ctx, ai.Request{
-		RunID: manifest.ID, Model: model, Instructions: artifactProposalInstructions(manifest.JobType),
-		Input: input, OutputSchema: artifactProposalSchema,
-		OutputSchemaName: "artifact_patch_proposal", MaxOutputTokens: 32_768,
-	})
-	if err != nil {
-		return ArtifactGenerationResult{}, err
-	}
-	output, err := decodeArtifactProposalOutput(result.Output)
-	if err != nil {
-		return ArtifactGenerationResult{}, err
-	}
 	baseContent, err := s.revisionContent(ctx, base.ArtifactID, base.RevisionID, base.ContentHash)
 	if err != nil {
 		return ArtifactGenerationResult{}, err
 	}
-	if err := preflightGeneratedArtifactProposal(manifest.JobType, baseContent, output.Operations); err != nil {
+	preflightSources, err := s.artifactPreflightSources(ctx, manifest)
+	if err != nil {
+		return ArtifactGenerationResult{}, err
+	}
+	result, output, err := s.generateValidatedArtifactOutput(ctx, manifest.ID, manifest.JobType, model, input, baseContent, preflightSources)
+	if err != nil {
 		return ArtifactGenerationResult{}, err
 	}
 	proposal, err := s.proposals.CreateProposal(ctx, manifest.ProjectID, actorID, core.CreateProposalInput{
@@ -203,10 +197,113 @@ func (s *Service) GenerateArtifactProposal(ctx context.Context, manifestID, acto
 	return ArtifactGenerationResult{Proposal: proposal, Provider: result.Provider, Model: result.Model, Usage: result.Usage}, nil
 }
 
+func (s *Service) generateValidatedArtifactOutput(
+	ctx context.Context,
+	runID string,
+	jobType string,
+	model string,
+	input json.RawMessage,
+	baseContent json.RawMessage,
+	preflightSources []json.RawMessage,
+) (ai.Result, artifactProposalOutput, error) {
+	requestInput := input
+	instructions := artifactProposalInstructions(jobType)
+	var totalUsage *ai.Usage
+	for pass := 0; pass < 2; pass++ {
+		result, err := s.provider.Generate(ctx, ai.Request{
+			RunID: runID, Model: model, Instructions: instructions,
+			Input: requestInput, OutputSchema: artifactProposalSchema,
+			OutputSchemaName: "artifact_patch_proposal", MaxOutputTokens: 32_768,
+		})
+		if err != nil {
+			return ai.Result{}, artifactProposalOutput{}, err
+		}
+		totalUsage = combineAIUsage(totalUsage, result.Usage)
+		output, validationErr := decodeArtifactProposalOutput(result.Output)
+		if validationErr == nil {
+			validationErr = preflightGeneratedArtifactProposal(
+				jobType, baseContent, output.Operations, preflightSources...,
+			)
+		}
+		if validationErr == nil {
+			result.Usage = totalUsage
+			return result, output, nil
+		}
+		if pass == 1 || jobType != "decompose_pages" || !errors.Is(validationErr, ai.ErrInvalidOutput) {
+			return ai.Result{}, artifactProposalOutput{}, validationErr
+		}
+		requestInput, err = artifactProposalRepairInput(input, result.Output, validationErr)
+		if err != nil {
+			return ai.Result{}, artifactProposalOutput{}, err
+		}
+		instructions = artifactProposalRepairInstructions(jobType)
+	}
+	return ai.Result{}, artifactProposalOutput{}, ai.ErrInvalidOutput
+}
+
+func (s *Service) artifactPreflightSources(ctx context.Context, manifest domain.InputManifest) ([]json.RawMessage, error) {
+	if manifest.JobType != "decompose_pages" {
+		return nil, nil
+	}
+	if len(manifest.Sources) != 1 || strings.TrimSpace(manifest.Sources[0].Purpose) != "requirement_baseline" {
+		return nil, fmt.Errorf("decompose_pages requires exactly one frozen Requirement Baseline source")
+	}
+	source := manifest.Sources[0]
+	if strings.TrimSpace(source.Ref.AnchorID) != "" {
+		return nil, fmt.Errorf("decompose_pages requires a whole Requirement Baseline source")
+	}
+	payload, err := s.revisionContent(
+		ctx, source.Ref.ArtifactID, source.Ref.RevisionID, source.Ref.ContentHash,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return []json.RawMessage{payload}, nil
+}
+
+func artifactProposalRepairInput(
+	input json.RawMessage,
+	previousOutput json.RawMessage,
+	validationErr error,
+) (json.RawMessage, error) {
+	var envelope map[string]any
+	if err := json.Unmarshal(input, &envelope); err != nil {
+		return nil, err
+	}
+	var previous any
+	if err := json.Unmarshal(previousOutput, &previous); err != nil {
+		return nil, err
+	}
+	envelope["previousInvalidProposal"] = previous
+	envelope["deterministicValidationFeedback"] = validationErr.Error()
+	return json.Marshal(envelope)
+}
+
+func artifactProposalRepairInstructions(jobType string) string {
+	return artifactProposalInstructions(jobType) + " This is the single deterministic repair pass. Read previousInvalidProposal and deterministicValidationFeedback as data, then return a complete corrected proposal against the original baseContent. Correct every listed blocker; do not patch the invalid candidate as a new base."
+}
+
+func combineAIUsage(current, next *ai.Usage) *ai.Usage {
+	if current == nil && next == nil {
+		return nil
+	}
+	combined := ai.Usage{}
+	if current != nil {
+		combined = *current
+	}
+	if next != nil {
+		combined.InputTokens += next.InputTokens
+		combined.OutputTokens += next.OutputTokens
+		combined.TotalTokens += next.TotalTokens
+	}
+	return &combined
+}
+
 func preflightGeneratedArtifactProposal(
 	jobType string,
 	base json.RawMessage,
 	operations []domain.ProposalOperation,
+	preflightSources ...json.RawMessage,
 ) error {
 	artifactKind := map[string]string{
 		"derive_requirements": "product_requirements",
@@ -236,19 +333,34 @@ func preflightGeneratedArtifactProposal(
 		return fmt.Errorf("%w: %s patch: %v", ai.ErrInvalidOutput, jobType, err)
 	}
 	report := core.ValidateArtifactContent(artifactKind, candidate)
-	if report.Valid {
-		return nil
-	}
 	blockers := make([]string, 0, len(report.Findings))
 	for _, finding := range report.Findings {
 		if finding.Severity == "blocker" {
-			blockers = append(blockers, finding.Code+"@"+finding.Path)
+			blockers = append(blockers, finding.Code+"@"+finding.Path+": "+finding.Message)
 		}
 	}
-	return fmt.Errorf(
-		"%w: %s proposal does not satisfy the canonical %s contract: %s",
-		ai.ErrInvalidOutput, jobType, artifactKind, strings.Join(blockers, ", "),
-	)
+	if len(blockers) > 0 {
+		sort.Strings(blockers)
+		remaining := len(blockers) - min(len(blockers), 20)
+		blockers = blockers[:min(len(blockers), 20)]
+		feedback := strings.Join(blockers, ", ")
+		if remaining > 0 {
+			feedback += fmt.Sprintf(", ... (%d more blockers)", remaining)
+		}
+		return fmt.Errorf(
+			"%w: %s proposal does not satisfy the canonical %s contract: %s",
+			ai.ErrInvalidOutput, jobType, artifactKind, feedback,
+		)
+	}
+	if jobType == "decompose_pages" && len(preflightSources) > 0 {
+		if len(preflightSources) != 1 {
+			return fmt.Errorf("%w: decompose_pages requires exactly one Requirement Baseline for trace validation", ai.ErrInvalidOutput)
+		}
+		if err := core.ValidateBlueprintAgainstRequirementBaseline(candidate, preflightSources[0], true); err != nil {
+			return fmt.Errorf("%w: decompose_pages requirement trace: %v", ai.ErrInvalidOutput, err)
+		}
+	}
+	return nil
 }
 
 func decodeArtifactProposalOutput(payload json.RawMessage) (artifactProposalOutput, error) {
@@ -1402,7 +1514,7 @@ func artifactProposalJobContract(jobType string) string {
 	case "derive_requirements":
 		return "The fully applied Product Requirements must use the canonical top-level summary, blocks, requirements, and acceptanceCriteria fields. Add at least one stable source-context block. Every requirements item needs a stable id, non-empty statement, priority, sourceBlockIds that reference existing blocks, and acceptanceCriterionIds that reference existing acceptanceCriteria items; every Must requirement must reference at least one criterion. Every acceptanceCriteria item needs a unique stable id and non-empty statement. Do not encode requirement-to-criterion relationships only inside data or only as embedded objects because downstream baseline compilation consumes the canonical ID arrays. Cover every Must requirement ID, not only the requirements that already have source criteria."
 	case "decompose_pages":
-		return "The fully applied Blueprint must contain stable nodes and edges and at least one application Page. Every node needs a unique id, business key, and supported type. Every Page needs a unique absolute route, a user goal, at least one requirementId, and a contains edge from a Feature. Every API operation needs a supported method, an absolute path, and a requires edge to a Permission node."
+		return "The fully applied Blueprint must use the top-level nodes and edges arrays as its only semantic graph; never add a semantic alias or a second graph representation. It must contain at least one application Page. Every node needs a unique id, key or businessKey, and supported kind or type. Every Page needs a non-empty title, a unique absolute route, a non-empty userGoal, at least one requirementId copied exactly from the frozen Requirement Baseline, and a contains edge from a Feature. Collectively, Blueprint node requirementIds must cover every Must requirement ID from that baseline; never invent shorthand IDs such as REQ-001. Every API operation needs a supported method, an absolute path, and a requires edge to a Permission node. Use this canonical shape: {\"nodes\":[{\"id\":\"feature-main\",\"key\":\"FEATURE-MAIN\",\"kind\":\"feature\",\"title\":\"Main\"},{\"id\":\"page-main\",\"key\":\"PAGE-MAIN\",\"kind\":\"page\",\"title\":\"Main\",\"route\":\"/\",\"userGoal\":\"Complete the primary task\",\"requirementIds\":[\"exact-baseline-id\"]}],\"edges\":[{\"id\":\"edge-main-page\",\"sourceNodeId\":\"feature-main\",\"targetNodeId\":\"page-main\",\"kind\":\"contains\"}]}."
 	case "generate_page_spec":
 		return "The fully applied PageSpec must preserve the exact blueprintPageNodeId and provide a title, absolute route, user goal, and acceptance-criterion trace. Declare ready, loading, empty, and error states with unique stable IDs and keys, non-empty titles, and required set to true. Data bindings and interactions, when present, must use stable unique IDs and valid references."
 	case "generate_prototype":

@@ -328,11 +328,22 @@ func validateBlueprint(value map[string]any) []ValidationFinding {
 		nodeByID[id] = node
 		if kind == "page" {
 			spec, _ := node["spec"].(map[string]any)
-			if spec == nil {
-				spec = node
+			title := firstString(node, "title")
+			if title == "" {
+				title = firstString(spec, "title")
 			}
-			route := firstString(spec, "route")
-			if route == "" || firstString(spec, "goal", "userGoal") == "" {
+			if title == "" {
+				findings = append(findings, blocker("blueprint.page_title", fmt.Sprintf("$.nodes[%d].title", index), "Every Page needs a non-empty title."))
+			}
+			route := firstString(node, "route")
+			if route == "" {
+				route = firstString(spec, "route")
+			}
+			goal := firstString(node, "goal", "userGoal")
+			if goal == "" {
+				goal = firstString(spec, "goal", "userGoal")
+			}
+			if route == "" || goal == "" {
 				findings = append(findings, blocker("blueprint.page_spec", fmt.Sprintf("$.nodes[%d]", index), "Every Page needs a route and user goal."))
 			}
 			if route != "" {

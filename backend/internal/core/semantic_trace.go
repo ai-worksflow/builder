@@ -74,6 +74,23 @@ func decodeRequirementTrace(payload json.RawMessage) (requirementTraceSnapshot, 
 	return result, nil
 }
 
+// ValidateBlueprintAgainstRequirementBaseline checks that every Blueprint
+// requirement reference belongs to the supplied Requirement Baseline and,
+// when requested, that the Blueprint covers every Must requirement.
+func ValidateBlueprintAgainstRequirementBaseline(
+	blueprint, baseline json.RawMessage,
+	requireMustCoverage bool,
+) error {
+	trace, err := decodeRequirementTrace(baseline)
+	if err != nil {
+		return fmt.Errorf("decode Requirement Baseline trace: %w", err)
+	}
+	if err := validateBlueprintRequirementTrace(blueprint, trace, requireMustCoverage); err != nil {
+		return fmt.Errorf("validate Blueprint against Requirement Baseline trace: %w", err)
+	}
+	return nil
+}
+
 func validateBlueprintRequirementTrace(payload json.RawMessage, trace requirementTraceSnapshot, strictValues ...bool) error {
 	var envelope struct {
 		Nodes    []json.RawMessage `json:"nodes"`

@@ -45,6 +45,39 @@ func (p *generationProviderSpy) Generate(context.Context, ai.Request) (ai.Result
 	return ai.Result{}, nil
 }
 
+type scriptedArtifactProvider struct {
+	requests []ai.Request
+	results  []ai.Result
+	failures []error
+}
+
+func (p *scriptedArtifactProvider) Generate(_ context.Context, request ai.Request) (ai.Result, error) {
+	index := len(p.requests)
+	p.requests = append(p.requests, request)
+	if index < len(p.failures) && p.failures[index] != nil {
+		return ai.Result{}, p.failures[index]
+	}
+	if index >= len(p.results) {
+		return ai.Result{}, errors.New("unexpected provider call")
+	}
+	return p.results[index], nil
+}
+
+func generatedArtifactResult(t *testing.T, candidate json.RawMessage, usage ai.Usage) ai.Result {
+	t.Helper()
+	payload, err := json.Marshal(artifactProposalAIOutput{
+		Operations: []artifactProposalAIOperation{{
+			ID: "replace-root", Kind: domain.OperationReplace, Path: "", ValueJSON: string(candidate),
+			DependsOn: []string{}, Rationale: "Generate the canonical artifact.",
+		}},
+		Assumptions: []string{}, Questions: []string{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ai.Result{Provider: "test", Model: "test-model", Output: payload, Usage: &usage}
+}
+
 type recoveryPermissionWorkbench struct {
 	proposal    core.ImplementationProposal
 	bundleCalls int
@@ -419,8 +452,12 @@ func TestArtifactProposalInstructionsIncludeCanonicalReviewContracts(t *testing.
 	tests := map[string][]string{
 		"refine_project_brief": {"top-level summary", "goal block", "blocking open question"},
 		"derive_requirements":  {"top-level summary, blocks, requirements, and acceptanceCriteria", "sourceBlockIds", "acceptanceCriterionIds", "every Must requirement ID"},
-		"decompose_pages":      {"at least one application Page", "contains edge from a Feature", "requires edge to a Permission"},
-		"generate_page_spec":   {"blueprintPageNodeId", "ready, loading, empty, and error", "acceptance-criterion trace"},
+		"decompose_pages": {
+			"top-level nodes and edges", "never add a semantic alias", "non-empty title",
+			"copied exactly from the frozen Requirement Baseline", "cover every Must requirement ID",
+			"contains edge from a Feature", "requires edge to a Permission", "sourceNodeId",
+		},
+		"generate_page_spec": {"blueprintPageNodeId", "ready, loading, empty, and error", "acceptance-criterion trace"},
 		"generate_prototype": {
 			"pageSpecRevision", "state set exactly", "fixtureIds arrays that exactly match", "Never invent a fixture or interaction",
 			"integer HTTP statusCode", "sanitized true", "declarative action", "semantic layer object record",
@@ -438,6 +475,134 @@ func TestArtifactProposalInstructionsIncludeCanonicalReviewContracts(t *testing.
 				}
 			}
 		})
+	}
+}
+
+func TestDecomposePagesRepairsOneInvalidCandidateWithDeterministicFeedback(t *testing.T) {
+	t.Parallel()
+	base := json.RawMessage(`{"schemaVersion":1,"nodes":[],"edges":[],"pageSpecs":[]}`)
+	baseline := json.RawMessage(`{
+  "requirements":[
+    {"type":"requirement","requirementId":"REQ-A","priority":"must","acceptanceCriterionIds":["AC-A"]},
+    {"type":"requirement","requirementId":"REQ-B","priority":"must","acceptanceCriterionIds":["AC-B"]},
+    {"type":"acceptanceCriterion","acceptanceCriterionId":"AC-A"},
+    {"type":"acceptanceCriterion","acceptanceCriterionId":"AC-B"}
+  ]
+}`)
+	invalid := json.RawMessage(`{
+  "schemaVersion":1,
+  "nodes":[
+    {"id":"feature-main","key":"FEATURE-MAIN","kind":"feature"},
+    {"id":"page-main","key":"PAGE-MAIN","kind":"page","route":"/","userGoal":"Complete the primary task","requirementIds":["REQ-A","REQ-B"]}
+  ],
+  "edges":[{"id":"edge-main","sourceNodeId":"feature-main","targetNodeId":"page-main","kind":"contains"}]
+}`)
+	valid := json.RawMessage(`{
+  "schemaVersion":1,
+  "nodes":[
+    {"id":"feature-main","key":"FEATURE-MAIN","kind":"feature","title":"Main"},
+    {"id":"page-main","key":"PAGE-MAIN","kind":"page","title":"Main","route":"/","userGoal":"Complete the primary task","requirementIds":["REQ-A","REQ-B"]}
+  ],
+  "edges":[{"id":"edge-main","sourceNodeId":"feature-main","targetNodeId":"page-main","kind":"contains"}]
+}`)
+	provider := &scriptedArtifactProvider{results: []ai.Result{
+		generatedArtifactResult(t, invalid, ai.Usage{InputTokens: 10, OutputTokens: 20, TotalTokens: 30}),
+		generatedArtifactResult(t, valid, ai.Usage{InputTokens: 40, OutputTokens: 50, TotalTokens: 90}),
+	}}
+	service := &Service{provider: provider}
+	originalInput := json.RawMessage(`{"baseContent":{"schemaVersion":1,"nodes":[],"edges":[]},"sources":[]}`)
+	result, _, err := service.generateValidatedArtifactOutput(
+		context.Background(), "manifest", "decompose_pages", "test-model",
+		originalInput, base, []json.RawMessage{baseline},
+	)
+	if err != nil {
+		t.Fatalf("repair did not produce a canonical Blueprint: %v", err)
+	}
+	if len(provider.requests) != 2 {
+		t.Fatalf("provider calls = %d, want one generation plus one repair", len(provider.requests))
+	}
+	if result.Usage == nil || *result.Usage != (ai.Usage{InputTokens: 50, OutputTokens: 70, TotalTokens: 120}) {
+		t.Fatalf("repair usage was not accumulated: %#v", result.Usage)
+	}
+	var repairInput map[string]any
+	if err := json.Unmarshal(provider.requests[1].Input, &repairInput); err != nil {
+		t.Fatal(err)
+	}
+	feedback, _ := repairInput["deterministicValidationFeedback"].(string)
+	if repairInput["baseContent"] == nil || repairInput["previousInvalidProposal"] == nil ||
+		!strings.Contains(feedback, "blueprint.page_title") || !strings.Contains(feedback, "non-empty title") {
+		t.Fatalf("repair input lost immutable base, invalid candidate, or detailed feedback: %#v", repairInput)
+	}
+	if !strings.Contains(provider.requests[1].Instructions, "single deterministic repair pass") {
+		t.Fatalf("repair request lacked its bounded repair contract: %s", provider.requests[1].Instructions)
+	}
+}
+
+func TestDecomposePagesStopsAfterOneFailedRepair(t *testing.T) {
+	t.Parallel()
+	base := json.RawMessage(`{"schemaVersion":1,"nodes":[],"edges":[]}`)
+	invalid := json.RawMessage(`{"schemaVersion":1,"nodes":[],"edges":[]}`)
+	provider := &scriptedArtifactProvider{results: []ai.Result{
+		generatedArtifactResult(t, invalid, ai.Usage{}),
+		generatedArtifactResult(t, invalid, ai.Usage{}),
+	}}
+	service := &Service{provider: provider}
+	_, _, err := service.generateValidatedArtifactOutput(
+		context.Background(), "manifest", "decompose_pages", "test-model",
+		json.RawMessage(`{"baseContent":{},"sources":[]}`), base, nil,
+	)
+	if !errors.Is(err, ai.ErrInvalidOutput) || len(provider.requests) != 2 {
+		t.Fatalf("invalid repair was not bounded to two provider calls: calls=%d err=%v", len(provider.requests), err)
+	}
+}
+
+func TestArtifactGenerationDoesNotRepairProviderFailures(t *testing.T) {
+	t.Parallel()
+	provider := &scriptedArtifactProvider{failures: []error{ai.ErrUnavailable}}
+	service := &Service{provider: provider}
+	_, _, err := service.generateValidatedArtifactOutput(
+		context.Background(), "manifest", "decompose_pages", "test-model",
+		json.RawMessage(`{"baseContent":{},"sources":[]}`),
+		json.RawMessage(`{"schemaVersion":1,"nodes":[],"edges":[]}`), nil,
+	)
+	if !errors.Is(err, ai.ErrUnavailable) || len(provider.requests) != 1 {
+		t.Fatalf("provider failure triggered a repair: calls=%d err=%v", len(provider.requests), err)
+	}
+}
+
+func TestBlueprintProposalPreflightUsesExactRequirementBaselineTrace(t *testing.T) {
+	t.Parallel()
+	base := json.RawMessage(`{"schemaVersion":1,"nodes":[],"edges":[]}`)
+	baseline := json.RawMessage(`{
+  "requirements":[
+    {"type":"requirement","requirementId":"REQ-A","priority":"must","acceptanceCriterionIds":["AC-A"]},
+    {"type":"requirement","requirementId":"REQ-B","priority":"must","acceptanceCriterionIds":["AC-B"]},
+    {"type":"acceptanceCriterion","acceptanceCriterionId":"AC-A"},
+    {"type":"acceptanceCriterion","acceptanceCriterionId":"AC-B"}
+  ]
+}`)
+	candidate := func(requirementIDs string) json.RawMessage {
+		return json.RawMessage(fmt.Sprintf(`{
+  "nodes":[
+    {"id":"feature-main","key":"FEATURE-MAIN","kind":"feature"},
+    {"id":"page-main","key":"PAGE-MAIN","kind":"page","title":"Main","route":"/","userGoal":"Complete the primary task","requirementIds":[%s]}
+  ],
+  "edges":[{"id":"edge-main","sourceNodeId":"feature-main","targetNodeId":"page-main","kind":"contains"}]
+}`, requirementIDs))
+	}
+	preflight := func(content json.RawMessage) error {
+		return preflightGeneratedArtifactProposal("decompose_pages", base, []domain.ProposalOperation{{
+			ID: "replace-root", Kind: domain.OperationReplace, Path: "", Value: content,
+		}}, baseline)
+	}
+	if err := preflight(candidate(`"REQ-A","REQ-B"`)); err != nil {
+		t.Fatalf("exact complete Requirement Baseline trace was rejected: %v", err)
+	}
+	if err := preflight(candidate(`"REQ-A","REQ-UNKNOWN"`)); !errors.Is(err, ai.ErrInvalidOutput) || !strings.Contains(err.Error(), "REQ-UNKNOWN") {
+		t.Fatalf("unknown Requirement Baseline ID passed preflight: %v", err)
+	}
+	if err := preflight(candidate(`"REQ-A"`)); !errors.Is(err, ai.ErrInvalidOutput) || !strings.Contains(err.Error(), "REQ-B") {
+		t.Fatalf("missing Must Requirement Baseline coverage passed preflight: %v", err)
 	}
 }
 

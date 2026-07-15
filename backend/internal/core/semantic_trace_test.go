@@ -96,6 +96,57 @@ func TestBlueprintStrictTraceCoversEveryMustRequirementAcrossAllNodeKinds(t *tes
 	}
 }
 
+func TestValidateBlueprintAgainstRequirementBaselineRejectsMalformedBaseline(t *testing.T) {
+	t.Parallel()
+	err := ValidateBlueprintAgainstRequirementBaseline(
+		semanticBlueprintFixture(t, []string{"REQ-A"}),
+		json.RawMessage(`{"requirements":[`),
+		false,
+	)
+	if err == nil || !strings.Contains(err.Error(), "decode Requirement Baseline trace") {
+		t.Fatalf("malformed Requirement Baseline lacked trace context: %v", err)
+	}
+}
+
+func TestValidateBlueprintAgainstRequirementBaselineAcceptsExactIDs(t *testing.T) {
+	t.Parallel()
+	baseline := requirementBaselineTraceFixture()
+	if err := ValidateBlueprintAgainstRequirementBaseline(
+		semanticBlueprintFixture(t, []string{"REQ-A", "REQ-B"}), baseline, true,
+	); err != nil {
+		t.Fatalf("exact Requirement Baseline IDs were rejected: %v", err)
+	}
+}
+
+func TestValidateBlueprintAgainstRequirementBaselineRejectsUnknownID(t *testing.T) {
+	t.Parallel()
+	err := ValidateBlueprintAgainstRequirementBaseline(
+		semanticBlueprintFixture(t, []string{"REQ-A", "REQ-UNKNOWN"}),
+		requirementBaselineTraceFixture(),
+		false,
+	)
+	if err == nil ||
+		!strings.Contains(err.Error(), "validate Blueprint against Requirement Baseline trace") ||
+		!strings.Contains(err.Error(), "REQ-UNKNOWN") {
+		t.Fatalf("unknown Requirement Baseline ID lacked trace context: %v", err)
+	}
+}
+
+func TestValidateBlueprintAgainstRequirementBaselineRequiresMustCoverage(t *testing.T) {
+	t.Parallel()
+	blueprint := semanticBlueprintFixture(t, []string{"REQ-A"})
+	baseline := requirementBaselineTraceFixture()
+	if err := ValidateBlueprintAgainstRequirementBaseline(blueprint, baseline, false); err != nil {
+		t.Fatalf("draft trace unexpectedly required full Must coverage: %v", err)
+	}
+	err := ValidateBlueprintAgainstRequirementBaseline(blueprint, baseline, true)
+	if err == nil ||
+		!strings.Contains(err.Error(), "validate Blueprint against Requirement Baseline trace") ||
+		!strings.Contains(err.Error(), "REQ-B") {
+		t.Fatalf("strict trace accepted missing Must coverage: %v", err)
+	}
+}
+
 func TestPageSpecSemanticTraceRejectsCrossPageAndForgedReferences(t *testing.T) {
 	t.Parallel()
 
@@ -370,6 +421,17 @@ func semanticTraceFixture(t *testing.T) requirementTraceSnapshot {
 		t.Fatal(err)
 	}
 	return trace
+}
+
+func requirementBaselineTraceFixture() json.RawMessage {
+	return json.RawMessage(`{
+		"requirements":[
+			{"type":"requirement","requirementId":"REQ-A","priority":"must","acceptanceCriterionIds":["AC-A"]},
+			{"type":"requirement","requirementId":"REQ-B","priority":"must","acceptanceCriterionIds":["AC-B"]},
+			{"type":"acceptanceCriterion","acceptanceCriterionId":"AC-A"},
+			{"type":"acceptanceCriterion","acceptanceCriterionId":"AC-B"}
+		]
+	}`)
 }
 
 func semanticBlueprintFixture(t *testing.T, requirementIDs []string) json.RawMessage {

@@ -166,6 +166,35 @@ func TestBlueprintGateAcceptsCanonicalFrontendIR(t *testing.T) {
 	}
 }
 
+func TestBlueprintGateRequiresPageTitleAtCanonicalPath(t *testing.T) {
+	t.Parallel()
+	report := ValidateArtifactContent("blueprint", json.RawMessage(`{
+  "nodes": [
+    {"id":"feature-orders","key":"FEATURE-ORDERS","kind":"feature"},
+    {"id":"page-orders","key":"PAGE-ORDERS","kind":"page","route":"/orders","userGoal":"Review open orders.","requirementIds":["REQ-001"]}
+  ],
+  "edges": [
+    {"id":"edge-orders","sourceNodeId":"feature-orders","targetNodeId":"page-orders","kind":"contains"}
+  ]
+}`))
+	var titleFinding *ValidationFinding
+	for index := range report.Findings {
+		if report.Findings[index].Code == "blueprint.page_title" {
+			titleFinding = &report.Findings[index]
+			break
+		}
+	}
+	if report.Valid || titleFinding == nil {
+		t.Fatalf("expected a missing Page title blocker: %#v", report.Findings)
+	}
+	if titleFinding.Path != "$.nodes[1].title" || titleFinding.Severity != "blocker" {
+		t.Fatalf("unexpected Page title finding: %#v", titleFinding)
+	}
+	if hasFinding(report, "blueprint.page_spec") || hasFinding(report, "blueprint.page_requirement") {
+		t.Fatalf("title-only failure was conflated with another Page field: %#v", report.Findings)
+	}
+}
+
 func TestBlueprintGateAndRuntimeShareNestedPageSpecSchema(t *testing.T) {
 	t.Parallel()
 	payload := json.RawMessage(`{

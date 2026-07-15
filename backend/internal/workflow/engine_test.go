@@ -879,7 +879,8 @@ func TestChangesRequestedReopensHumanEditBeforeReviewCanContinue(t *testing.T) {
 func TestNodeTimeoutRetriesThenFails(t *testing.T) {
 	schema := engineSchema()
 	userID := uuid.NewString()
-	nodes := []domain.NodeDefinition{{ID: "input", Name: "Input", Type: domain.NodeArtifactInput, InputSchema: schema, OutputSchema: schema, ArtifactInput: &domain.ArtifactInputNodeConfig{AllowedTypes: []domain.ArtifactType{domain.ArtifactDocument}, MinimumArtifacts: 1}}, {ID: "build", Name: "Build", Type: domain.NodeWorkbenchBuild, InputSchema: schema, OutputSchema: schema, WorkbenchBuild: &domain.WorkbenchBuildNodeConfig{BuildManifestSchemaVersion: 1, MaxAttempts: 2, Timeout: 5 * time.Millisecond}}}
+	const definitionMaxAttempts = 2
+	nodes := []domain.NodeDefinition{{ID: "input", Name: "Input", Type: domain.NodeArtifactInput, InputSchema: schema, OutputSchema: schema, ArtifactInput: &domain.ArtifactInputNodeConfig{AllowedTypes: []domain.ArtifactType{domain.ArtifactDocument}, MinimumArtifacts: 1}}, {ID: "build", Name: "Build", Type: domain.NodeWorkbenchBuild, InputSchema: schema, OutputSchema: schema, WorkbenchBuild: &domain.WorkbenchBuildNodeConfig{BuildManifestSchemaVersion: 1, MaxAttempts: definitionMaxAttempts, Timeout: 5 * time.Millisecond}}}
 	definition, err := domain.NewWorkflowDefinition(uuid.NewString(), 1, "Timeout", "2", nodes, []domain.WorkflowEdge{{ID: "e1", From: "input", To: "build"}}, userID, time.Now())
 	if err != nil {
 		t.Fatal(err)
@@ -908,5 +909,30 @@ func TestNodeTimeoutRetriesThenFails(t *testing.T) {
 	retried, _ := store.GetRun(context.Background(), run.ID)
 	if retried.Status != RunRunning || retried.Nodes["build"].Status != NodeReady || retried.Nodes["build"].Attempt != 0 {
 		t.Fatalf("manual retry did not resume run: %+v", retried.Nodes["build"])
+	}
+	if retried.Context.Nodes["build"].MaxAttempts != definitionMaxAttempts {
+		t.Fatalf("manual retry changed definition attempt budget: got %d want %d", retried.Context.Nodes["build"].MaxAttempts, definitionMaxAttempts)
+	}
+	for attempt := 1; attempt <= definitionMaxAttempts; attempt++ {
+		if err := engine.ClaimAndExecute(context.Background(), "worker"); !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("expected timeout on manual retry attempt %d, got %v", attempt, err)
+		}
+		current, err := store.GetRun(context.Background(), run.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if current.Nodes["build"].Attempt != attempt {
+			t.Fatalf("manual retry attempt = %d, want %d", current.Nodes["build"].Attempt, attempt)
+		}
+		if current.Context.Nodes["build"].MaxAttempts != definitionMaxAttempts {
+			t.Fatalf("manual retry budget drifted after attempt %d: got %d want %d", attempt, current.Context.Nodes["build"].MaxAttempts, definitionMaxAttempts)
+		}
+	}
+	exhausted, err := store.GetRun(context.Background(), run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if exhausted.Status != RunFailed || exhausted.Nodes["build"].Status != NodeFailed || exhausted.Nodes["build"].Attempt != definitionMaxAttempts {
+		t.Fatalf("manual retry did not stop at the definition budget: run=%s node=%+v", exhausted.Status, exhausted.Nodes["build"])
 	}
 }
