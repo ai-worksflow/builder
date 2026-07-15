@@ -732,6 +732,9 @@ func (s *ProposalService) Apply(ctx context.Context, proposalID, actorID string,
 	if err := ensureGenericArtifactMutationAllowed(artifact.Kind); err != nil {
 		return ArtifactDraft{}, err
 	}
+	if err := validateProposalPatchedContent(artifact.Kind, patched); err != nil {
+		return ArtifactDraft{}, err
+	}
 	if artifact.LatestRevisionID == nil || *artifact.LatestRevisionID != base.ID {
 		return ArtifactDraft{}, ErrProposalStale
 	}
@@ -888,6 +891,15 @@ func (s *ProposalService) Apply(ctx context.Context, proposalID, actorID string,
 		return ArtifactDraft{}, fmt.Errorf("%w: %v", ErrContentNotReady, err)
 	}
 	return draftFromModel(draftModel, patched, sourcesFromModels(sourceModels)), nil
+}
+
+func validateProposalPatchedContent(kind string, payload json.RawMessage) error {
+	report := ValidateArtifactContent(kind, payload)
+	if report.Valid {
+		return nil
+	}
+	encoded, _ := json.Marshal(report.Findings)
+	return fmt.Errorf("%w: validation findings %s", ErrBlockingGate, encoded)
 }
 
 func (s *ProposalService) loadManifest(ctx context.Context, manifestID string) (domain.InputManifest, storage.InputManifestModel, error) {

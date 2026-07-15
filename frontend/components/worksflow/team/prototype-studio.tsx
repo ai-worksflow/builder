@@ -65,6 +65,7 @@ import {
   addPrototypeBreakpoint,
   addPrototypeState,
   isRequiredPrototypeBreakpoint,
+  normalizePrototypeContent,
   prototypeFrameCoverageGaps,
   prototypeReviewIssues,
   removePrototypeBreakpoint,
@@ -151,6 +152,7 @@ export function PrototypeStudio() {
     originY: number
   } | null>(null)
   const saveSequence = useRef(0)
+  const proposalFocusKey = useRef('')
   const activeResource = workspace.prototypes.find((item) => item.artifact.id === activeArtifactId)
     ?? workspace.prototypes[0]
   const activeId = activeResource?.artifact.id ?? ''
@@ -179,17 +181,18 @@ export function PrototypeStudio() {
       return
     }
     if (saveState === 'dirty' || saveState === 'saving' || saveState === 'conflict') return
-    setContent(cloneContent(serverContent))
+    const normalizedContent = normalizePrototypeContent(serverContent)
+    setContent(cloneContent(normalizedContent))
     setDraftEtag(activeResource.draft?.etag ?? activeResource.artifact.etag)
-    setSelectedLayerId((current) => current && serverContent.layers[current]
+    setSelectedLayerId((current) => current && normalizedContent.layers[current]
       ? current
-      : serverContent.frames[0]?.rootLayerId ?? Object.keys(serverContent.layers)[0] ?? '')
-    setSelectedStateId((current) => serverContent.states.some((item) => item.id === current)
+      : normalizedContent.frames[0]?.rootLayerId ?? Object.keys(normalizedContent.layers)[0] ?? '')
+    setSelectedStateId((current) => normalizedContent.states.some((item) => item.id === current)
       ? current
-      : serverContent.states[0]?.id ?? '')
-    setSelectedBreakpointId((current) => serverContent.breakpoints.some((item) => item.id === current)
+      : normalizedContent.states[0]?.id ?? '')
+    setSelectedBreakpointId((current) => normalizedContent.breakpoints.some((item) => item.id === current)
       ? current
-      : serverContent.breakpoints[0]?.id ?? '')
+      : normalizedContent.breakpoints[0]?.id ?? '')
     setSaveState('idle')
     void workspace.loadDetails<PrototypeContentDto>(activeResource.artifact.id)
       .then(setDetails)
@@ -259,6 +262,8 @@ export function PrototypeStudio() {
     [content, frame?.rootLayerId],
   )
   const proposals = workspace.proposals.filter((item) => item.artifactId === activeId)
+  const actionableProposal = proposals.find((proposal) =>
+    proposal.status === 'open' || proposal.status === 'reviewing' || proposal.status === 'ready')
   const review = collaboration.reviews.find((item) => item.target?.artifactId === activeId)
   const clientIssues = useMemo(
     () => content ? prototypeReviewIssues(content) : [],
@@ -270,6 +275,14 @@ export function PrototypeStudio() {
   )
   const revisionReady = clientIssues.length === 0
   const requestReady = reviewGateReadyForRequest(details?.reviewGate)
+
+  useEffect(() => {
+    if (!content || content.frames.length > 0 || !actionableProposal) return
+    const focusKey = `${activeId}:${actionableProposal.id}`
+    if (proposalFocusKey.current === focusKey) return
+    proposalFocusKey.current = focusKey
+    setPanel('trace')
+  }, [actionableProposal, activeId, content])
 
   function updateLayer(updates: Partial<PrototypeLayerDto>) {
     if (!selectedLayer) return
@@ -487,7 +500,7 @@ export function PrototypeStudio() {
           .filter((operation) => operation.decision === 'accepted')
           .map((operation) => operation.id),
       )
-      const nextContent = draft.content as unknown as PrototypeContentDto
+      const nextContent = normalizePrototypeContent(draft.content as unknown as PrototypeContentDto)
       setContent(cloneContent(nextContent))
       setDraftEtag(draft.etag)
       setSaveState('saved')
@@ -709,6 +722,14 @@ export function PrototypeStudio() {
               {mode === 'design' && <div className="absolute left-3 top-3 z-20 rounded border border-primary/30 bg-primary/10 px-2 py-1 text-[8px] text-primary-bright">{t('prototypePlatform.banner.design', { count: formatNumber(content.tokenBindings.length) })}</div>}
               {mode === 'component' && <div className="absolute left-3 top-3 z-20 rounded border border-primary/30 bg-primary/10 px-2 py-1 text-[8px] text-primary-bright">{t('prototypePlatform.banner.component', { count: formatNumber(content.componentBindings.length) })}</div>}
               {mode === 'handoff' && <div className="absolute left-3 top-3 z-20 rounded border border-success/30 bg-success/10 px-2 py-1 text-[8px] text-success">{t('prototypePlatform.banner.handoff', { count: formatNumber(content.traceLinks.length) })}</div>}
+              {(!state || !breakpoint) && actionableProposal && (
+                <div className="mx-auto mt-16 max-w-md rounded-xl border border-primary/30 bg-primary/10 p-6 text-center text-primary-bright">
+                  <Wand2 className="mx-auto size-6" />
+                  <p className="mt-2 text-xs font-semibold">{t('prototypePlatform.proposalWaiting.title')}</p>
+                  <p className="mt-1 text-[9px] leading-relaxed opacity-80">{t('prototypePlatform.proposalWaiting.description')}</p>
+                  <button type="button" onClick={() => setPanel('trace')} className="mt-3 rounded bg-primary px-3 py-1.5 text-[9px] font-semibold text-primary-foreground">{t('prototypePlatform.proposalWaiting.action')}</button>
+                </div>
+              )}
               {breakpoint && frame && (
                 <div className="relative mx-auto origin-top-left overflow-hidden rounded-xl border border-white/15 bg-[#171719] shadow-2xl" style={{ width: breakpoint.viewportWidth, height: breakpoint.viewportHeight, transform: `scale(${zoom / 100})`, marginBottom: `${breakpoint.viewportHeight * (zoom / 100 - 1)}px`, backgroundImage: showGrid ? 'linear-gradient(rgba(255,255,255,.035) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,.035) 1px, transparent 1px)' : undefined, backgroundSize: showGrid ? '8px 8px' : undefined }}>
                   {visibleLayers.map((item) => <CanvasLayer key={item.id} layer={item} selected={item.id === selectedLayerId} onSelect={() => setSelectedLayerId(item.id)} onPointerDown={(event) => startDrag(event, item)} />)}

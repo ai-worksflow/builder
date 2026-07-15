@@ -1,6 +1,11 @@
 package core
 
-import "testing"
+import (
+	"encoding/json"
+	"errors"
+	"strings"
+	"testing"
+)
 
 func TestOnlyExactManifestBaseMayBeAnUnapprovedSource(t *testing.T) {
 	anchor := "brief"
@@ -27,5 +32,27 @@ func TestOnlyExactManifestBaseMayBeAnUnapprovedSource(t *testing.T) {
 				t.Fatalf("mismatched %s source bypassed the formal approval policy", name)
 			}
 		})
+	}
+}
+
+func TestProposalPatchedContentMustPassArtifactValidationBeforeApply(t *testing.T) {
+	t.Parallel()
+	if err := validateProposalPatchedContent("prototype", canonicalPrototypeValidationPayload()); err != nil {
+		t.Fatalf("canonical Prototype patch was rejected: %v", err)
+	}
+
+	var incomplete map[string]any
+	if err := json.Unmarshal(canonicalPrototypeValidationPayload(), &incomplete); err != nil {
+		t.Fatal(err)
+	}
+	delete(incomplete, "tokenBindings")
+	payload, err := json.Marshal(incomplete)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = validateProposalPatchedContent("prototype", payload)
+	if !errors.Is(err, ErrBlockingGate) || !strings.Contains(err.Error(), "prototype.array_contract") ||
+		!strings.Contains(err.Error(), "$.tokenBindings") {
+		t.Fatalf("invalid Prototype patch did not fail closed with validation evidence: %v", err)
 	}
 }

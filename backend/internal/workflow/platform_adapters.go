@@ -1754,15 +1754,20 @@ func prototypeTargetContent(execution Execution, pageSpec core.VersionRef) (json
 		exploratory, _ = payload["exploratory"].(bool)
 	}
 	return domain.CanonicalJSON(map[string]any{
-		"schemaVersion":    1,
-		"pageSpecRevision": pageSpec,
-		"exploratory":      exploratory,
-		"states":           []any{},
-		"breakpoints":      []any{},
-		"layers":           map[string]any{},
-		"frames":           []any{},
-		"interactions":     []any{},
-		"fixtures":         []any{},
+		"schemaVersion":     1,
+		"pageSpecRevision":  pageSpec,
+		"exploratory":       exploratory,
+		"states":            []any{},
+		"breakpoints":       []any{},
+		"layers":            map[string]any{},
+		"frames":            []any{},
+		"overrides":         []any{},
+		"interactions":      []any{},
+		"fixtures":          []any{},
+		"tokenBindings":     []any{},
+		"componentBindings": []any{},
+		"assets":            []any{},
+		"traceLinks":        []any{},
 	})
 }
 
@@ -1791,7 +1796,7 @@ func targetArtifactTemplate(execution Execution, jobType string) (kind, key, tit
 	case "generate_prototype":
 		slice, _ := targetExecutionSlice(execution)
 		suffix := targetSliceSuffix(slice, execution)
-		return "prototype", "PROTOTYPE-" + suffix, "Prototype · " + slice.Title, json.RawMessage(`{"schemaVersion":1,"states":[],"breakpoints":[],"layers":[],"frames":[],"interactions":[],"fixtures":[]}`), true
+		return "prototype", "PROTOTYPE-" + suffix, "Prototype · " + slice.Title, json.RawMessage(`{"schemaVersion":1,"exploratory":false,"states":[],"breakpoints":[],"layers":{},"frames":[],"overrides":[],"interactions":[],"fixtures":[],"tokenBindings":[],"componentBindings":[],"assets":[],"traceLinks":[]}`), true
 	default:
 		return "", "", "", nil, false
 	}

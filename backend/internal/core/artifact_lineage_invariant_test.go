@@ -999,8 +999,19 @@ func seedArtifactSemanticPageSpecRevision(
 func prototypeLineagePayload(t *testing.T, pageSpec VersionRef, exploratory bool) json.RawMessage {
 	t.Helper()
 	payload, err := json.Marshal(map[string]any{
-		"pageSpecRevision": pageSpec,
-		"exploratory":      exploratory,
+		"pageSpecRevision":  pageSpec,
+		"exploratory":       exploratory,
+		"states":            []any{},
+		"breakpoints":       []any{},
+		"layers":            map[string]any{},
+		"frames":            []any{},
+		"overrides":         []any{},
+		"interactions":      []any{},
+		"fixtures":          []any{},
+		"tokenBindings":     []any{},
+		"componentBindings": []any{},
+		"assets":            []any{},
+		"traceLinks":        []any{},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1020,9 +1031,9 @@ func prototypeLineageCoveragePayload(t *testing.T, pageSpec VersionRef) json.Raw
 			map[string]any{"id": "state-error", "key": "error", "title": "Error", "required": true, "fixtureIds": []any{}},
 		},
 		"breakpoints": []any{
-			map[string]any{"id": "breakpoint-desktop", "name": "desktop"},
-			map[string]any{"id": "breakpoint-tablet", "name": "tablet"},
-			map[string]any{"id": "breakpoint-mobile", "name": "mobile"},
+			map[string]any{"id": "breakpoint-desktop", "name": "desktop", "minWidth": 1024, "viewportWidth": 1440, "viewportHeight": 900},
+			map[string]any{"id": "breakpoint-tablet", "name": "tablet", "minWidth": 768, "maxWidth": 1023, "viewportWidth": 768, "viewportHeight": 1024},
+			map[string]any{"id": "breakpoint-mobile", "name": "mobile", "minWidth": 0, "maxWidth": 767, "viewportWidth": 390, "viewportHeight": 844},
 		},
 		"frames": prototypeLineageFrames(),
 		"fixtures": []any{map[string]any{
@@ -1039,8 +1050,15 @@ func prototypeLineageCoveragePayload(t *testing.T, pageSpec VersionRef) json.Raw
 			},
 		},
 		"layers": map[string]any{"layer-orders": map[string]any{
-			"id": "layer-orders", "kind": "frame", "childIds": []any{}, "dataBindingId": "binding-orders",
+			"id": "layer-orders", "kind": "frame", "name": "Orders", "childIds": []any{}, "dataBindingId": "binding-orders",
+			"layout": map[string]any{"x": 0, "y": 0, "width": 1440, "height": 900}, "style": map[string]any{}, "properties": map[string]any{},
+			"requirementIds": []any{}, "acceptanceCriterionIds": []any{"AC-1"}, "fieldMetadata": map[string]any{},
 		}},
+		"overrides":         []any{},
+		"tokenBindings":     []any{},
+		"componentBindings": []any{},
+		"assets":            []any{},
+		"traceLinks":        []any{},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1055,6 +1073,7 @@ func prototypeLineageFrames() []any {
 			frames = append(frames, map[string]any{
 				"id": stateID + "-" + breakpointID, "stateId": stateID,
 				"breakpointId": breakpointID, "rootLayerId": "layer-orders",
+				"title": stateID + " · " + breakpointID,
 			})
 		}
 	}
@@ -1070,20 +1089,29 @@ func prototypeLineageReviewIncompletePayload(t *testing.T, pageSpec VersionRef) 
 			map[string]any{"id": "state-ready", "key": "ready", "title": "Ready", "required": true, "fixtureIds": []any{}},
 		},
 		"breakpoints": []any{
-			map[string]any{"id": "breakpoint-desktop", "name": "desktop"},
-			map[string]any{"id": "breakpoint-tablet", "name": "tablet"},
-			map[string]any{"id": "breakpoint-mobile", "name": "mobile"},
+			map[string]any{"id": "breakpoint-desktop", "name": "desktop", "minWidth": 1024, "viewportWidth": 1440, "viewportHeight": 900},
+			map[string]any{"id": "breakpoint-tablet", "name": "tablet", "minWidth": 768, "maxWidth": 1023, "viewportWidth": 768, "viewportHeight": 1024},
+			map[string]any{"id": "breakpoint-mobile", "name": "mobile", "minWidth": 0, "maxWidth": 767, "viewportWidth": 390, "viewportHeight": 844},
 		},
 		"layers": map[string]any{
-			"layer-root": map[string]any{"id": "layer-root", "childIds": []any{}},
+			"layer-root": map[string]any{
+				"id": "layer-root", "childIds": []any{}, "kind": "frame", "name": "Page",
+				"layout": map[string]any{}, "style": map[string]any{}, "properties": map[string]any{},
+				"requirementIds": []any{}, "acceptanceCriterionIds": []any{}, "fieldMetadata": map[string]any{},
+			},
 		},
 		"frames": []any{
-			map[string]any{"id": "frame-desktop", "stateId": "state-ready", "breakpointId": "breakpoint-desktop", "rootLayerId": "layer-root"},
-			map[string]any{"id": "frame-tablet", "stateId": "state-ready", "breakpointId": "breakpoint-tablet", "rootLayerId": "layer-root"},
-			map[string]any{"id": "frame-mobile", "stateId": "state-ready", "breakpointId": "breakpoint-mobile", "rootLayerId": "layer-root"},
+			map[string]any{"id": "frame-desktop", "stateId": "state-ready", "breakpointId": "breakpoint-desktop", "rootLayerId": "layer-root", "title": "Ready · Desktop"},
+			map[string]any{"id": "frame-tablet", "stateId": "state-ready", "breakpointId": "breakpoint-tablet", "rootLayerId": "layer-root", "title": "Ready · Tablet"},
+			map[string]any{"id": "frame-mobile", "stateId": "state-ready", "breakpointId": "breakpoint-mobile", "rootLayerId": "layer-root", "title": "Ready · Mobile"},
 		},
-		"fixtures":     []any{},
-		"interactions": []any{},
+		"overrides":         []any{},
+		"fixtures":          []any{},
+		"interactions":      []any{},
+		"tokenBindings":     []any{},
+		"componentBindings": []any{},
+		"assets":            []any{},
+		"traceLinks":        []any{},
 	})
 	if err != nil {
 		t.Fatal(err)

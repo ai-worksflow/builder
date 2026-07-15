@@ -1,9 +1,11 @@
 import type {
+  JsonObject,
   PrototypeActionDto,
   PrototypeBreakpointDto,
   PrototypeContentDto,
   PrototypeFrameDto,
   PrototypeLayerDto,
+  PrototypeLayerKind,
   PrototypeStateDto,
 } from './dto'
 
@@ -28,7 +30,138 @@ export class PrototypeContentMutationError extends Error {
   }
 }
 
+const PROTOTYPE_LAYER_KINDS = new Set<PrototypeLayerKind>([
+  'frame',
+  'group',
+  'text',
+  'image',
+  'componentInstance',
+  'input',
+  'button',
+  'list',
+  'overlay',
+  'slot',
+])
+
+// Platform payloads are runtime data even when the HTTP client has a generic
+// TypeScript return type. Keep the editor usable for incomplete historical
+// drafts while the canonical server gate continues to reject missing semantic
+// content such as states, layers, and frames.
+export function normalizePrototypeContent(content: PrototypeContentDto): PrototypeContentDto {
+  const raw = objectValue(content)
+  const pageSpecRevision = objectValue(raw.pageSpecRevision)
+  const states = objectArrayValue(raw.states).map((state) => {
+    const id = textValue(state.id)
+    const key = textValue(state.key) || id
+    return {
+      ...state,
+      id,
+      key,
+      title: textValue(state.title) || key || id,
+      required: state.required === true,
+      fixtureIds: stringArrayValue(state.fixtureIds),
+      ...(textValue(state.pageStateId) ? { pageStateId: textValue(state.pageStateId) } : {}),
+    }
+  })
+  const breakpoints = objectArrayValue(raw.breakpoints).map((breakpoint) => {
+    const id = textValue(breakpoint.id)
+    const name = textValue(breakpoint.name)
+      || textValue(breakpoint.title)
+      || textValue(breakpoint.key)
+      || id
+    return {
+      ...breakpoint,
+      id,
+      name,
+      minWidth: numericValue(breakpoint.minWidth, defaultBreakpointMinWidth(name)),
+      ...(hasFiniteNumber(breakpoint.maxWidth)
+        ? { maxWidth: numericValue(breakpoint.maxWidth, 0) }
+        : {}),
+      viewportWidth: Math.max(1, numericValue(
+        breakpoint.viewportWidth,
+        numericValue(breakpoint.width, 1),
+      )),
+      viewportHeight: Math.max(1, numericValue(
+        breakpoint.viewportHeight,
+        numericValue(breakpoint.height, 1),
+      )),
+    }
+  })
+  const rawLayers = layerCollectionValue(raw.layers, objectValue(raw.scene).layers)
+  const layers = Object.fromEntries(rawLayers.flatMap(([recordId, layer], index) => {
+    const id = textValue(layer.id) || textValue(layer.layerId) || recordId
+    if (!id) return []
+    const kind = prototypeLayerKind(layer.kind ?? layer.type)
+    const legacyProperties = objectValue(layer.props)
+    const properties = {
+      ...legacyProperties,
+      ...objectValue(layer.properties),
+    }
+    if (kind === 'button' && !textValue(properties.text) && textValue(properties.label)) {
+      properties.text = textValue(properties.label)
+    }
+    const parentId = textValue(layer.parentId)
+    const semanticRole = textValue(layer.semanticRole) || textValue(properties.role)
+    return [[id, {
+      ...layer,
+      id,
+      ...(parentId ? { parentId } : {}),
+      childIds: stringArrayValue(layer.childIds),
+      kind,
+      name: textValue(layer.name) || `Layer ${index + 1}`,
+      ...(semanticRole ? { semanticRole } : {}),
+      layout: jsonObjectValue(layer.layout),
+      style: jsonObjectValue(layer.style),
+      properties: properties as JsonObject,
+      ...(textValue(layer.dataBindingId) ? { dataBindingId: textValue(layer.dataBindingId) } : {}),
+      ...(isObjectValue(layer.componentRef) ? { componentRef: layer.componentRef } : {}),
+      requirementIds: stringArrayValue(layer.requirementIds),
+      acceptanceCriterionIds: stringArrayValue(layer.acceptanceCriterionIds),
+      fieldMetadata: objectValue(layer.fieldMetadata),
+    }]]
+  })) as Readonly<Record<string, PrototypeLayerDto>>
+  const stateTitles = new Map(states.map((state) => [state.id, state.title]))
+  const breakpointNames = new Map(breakpoints.map((breakpoint) => [breakpoint.id, breakpoint.name]))
+
+  return {
+    ...raw,
+    pageSpecRevision: {
+      artifactId: textValue(pageSpecRevision.artifactId) || textValue(raw.sourcePageSpecArtifactId),
+      revisionId: textValue(pageSpecRevision.revisionId) || textValue(raw.sourcePageSpecRevisionId),
+      contentHash: textValue(pageSpecRevision.contentHash) || textValue(raw.sourcePageSpecHash),
+    },
+    exploratory: raw.exploratory === true,
+    states,
+    breakpoints,
+    layers,
+    frames: objectArrayValue(raw.frames).map((frame) => ({
+      ...frame,
+      id: textValue(frame.id),
+      stateId: textValue(frame.stateId),
+      breakpointId: textValue(frame.breakpointId),
+      rootLayerId: textValue(frame.rootLayerId),
+      title: textValue(frame.title)
+        || `${stateTitles.get(textValue(frame.stateId)) || 'State'} · ${breakpointNames.get(textValue(frame.breakpointId)) || 'Breakpoint'}`,
+    })),
+    overrides: objectArrayValue(raw.overrides),
+    interactions: objectArrayValue(raw.interactions).map((interaction) => ({
+      ...interaction,
+      guards: objectArrayValue(interaction.guards),
+      actions: objectArrayValue(interaction.actions),
+    })),
+    fixtures: objectArrayValue(raw.fixtures),
+    tokenBindings: objectArrayValue(raw.tokenBindings),
+    componentBindings: objectArrayValue(raw.componentBindings).map((binding) => ({
+      ...binding,
+      propertyMapping: jsonObjectValue(binding.propertyMapping),
+    })),
+    assets: objectArrayValue(raw.assets),
+    traceLinks: objectArrayValue(raw.traceLinks),
+  } as unknown as PrototypeContentDto
+}
+
 export function prototypeReviewIssues(content: PrototypeContentDto) {
+  content = normalizePrototypeContent(content)
   const issues: string[] = []
   const pageSpecRevision = content.pageSpecRevision
   if (!pageSpecRevision
@@ -425,6 +558,75 @@ function titleCase(value: string) {
 function actionType(action: unknown) {
   if (!action || typeof action !== 'object' || !('type' in action)) return ''
   return trimmed((action as { type?: unknown }).type)
+}
+
+function isObjectValue(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value)
+}
+
+function objectValue(value: unknown): Record<string, unknown> {
+  return isObjectValue(value) ? value : {}
+}
+
+function objectArrayValue(value: unknown): Record<string, unknown>[] {
+  return Array.isArray(value) ? value.filter(isObjectValue) : []
+}
+
+function jsonObjectValue(value: unknown): JsonObject {
+  return objectValue(value) as JsonObject
+}
+
+function stringArrayValue(value: unknown): string[] {
+  return Array.isArray(value) ? value.map(textValue).filter(Boolean) : []
+}
+
+function textValue(value: unknown) {
+  return typeof value === 'string' ? value.trim() : ''
+}
+
+function hasFiniteNumber(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value)
+}
+
+function numericValue(value: unknown, fallback: number) {
+  return hasFiniteNumber(value) ? Math.max(0, Math.round(value)) : fallback
+}
+
+function defaultBreakpointMinWidth(name: string) {
+  switch (name.trim().toLowerCase()) {
+  case 'desktop': return 1024
+  case 'tablet': return 768
+  default: return 0
+  }
+}
+
+function prototypeLayerKind(value: unknown): PrototypeLayerKind {
+  const kind = textValue(value)
+  if (PROTOTYPE_LAYER_KINDS.has(kind as PrototypeLayerKind)) return kind as PrototypeLayerKind
+  switch (kind.toLowerCase()) {
+  case 'screen': return 'frame'
+  case 'section':
+  case 'container':
+  case 'card': return 'group'
+  case 'component': return 'componentInstance'
+  case 'heading':
+  case 'label':
+  case 'paragraph': return 'text'
+  default: return 'group'
+  }
+}
+
+function layerCollectionValue(primary: unknown, legacy: unknown): [string, Record<string, unknown>][] {
+  const value = primary ?? legacy
+  if (Array.isArray(value)) {
+    return value.filter(isObjectValue).map((layer) => [
+      textValue(layer.id) || textValue(layer.layerId),
+      layer,
+    ])
+  }
+  return Object.entries(objectValue(value)).flatMap(([id, layer]) =>
+    isObjectValue(layer) ? [[id, layer]] : [],
+  )
 }
 
 function recordValue<T>(value: Readonly<Record<string, T>> | null | undefined) {

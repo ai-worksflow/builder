@@ -4048,6 +4048,48 @@ test('Prototype Studio creates from an approved PageSpec and persists an ETag dr
   })
 })
 
+test('Prototype Studio safely opens an incomplete workflow target and directs the user to its Proposal', async ({ page }) => {
+  const errors: Error[] = []
+  page.on('pageerror', (error) => errors.push(error))
+  const state = await installPlatformMock(page, {
+    authenticated: true,
+    prototypeProposal: true,
+  })
+  const current = state.prototypes[0] as typeof approvedPrototype
+  const incompleteContent = structuredClone(current.draft.content) as Record<string, unknown>
+  delete incompleteContent.overrides
+  delete incompleteContent.tokenBindings
+  delete incompleteContent.componentBindings
+  delete incompleteContent.assets
+  delete incompleteContent.traceLinks
+  state.prototypes = [{
+    ...current,
+    draft: {
+      ...current.draft,
+      content: {
+        ...incompleteContent,
+        states: [],
+        breakpoints: [],
+        frames: [],
+      },
+    },
+  }]
+
+  await page.goto(`/team/acme/project/${project.id}/prototype`)
+
+  await expect(page.getByText('AI prototype proposal is waiting')).toBeVisible()
+  await expect(page.getByText('prototype-proposal-1', { exact: true })).toBeVisible()
+  await page.getByRole('button', { name: 'Visual design', exact: true }).click()
+  await expect(page.getByText('Design mode · 0 token bindings')).toBeVisible()
+  await page.getByRole('button', { name: 'Components', exact: true }).click()
+  await expect(page.getByText('0 component mappings')).toBeVisible()
+  await page.getByRole('button', { name: 'Handoff', exact: true }).click()
+  await expect(page.getByText('Exact source trace · 0 links')).toBeVisible()
+  await page.getByRole('button', { name: 'Data', exact: true }).click()
+  await expect(page.getByText('Token bindings')).toBeVisible()
+  expect(errors).toEqual([])
+})
+
 test('Prototype Studio decides and applies an AI proposal before freezing its attributed revision', async ({ page }) => {
   const state = await installPlatformMock(page, {
     authenticated: true,

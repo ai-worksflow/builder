@@ -13,6 +13,7 @@ import {
   PrototypeContentMutationError,
   addPrototypeBreakpoint,
   addPrototypeState,
+  normalizePrototypeContent,
   prototypeFrameCoverageGaps,
   prototypeReviewIssues,
   removePrototypeBreakpoint,
@@ -59,6 +60,103 @@ test('prototype review gate accepts the canonical PageSpec-derived responsive sc
   const content = canonicalPrototype()
   assert.deepEqual(prototypeReviewIssues(content), [])
   assert.equal(content.states.length * content.breakpoints.length, content.frames.length)
+})
+
+test('prototype normalization keeps incomplete workflow targets render-safe without inventing semantic content', () => {
+  const raw = {
+    schemaVersion: 1,
+    pageSpecRevision: {
+      artifactId: 'page-spec-orders',
+      revisionId: 'page-spec-revision-1',
+      contentHash: 'sha256:page-spec-orders',
+    },
+    exploratory: false,
+    states: [],
+    breakpoints: [],
+    layers: {
+      'layer-input': {
+        id: 'layer-input',
+        childIds: [],
+        kind: 'input',
+        name: 'Answer',
+      },
+    },
+    frames: [],
+    interactions: [],
+    fixtures: [],
+    futureField: { retained: true },
+  }
+
+  const normalized = normalizePrototypeContent(raw as unknown as PrototypeContentDto)
+
+  assert.deepEqual(normalized.overrides, [])
+  assert.deepEqual(normalized.tokenBindings, [])
+  assert.deepEqual(normalized.componentBindings, [])
+  assert.deepEqual(normalized.assets, [])
+  assert.deepEqual(normalized.traceLinks, [])
+  assert.deepEqual(normalized.layers['layer-input'].layout, {})
+  assert.deepEqual(normalized.layers['layer-input'].style, {})
+  assert.deepEqual(normalized.layers['layer-input'].properties, {})
+  assert.deepEqual(normalized.layers['layer-input'].requirementIds, [])
+  assert.deepEqual(normalized.layers['layer-input'].acceptanceCriterionIds, [])
+  assert.deepEqual(normalized.layers['layer-input'].fieldMetadata, {})
+  assert.deepEqual((normalized as unknown as { futureField: unknown }).futureField, { retained: true })
+  assert.equal('tokenBindings' in raw, false)
+
+  const issues = prototypeReviewIssues(raw as unknown as PrototypeContentDto)
+  assert.ok(issues.some((issue) => issue.includes('PageSpec state')))
+  assert.ok(issues.some((issue) => issue.includes('Desktop, Tablet, and Mobile')))
+  assert.ok(issues.some((issue) => issue.includes('frame for each required state')))
+})
+
+test('prototype normalization adapts legacy AI breakpoint, layer, and frame aliases for safe inspection', () => {
+  const normalized = normalizePrototypeContent({
+    pageSpecRevision: {
+      artifactId: 'page-spec-orders',
+      revisionId: 'page-spec-revision-1',
+      contentHash: 'sha256:page-spec-orders',
+    },
+    states: [{ id: 'state-ready', key: 'ready', title: 'Ready', required: true }],
+    breakpoints: [{ id: 'desktop', key: 'desktop', title: 'Desktop', width: 1440, height: 1024 }],
+    layers: [{
+      id: 'layer-root',
+      type: 'screen',
+      name: 'Interview',
+      childIds: ['layer-action'],
+      props: { role: 'main' },
+    }, {
+      id: 'layer-action',
+      parentId: 'layer-root',
+      type: 'button',
+      name: 'Continue',
+      childIds: [],
+      props: { label: 'Continue' },
+    }],
+    frames: [{
+      id: 'frame-ready-desktop',
+      stateId: 'state-ready',
+      breakpointId: 'desktop',
+      rootLayerId: 'layer-root',
+    }],
+  } as unknown as PrototypeContentDto)
+
+  assert.deepEqual(normalized.states[0].fixtureIds, [])
+  assert.deepEqual(normalized.breakpoints[0], {
+    id: 'desktop',
+    key: 'desktop',
+    title: 'Desktop',
+    width: 1440,
+    height: 1024,
+    name: 'Desktop',
+    minWidth: 1024,
+    viewportWidth: 1440,
+    viewportHeight: 1024,
+  })
+  assert.equal(normalized.layers['layer-root'].kind, 'frame')
+  assert.equal(normalized.layers['layer-root'].semanticRole, 'main')
+  assert.equal(normalized.layers['layer-action'].kind, 'button')
+  assert.equal(normalized.layers['layer-action'].properties.text, 'Continue')
+  assert.equal(normalized.frames[0].title, 'Ready · Desktop')
 })
 
 test('first revision and valid dirty drafts use client structure before the post-revision server gate', () => {

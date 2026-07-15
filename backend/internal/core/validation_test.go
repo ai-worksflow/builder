@@ -386,25 +386,60 @@ func TestPageSpecGateUsesStableStateKeysInsteadOfServerIDs(t *testing.T) {
 
 func TestPrototypeGateAcceptsCanonicalResponsiveScene(t *testing.T) {
 	t.Parallel()
-	report := ValidateArtifactContent("prototype", json.RawMessage(`{
-  "pageSpecRevision":{"artifactId":"page-spec-1","revisionId":"revision-1","contentHash":"sha256:page-spec"},
-  "states":[{"id":"state-ready","key":"ready","title":"Ready","required":true,"fixtureIds":[]}],
-  "breakpoints":[
-    {"id":"bp-desktop","name":"Desktop"},
-    {"id":"bp-tablet","name":"Tablet"},
-    {"id":"bp-mobile","name":"Mobile"}
-  ],
-  "layers":{"layer-root":{"id":"layer-root","childIds":[],"kind":"frame"}},
-  "frames":[
-    {"id":"frame-desktop","stateId":"state-ready","breakpointId":"bp-desktop","rootLayerId":"layer-root"},
-    {"id":"frame-tablet","stateId":"state-ready","breakpointId":"bp-tablet","rootLayerId":"layer-root"},
-    {"id":"frame-mobile","stateId":"state-ready","breakpointId":"bp-mobile","rootLayerId":"layer-root"}
-  ],
-  "fixtures":[],
-  "interactions":[]
-}`))
+	report := ValidateArtifactContent("prototype", canonicalPrototypeValidationPayload())
 	if !report.Valid {
 		t.Fatalf("expected canonical responsive prototype to pass: %#v", report.Findings)
+	}
+}
+
+func TestPrototypeGateRequiresEveryCanonicalCollectionAndLayerRecord(t *testing.T) {
+	t.Parallel()
+	var content map[string]any
+	if err := json.Unmarshal(canonicalPrototypeValidationPayload(), &content); err != nil {
+		t.Fatal(err)
+	}
+	delete(content, "tokenBindings")
+	content["layers"] = []any{map[string]any{"id": "layer-root"}}
+	payload, err := json.Marshal(content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	report := ValidateArtifactContent("prototype", payload)
+	if report.Valid || !hasFindingAt(report, "prototype.array_contract", "$.tokenBindings") ||
+		!hasFindingAt(report, "prototype.layer_contract", "$.layers") {
+		t.Fatalf("Prototype accepted a missing canonical collection or layer array: %#v", report.Findings)
+	}
+}
+
+func TestPrototypeGateRequiresEditorSafeBreakpointLayerAndFrameFields(t *testing.T) {
+	t.Parallel()
+	var content map[string]any
+	if err := json.Unmarshal(canonicalPrototypeValidationPayload(), &content); err != nil {
+		t.Fatal(err)
+	}
+	breakpoints := content["breakpoints"].([]any)
+	breakpoints[0].(map[string]any)["viewportWidth"] = 0
+	layer := content["layers"].(map[string]any)["layer-root"].(map[string]any)
+	layer["kind"] = "canvas"
+	layer["name"] = ""
+	layer["layout"] = []any{}
+	layer["fieldMetadata"] = map[string]any{"layout": map[string]any{"source": "ai"}}
+	frames := content["frames"].([]any)
+	delete(frames[0].(map[string]any), "title")
+	payload, err := json.Marshal(content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	report := ValidateArtifactContent("prototype", payload)
+	for _, code := range []string{
+		"prototype.breakpoint_ui_contract",
+		"prototype.layer_ui_contract",
+		"prototype.layer_field_metadata",
+		"prototype.invalid_frame",
+	} {
+		if !hasFinding(report, code) {
+			t.Fatalf("Prototype omitted strict %s finding: %#v", code, report.Findings)
+		}
 	}
 }
 
@@ -458,9 +493,44 @@ func TestPrototypeFixtureDTORequiresExactIntegerFields(t *testing.T) {
 	}
 }
 
+func canonicalPrototypeValidationPayload() json.RawMessage {
+	return json.RawMessage(`{
+  "schemaVersion":1,
+  "pageSpecRevision":{"artifactId":"page-spec-1","revisionId":"revision-1","contentHash":"sha256:page-spec"},
+  "exploratory":false,
+  "states":[{"id":"state-ready","key":"ready","title":"Ready","required":true,"fixtureIds":[]}],
+  "breakpoints":[
+    {"id":"bp-desktop","name":"Desktop","minWidth":1024,"viewportWidth":1440,"viewportHeight":900},
+    {"id":"bp-tablet","name":"Tablet","minWidth":768,"maxWidth":1023,"viewportWidth":768,"viewportHeight":1024},
+    {"id":"bp-mobile","name":"Mobile","minWidth":0,"maxWidth":767,"viewportWidth":390,"viewportHeight":844}
+  ],
+  "layers":{"layer-root":{
+    "id":"layer-root","childIds":[],"kind":"frame","name":"Page",
+    "layout":{"x":0,"y":0,"width":1440,"height":900},"style":{"fill":"#171719"},"properties":{},
+    "requirementIds":[],"acceptanceCriterionIds":[],"fieldMetadata":{}
+  }},
+  "frames":[
+    {"id":"frame-desktop","stateId":"state-ready","breakpointId":"bp-desktop","rootLayerId":"layer-root","title":"Ready · Desktop"},
+    {"id":"frame-tablet","stateId":"state-ready","breakpointId":"bp-tablet","rootLayerId":"layer-root","title":"Ready · Tablet"},
+    {"id":"frame-mobile","stateId":"state-ready","breakpointId":"bp-mobile","rootLayerId":"layer-root","title":"Ready · Mobile"}
+  ],
+  "overrides":[],"interactions":[],"fixtures":[],"tokenBindings":[],
+  "componentBindings":[],"assets":[],"traceLinks":[]
+}`)
+}
+
 func hasFinding(report ValidationReport, code string) bool {
 	for _, finding := range report.Findings {
 		if finding.Code == code {
+			return true
+		}
+	}
+	return false
+}
+
+func hasFindingAt(report ValidationReport, code, path string) bool {
+	for _, finding := range report.Findings {
+		if finding.Code == code && finding.Path == path {
 			return true
 		}
 	}

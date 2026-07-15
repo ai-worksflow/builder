@@ -370,6 +370,7 @@ func TestTargetArtifactTemplatesAreStableAndSliceScoped(t *testing.T) {
 	if !ok || kind != "prototype" || key != "PROTOTYPE-PAGE-HOME" || title != "Prototype · Home" || len(content) == 0 {
 		t.Fatalf("prototype target = %q %q %q %s %v", kind, key, title, content, ok)
 	}
+	assertCanonicalPrototypeTargetShape(t, content)
 }
 
 func TestRequirementsTargetTemplateHasCompleteEditorShape(t *testing.T) {
@@ -604,7 +605,32 @@ func TestCoreTargetArtifactInitializerPinsGovernedLineage(t *testing.T) {
 			len(input.SourceVersions) != 1 || !sameCoreVersionRef(input.SourceVersions[0].Ref, pageSpec) {
 			t.Fatalf("Prototype target lost exact PageSpec lineage or exploratory policy: input=%+v content=%s", input, input.Content)
 		}
+		assertCanonicalPrototypeTargetShape(t, input.Content)
 	})
+}
+
+func assertCanonicalPrototypeTargetShape(t *testing.T, content json.RawMessage) {
+	t.Helper()
+	var payload map[string]any
+	if err := json.Unmarshal(content, &payload); err != nil {
+		t.Fatalf("decode Prototype target: %v", err)
+	}
+	if _, ok := payload["exploratory"].(bool); !ok {
+		t.Fatalf("Prototype target exploratory = %#v", payload["exploratory"])
+	}
+	if _, ok := payload["layers"].(map[string]any); !ok {
+		t.Fatalf("Prototype target layers must be an object record: %#v", payload["layers"])
+	}
+	for _, field := range []string{
+		"states", "breakpoints", "frames", "overrides", "interactions", "fixtures",
+		"tokenBindings", "componentBindings", "assets", "traceLinks",
+	} {
+		value, exists := payload[field]
+		items, array := value.([]any)
+		if !exists || !array || len(items) != 0 {
+			t.Fatalf("Prototype target %s = %#v, exists = %v", field, value, exists)
+		}
+	}
 }
 
 func TestCoreTargetArtifactInitializerFailsClosedOnMissingOrWrongLineage(t *testing.T) {

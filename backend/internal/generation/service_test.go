@@ -465,7 +465,8 @@ func TestArtifactProposalInstructionsIncludeCanonicalReviewContracts(t *testing.
 		"generate_prototype": {
 			"pageSpecRevision", "state set exactly", "fixtureIds arrays that exactly match", "Never invent a fixture or interaction",
 			"integer HTTP statusCode", "sanitized true", "declarative action", "semantic layer object record",
-			"desktop, tablet, and mobile", "every required state and breakpoint pair",
+			"desktop, tablet, and mobile", "every required state and breakpoint pair", "Every named collection must be present",
+			"\"layers\":{}", "\"tokenBindings\":[]", "viewportWidth", "fieldMetadata", "\"title\":\"State · Breakpoint\"",
 		},
 	}
 	for jobType, required := range tests {

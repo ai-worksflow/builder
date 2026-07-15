@@ -3,6 +3,7 @@ package core
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"strings"
 
 	"github.com/worksflow/builder/backend/internal/domain"
@@ -500,15 +501,16 @@ func validatePrototype(value map[string]any) []ValidationFinding {
 		"states", "breakpoints", "frames", "overrides", "interactions", "fixtures",
 		"tokenBindings", "componentBindings", "assets", "traceLinks",
 	} {
-		if raw, exists := value[field]; exists && !isJSONObjectArray(raw) {
+		if raw, exists := value[field]; !exists || !isJSONObjectArray(raw) {
 			findings = append(findings, blocker(
 				"prototype.array_contract", "$."+field,
-				fmt.Sprintf("Prototype %s must be an array containing only JSON objects.", field),
+				fmt.Sprintf("Prototype must declare %s as an array containing only JSON objects.", field),
 			))
 		}
 	}
-	if raw, exists := value["layers"]; exists && !isPrototypeLayerCollection(raw) {
-		findings = append(findings, blocker("prototype.layer_contract", "$.layers", "Prototype layers must be a record or array containing only JSON objects."))
+	rawLayers, layersExist := value["layers"]
+	if !layersExist || !isPrototypeLayerCollection(rawLayers) {
+		findings = append(findings, blocker("prototype.layer_contract", "$.layers", "Prototype layers must be an object record whose values are layer objects."))
 	}
 	legacyPageSpecRef := firstString(value, "sourcePageSpecArtifactId") != "" &&
 		firstString(value, "sourcePageSpecRevisionId") != "" &&
@@ -545,9 +547,23 @@ func validatePrototype(value map[string]any) []ValidationFinding {
 	breakpointNames := map[string]bool{}
 	for index, breakpoint := range breakpoints {
 		identifier := firstString(breakpoint, "id")
-		name := strings.ToLower(firstString(breakpoint, "name", "key"))
+		name := strings.ToLower(firstString(breakpoint, "name"))
 		if identifier == "" || name == "" {
 			findings = append(findings, blocker("prototype.invalid_breakpoint", fmt.Sprintf("$.breakpoints[%d]", index), "Every breakpoint needs a stable ID and name."))
+		}
+		minWidth, validMinWidth := nonNegativeInteger(breakpoint["minWidth"])
+		_, validViewportWidth := positiveInteger(breakpoint["viewportWidth"])
+		_, validViewportHeight := positiveInteger(breakpoint["viewportHeight"])
+		validMaxWidth := true
+		if rawMaxWidth, exists := breakpoint["maxWidth"]; exists {
+			maxWidth, valid := nonNegativeInteger(rawMaxWidth)
+			validMaxWidth = valid && validMinWidth && maxWidth >= minWidth
+		}
+		if !validMinWidth || !validMaxWidth || !validViewportWidth || !validViewportHeight {
+			findings = append(findings, blocker(
+				"prototype.breakpoint_ui_contract", fmt.Sprintf("$.breakpoints[%d]", index),
+				"Every breakpoint must declare a nonnegative integer minWidth, an optional maxWidth not below minWidth, and positive integer viewportWidth and viewportHeight values.",
+			))
 		}
 		if breakpointIDs[identifier] || breakpointNames[name] {
 			findings = append(findings, blocker("prototype.duplicate_breakpoint", fmt.Sprintf("$.breakpoints[%d]", index), "Prototype breakpoint IDs and names must be unique."))
@@ -560,31 +576,41 @@ func validatePrototype(value map[string]any) []ValidationFinding {
 			findings = append(findings, blocker("prototype.required_breakpoint", "$.breakpoints", fmt.Sprintf("Prototype must declare the %s breakpoint.", required)))
 		}
 	}
-	layerObjects := prototypeCanonicalLayerObjects(value)
-	layers := objectSlice(value["layers"])
-	if len(layerObjects) == 0 && len(layers) == 0 {
-		if scene, ok := value["scene"].(map[string]any); ok {
-			layers = objectSlice(scene["layers"])
-		}
+	layerObjects := map[string]map[string]any{}
+	if isPrototypeLayerCollection(rawLayers) {
+		layerObjects = prototypeLayerObjects(rawLayers)
 	}
-	if len(layerObjects) == 0 && len(layers) == 0 {
+	if len(layerObjects) == 0 {
 		findings = append(findings, blocker("prototype.layers", "$.layers", "Prototype must contain a semantic layer tree."))
 	}
 	seen := map[string]bool{}
 	for id, layer := range layerObjects {
-		if id == "" || seen[id] || firstString(layer, "id") != "" && firstString(layer, "id") != id {
+		embeddedID := firstString(layer, "id")
+		if id == "" || seen[id] || embeddedID == "" || embeddedID != id {
 			findings = append(findings, blocker("prototype.layer_id", "$.layers", "Every layer needs a unique stable ID."))
 		}
 		seen[id] = true
-	}
-	for index, layer := range layers {
-		id := firstString(layer, "id", "layerId")
-		if id == "" || seen[id] {
-			findings = append(findings, blocker("prototype.layer_id", fmt.Sprintf("$.layers[%d]", index), "Every layer needs a unique stable ID."))
+		kind := firstString(layer, "kind")
+		if !allowedPrototypeLayerKind(kind) || firstString(layer, "name") == "" {
+			findings = append(findings, blocker(
+				"prototype.layer_ui_contract", "$.layers."+id,
+				"Every layer must declare a supported kind and a non-empty name.",
+			))
 		}
-		seen[id] = true
-	}
-	for id, layer := range layerObjects {
+		for _, field := range []string{"layout", "style", "properties"} {
+			if !isJSONObject(layer[field]) {
+				findings = append(findings, blocker(
+					"prototype.layer_ui_contract", "$.layers."+id+"."+field,
+					fmt.Sprintf("Prototype layer %s must be a JSON object.", field),
+				))
+			}
+		}
+		if !validPrototypeFieldMetadata(layer["fieldMetadata"]) {
+			findings = append(findings, blocker(
+				"prototype.layer_field_metadata", "$.layers."+id+".fieldMetadata",
+				"Prototype layer fieldMetadata must be an object record of complete AI policy metadata.",
+			))
+		}
 		if parentID := firstString(layer, "parentId"); parentID != "" && layerObjects[parentID] == nil {
 			findings = append(findings, blocker("prototype.layer_parent", "$.layers."+id+".parentId", "Layer parentId must reference an existing layer."))
 		}
@@ -594,7 +620,7 @@ func validatePrototype(value map[string]any) []ValidationFinding {
 			}
 		}
 		for _, field := range []string{"childIds", "requirementIds", "acceptanceCriterionIds"} {
-			if _, exists := layer[field]; exists && !hasJSONStringArray(layer, field) {
+			if !hasJSONStringArray(layer, field) {
 				findings = append(findings, blocker("prototype.layer_array_contract", "$.layers."+id+"."+field, "Prototype layer trace and child fields must contain only stable string IDs."))
 			}
 		}
@@ -609,8 +635,8 @@ func validatePrototype(value map[string]any) []ValidationFinding {
 			breakpointID := firstString(frame, "breakpointId")
 			rootLayerID := firstString(frame, "rootLayerId")
 			key := stateID + "\x00" + breakpointID
-			if firstString(frame, "id") == "" || !stateIDs[stateID] || !breakpointIDs[breakpointID] || layerObjects[rootLayerID] == nil {
-				findings = append(findings, blocker("prototype.invalid_frame", fmt.Sprintf("$.frames[%d]", index), "Every frame must reference an existing state, breakpoint, and root layer."))
+			if firstString(frame, "id") == "" || firstString(frame, "title") == "" || !stateIDs[stateID] || !breakpointIDs[breakpointID] || layerObjects[rootLayerID] == nil {
+				findings = append(findings, blocker("prototype.invalid_frame", fmt.Sprintf("$.frames[%d]", index), "Every frame must have a stable ID and title and reference an existing state, breakpoint, and root layer."))
 			}
 			if coverage[key] {
 				findings = append(findings, blocker("prototype.duplicate_frame", fmt.Sprintf("$.frames[%d]", index), "Only one base frame is allowed per state and breakpoint pair."))
@@ -716,6 +742,55 @@ func validatePrototype(value map[string]any) []ValidationFinding {
 	return findings
 }
 
+func allowedPrototypeLayerKind(value string) bool {
+	switch value {
+	case "frame", "group", "text", "image", "componentInstance", "input", "button", "list", "overlay", "slot":
+		return true
+	default:
+		return false
+	}
+}
+
+func validPrototypeFieldMetadata(value any) bool {
+	metadata, ok := value.(map[string]any)
+	if !ok {
+		return false
+	}
+	for field, raw := range metadata {
+		entry, ok := raw.(map[string]any)
+		if !ok || strings.TrimSpace(field) == "" {
+			return false
+		}
+		source := firstString(entry, "source")
+		policy := firstString(entry, "aiPolicy")
+		if (source != "ai" && source != "human" && source != "import") ||
+			(policy != "replaceable" && policy != "suggestOnly" && policy != "preserve") ||
+			firstString(entry, "changedBy") == "" || firstString(entry, "changedAt") == "" ||
+			firstString(entry, "operationId") == "" {
+			return false
+		}
+	}
+	return true
+}
+
+func isJSONObject(value any) bool {
+	_, ok := value.(map[string]any)
+	return ok
+}
+
+func nonNegativeInteger(value any) (int64, bool) {
+	number, ok := value.(float64)
+	if !ok || number < 0 || math.Trunc(number) != number || number > math.MaxInt64 {
+		return 0, false
+	}
+	return int64(number), true
+}
+
+func positiveInteger(value any) (int64, bool) {
+	number, ok := nonNegativeInteger(value)
+	return number, ok && number > 0
+}
+
 func hasJSONStringArray(value map[string]any, key string) bool {
 	items, exists := value[key].([]any)
 	if !exists {
@@ -743,15 +818,16 @@ func isJSONObjectArray(value any) bool {
 }
 
 func isPrototypeLayerCollection(value any) bool {
-	if object, ok := value.(map[string]any); ok {
-		for _, item := range object {
-			if _, ok := item.(map[string]any); !ok {
-				return false
-			}
-		}
-		return true
+	object, ok := value.(map[string]any)
+	if !ok {
+		return false
 	}
-	return isJSONObjectArray(value)
+	for _, item := range object {
+		if _, ok := item.(map[string]any); !ok {
+			return false
+		}
+	}
+	return true
 }
 
 func validVersionReference(value any) bool {
