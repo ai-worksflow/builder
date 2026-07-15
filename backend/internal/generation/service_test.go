@@ -457,7 +457,11 @@ func TestArtifactProposalInstructionsIncludeCanonicalReviewContracts(t *testing.
 			"copied exactly from the frozen Requirement Baseline", "cover every Must requirement ID",
 			"contains edge from a Feature", "requires edge to a Permission", "sourceNodeId",
 		},
-		"generate_page_spec": {"blueprintPageNodeId", "ready, loading, empty, and error", "acceptance-criterion trace"},
+		"generate_page_spec": {
+			"blueprintPageNodeId", "top-level acceptanceCriterionIds array", "every acceptance criterion linked to every requirementId",
+			"ready, loading, empty, and error", "\"source\":\"api|database|fixture|local\"",
+			"Keep dataBindings and interactions as empty arrays", "\"trigger\":\"explicit trigger\"",
+		},
 		"generate_prototype": {
 			"pageSpecRevision", "state set exactly", "fixtureIds arrays that exactly match", "Never invent a fixture or interaction",
 			"integer HTTP statusCode", "sanitized true", "declarative action", "semantic layer object record",
@@ -553,6 +557,79 @@ func TestDecomposePagesStopsAfterOneFailedRepair(t *testing.T) {
 	)
 	if !errors.Is(err, ai.ErrInvalidOutput) || len(provider.requests) != 2 {
 		t.Fatalf("invalid repair was not bounded to two provider calls: calls=%d err=%v", len(provider.requests), err)
+	}
+}
+
+func TestGeneratePageSpecRepairsInvalidCandidateWithDeterministicFeedback(t *testing.T) {
+	t.Parallel()
+	base := json.RawMessage(`{
+  "schemaVersion":1,
+  "blueprintPageNodeId":"page-a",
+  "title":"Page A",
+  "route":"/a",
+  "userGoal":"Use Page A",
+  "states":[],
+  "dataBindings":[],
+  "interactions":[]
+}`)
+	states := `[
+  {"id":"state-ready","key":"ready","title":"Ready","required":true},
+  {"id":"state-loading","key":"loading","title":"Loading","required":true},
+  {"id":"state-empty","key":"empty","title":"Empty","required":true},
+  {"id":"state-error","key":"error","title":"Error","required":true}
+]`
+	invalid := json.RawMessage(fmt.Sprintf(`{
+  "schemaVersion":1,
+  "blueprintPageNodeId":"page-a",
+  "title":"Page A",
+  "route":"/a",
+  "userGoal":"Use Page A",
+  "states":%s,
+  "dataBindings":[],
+  "interactions":[]
+}`, states))
+	valid := json.RawMessage(fmt.Sprintf(`{
+  "schemaVersion":1,
+  "blueprintPageNodeId":"page-a",
+  "title":"Page A",
+  "route":"/a",
+  "userGoal":"Use Page A",
+  "acceptanceCriterionIds":["AC-A"],
+  "states":%s,
+  "dataBindings":[],
+  "interactions":[]
+}`, states))
+	provider := &scriptedArtifactProvider{results: []ai.Result{
+		generatedArtifactResult(t, invalid, ai.Usage{InputTokens: 10, OutputTokens: 20, TotalTokens: 30}),
+		generatedArtifactResult(t, valid, ai.Usage{InputTokens: 40, OutputTokens: 50, TotalTokens: 90}),
+	}}
+	service := &Service{provider: provider}
+	originalInput := json.RawMessage(`{"baseContent":{"blueprintPageNodeId":"page-a"},"sources":[]}`)
+	result, _, err := service.generateValidatedArtifactOutput(
+		context.Background(), "manifest", "generate_page_spec", "test-model",
+		originalInput, base, nil,
+	)
+	if err != nil {
+		t.Fatalf("repair did not produce a canonical PageSpec: %v", err)
+	}
+	if len(provider.requests) != 2 {
+		t.Fatalf("provider calls = %d, want one generation plus one repair", len(provider.requests))
+	}
+	if result.Usage == nil || *result.Usage != (ai.Usage{InputTokens: 50, OutputTokens: 70, TotalTokens: 120}) {
+		t.Fatalf("repair usage was not accumulated: %#v", result.Usage)
+	}
+	var repairInput map[string]any
+	if err := json.Unmarshal(provider.requests[1].Input, &repairInput); err != nil {
+		t.Fatal(err)
+	}
+	feedback, _ := repairInput["deterministicValidationFeedback"].(string)
+	if repairInput["baseContent"] == nil || repairInput["previousInvalidProposal"] == nil ||
+		!strings.Contains(feedback, "page_spec.acceptance_trace") {
+		t.Fatalf("repair input lost immutable base, invalid candidate, or detailed feedback: %#v", repairInput)
+	}
+	if !strings.Contains(provider.requests[1].Instructions, "single deterministic repair pass") ||
+		!strings.Contains(provider.requests[1].Instructions, "top-level acceptanceCriterionIds array") {
+		t.Fatalf("repair request lacked the PageSpec repair contract: %s", provider.requests[1].Instructions)
 	}
 }
 

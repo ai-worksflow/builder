@@ -229,7 +229,7 @@ func (s *Service) generateValidatedArtifactOutput(
 			result.Usage = totalUsage
 			return result, output, nil
 		}
-		if pass == 1 || jobType != "decompose_pages" || !errors.Is(validationErr, ai.ErrInvalidOutput) {
+		if pass == 1 || !supportsArtifactProposalRepair(jobType) || !errors.Is(validationErr, ai.ErrInvalidOutput) {
 			return ai.Result{}, artifactProposalOutput{}, validationErr
 		}
 		requestInput, err = artifactProposalRepairInput(input, result.Output, validationErr)
@@ -239,6 +239,15 @@ func (s *Service) generateValidatedArtifactOutput(
 		instructions = artifactProposalRepairInstructions(jobType)
 	}
 	return ai.Result{}, artifactProposalOutput{}, ai.ErrInvalidOutput
+}
+
+func supportsArtifactProposalRepair(jobType string) bool {
+	switch jobType {
+	case "decompose_pages", "generate_page_spec":
+		return true
+	default:
+		return false
+	}
 }
 
 func (s *Service) artifactPreflightSources(ctx context.Context, manifest domain.InputManifest) ([]json.RawMessage, error) {
@@ -1516,7 +1525,7 @@ func artifactProposalJobContract(jobType string) string {
 	case "decompose_pages":
 		return "The fully applied Blueprint must use the top-level nodes and edges arrays as its only semantic graph; never add a semantic alias or a second graph representation. It must contain at least one application Page. Every node needs a unique id, key or businessKey, and supported kind or type. Every Page needs a non-empty title, a unique absolute route, a non-empty userGoal, at least one requirementId copied exactly from the frozen Requirement Baseline, and a contains edge from a Feature. Collectively, Blueprint node requirementIds must cover every Must requirement ID from that baseline; never invent shorthand IDs such as REQ-001. Every API operation needs a supported method, an absolute path, and a requires edge to a Permission node. Use this canonical shape: {\"nodes\":[{\"id\":\"feature-main\",\"key\":\"FEATURE-MAIN\",\"kind\":\"feature\",\"title\":\"Main\"},{\"id\":\"page-main\",\"key\":\"PAGE-MAIN\",\"kind\":\"page\",\"title\":\"Main\",\"route\":\"/\",\"userGoal\":\"Complete the primary task\",\"requirementIds\":[\"exact-baseline-id\"]}],\"edges\":[{\"id\":\"edge-main-page\",\"sourceNodeId\":\"feature-main\",\"targetNodeId\":\"page-main\",\"kind\":\"contains\"}]}."
 	case "generate_page_spec":
-		return "The fully applied PageSpec must preserve the exact blueprintPageNodeId and provide a title, absolute route, user goal, and acceptance-criterion trace. Declare ready, loading, empty, and error states with unique stable IDs and keys, non-empty titles, and required set to true. Data bindings and interactions, when present, must use stable unique IDs and valid references."
+		return "The fully applied PageSpec must preserve the exact blueprintPageNodeId, title, absolute route, and userGoal from baseContent. Populate the top-level acceptanceCriterionIds array with exact IDs copied from the frozen Product Requirements source: include every acceptance criterion linked to every requirementId on this Blueprint Page and never invent or abbreviate an ID. Use this canonical state shape for all four required states: {\"id\":\"state-ready\",\"key\":\"ready\",\"title\":\"Ready\",\"required\":true}; declare ready, loading, empty, and error with unique stable IDs and keys, non-empty titles, and required set to true. Keep dataBindings and interactions as empty arrays unless immutable sources justify complete records. Every data binding must use {\"id\":\"stable-id\",\"name\":\"Name\",\"source\":\"api|database|fixture|local\"}; an api source also requires operationId copied exactly from a permission-protected Blueprint API operation owned by this Page, while non-api bindings must omit operationId. Every interaction must use {\"id\":\"stable-id\",\"trigger\":\"explicit trigger\",\"outcome\":\"explicit outcome\"}."
 	case "generate_prototype":
 		return "The fully applied Prototype must preserve the exact pageSpecRevision, set exploratory to false, and reproduce the PageSpec state set exactly with identical stable IDs and keys, non-empty titles, explicit required flags, and fixtureIds arrays that exactly match each source state. Never invent a fixture or interaction: copy only fixtures and interactions declared by the PageSpec, and emit empty fixtures and interactions arrays when their PageSpec collections are empty. Every fixture must preserve its PageSpec state ownership and declare a name, response, integer HTTP statusCode from 100 through 599, nonnegative integer latencyMs, sanitized true, and a canonical sha256 contentHash; operationId is allowed only when it names the exact PageSpec API binding operation. Every interaction must preserve its PageSpec ID and trigger, reference an existing sourceLayerId, and contain at least one declarative action using only navigate, setState, openOverlay, closeOverlay, updateBinding, or submitFixture with exact declared references. Use a stable semantic layer object record keyed by layer ID, not a layer array; every record value must repeat its matching id and use valid parentId and childIds references. Provide exactly the desktop, tablet, and mobile breakpoints and exactly one valid frame for every required state and breakpoint pair, referencing an existing root layer. Do not invent componentRef, traceLinks, assets, overrides, tokenBindings, or componentBindings; keep those collections empty unless an immutable source supplies every exact governed reference."
 	default:
