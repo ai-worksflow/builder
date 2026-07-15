@@ -6,6 +6,7 @@ import {
   reviewGateApprovalReadiness,
   revisionCandidates,
   starterWorkflowDefinition as starterDefinition,
+  workflowEditorTargetForArtifact,
   workflowRoleSatisfies,
 } from '../lib/platform/workflow-ui-contract'
 import {
@@ -730,6 +731,82 @@ test('PageSpec Human Edit exposes the exact open Proposal edit target', () => {
   })
   assert.equal(resolution.candidates.length, 0)
   assert.match(resolution.error ?? '', /Review and apply the linked Proposal/i)
+
+  assert.deepEqual(workflowEditorTargetForArtifact(
+    { nodes: [definitionNode] } as never,
+    { ...run, nodes: [node] } as never,
+    artifactSnapshot({ pageSpecs: [pageSpec], proposals: [linkedProposal] }) as never,
+    pageSpec.artifact.id,
+    'page_spec',
+  ), resolution.editorTarget)
+})
+
+test('workflow editor target inference fails closed for an ambiguous PageSpec run', () => {
+  const pageSpec = versionedResource('page-ambiguous', 'page-ambiguous-r1', 'Ambiguous PageSpec', {
+    blueprintPageNodeId: 'page-node-ambiguous',
+    title: 'Ambiguous Page',
+  })
+  Object.assign(pageSpec.artifact, { kind: 'page_spec' })
+  const firstProposal = {
+    ...proposal('page-proposal-first', 'page-payload-first', pageSpec.artifact.id, pageSpec.latestRevision),
+    status: 'open' as const,
+  }
+  const secondProposal = {
+    ...proposal('page-proposal-second', 'page-payload-second', pageSpec.artifact.id, pageSpec.latestRevision),
+    status: 'open' as const,
+  }
+  const firstNode = {
+    id: 'page-node-first', runId: 'run-1', key: 'page-edit:first',
+    definitionNodeId: 'page-edit', type: 'human_edit', status: 'waiting_input', attempt: 1,
+  }
+  const secondNode = {
+    ...firstNode,
+    id: 'page-node-second',
+    key: 'page-edit:second',
+  }
+  const definitionNode = {
+    id: 'page-edit', name: 'Edit PageSpec', type: 'human_edit',
+    humanEdit: { artifactType: 'blueprint', artifactKind: 'page_spec', requiredRole: 'editor' },
+  }
+  const firstRun = workflowRun(firstNode, [lineageBinding(
+    [],
+    { id: firstProposal.id, payloadHash: firstProposal.payloadHash },
+  )])
+  const secondRun = workflowRun(secondNode, [lineageBinding(
+    [],
+    { id: secondProposal.id, payloadHash: secondProposal.payloadHash },
+  )])
+  const run = {
+    ...firstRun,
+    nodes: [firstNode, secondNode],
+    context: {
+      ...firstRun.context,
+      nodes: {
+        ...firstRun.context.nodes,
+        ...secondRun.context.nodes,
+      },
+    },
+  }
+  const artifacts = artifactSnapshot({
+    pageSpecs: [pageSpec],
+    proposals: [firstProposal, secondProposal],
+  })
+
+  assert.equal(workflowEditorTargetForArtifact(
+    { nodes: [definitionNode] } as never,
+    run as never,
+    artifacts as never,
+    pageSpec.artifact.id,
+    'page_spec',
+  ), undefined)
+  assert.equal(workflowEditorTargetForArtifact(
+    { nodes: [definitionNode] } as never,
+    run as never,
+    artifacts as never,
+    pageSpec.artifact.id,
+    'page_spec',
+    firstNode.key,
+  )?.proposalId, firstProposal.id)
 })
 
 test('PageSpec Human Edit retains the applied Proposal target while awaiting its immutable revision', () => {

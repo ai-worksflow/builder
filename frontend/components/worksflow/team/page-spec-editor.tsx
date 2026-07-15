@@ -1,6 +1,6 @@
 'use client'
 
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useCollaboration } from '@/lib/collaboration/provider'
 import {
   ArtifactWorkspaceConflictError,
@@ -8,6 +8,8 @@ import {
   type ArtifactDetails,
 } from '@/lib/platform/artifact-workspace'
 import { useArtifactWorkspace } from '@/lib/platform/artifact-provider'
+import { usePlatformFlow } from '@/lib/platform/flow-provider'
+import { workflowEditorTargetForArtifact } from '@/lib/platform/workflow-ui-contract'
 import { useWorksflow } from '@/lib/worksflow/store'
 import {
   normalizePageSpecContent,
@@ -53,6 +55,12 @@ import {
 type EditorTab = 'content' | 'states' | 'data' | 'interactions' | 'versions' | 'proposal' | 'trace' | 'review'
 type SaveState = 'idle' | 'dirty' | 'saving' | 'saved' | 'conflict' | 'error'
 
+interface WorkflowRouteReference {
+  readonly runId: string
+  readonly proposalId: string
+  readonly nodeKey: string
+}
+
 export function PageSpecEditor({
   artifactId,
   onBack,
@@ -62,6 +70,7 @@ export function PageSpecEditor({
 }) {
   const { locale, t } = useI18n()
   const workspace = useArtifactWorkspace()
+  const flow = usePlatformFlow()
   const collaboration = useCollaboration()
   const { setSurface } = useWorksflow()
   const resource = workspace.pageSpecs.find((item) => item.artifact.id === artifactId)
@@ -91,7 +100,27 @@ export function PageSpecEditor({
   const saveInFlightRef = useRef(false)
   const queuedContentRef = useRef<PageSpecContentDto | null>(null)
   const canEdit = collaboration.can('edit')
-  const workflowProposalId = workflowProposalReference(artifactId)
+  const workflowReference = workflowRouteReference(artifactId)
+  const inferredWorkflowProposalId = useMemo(() => workflowEditorTargetForArtifact(
+    flow.runDefinition?.definition,
+    flow.run?.id === workflowReference.runId ? flow.run : null,
+    workspace,
+    artifactId,
+    'page_spec',
+    workflowReference.nodeKey || undefined,
+  )?.proposalId ?? '', [
+    artifactId,
+    flow.run,
+    flow.runDefinition?.definition,
+    workflowReference.nodeKey,
+    workflowReference.runId,
+    workspace,
+  ])
+  const workflowProposalId = resolvedWorkflowProposalReference(
+    workflowReference,
+    inferredWorkflowProposalId,
+  )
+  const workflowContextRequested = Boolean(workflowReference.runId || workflowReference.proposalId)
 
   const latestVersion = resource?.latestRevision
     ? versionRef(resource.latestRevision)
@@ -109,11 +138,9 @@ export function PageSpecEditor({
       || confirmedAppliedProposalId === linkedProposal.id
     ),
   )
-  const linkedProposalRevision = [
-    resource?.latestRevision,
-    resource?.approvedRevision,
-    ...(details?.versions ?? []),
-  ].find((revision) => revision?.proposalId === workflowProposalId)
+  const linkedProposalRevision = resource?.latestRevision?.proposalId === workflowProposalId
+    ? resource.latestRevision
+    : undefined
   const linkedProposalBaseIsLatest = Boolean(
     linkedProposal
     && resource?.latestRevision
@@ -121,6 +148,7 @@ export function PageSpecEditor({
     && resource.latestRevision.contentHash === linkedProposal.baseRevision.contentHash,
   )
   const workflowRevisionReady = Boolean(linkedProposalRevision || createdWorkflowRevisionId)
+  const workflowReviewLocked = workflowContextRequested && !workflowRevisionReady
   const linkedProposalBaseMatchesDraft = Boolean(
     linkedProposal
     && (resource?.draft?.contentHash ?? resource?.latestRevision?.contentHash) === linkedProposal.baseRevision.contentHash,
@@ -136,7 +164,8 @@ export function PageSpecEditor({
     && !dirty
     && !['dirty', 'saving', 'conflict'].includes(saveState),
   )
-  const contentCanEdit = canEdit && (!workflowProposalId || linkedProposalApplied)
+  const contentCanEdit = canEdit
+    && (!workflowContextRequested || Boolean(workflowProposalId && linkedProposalApplied))
   const comments = collaboration.comments.filter((thread) =>
     thread.target?.artifactId === artifactId
     && thread.target.revisionId === latestVersion?.revisionId,
@@ -159,10 +188,21 @@ export function PageSpecEditor({
     && reviewGateReadyForRequest(details?.reviewGate)
 
   useEffect(() => {
+    if (workflowReference.proposalId || !inferredWorkflowProposalId || typeof window === 'undefined') return
+    const url = new URL(window.location.href)
+    url.searchParams.set('proposalId', inferredWorkflowProposalId)
+    window.history.replaceState(window.history.state, '', url)
+  }, [inferredWorkflowProposalId, workflowReference.proposalId])
+
+  useEffect(() => {
     setConfirmedAppliedProposalId('')
     setCreatedWorkflowRevisionId('')
     setConfirmProposalBaseRestore(false)
   }, [artifactId, workflowProposalId])
+
+  useEffect(() => {
+    if (workflowContextRequested && !workflowProposalId) setTab('content')
+  }, [workflowContextRequested, workflowProposalId])
 
   useEffect(() => {
     if (!workflowProposalId || !linkedProposal) return
@@ -286,13 +326,20 @@ export function PageSpecEditor({
       || saveState === 'saving'
       || saveState === 'conflict'
       || !hasUnversionedChanges
-      || (workflowProposalId && !linkedProposalApplied)
+      || (workflowContextRequested && (!workflowProposalId || !linkedProposalApplied))
     ) return
     setSaveState('saving')
     setError(null)
     try {
       const revision = await workspace.createPageSpecRevision(resource.artifact.id)
-      if (workflowProposalId) setCreatedWorkflowRevisionId(revision.id)
+      if (workflowProposalId) {
+        if (
+          revision.artifactId !== artifactId
+          || revision.proposalId !== workflowProposalId
+          || revision.contentHash !== resource.draft?.contentHash
+        ) throw new Error(t('teamPlatform.pageSpec.workflowRevisionMismatch'))
+        setCreatedWorkflowRevisionId(revision.id)
+      }
       setSaveState('saved')
       await loadDetails()
     } catch (cause) {
@@ -315,8 +362,8 @@ export function PageSpecEditor({
       || dirty
       || saveState === 'saving'
       || saveState === 'conflict'
-      || (workflowProposalId && proposal.id !== workflowProposalId)
-      || (workflowProposalId && !linkedProposalBaseMatchesDraft)
+      || (workflowContextRequested && (!workflowProposalId || proposal.id !== workflowProposalId))
+      || (workflowContextRequested && !linkedProposalBaseMatchesDraft)
     ) return
     setProposalBusyId(proposal.id)
     setError(null)
@@ -465,6 +512,22 @@ export function PageSpecEditor({
         </div>
       )}
 
+      {workflowReference.runId && !workflowProposalId && (
+        <div className="flex items-start gap-2 border-b border-warning/30 bg-warning/10 px-3 py-2.5" data-testid="page-spec-workflow-proposal-guide">
+          {flow.run?.id === workflowReference.runId && flow.runDefinition
+            ? <AlertTriangle className="mt-0.5 size-3.5 shrink-0 text-warning" />
+            : <Loader2 className="mt-0.5 size-3.5 shrink-0 animate-spin text-warning" />}
+          <div className="min-w-0 flex-1">
+            <p className="text-[10px] font-semibold text-foreground">{t('teamPlatform.pageSpec.workflowProposalTitle')}</p>
+            <p className="mt-1 text-[9px] leading-relaxed text-warning">
+              {flow.run?.id === workflowReference.runId && flow.runDefinition
+                ? t('teamPlatform.pageSpec.workflowProposalUnresolved')
+                : t('teamPlatform.pageSpec.workflowProposalResolving')}
+            </p>
+          </div>
+        </div>
+      )}
+
       <nav className="flex overflow-x-auto border-b border-border bg-panel p-1 scrollbar-thin">
         {([
           ['content', t('teamPlatform.pageSpec.tab.basics')],
@@ -475,9 +538,17 @@ export function PageSpecEditor({
           ['proposal', t('teamPlatform.editor.tab.proposals', { count: proposals.length.toLocaleString(locale) })],
           ['trace', t('teamPlatform.editor.tab.trace', { count: (details?.dependencies.length ?? 0).toLocaleString(locale) })],
           ['review', t('teamPlatform.editor.tab.review', { count: (comments.length + reviews.length).toLocaleString(locale) })],
-        ] as const).map(([id, label]) => (
-          <button key={id} type="button" onClick={() => setTab(id)} className={cn('shrink-0 rounded px-2.5 py-1.5 text-[9px] font-medium', tab === id ? 'bg-primary/15 text-primary-bright' : 'text-muted-foreground')}>{label}</button>
-        ))}
+        ] as const).map(([id, label]) => {
+          const workflowLocked = id === 'review' && workflowReviewLocked
+          return <button
+            key={id}
+            type="button"
+            onClick={() => setTab(id)}
+            disabled={workflowLocked}
+            title={workflowLocked ? t('teamPlatform.pageSpec.workflowReviewLocked') : undefined}
+            className={cn('shrink-0 rounded px-2.5 py-1.5 text-[9px] font-medium disabled:cursor-not-allowed disabled:opacity-40', tab === id ? 'bg-primary/15 text-primary-bright' : 'text-muted-foreground')}
+          >{label}</button>
+        })}
       </nav>
 
       <div className="max-h-[680px] overflow-y-auto p-4 scrollbar-thin">
@@ -488,7 +559,7 @@ export function PageSpecEditor({
         {tab === 'versions' && (
           <div className="space-y-3">
             <ReviewGatePanel clientIssues={clientIssues} serverGate={details?.reviewGate} />
-            <button type="button" onClick={() => void createRevision()} disabled={!canEdit || clientIssues.length > 0 || dirty || !hasUnversionedChanges || saveState === 'saving' || saveState === 'conflict' || Boolean(workflowProposalId && !linkedProposalApplied)} className="inline-flex items-center gap-1.5 rounded bg-primary px-3 py-2 text-[10px] font-semibold text-primary-foreground disabled:opacity-40"><GitBranch className="size-3.5" />{t('teamPlatform.pageSpec.createRevision')}</button>
+            <button type="button" onClick={() => void createRevision()} disabled={!canEdit || clientIssues.length > 0 || dirty || !hasUnversionedChanges || saveState === 'saving' || saveState === 'conflict' || Boolean(workflowContextRequested && (!workflowProposalId || !linkedProposalApplied))} className="inline-flex items-center gap-1.5 rounded bg-primary px-3 py-2 text-[10px] font-semibold text-primary-foreground disabled:opacity-40"><GitBranch className="size-3.5" />{t('teamPlatform.pageSpec.createRevision')}</button>
             {dirty && <p className="text-[9px] text-warning">{t('teamPlatform.pageSpec.waitAutosave')}</p>}
             {workflowProposalId && !linkedProposalApplied && <p className="text-[9px] text-warning">{t('teamPlatform.pageSpec.applyWorkflowProposalFirst')}</p>}
             {!dirty && !hasUnversionedChanges && <p className="text-[9px] text-faint-foreground">{t('teamPlatform.pageSpec.draftMatchesRevision')}</p>}
@@ -502,11 +573,11 @@ export function PageSpecEditor({
             onSelected={setSelectedOperations}
             instruction={proposalInstruction}
             onInstruction={setProposalInstruction}
-            canEdit={canEdit}
-            canCreate={Boolean(latestVersion) && !workflowProposalId && draftMatchesLatest && !dirty && saveState !== 'saving' && saveState !== 'conflict'}
+            canEdit={canEdit && (!workflowContextRequested || Boolean(workflowProposalId))}
+            canCreate={Boolean(latestVersion) && !workflowContextRequested && draftMatchesLatest && !dirty && saveState !== 'saving' && saveState !== 'conflict'}
             linkedProposalId={workflowProposalId}
             proposalBusyId={proposalBusyId}
-            applyBlocked={dirty || saveState === 'saving' || saveState === 'conflict' || proposalBaseRestoreBusy || Boolean(workflowProposalId && !linkedProposalBaseMatchesDraft)}
+            applyBlocked={dirty || saveState === 'saving' || saveState === 'conflict' || proposalBaseRestoreBusy || Boolean(workflowContextRequested && (!workflowProposalId || !linkedProposalBaseMatchesDraft))}
             onCreate={() => void workspace.createProposal({
               jobType: 'page_spec.patch',
               targetRevision: latestVersion!,
@@ -526,7 +597,7 @@ export function PageSpecEditor({
         {tab === 'review' && (
           <ReviewEditor
             latestVersion={latestVersion}
-            gatePassed={gatePassed}
+            gatePassed={gatePassed && !workflowReviewLocked}
             gate={<ReviewGatePanel clientIssues={clientIssues} serverGate={details?.reviewGate} />}
             comment={comment}
             onComment={setComment}
@@ -679,7 +750,7 @@ function ProposalEditor({ proposals, selected, onSelected, instruction, onInstru
             <div className="mt-2 space-y-1.5">
               {operations.map((operation) => (
                 <label key={operation.id} className="flex gap-2 rounded border border-border bg-background p-2 text-[9px] text-muted-foreground">
-                  <input type="checkbox" disabled={!isLinked || Boolean(proposalBusyId) || operation.decision !== 'pending'} checked={operation.decision === 'accepted' || operation.decision === 'applied' || selectedIds.includes(operation.id)} onChange={(event) => onSelected({ ...selected, [proposal.id]: event.target.checked ? [...selectedIds, operation.id] : selectedIds.filter((id) => id !== operation.id) })} />
+                  <input type="checkbox" disabled={!canEdit || !isLinked || Boolean(proposalBusyId) || operation.decision !== 'pending'} checked={operation.decision === 'accepted' || operation.decision === 'applied' || selectedIds.includes(operation.id)} onChange={(event) => onSelected({ ...selected, [proposal.id]: event.target.checked ? [...selectedIds, operation.id] : selectedIds.filter((id) => id !== operation.id) })} />
                   <span className="min-w-0 flex-1"><code>{proposalOperationLabel(operation.kind, t)} {operation.path || '/'}</code><span className="ml-2 text-faint-foreground">{proposalDecisionLabel(operation.decision, t)}</span>{operation.rationale && <span className="mt-1 block">{operation.rationale}</span>}{operation.value !== undefined && <pre className="mt-1 max-h-36 overflow-auto whitespace-pre-wrap rounded bg-black/20 p-1.5 font-mono text-[8px]">{JSON.stringify(operation.value, null, 2)}</pre>}</span>
                 </label>
               ))}
@@ -728,15 +799,28 @@ function ReviewEditor({ latestVersion, gatePassed, gate, comment, onComment, rev
 
 function ReviewGatePanel({ clientIssues, serverGate }: { clientIssues: readonly string[]; serverGate?: ArtifactReviewGateDto }) {
   const { locale, t } = useI18n()
-  const serverIssues = serverGate?.checks.filter((check) => check.severity === 'error' && check.code !== 'canonical_review_approved').map((check) => check.message) ?? []
-  const issues = [...clientIssues, ...serverIssues]
-  const ready = issues.length === 0 && reviewGateReadyForRequest(serverGate)
+  const serverErrors = serverGate?.checks.filter(
+    (check) => check.severity === 'error' && check.code !== 'canonical_review_approved',
+  ) ?? []
+  const draftIssues = uniqueStrings([
+    ...clientIssues.map((issue) => pageSpecIssueLabel(issue, t)),
+    ...serverErrors
+      .filter((check) => check.code === 'draft_matches_latest_revision')
+      .map((check) => pageSpecIssueLabel(check.message, t)),
+  ])
+  const revisionIssues = uniqueStrings(serverErrors
+    .filter((check) => check.code !== 'draft_matches_latest_revision')
+    .map((check) => pageSpecIssueLabel(check.message, t)))
+  const ready = draftIssues.length === 0
+    && revisionIssues.length === 0
+    && reviewGateReadyForRequest(serverGate)
   return (
     <div className={cn('rounded-lg border p-3', ready ? 'border-success/30 bg-success/10' : 'border-warning/30 bg-warning/10')}>
       <div className="flex items-center gap-2 text-[10px] font-semibold text-foreground">{ready ? <CheckCircle2 className="size-4 text-success" /> : <AlertTriangle className="size-4 text-warning" />}{t('teamPlatform.pageSpec.reviewGateStatus', { status: ready ? t('teamPlatform.common.ready') : t('teamPlatform.graph.status.blocked') })}</div>
-      {issues.map((issue) => <p key={issue} className="mt-1 text-[9px] text-muted-foreground">• {pageSpecIssueLabel(issue, t)}</p>)}
+      {draftIssues.length > 0 && <div className="mt-2"><p className="text-[8px] font-semibold uppercase tracking-wide text-faint-foreground">{t('teamPlatform.pageSpec.draftGateIssues')}</p>{draftIssues.map((issue) => <p key={issue} className="mt-1 text-[9px] text-muted-foreground">• {issue}</p>)}</div>}
+      {revisionIssues.length > 0 && <div className="mt-2"><p className="text-[8px] font-semibold uppercase tracking-wide text-faint-foreground">{t('teamPlatform.pageSpec.revisionGateIssues')}</p>{revisionIssues.map((issue) => <p key={issue} className="mt-1 text-[9px] text-muted-foreground">• {issue}</p>)}</div>}
       {!serverGate && <p className="mt-1 text-[9px] text-warning">{t('teamPlatform.pageSpec.waitingServerGate')}</p>}
-      {serverGate && <p className="mt-2 text-[8px] text-faint-foreground">{t('teamPlatform.pageSpec.serverGateSummary', { status: serverGate.passed ? t('teamPlatform.pageSpec.gatePassed') : t('teamPlatform.pageSpec.awaitingApproval'), percent: new Intl.NumberFormat(locale, { maximumFractionDigits: 0 }).format(serverGate.traceCoverage * 100), count: serverGate.unresolvedBlockingCommentIds.length.toLocaleString(locale) })}</p>}
+      {serverGate && <p className="mt-2 text-[8px] text-faint-foreground">{t('teamPlatform.pageSpec.serverGateSummary', { status: ready ? t('teamPlatform.common.ready') : t('teamPlatform.graph.status.blocked'), percent: new Intl.NumberFormat(locale, { maximumFractionDigits: 0 }).format(serverGate.traceCoverage * 100), count: serverGate.unresolvedBlockingCommentIds.length.toLocaleString(locale) })}</p>}
     </div>
   )
 }
@@ -888,10 +972,14 @@ function pageSpecIssueLabel(issue: string, t: Translate) {
     'Every interaction needs a unique stable ID.': t('teamPlatform.pageSpec.issue.interactionId'),
     'Every interaction needs both a trigger and an outcome.': t('teamPlatform.pageSpec.issue.interactionFields'),
     'Trace the PageSpec to at least one stable acceptance criterion ID.': t('teamPlatform.pageSpec.issue.acceptanceTrace'),
+    'PageSpec must trace to at least one acceptance criterion.': t('teamPlatform.pageSpec.issue.acceptanceTrace'),
+    'The working draft has unrevisioned changes.': t('teamPlatform.pageSpec.issue.unrevisionedChanges'),
   }
   const missingState = /^PageSpec must declare the canonical (.+) state key\.$/.exec(issue)
+    ?? /^PageSpec must declare the (.+) state\.$/.exec(issue)
   if (missingState) return t('teamPlatform.pageSpec.issue.canonicalState', { state: requiredStateTitle(missingState[1], t) })
   const requiredStateMatch = /^Required state (.+) must be marked required\.$/.exec(issue)
+    ?? /^The canonical (.+) state must be marked required\.$/.exec(issue)
   if (requiredStateMatch) return t('teamPlatform.pageSpec.issue.requiredState', { state: requiredStateTitle(requiredStateMatch[1], t) })
   return labels[issue] ?? issue
 }
@@ -933,11 +1021,26 @@ function stableId(prefix: string) {
   return `${prefix}-${id}`
 }
 
-function workflowProposalReference(artifactId: string) {
-  if (typeof window === 'undefined') return ''
+function workflowRouteReference(artifactId: string): WorkflowRouteReference {
+  if (typeof window === 'undefined') return { runId: '', proposalId: '', nodeKey: '' }
   const query = new URLSearchParams(window.location.search)
-  if (query.get('artifactId') !== artifactId) return ''
-  return query.get('proposalId') ?? ''
+  if (query.get('artifactId') !== artifactId) return { runId: '', proposalId: '', nodeKey: '' }
+  return {
+    runId: query.get('runId') ?? '',
+    proposalId: query.get('proposalId') ?? '',
+    nodeKey: query.get('workbenchNodeKey') ?? '',
+  }
+}
+
+function resolvedWorkflowProposalReference(
+  reference: WorkflowRouteReference,
+  inferredProposalId: string,
+) {
+  if (!reference.runId) return reference.proposalId
+  if (!inferredProposalId) return ''
+  return !reference.proposalId || reference.proposalId === inferredProposalId
+    ? inferredProposalId
+    : ''
 }
 
 function commaList(value: string) {

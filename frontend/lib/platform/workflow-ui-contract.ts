@@ -75,6 +75,31 @@ export interface WorkflowRevisionCandidateResolution {
   readonly error?: string
 }
 
+export function workflowEditorTargetForArtifact(
+  definition: WorkflowDefinitionDto | null | undefined,
+  run: WorkflowRunDto | null,
+  artifacts: WorkflowArtifactSnapshot,
+  artifactId: string,
+  artifactKind?: string,
+  nodeKey?: string,
+): WorkflowRevisionCandidateResolution['editorTarget'] {
+  if (!definition || !run || !artifactId) return undefined
+  const targets = run.nodes.flatMap((nodeRun) => {
+    if (
+      nodeRun.type !== 'human_edit'
+      || nodeRun.status !== 'waiting_input'
+      || (nodeKey && nodeRun.key !== nodeKey)
+    ) return []
+    const definitionNode = definition.nodes.find((node) => node.id === nodeRun.definitionNodeId)
+    const target = revisionCandidates(definitionNode, nodeRun, run, artifacts).editorTarget
+    return target?.artifactId === artifactId
+      && (!artifactKind || target.artifactKind === artifactKind)
+      ? [target]
+      : []
+  })
+  return targets.length === 1 ? targets[0] : undefined
+}
+
 export interface WorkflowReviewGateApprovalReadiness {
   readonly ready: boolean
   readonly revisions: readonly ExactArtifactRefDto[]
@@ -850,14 +875,14 @@ export function revisionCandidates(
     if (proposal.payloadHash !== proposalRef.payloadHash) {
       return { candidates: [], error: `Proposal ${proposalRef.id} does not match the payload hash pinned by the typed input lineage.` }
     }
+    if (!exactRef(proposal.baseRevision) || proposal.baseRevision.artifactId !== proposal.artifactId) {
+      return { candidates: [], error: `Proposal ${proposalRef.id} has an invalid target revision.` }
+    }
     editorTarget = {
       artifactId: proposal.artifactId,
       artifactKind: allResources.find((resource) => resource.artifact.id === proposal.artifactId)?.artifact.kind ?? kind,
       proposalId: proposal.id,
       proposalStatus: proposal.status,
-    }
-    if (!exactRef(proposal.baseRevision) || proposal.baseRevision.artifactId !== proposal.artifactId) {
-      return { candidates: [], editorTarget, error: `Proposal ${proposalRef.id} has an invalid target revision.` }
     }
     proposalTargetIds.add(proposal.artifactId)
     if (proposal.status !== 'applied' && proposal.status !== 'partially_applied') {

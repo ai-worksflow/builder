@@ -414,6 +414,7 @@ interface MockPlatformOptions {
   readonly multiWorkbenchGroups?: boolean
   readonly blueprintProposal?: boolean
   readonly blueprintHumanEditRun?: boolean
+  readonly pageSpecHumanEditRun?: boolean
   readonly secondBlueprint?: boolean
   readonly pauseFirstBlueprintDraftSave?: boolean
   readonly pauseBlueprintProposalApply?: boolean
@@ -452,7 +453,7 @@ interface MockPlatformState {
   blueprint: MockBlueprint
   secondaryBlueprint: MockBlueprint | null
   pageSpec: typeof pageSpec
-  run: ReturnType<typeof workflowRun> | ReturnType<typeof blueprintHumanEditWorkflowRun> | ReturnType<typeof selectionWorkflowRun> | ReturnType<typeof multiBundleWorkflowRun> | ReturnType<typeof multiGroupWorkflowRun> | null
+  run: ReturnType<typeof workflowRun> | ReturnType<typeof blueprintHumanEditWorkflowRun> | ReturnType<typeof pageSpecHumanEditWorkflowRun> | ReturnType<typeof selectionWorkflowRun> | ReturnType<typeof multiBundleWorkflowRun> | ReturnType<typeof multiGroupWorkflowRun> | null
   proposal: ReturnType<typeof implementationProposal> | null
   workspaceRevision: ReturnType<typeof applicationRevision> | null
   workbenchBundle: ReturnType<typeof buildManifest>
@@ -536,7 +537,9 @@ async function installPlatformMock(page: Page, options: MockPlatformOptions = {}
     blueprint: structuredClone(blueprint) as MockBlueprint,
     secondaryBlueprint: options.secondBlueprint ? createSecondaryBlueprint() : null,
     pageSpec: structuredClone(pageSpec),
-    run: options.blueprintHumanEditRun
+    run: options.pageSpecHumanEditRun
+      ? pageSpecHumanEditWorkflowRun()
+      : options.blueprintHumanEditRun
       ? blueprintHumanEditWorkflowRun()
       : options.failedRun
       ? workflowRun('run-failed', 'failed')
@@ -1464,6 +1467,7 @@ async function handlePlatformRoute(
     return
   }
   if (path === `/v1/page-specs/${pageSpec.artifact.id}/revisions` && method === 'POST') {
+    const appliedProposal = state.pageSpecProposals.find((proposal) => proposal.status === 'applied')
     const revision = {
       id: 'dddddddd-dddd-4ddd-8ddd-ddddddddddd4',
       artifactId: pageSpec.artifact.id,
@@ -1472,6 +1476,10 @@ async function handlePlatformRoute(
       status: 'draft',
       content: state.pageSpec.draft!.content,
       sourceVersions: state.pageSpec.draft!.sourceVersions,
+      ...(appliedProposal ? {
+        proposalId: appliedProposal.id,
+        sourceManifestId: appliedProposal.manifest.id,
+      } : {}),
       createdBy: user.id,
       createdAt: now,
     }
@@ -4179,6 +4187,69 @@ test('PageSpec workflow deep link prioritizes the exact Proposal and locks histo
   )).toBeVisible()
 })
 
+test('PageSpec run link infers the exact typed-lineage Proposal and locks Review until Revision', async ({ page }) => {
+  const state = await installPlatformMock(page, {
+    authenticated: true,
+    pageSpecHumanEditRun: true,
+  })
+  const linkedProposal = pageSpecArtifactProposal('page-spec-human-edit-proposal')
+  const historicalProposal = pageSpecArtifactProposal('page-spec-historical-proposal')
+  state.pageSpecProposals = [historicalProposal, linkedProposal]
+
+  await page.goto(
+    `/team/acme/project/${project.id}/blueprint?runId=run-page-spec-human-edit&artifactId=${pageSpec.artifact.id}`,
+  )
+
+  await expect(page).toHaveURL(new RegExp(`[?&]proposalId=${linkedProposal.id}(?:&|$)`))
+  const guide = page.getByTestId('page-spec-workflow-proposal-guide')
+  await expect(guide).toContainText('Exact workflow-linked PageSpec proposal')
+  await expect(guide).toContainText(linkedProposal.id)
+
+  const linkedCard = page.locator('article').filter({ hasText: linkedProposal.id })
+  await expect(linkedCard.getByText('Workflow linked', { exact: true })).toBeVisible()
+  const review = page.getByRole('button', { name: 'Review 0' }).last()
+  await expect(review).toBeDisabled()
+
+  await linkedCard.getByRole('button', { name: 'Apply selected operations' }).click()
+  await expect(guide).toContainText('The proposal is applied.')
+  await expect(review).toBeDisabled()
+
+  await page.getByRole('button', { name: 'Versions 1' }).last().click()
+  const createRevision = page.getByRole('button', { name: 'Create immutable revision' })
+  await expect(createRevision).toBeEnabled()
+  await createRevision.click()
+  await expect(guide).toContainText('The immutable Revision is ready.')
+  await expect(review).toBeEnabled()
+})
+
+test('PageSpec run link does not trust a Proposal ID outside the typed lineage', async ({ page }) => {
+  const state = await installPlatformMock(page, {
+    authenticated: true,
+    pageSpecHumanEditRun: true,
+  })
+  const linkedProposal = pageSpecArtifactProposal('page-spec-human-edit-proposal')
+  const historicalProposal = pageSpecArtifactProposal('page-spec-historical-proposal')
+  state.pageSpecProposals = [historicalProposal, linkedProposal]
+
+  await page.goto(
+    `/team/acme/project/${project.id}/blueprint?runId=run-page-spec-human-edit&artifactId=${pageSpec.artifact.id}&proposalId=${historicalProposal.id}`,
+  )
+
+  await expect(page).toHaveURL(new RegExp(`[?&]proposalId=${linkedProposal.id}(?:&|$)`))
+  const guide = page.getByTestId('page-spec-workflow-proposal-guide')
+  await expect(guide).toContainText(linkedProposal.id)
+  await expect(page.getByRole('button', { name: 'Review 0' }).last()).toBeDisabled()
+
+  const historicalCard = page.locator('article').filter({ hasText: historicalProposal.id })
+  await expect(historicalCard.getByRole('button', { name: 'Apply selected operations' })).toBeDisabled()
+  expect(state.requests.some((request) =>
+    request.method === 'POST'
+      && (
+        request.path.includes('/output-proposals/')
+        || request.path === `/v1/page-specs/${pageSpec.artifact.id}/revisions`
+      ))).toBe(false)
+})
+
 test('PageSpec workflow can explicitly restore an exact Proposal base without normalized autosave', async ({ page }) => {
   const state = await installPlatformMock(page, { authenticated: true })
   const rawBaseContent = {
@@ -5001,28 +5072,40 @@ function workflowDefinitionFor(options: MockPlatformOptions) {
         ...workflowDefinition.definition.inputContract,
         requireApproved: options.workflowRequireApproved ?? workflowDefinition.definition.inputContract.requireApproved,
       },
-      nodes: options.blueprintHumanEditRun
-        ? [...nodes, {
-            id: 'blueprint-edit',
-            name: 'Edit generated Blueprint',
-            type: 'human_edit' as const,
-            humanEdit: {
-              artifactType: 'blueprint' as const,
-              artifactKind: 'blueprint',
-              requiredRole: 'editor',
-              instructions: 'Apply the linked Proposal and submit its exact immutable revision.',
-            },
-          }, {
-            id: 'workbench-blueprint',
-            name: 'Build from submitted Blueprint',
-            type: 'workbench_build' as const,
-            workbenchBuild: {
-              buildManifestSchemaVersion: 1,
-              maxAttempts: 3,
-              timeout: 60,
-            },
-          }]
-        : nodes,
+      nodes: [
+        ...nodes,
+        ...(options.blueprintHumanEditRun ? [{
+          id: 'blueprint-edit',
+          name: 'Edit generated Blueprint',
+          type: 'human_edit' as const,
+          humanEdit: {
+            artifactType: 'blueprint' as const,
+            artifactKind: 'blueprint',
+            requiredRole: 'editor',
+            instructions: 'Apply the linked Proposal and submit its exact immutable revision.',
+          },
+        }, {
+          id: 'workbench-blueprint',
+          name: 'Build from submitted Blueprint',
+          type: 'workbench_build' as const,
+          workbenchBuild: {
+            buildManifestSchemaVersion: 1,
+            maxAttempts: 3,
+            timeout: 60,
+          },
+        }] : []),
+        ...(options.pageSpecHumanEditRun ? [{
+          id: 'page-spec-edit',
+          name: 'Edit generated PageSpec',
+          type: 'human_edit' as const,
+          humanEdit: {
+            artifactType: 'blueprint' as const,
+            artifactKind: 'page_spec',
+            requiredRole: 'editor',
+            instructions: 'Apply the linked Proposal and submit its exact immutable revision.',
+          },
+        }] : []),
+      ],
     },
   }
 }
@@ -5400,6 +5483,81 @@ function blueprintHumanEditWorkflowRun() {
       type: 'workbench_build' as const,
       status: 'pending' as const,
       attempt: 0,
+      availableAt: now,
+      createdAt: now,
+      updatedAt: now,
+    }],
+  }
+}
+
+function pageSpecHumanEditWorkflowRun() {
+  const proposal = pageSpecArtifactProposal('page-spec-human-edit-proposal')
+  const nodeKey = 'page-spec-edit:slice-dashboard'
+  const sliceId = 'slice-dashboard'
+  const producerNodeKey = 'page-spec-generate:slice-dashboard'
+  return {
+    id: 'run-page-spec-human-edit',
+    projectId: project.id,
+    definitionVersionId: workflowDefinition.versionId,
+    definition: {
+      id: workflowDefinition.id,
+      version: workflowDefinition.version,
+      hash: workflowDefinition.contentHash,
+      executionProfile: workflowExecutionProfile,
+    },
+    executionProfile: workflowExecutionProfile,
+    inputManifest: { id: 'manifest-1', hash: hash('1') },
+    governanceMode: 'team' as const,
+    status: 'waiting_input' as const,
+    scope: {},
+    context: {
+      values: {},
+      nodes: {
+        [nodeKey]: {
+          definitionNodeId: 'page-spec-edit',
+          maxAttempts: 3,
+          timeoutNanos: 60_000_000_000,
+          input: {
+            hash: hash('i'),
+            bindings: [{
+              source: {
+                nodeKey: producerNodeKey,
+                definitionNodeId: 'page-spec-generate',
+                artifactRevisions: [proposal.baseRevision],
+                materializedArtifactRevisions: [],
+                deliverySliceRefs: [{
+                  id: sliceId,
+                  key: 'PAGE-DASHBOARD',
+                  fanOutNodeId: 'pages',
+                  blueprint: blueprintRevision,
+                  pageSpec: proposal.baseRevision,
+                }],
+                proposalPins: [{
+                  proposal: { id: proposal.id, payloadHash: proposal.payloadHash },
+                  manifest: proposal.manifest,
+                  producerNodeKey,
+                  producerDefinitionNodeId: 'page-spec-generate',
+                }],
+              },
+            }],
+          },
+        },
+      },
+      slices: {},
+    },
+    eventCursor: 2,
+    startedBy: user.id,
+    createdAt: now,
+    updatedAt: now,
+    nodes: [{
+      id: 'run-page-spec-human-edit-node',
+      runId: 'run-page-spec-human-edit',
+      key: nodeKey,
+      definitionNodeId: 'page-spec-edit',
+      sliceId,
+      type: 'human_edit' as const,
+      status: 'waiting_input' as const,
+      attempt: 1,
       availableAt: now,
       createdAt: now,
       updatedAt: now,
