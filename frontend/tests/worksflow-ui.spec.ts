@@ -4,6 +4,19 @@ const now = '2026-07-10T08:00:00Z'
 const hash = (character: string) => character.repeat(64)
 const workflowExecutionProfile = { version: 'workflow-engine/v2', hash: 'dd247a77ce3cfa1095a575a238b93c4bd41dd991eac07e8b62ec170864470da1' }
 
+interface Deferred {
+  readonly promise: Promise<void>
+  readonly release: () => void
+}
+
+function deferred(): Deferred {
+  let release = () => {}
+  const promise = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  return { promise, release }
+}
+
 async function openConversationPanel(page: Page) {
   await page.getByRole('button', { name: 'Conversation', exact: true }).click()
   const panel = page.getByRole('complementary', { name: 'Conversation control plane' })
@@ -366,6 +379,29 @@ const workflowCapabilities = {
   },
 }
 
+type MockBlueprintRevision = typeof fullBlueprintRevision & {
+  readonly proposalId?: string
+  readonly sourceManifestId?: string
+  readonly changeSource?: string
+}
+
+type MockBlueprint = Omit<typeof blueprint, 'latestRevision' | 'approvedRevision'> & {
+  latestRevision: MockBlueprintRevision
+  approvedRevision: typeof fullBlueprintRevision
+  draft?: {
+    readonly id: string
+    readonly artifactId: string
+    readonly baseRevisionId: string
+    readonly sourceVersions: unknown[]
+    readonly revision: number
+    readonly content: typeof blueprintContent
+    readonly contentHash: string
+    readonly updatedBy: string
+    readonly updatedAt: string
+    readonly etag: string
+  }
+}
+
 interface MockPlatformOptions {
   readonly authenticated?: boolean
   readonly showOnboarding?: boolean
@@ -376,6 +412,13 @@ interface MockPlatformOptions {
   readonly workflowRequireApproved?: boolean
   readonly multiBundleWorkbench?: boolean
   readonly multiWorkbenchGroups?: boolean
+  readonly blueprintProposal?: boolean
+  readonly blueprintHumanEditRun?: boolean
+  readonly secondBlueprint?: boolean
+  readonly pauseFirstBlueprintDraftSave?: boolean
+  readonly pauseBlueprintProposalApply?: boolean
+  readonly pauseBlueprintNodeResume?: boolean
+  readonly rejectFirstBlueprintDraftSave?: boolean
   readonly prototypeProposal?: boolean
   readonly designImportDecisionFails?: boolean
   readonly designImportCreateProcessingOnce?: boolean
@@ -406,12 +449,21 @@ interface MockPlatformState {
   governanceMode: 'solo' | 'team'
   prototypes: unknown[]
   brief: ReturnType<typeof staleProjectBrief>
+  blueprint: MockBlueprint
+  secondaryBlueprint: MockBlueprint | null
   pageSpec: typeof pageSpec
-  run: ReturnType<typeof workflowRun> | ReturnType<typeof selectionWorkflowRun> | ReturnType<typeof multiBundleWorkflowRun> | ReturnType<typeof multiGroupWorkflowRun> | null
+  run: ReturnType<typeof workflowRun> | ReturnType<typeof blueprintHumanEditWorkflowRun> | ReturnType<typeof selectionWorkflowRun> | ReturnType<typeof multiBundleWorkflowRun> | ReturnType<typeof multiGroupWorkflowRun> | null
   proposal: ReturnType<typeof implementationProposal> | null
   workspaceRevision: ReturnType<typeof applicationRevision> | null
   workbenchBundle: ReturnType<typeof buildManifest>
   multiWorkbench: ReturnType<typeof multiWorkbenchState> | null
+  blueprintProposal: ReturnType<typeof blueprintArtifactProposal> | null
+  blueprintCreatedRevision: MockBlueprintRevision | null
+  blueprintDraftSaveGate: Deferred | null
+  blueprintListGate: Deferred | null
+  blueprintProposalApplyGate: Deferred | null
+  blueprintNodeResumeGate: Deferred | null
+  rejectNextBlueprintDraftSave: boolean
   prototypeProposal: ReturnType<typeof artifactProposal> | null
   prototypeCreatedRevision: Record<string, unknown> | null
   designImports: MockDesignImport[]
@@ -424,6 +476,42 @@ interface MockPlatformState {
   graphBriefTitle: string
   bindingVersion: number
   bindingReviewerRole: 'reviewer' | 'assignee' | 'watcher'
+}
+
+function createSecondaryBlueprint(): MockBlueprint {
+  const artifactId = 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee'
+  const revisionId = 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeee2'
+  const content = structuredClone(blueprintContent)
+  content.nodes = content.nodes.map((node) => node.id === 'feature-orders'
+    ? { ...node, title: 'Billing management' }
+    : node)
+  content.semantic.nodes = content.semantic.nodes.map((node) => node.id === 'feature-orders'
+    ? { ...node, title: 'Billing management' }
+    : node)
+  const revision: MockBlueprintRevision = {
+    ...fullBlueprintRevision,
+    id: revisionId,
+    artifactId,
+    contentHash: hash('e'),
+    content,
+  }
+  return {
+    artifact: {
+      ...blueprint.artifact,
+      id: artifactId,
+      artifactKey: 'blueprint-' + artifactId,
+      title: 'Billing Blueprint',
+      latestRevisionId: revisionId,
+      approvedRevisionId: revisionId,
+      etag: '"artifact:' + artifactId + ':1"',
+    },
+    latestRevision: revision,
+    approvedRevision: revision,
+  }
+}
+
+function mockBlueprints(state: MockPlatformState): MockBlueprint[] {
+  return state.secondaryBlueprint ? [state.blueprint, state.secondaryBlueprint] : [state.blueprint]
 }
 
 async function installPlatformMock(page: Page, options: MockPlatformOptions = {}) {
@@ -444,8 +532,12 @@ async function installPlatformMock(page: Page, options: MockPlatformOptions = {}
     governanceMode: options.soloReviewRun || options.soloProject ? 'solo' : 'team',
     prototypes: options.prototypes === 'none' ? [] : [approvedPrototype],
     brief: staleProjectBrief(options.staleBriefDraft ?? false),
+    blueprint: structuredClone(blueprint) as MockBlueprint,
+    secondaryBlueprint: options.secondBlueprint ? createSecondaryBlueprint() : null,
     pageSpec: structuredClone(pageSpec),
-    run: options.failedRun
+    run: options.blueprintHumanEditRun
+      ? blueprintHumanEditWorkflowRun()
+      : options.failedRun
       ? workflowRun('run-failed', 'failed')
       : options.soloReviewRun
       ? workflowRun('run-solo-review', 'waiting_review', 'solo')
@@ -466,6 +558,13 @@ async function installPlatformMock(page: Page, options: MockPlatformOptions = {}
     multiWorkbench: options.multiWorkbenchGroups
       ? multiGroupWorkbenchState()
       : options.multiBundleWorkbench ? multiWorkbenchState() : null,
+    blueprintProposal: options.blueprintProposal ? blueprintArtifactProposal() : null,
+    blueprintCreatedRevision: null,
+    blueprintDraftSaveGate: options.pauseFirstBlueprintDraftSave ? deferred() : null,
+    blueprintListGate: null,
+    blueprintProposalApplyGate: options.pauseBlueprintProposalApply ? deferred() : null,
+    blueprintNodeResumeGate: options.pauseBlueprintNodeResume ? deferred() : null,
+    rejectNextBlueprintDraftSave: options.rejectFirstBlueprintDraftSave ?? false,
     prototypeProposal: options.prototypeProposal ? artifactProposal() : null,
     prototypeCreatedRevision: null,
     designImports: [],
@@ -1155,7 +1254,7 @@ async function handlePlatformRoute(
     return
   }
   if (path === `/v1/projects/${project.id}/artifacts`) {
-    await respond({ items: [projectBrief.artifact, blueprint.artifact, state.pageSpec.artifact, ...state.prototypes.map((value) => (value as typeof approvedPrototype).artifact)] })
+    await respond({ items: [projectBrief.artifact, ...mockBlueprints(state).map((value) => value.artifact), state.pageSpec.artifact, ...state.prototypes.map((value) => (value as typeof approvedPrototype).artifact)] })
     return
   }
   if (path === `/v1/revisions/${briefRevision.id}`) {
@@ -1231,20 +1330,86 @@ async function handlePlatformRoute(
     return
   }
   if (path === `/v1/projects/${project.id}/blueprints`) {
-    await respond({ items: [blueprint] })
+    const items = structuredClone(mockBlueprints(state))
+    const gate = state.blueprintListGate
+    state.blueprintListGate = null
+    if (gate) await gate.promise
+    await respond({ items })
     return
   }
-  if (path === `/v1/blueprints/${blueprint.artifact.id}/draft` && method === 'PATCH') {
+  const blueprintDraftPath = path.match(/^\/v1\/blueprints\/([^/]+)\/draft$/)
+  if (blueprintDraftPath && method === 'PATCH') {
+    const target = mockBlueprints(state).find((item) => item.artifact.id === blueprintDraftPath[1])
+    if (!target) {
+      await respond({ title: 'Blueprint not found' }, 404)
+      return
+    }
+    const expectedEtag = target.draft?.etag ?? target.artifact.etag
+    const forcedConflict = state.rejectNextBlueprintDraftSave && target.artifact.id === state.blueprint.artifact.id
+    if (headers['if-match'] !== expectedEtag || forcedConflict) {
+      state.rejectNextBlueprintDraftSave = false
+      await respond({
+        type: 'urn:worksflow:problem:etag_mismatch',
+        title: 'Precondition failed',
+        status: 412,
+        detail: 'The Blueprint draft changed since it was loaded.',
+        code: 'etag_mismatch',
+      }, 412)
+      return
+    }
     const input = body as { content: typeof blueprintContent }
-    await respond({
-      ...blueprint,
-      draft: {
-        id: 'blueprint-draft-1', artifactId: blueprint.artifact.id,
-        baseRevisionId: blueprintRevision.revisionId, sourceVersions: [], revision: 2,
-        content: input.content, contentHash: hash('4'), updatedBy: user.id, updatedAt: now,
-        etag: '"blueprint-draft:2"',
-      },
-    }, 200, { etag: '"blueprint-draft:2"' })
+    const gate = target.artifact.id === state.blueprint.artifact.id
+      ? state.blueprintDraftSaveGate
+      : null
+    if (gate) state.blueprintDraftSaveGate = null
+    if (gate) await gate.promise
+    const currentDraft = target.draft
+    const nextDraftRevision = (currentDraft?.revision ?? 1) + 1
+    const draft = {
+      id: currentDraft?.id ?? `blueprint-draft-${target.artifact.id}`,
+      artifactId: target.artifact.id,
+      baseRevisionId: currentDraft?.baseRevisionId ?? target.latestRevision.id,
+      sourceVersions: currentDraft?.sourceVersions ?? [],
+      revision: nextDraftRevision,
+      content: input.content,
+      contentHash: hash(String(nextDraftRevision)),
+      updatedBy: user.id,
+      updatedAt: now,
+      etag: `"blueprint-draft:${nextDraftRevision}"`,
+    }
+    const updated = { ...target, draft }
+    if (target.artifact.id === state.blueprint.artifact.id) state.blueprint = updated
+    else state.secondaryBlueprint = updated
+    await respond(updated, 200, { etag: draft.etag })
+    return
+  }
+  if (path === `/v1/blueprints/${blueprint.artifact.id}/revisions` && method === 'POST') {
+    const input = body as { changeSource?: string }
+    const draft = state.blueprint.draft
+    if (!draft) {
+      await respond({ title: 'Blueprint draft not found' }, 404)
+      return
+    }
+    const revision: MockBlueprintRevision = {
+      ...fullBlueprintRevision,
+      id: 'cccccccc-cccc-4ccc-8ccc-ccccccccccc3',
+      revisionNumber: state.blueprint.latestRevision.revisionNumber + 1,
+      contentHash: draft.contentHash,
+      status: 'draft',
+      content: draft.content,
+      ...(state.blueprintProposal?.status === 'applied' ? {
+        proposalId: state.blueprintProposal.id,
+        sourceManifestId: state.blueprintProposal.manifest.id,
+      } : {}),
+      changeSource: input.changeSource ?? 'human',
+    }
+    state.blueprint = {
+      ...state.blueprint,
+      artifact: { ...state.blueprint.artifact, latestRevisionId: revision.id },
+      latestRevision: revision,
+    }
+    state.blueprintCreatedRevision = revision
+    await respond(revision, 201)
     return
   }
   if (path === `/v1/projects/${project.id}/page-specs`) {
@@ -1300,7 +1465,11 @@ async function handlePlatformRoute(
     return
   }
   if (path === `/v1/artifacts/${blueprint.artifact.id}/revisions`) {
-    await respond({ items: [fullBlueprintRevision] })
+    await respond({
+      items: state.blueprint.latestRevision.id === fullBlueprintRevision.id
+        ? [fullBlueprintRevision]
+        : [state.blueprint.latestRevision, fullBlueprintRevision],
+    })
     return
   }
   if (path === `/v1/projects/${project.id}/prototypes` && method === 'GET') {
@@ -1308,10 +1477,62 @@ async function handlePlatformRoute(
     return
   }
   if (path === `/v1/projects/${project.id}/output-proposals` && method === 'GET') {
-    await respond({ items: state.prototypeProposal ? [state.prototypeProposal] : [] })
+    await respond({ items: [state.blueprintProposal, state.prototypeProposal].filter(Boolean) })
     return
   }
   const artifactProposalItem = path.match(/^\/v1\/output-proposals\/([^/]+)$/)
+  const blueprintProposal = state.blueprintProposal
+  if (blueprintProposal && artifactProposalItem?.[1] === blueprintProposal.id && method === 'GET') {
+    await respond(blueprintProposal)
+    return
+  }
+  const artifactProposalApply = path.match(/^\/v1\/output-proposals\/([^/]+)\/apply$/)
+  if (blueprintProposal && artifactProposalApply?.[1] === blueprintProposal.id && method === 'POST') {
+    const gate = state.blueprintProposalApplyGate
+    state.blueprintProposalApplyGate = null
+    if (gate) await gate.promise
+    const currentContent = state.blueprint.draft?.content ?? state.blueprint.latestRevision.content
+    const appliedTitle = 'AI-reviewed order management'
+    const appliedContent = {
+      ...currentContent,
+      nodes: currentContent.nodes.map((node) => node.id === 'feature-orders'
+        ? { ...node, title: appliedTitle }
+        : node),
+      semantic: {
+        ...currentContent.semantic,
+        nodes: currentContent.semantic.nodes.map((node) => node.id === 'feature-orders'
+          ? { ...node, title: appliedTitle }
+          : node),
+      },
+    }
+    const currentDraft = state.blueprint.draft
+    const nextDraftRevision = (currentDraft?.revision ?? 1) + 1
+    const draft = {
+      id: currentDraft?.id ?? 'blueprint-draft-1',
+      artifactId: blueprint.artifact.id,
+      baseRevisionId: currentDraft?.baseRevisionId ?? blueprintRevision.revisionId,
+      sourceVersions: currentDraft?.sourceVersions ?? [],
+      revision: nextDraftRevision,
+      content: appliedContent,
+      contentHash: hash('p'),
+      updatedBy: user.id,
+      updatedAt: now,
+      etag: `"blueprint-draft:${nextDraftRevision}:proposal"`,
+    }
+    state.blueprint = { ...state.blueprint, draft }
+    state.blueprintProposal = {
+      ...blueprintProposal,
+      status: 'applied',
+      operations: blueprintProposal.operations.map((operation) => ({
+        ...operation,
+        decision: operation.decision === 'accepted' ? 'applied' as const : operation.decision,
+      })),
+      version: blueprintProposal.version + 1,
+      appliedAt: now,
+    }
+    await respond(draft, 200, { etag: draft.etag })
+    return
+  }
   if (artifactProposalItem && method === 'GET' && state.prototypeProposal) {
     await respond(state.prototypeProposal)
     return
@@ -1347,7 +1568,6 @@ async function handlePlatformRoute(
     })
     return
   }
-  const artifactProposalApply = path.match(/^\/v1\/output-proposals\/([^/]+)\/apply$/)
   if (artifactProposalApply && method === 'POST' && state.prototypeProposal) {
     const current = state.prototypes[0] as typeof approvedPrototype
     const appliedContent = {
@@ -1536,6 +1756,25 @@ async function handlePlatformRoute(
       state.workbenchBundle = buildManifest(state.run.id)
     }
     await respond(state.run, 201)
+    return
+  }
+  if (
+    options.blueprintHumanEditRun
+    && path === '/v1/projects/' + project.id + '/workflow-runs/run-blueprint-human-edit/resume'
+    && method === 'POST'
+  ) {
+    const gate = state.blueprintNodeResumeGate
+    state.blueprintNodeResumeGate = null
+    if (gate) await gate.promise
+    const current = state.run as ReturnType<typeof blueprintHumanEditWorkflowRun>
+    state.run = {
+      ...current,
+      status: 'running' as const,
+      nodes: current.nodes.map((node) => node.key === 'blueprint-edit'
+        ? { ...node, status: 'completed' as const, completedAt: now }
+        : node),
+    } as MockPlatformState['run']
+    await respond(undefined, 204)
     return
   }
   if (/\/workflow-runs\/[^/]+\/approve$/.test(path) && method === 'POST') {
@@ -3814,7 +4053,7 @@ test('Blueprint PageSpec editor autosaves, versions, and requests exact revision
   await expect.poll(() => state.requests.some((item) =>
     item.method === 'POST' && item.path === `/v1/page-specs/${pageSpec.artifact.id}/revisions`,
   )).toBe(true)
-  await expect(createPageSpecRevision).toBeHidden()
+  await expect(createPageSpecRevision).toBeDisabled()
 
   await page.getByRole('button', { name: 'Review 0' }).last().click()
   await page.getByLabel('PageSpec reviewer', { exact: true }).selectOption(reviewer.id)
@@ -3823,6 +4062,302 @@ test('Blueprint PageSpec editor autosaves, versions, and requests exact revision
     item.method === 'POST' && item.path === `/v1/projects/${project.id}/reviews`
       && (item.body as { target?: { revisionId?: string } })?.target?.revisionId === 'dddddddd-dddd-4ddd-8ddd-ddddddddddd4',
   )).toBe(true)
+})
+
+test('Blueprint autosave preserves newer input and background refresh keeps the editor mounted', async ({ page }) => {
+  const realtime = await installProjectWebSocketMock(page)
+  const state = await installPlatformMock(page, {
+    authenticated: true,
+    pauseFirstBlueprintDraftSave: true,
+  })
+  const firstSaveGate = state.blueprintDraftSaveGate
+  expect(firstSaveGate).not.toBeNull()
+  await page.goto(`/team/acme/project/${project.id}/blueprint`)
+
+  const editor = page.getByRole('main')
+  const title = page.getByLabel('Node title')
+  await expect(editor).toBeVisible()
+  await expect(title).toHaveValue('Order management')
+
+  await title.fill('Order operations')
+  await expect.poll(() => state.requests.filter((item) =>
+    item.method === 'PATCH'
+      && item.path === `/v1/blueprints/${blueprint.artifact.id}/draft`).length,
+  ).toBe(1)
+
+  await title.fill('Order operations and exceptions')
+  firstSaveGate!.release()
+  await expect(page.getByText(/blueprint-draft:2/)).toBeVisible()
+  await expect(title).toHaveValue('Order operations and exceptions')
+  await expect.poll(() => state.requests.some((item) => {
+    if (item.method !== 'PATCH' || item.path !== `/v1/blueprints/${blueprint.artifact.id}/draft`) return false
+    const content = (item.body as { content?: typeof blueprintContent })?.content
+    return content?.semantic.nodes.find((node) => node.id === 'feature-orders')?.title
+      === 'Order operations and exceptions'
+  })).toBe(true)
+  await expect(page.getByText(/blueprint-draft:3/)).toBeVisible()
+
+  const listRequestsBeforeRefresh = state.requests.filter((item) =>
+    item.method === 'GET' && item.path === `/v1/projects/${project.id}/blueprints`).length
+  const refreshGate = deferred()
+  state.blueprintListGate = refreshGate
+  await expect.poll(() => realtime.ready(project.id)).toBe(true)
+  realtime.emit('artifact.draft_updated', project.id, {
+    projectId: project.id,
+    artifactId: blueprint.artifact.id,
+    draftId: state.blueprint.draft?.id ?? 'blueprint-draft-1',
+    sequence: state.blueprint.draft?.revision ?? 3,
+  })
+  await expect.poll(() => state.requests.filter((item) =>
+    item.method === 'GET' && item.path === `/v1/projects/${project.id}/blueprints`).length,
+  ).toBeGreaterThan(listRequestsBeforeRefresh)
+
+  const freshGate = deferred()
+  state.blueprintListGate = freshGate
+  await title.fill('Order operations, exceptions, and refunds')
+  await expect.poll(() => state.requests.some((item) => {
+    if (item.method !== 'PATCH' || item.path !== '/v1/blueprints/' + blueprint.artifact.id + '/draft') return false
+    const content = (item.body as { content?: typeof blueprintContent })?.content
+    return content?.semantic.nodes.find((node) => node.id === 'feature-orders')?.title
+      === 'Order operations, exceptions, and refunds'
+  })).toBe(true)
+  await expect(page.getByText(/blueprint-draft:4/)).toBeVisible()
+
+  refreshGate.release()
+  await expect.poll(() => state.requests.filter((item) => (
+    item.method === 'GET' && item.path === '/v1/projects/' + project.id + '/blueprints'
+  )).length).toBeGreaterThan(listRequestsBeforeRefresh + 1)
+
+  try {
+    await expect(editor).toBeVisible()
+    await expect(title).toBeVisible()
+    await expect(title).toHaveValue('Order operations, exceptions, and refunds')
+    await expect(page.getByText(/blueprint-draft:4/)).toBeVisible()
+    await expect(page.getByRole('heading', { name: /Loading (?:platform )?Blueprints?/i })).toHaveCount(0)
+  } finally {
+    freshGate.release()
+  }
+
+  await expect(title).toHaveValue('Order operations, exceptions, and refunds')
+})
+
+test('Blueprint autosave cannot write one artifact content into another while switching artifacts', async ({ page }) => {
+  const realtime = await installProjectWebSocketMock(page)
+  const state = await installPlatformMock(page, {
+    authenticated: true,
+    secondBlueprint: true,
+    pauseFirstBlueprintDraftSave: true,
+  })
+  const firstSaveGate = state.blueprintDraftSaveGate
+  expect(firstSaveGate).not.toBeNull()
+  await page.goto('/team/acme/project/' + project.id + '/blueprint')
+
+  const title = page.getByLabel('Node title')
+  const secondary = page.getByRole('button', { name: /Billing Blueprint/ })
+  const primaryDraftPath = '/v1/blueprints/' + blueprint.artifact.id + '/draft'
+  const secondaryDraftPath = '/v1/blueprints/' + state.secondaryBlueprint!.artifact.id + '/draft'
+
+  await expect.poll(() => realtime.ready(project.id)).toBe(true)
+  await expect(title).toHaveValue('Order management')
+  await title.fill('Order operations')
+  await expect.poll(() => state.requests.filter((item) => (
+    item.method === 'PATCH' && item.path === primaryDraftPath
+  )).length).toBe(1)
+  await title.fill('Order operations and exceptions')
+  await expect(secondary).toBeDisabled()
+
+  firstSaveGate!.release()
+  await expect.poll(() => state.requests.some((item) => {
+    if (item.method !== 'PATCH' || item.path !== primaryDraftPath) return false
+    const content = (item.body as { content?: typeof blueprintContent })?.content
+    return content?.semantic.nodes.find((node) => node.id === 'feature-orders')?.title
+      === 'Order operations and exceptions'
+  })).toBe(true)
+  expect(state.secondaryBlueprint?.draft).toBeUndefined()
+  await expect(secondary).toBeEnabled()
+  await secondary.click()
+  await expect(title).toHaveValue('Billing management')
+
+  await title.fill('Billing operations')
+  await expect.poll(() => state.requests.some((item) => {
+    if (item.method !== 'PATCH' || item.path !== secondaryDraftPath) return false
+    const content = (item.body as { content?: typeof blueprintContent })?.content
+    return content?.semantic.nodes.find((node) => node.id === 'feature-orders')?.title
+      === 'Billing operations'
+  })).toBe(true)
+
+  const primarySaves = state.requests.filter((item) => item.method === 'PATCH' && item.path === primaryDraftPath)
+  expect(primarySaves[0]?.headers['if-match']).toBe(blueprint.artifact.etag)
+  expect(primarySaves[1]?.headers['if-match']).toBe('"blueprint-draft:2"')
+  expect(primarySaves.every((item) => {
+    const content = (item.body as { content?: typeof blueprintContent })?.content
+    return content?.semantic.nodes.find((node) => node.id === 'feature-orders')?.title !== 'Billing operations'
+  })).toBe(true)
+  expect(state.blueprint.draft?.content.semantic.nodes.find((node) => node.id === 'feature-orders')?.title)
+    .toBe('Order operations and exceptions')
+})
+
+test('Blueprint actions lock editing and artifact switching until the server responds', async ({ page }) => {
+  const state = await installPlatformMock(page, {
+    authenticated: true,
+    blueprintProposal: true,
+    secondBlueprint: true,
+    pauseBlueprintProposalApply: true,
+  })
+  const applyGate = state.blueprintProposalApplyGate
+  expect(applyGate).not.toBeNull()
+  await page.goto('/team/acme/project/' + project.id + '/blueprint')
+
+  await page.getByRole('button', { name: 'Proposals 1' }).click()
+  await page.getByRole('button', { name: 'Apply accepted operations' }).click()
+  await expect.poll(() => state.requests.some((item) => (
+    item.method === 'POST' && item.path === '/v1/output-proposals/blueprint-proposal-1/apply'
+  ))).toBe(true)
+
+  await page.getByRole('button', { name: 'Blueprint graph (2)', exact: true }).evaluate((button) => (button as HTMLButtonElement).click())
+  const title = page.getByLabel('Node title')
+  const secondary = page.getByRole('button', { name: /Billing Blueprint/ })
+  await expect(title).not.toBeEditable()
+  await expect(secondary).toBeDisabled()
+
+  applyGate!.release()
+  await expect(title).toBeEditable()
+  await expect(secondary).toBeEnabled()
+  await expect(title).toHaveValue('AI-reviewed order management')
+})
+
+test('Blueprint 412 conflict remains blocking while newer local input is preserved', async ({ page }) => {
+  const state = await installPlatformMock(page, {
+    authenticated: true,
+    rejectFirstBlueprintDraftSave: true,
+  })
+  await page.goto('/team/acme/project/' + project.id + '/blueprint')
+
+  const title = page.getByLabel('Node title')
+  const draftPath = '/v1/blueprints/' + blueprint.artifact.id + '/draft'
+  await title.fill('Order conflict')
+  await expect.poll(() => state.requests.filter((item) => (
+    item.method === 'PATCH' && item.path === draftPath
+  )).length).toBe(1)
+  await expect(page.getByRole('alert').filter({ hasText: /artifact draft changed/i })).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Reload server draft' })).toBeVisible()
+
+  const firstSave = state.requests.find((item) => item.method === 'PATCH' && item.path === draftPath)
+  expect(firstSave?.headers['if-match']).toBe(blueprint.artifact.etag)
+  await title.fill('Order conflict kept locally')
+  await expect(title).toHaveValue('Order conflict kept locally')
+  await page.waitForTimeout(1_200)
+
+  expect(state.requests.filter((item) => item.method === 'PATCH' && item.path === draftPath)).toHaveLength(1)
+  await expect(page.getByRole('alert').filter({ hasText: /artifact draft changed/i })).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Reload server draft' })).toBeVisible()
+  await expect(title).toHaveValue('Order conflict kept locally')
+})
+
+test('applied Blueprint Proposal submits its exact immutable revision to the waiting Human Edit node', async ({ page }) => {
+  const state = await installPlatformMock(page, {
+    authenticated: true,
+    blueprintProposal: true,
+    blueprintHumanEditRun: true,
+    pauseBlueprintNodeResume: true,
+  })
+  const resumeGate = state.blueprintNodeResumeGate
+  expect(resumeGate).not.toBeNull()
+  const currentFlowLocation = () => {
+    const url = new URL(page.url())
+    return {
+      surface: url.pathname.startsWith('/workbench/') ? 'workbench' : 'team',
+      runId: url.searchParams.get('runId'),
+      workbenchNodeKey: url.searchParams.get('workbenchNodeKey'),
+    }
+  }
+  await page.goto(
+    '/team/acme/project/' + project.id
+      + '/blueprint?runId=run-blueprint-human-edit&workbenchNodeKey=workbench-blueprint',
+  )
+  await expect.poll(currentFlowLocation).toEqual({
+    surface: 'team',
+    runId: 'run-blueprint-human-edit',
+    workbenchNodeKey: 'workbench-blueprint',
+  })
+
+  await page.getByRole('button', { name: 'Proposals 1' }).click()
+  await page.getByRole('button', { name: 'Apply accepted operations' }).click()
+  await expect.poll(() => state.requests.some((item) =>
+    item.method === 'POST'
+      && item.path === `/v1/output-proposals/${state.blueprintProposal?.id ?? 'blueprint-proposal-1'}/apply`,
+  )).toBe(true)
+
+  const proposalNextStep = page.getByRole('status').filter({ hasText: /Proposal/i })
+  await expect(proposalNextStep).toBeVisible()
+  await expect(proposalNextStep).toContainText(/applied/i)
+  await expect(proposalNextStep).toContainText(/immutable revision/i)
+  const createRevision = proposalNextStep.getByRole('button', {
+    name: 'Create immutable revision',
+    exact: true,
+  })
+  await expect(createRevision).toBeEnabled()
+  await createRevision.click()
+
+  await expect.poll(() => state.blueprintCreatedRevision?.id).toBe('cccccccc-cccc-4ccc-8ccc-ccccccccccc3')
+  expect(state.blueprintCreatedRevision).toMatchObject({
+    proposalId: 'blueprint-proposal-1',
+    sourceManifestId: 'blueprint-manifest-1',
+  })
+  const applyIndex = state.requests.findIndex((item) =>
+    item.method === 'POST' && item.path === '/v1/output-proposals/blueprint-proposal-1/apply')
+  const revisionIndex = state.requests.findIndex((item) =>
+    item.method === 'POST' && item.path === `/v1/blueprints/${blueprint.artifact.id}/revisions`)
+  expect(revisionIndex).toBeGreaterThan(applyIndex)
+  expect(state.requests[revisionIndex]?.headers['if-match']).toBe(state.blueprint.draft?.etag)
+
+  const revisionNextStep = page.getByRole('status').filter({ hasText: /return to Workbench/i })
+  await expect(revisionNextStep).toBeVisible()
+  await expect(revisionNextStep).toContainText(/return to Workbench/i)
+  await expect(revisionNextStep).toContainText(/submit/i)
+  const submitRevision = revisionNextStep.getByRole('button', {
+    name: 'Return to Workbench and submit pinned revision',
+    exact: true,
+  })
+  await expect(submitRevision).toBeEnabled()
+  await submitRevision.click()
+
+  const resumePath = '/v1/projects/' + project.id
+    + '/workflow-runs/run-blueprint-human-edit/resume'
+  await expect.poll(() => state.requests.some((item) => (
+    item.method === 'POST' && item.path === resumePath
+  ))).toBe(true)
+  const completion = state.requests.find((item) => (
+    item.method === 'POST' && item.path === resumePath
+  ))
+  const createdRevision = state.blueprintCreatedRevision
+  if (!createdRevision) throw new Error('Expected the Blueprint revision to be created.')
+  expect(completion?.body).toEqual({
+    nodeKey: 'blueprint-edit',
+    output: {
+      artifactRevision: {
+        artifactId: createdRevision.artifactId,
+        revisionId: createdRevision.id,
+        contentHash: createdRevision.contentHash,
+      },
+    },
+  })
+  await expect.poll(currentFlowLocation).toEqual({
+    surface: 'team',
+    runId: 'run-blueprint-human-edit',
+    workbenchNodeKey: 'workbench-blueprint',
+  })
+  await expect(submitRevision).toBeDisabled()
+  expect(state.requests.some((item) => (
+    item.method === 'POST' && item.path === '/v1/projects/' + project.id + '/reviews'
+  ))).toBe(false)
+
+  resumeGate!.release()
+  await expect.poll(currentFlowLocation).toEqual({
+    surface: 'workbench',
+    runId: 'run-blueprint-human-edit',
+    workbenchNodeKey: 'workbench-blueprint',
+  })
 })
 
 test('Blueprint Composer inserts module packs, multi-selects them, and persists a capability group', async ({ page }) => {
@@ -4174,6 +4709,15 @@ function staleProjectBrief(stale = true) {
 }
 
 function workflowDefinitionFor(options: MockPlatformOptions) {
+  const nodes = workflowDefinition.definition.nodes.map((node) => node.type !== 'artifact_input'
+    ? node
+    : {
+        ...node,
+        artifactInput: {
+          ...node.artifactInput,
+          requireApproved: options.workflowRequireApproved ?? node.artifactInput?.requireApproved ?? true,
+        },
+      })
   return {
     ...workflowDefinition,
     definition: {
@@ -4182,15 +4726,28 @@ function workflowDefinitionFor(options: MockPlatformOptions) {
         ...workflowDefinition.definition.inputContract,
         requireApproved: options.workflowRequireApproved ?? workflowDefinition.definition.inputContract.requireApproved,
       },
-      nodes: workflowDefinition.definition.nodes.map((node) => node.type !== 'artifact_input'
-        ? node
-        : {
-            ...node,
-            artifactInput: {
-              ...node.artifactInput,
-              requireApproved: options.workflowRequireApproved ?? node.artifactInput?.requireApproved ?? true,
+      nodes: options.blueprintHumanEditRun
+        ? [...nodes, {
+            id: 'blueprint-edit',
+            name: 'Edit generated Blueprint',
+            type: 'human_edit' as const,
+            humanEdit: {
+              artifactType: 'blueprint' as const,
+              artifactKind: 'blueprint',
+              requiredRole: 'editor',
+              instructions: 'Apply the linked Proposal and submit its exact immutable revision.',
             },
-          }),
+          }, {
+            id: 'workbench-blueprint',
+            name: 'Build from submitted Blueprint',
+            type: 'workbench_build' as const,
+            workbenchBuild: {
+              buildManifestSchemaVersion: 1,
+              maxAttempts: 3,
+              timeout: 60,
+            },
+          }]
+        : nodes,
     },
   }
 }
@@ -4485,6 +5042,96 @@ function workflowRun(
   }
 }
 
+function blueprintHumanEditWorkflowRun() {
+  const proposal = blueprintArtifactProposal()
+  const proposalPin = {
+    proposal: { id: proposal.id, payloadHash: proposal.payloadHash },
+    manifest: proposal.manifest,
+    producerNodeKey: 'blueprint-generate',
+    producerDefinitionNodeId: 'blueprint-generate',
+  }
+  const workbenchInput = {
+    bundleIds: ['build-1'],
+    sliceIds: ['page-orders'],
+    manifestGroupKey: 'run-blueprint-human-edit-workbench',
+    hash: hash('w'),
+  }
+  return {
+    id: 'run-blueprint-human-edit',
+    projectId: project.id,
+    definitionVersionId: workflowDefinition.versionId,
+    definition: {
+      id: workflowDefinition.id,
+      version: workflowDefinition.version,
+      hash: workflowDefinition.contentHash,
+      executionProfile: workflowExecutionProfile,
+    },
+    executionProfile: workflowExecutionProfile,
+    inputManifest: { id: 'manifest-1', hash: hash('1') },
+    governanceMode: 'team' as const,
+    status: 'waiting_input' as const,
+    scope: {},
+    context: {
+      values: { buildManifest: workbenchInput },
+      nodes: {
+        'blueprint-edit': {
+          definitionNodeId: 'blueprint-edit',
+          maxAttempts: 3,
+          timeoutNanos: 60_000_000_000,
+          input: {
+            hash: hash('i'),
+            bindings: [{
+              source: {
+                nodeKey: 'blueprint-generate',
+                definitionNodeId: 'blueprint-generate',
+                artifactRevisions: [proposal.baseRevision],
+                materializedArtifactRevisions: [],
+                deliverySliceRefs: [],
+                proposalPins: [proposalPin],
+              },
+            }],
+          },
+        },
+        'workbench-blueprint': {
+          definitionNodeId: 'workbench-blueprint',
+          maxAttempts: 3,
+          timeoutNanos: 60_000_000_000,
+          input: { bindings: [{ value: workbenchInput, output: workbenchInput }] },
+          output: { implementationProposals: [] },
+        },
+      },
+      slices: {},
+    },
+    eventCursor: 2,
+    startedBy: user.id,
+    createdAt: now,
+    updatedAt: now,
+    nodes: [{
+      id: 'run-blueprint-human-edit-node',
+      runId: 'run-blueprint-human-edit',
+      key: 'blueprint-edit',
+      definitionNodeId: 'blueprint-edit',
+      type: 'human_edit' as const,
+      status: 'waiting_input' as const,
+      attempt: 1,
+      availableAt: now,
+      createdAt: now,
+      updatedAt: now,
+    }, {
+      id: 'run-blueprint-workbench-node',
+      runId: 'run-blueprint-human-edit',
+      key: 'workbench-blueprint',
+      definitionNodeId: 'workbench-blueprint',
+      type: 'workbench_build' as const,
+      status: 'pending' as const,
+      attempt: 0,
+      availableAt: now,
+      createdAt: now,
+      updatedAt: now,
+    }],
+  }
+}
+
 function selectionWorkflowRun(id: string, rootBundleId = 'build-1') {
   const applicationBuild = {
     bundleIds: [rootBundleId],
@@ -4669,6 +5316,35 @@ function applicationRevision() {
     },
     createdBy: user.id,
     createdAt: now,
+  }
+}
+
+function blueprintArtifactProposal(
+  status: 'ready' | 'applied' = 'ready',
+  decision: 'accepted' | 'applied' = status === 'applied' ? 'applied' : 'accepted',
+) {
+  return {
+    id: 'blueprint-proposal-1',
+    projectId: project.id,
+    artifactId: blueprint.artifact.id,
+    manifest: { id: 'blueprint-manifest-1', hash: hash('f') },
+    baseRevision: blueprintRevision,
+    payloadHash: hash('g'),
+    status,
+    operations: [{
+      id: 'blueprint-operation-feature-title',
+      kind: 'replace' as const,
+      path: '/semantic/nodes/0/title',
+      value: 'AI-reviewed order management',
+      rationale: 'Clarify the primary capability title.',
+      decision,
+    }],
+    assumptions: [],
+    questions: [],
+    version: status === 'applied' ? 2 : 1,
+    createdBy: user.id,
+    createdAt: now,
+    appliedAt: status === 'applied' ? now : undefined,
   }
 }
 

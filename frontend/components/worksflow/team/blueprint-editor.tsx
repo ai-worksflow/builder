@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useCollaboration } from '@/lib/collaboration/provider'
 import {
   ArtifactWorkspaceConflictError,
@@ -27,6 +27,10 @@ import {
   normalizeBlueprintContent,
   type SemanticBlueprintNode,
 } from '@/lib/platform/blueprint-content'
+import {
+  exactArtifactRefsEqual,
+  revisionCandidates,
+} from '@/lib/platform/workflow-ui-contract'
 import type {
   ArtifactReviewGateDto,
   ArtifactRevisionDto,
@@ -71,6 +75,13 @@ import {
 
 type EditorTab = 'canvas' | 'pages' | 'versions' | 'proposal' | 'impact' | 'trace' | 'review'
 type SemanticNode = SemanticBlueprintNode
+
+interface BlueprintSaveTask {
+  readonly session: number
+  readonly artifactId: string
+  etag: string
+  latestContent: BlueprintContentDto
+}
 
 const NODE_KINDS: readonly BlueprintNodeKind[] = [
   'feature',
@@ -129,8 +140,10 @@ export function BlueprintEditor() {
   const [tab, setTab] = useState<EditorTab>('canvas')
   const [content, setContent] = useState<BlueprintContentDto | null>(null)
   const [details, setDetails] = useState<ArtifactDetails<BlueprintContentDto> | null>(null)
+  const [detailsArtifactId, setDetailsArtifactId] = useState('')
   const [impact, setImpact] = useState<ImpactReportDto | null>(null)
   const [saving, setSaving] = useState(false)
+  const [actionBusy, setActionBusy] = useState(false)
   const [savedAt, setSavedAt] = useState<string | null>(null)
   const [localError, setLocalError] = useState<string | null>(null)
   const [conflict, setConflict] = useState(false)
@@ -146,11 +159,23 @@ export function BlueprintEditor() {
   const [selectionMessage, setSelectionMessage] = useState<string | null>(null)
   const canvasRef = useRef<HTMLDivElement | null>(null)
   const dragRef = useRef<{ id: string; pointerId: number; offsetX: number; offsetY: number } | null>(null)
+  const activeArtifactRef = useRef('')
+  const contentRef = useRef<BlueprintContentDto | null>(null)
+  const draftEtagRef = useRef('')
+  const saveTaskRef = useRef<BlueprintSaveTask | null>(null)
+  const saveDraftRef = useRef<(nextContent?: BlueprintContentDto | null) => Promise<unknown>>(async () => null)
+  const localDirtyRef = useRef(false)
+  const editSessionRef = useRef(0)
+  const actionBusyRef = useRef(false)
 
   const resource = workspace.blueprints.find((item) => item.artifact.id === selectedBlueprintId)
     ?? workspace.blueprints[0]
   const serverContent = resource?.draft?.content ?? resource?.latestRevision?.content
   const serverEtag = resource?.draft?.etag ?? resource?.artifact.etag
+  const canEdit = collaboration.can('edit')
+  const currentDetails = detailsArtifactId === resource?.artifact.id
+    ? details
+    : null
   const normalized = useMemo(() => content ? normalizeBlueprintContent(content) : null, [content])
   const nodes = normalized?.semantic?.nodes ?? EMPTY_SEMANTIC_NODES
   const edges = normalized?.semantic?.edges ?? EMPTY_SEMANTIC_EDGES
@@ -175,7 +200,49 @@ export function BlueprintEditor() {
     : reviewerId
   const clientGate = normalized ? blueprintGate(normalized) : []
   const revisionReady = clientGate.length === 0
-  const gatePassed = revisionReady && reviewGateReadyForRequest(details?.reviewGate)
+  const gatePassed = revisionReady && reviewGateReadyForRequest(currentDetails?.reviewGate)
+  const appliedProposals = useMemo(() => proposals
+    .filter((proposal) => proposal.status === 'applied' || proposal.status === 'partially_applied')
+    .sort((left, right) => (right.appliedAt ?? right.createdAt).localeCompare(left.appliedAt ?? left.createdAt)), [proposals])
+  const proposalRevisionById = useMemo(() => {
+    const result = new Map<string, ArtifactRevisionDto<BlueprintContentDto>>()
+    for (const revision of [resource?.latestRevision, resource?.approvedRevision, ...(currentDetails?.versions ?? [])]) {
+      if (!revision?.proposalId) continue
+      const current = result.get(revision.proposalId)
+      if (!current || revision.revisionNumber > current.revisionNumber) {
+        result.set(revision.proposalId, revision)
+      }
+    }
+    return result
+  }, [currentDetails?.versions, resource?.approvedRevision, resource?.latestRevision])
+  const appliedProposalAwaitingRevision = appliedProposals.find(
+    (proposal) => !proposalRevisionById.has(proposal.id),
+  )
+  const versionedAppliedProposal = appliedProposals.find(
+    (proposal) => proposalRevisionById.has(proposal.id),
+  )
+  const appliedProposalRevision = versionedAppliedProposal
+    ? proposalRevisionById.get(versionedAppliedProposal.id)
+    : undefined
+  const appliedProposalRevisionRef = useMemo(
+    () => appliedProposalRevision ? versionRef(appliedProposalRevision) : undefined,
+    [appliedProposalRevision],
+  )
+  const appliedRevisionSubmissionNodes = useMemo(() => {
+    if (!appliedProposalRevisionRef || !flow.run || !flow.runDefinition) return []
+    return flow.run.nodes.filter((node) => {
+      if (node.type !== 'human_edit' || node.status !== 'waiting_input') return false
+      const definitionNode = flow.runDefinition?.definition.nodes.find(
+        (candidate) => candidate.id === node.definitionNodeId,
+      )
+      return revisionCandidates(definitionNode, node, flow.run, workspace).candidates.some(
+        (candidate) => exactArtifactRefsEqual(candidate.ref, appliedProposalRevisionRef),
+      )
+    })
+  }, [appliedProposalRevisionRef, flow.run, flow.runDefinition, workspace])
+  const appliedRevisionSubmissionNode = appliedRevisionSubmissionNodes.length === 1
+    ? appliedRevisionSubmissionNodes[0]
+    : undefined
 
   useEffect(() => {
     const artifactId = artifactReference()
@@ -199,12 +266,58 @@ export function BlueprintEditor() {
 
   useEffect(() => {
     if (!resource) {
+      if (localDirtyRef.current && contentRef.current) {
+        void saveDraftRef.current(contentRef.current)
+      }
+      editSessionRef.current += 1
+      activeArtifactRef.current = ''
+      contentRef.current = null
+      draftEtagRef.current = ''
+      localDirtyRef.current = false
+      actionBusyRef.current = false
       setContent(null)
+      setSaving(false)
+      setActionBusy(false)
       return
     }
     if (selectedBlueprintId !== resource.artifact.id) setSelectedBlueprintId(resource.artifact.id)
-    if (!conflict) setContent(normalizeBlueprintContent(serverContent ?? createEmptyBlueprintContent()))
-  }, [conflict, resource, selectedBlueprintId, serverContent])
+    const next = normalizeBlueprintContent(serverContent ?? createEmptyBlueprintContent())
+    const switched = activeArtifactRef.current !== resource.artifact.id
+    if (switched || !contentRef.current) {
+      if (switched && localDirtyRef.current && contentRef.current) {
+        void saveDraftRef.current(contentRef.current)
+      }
+      editSessionRef.current += 1
+      activeArtifactRef.current = resource.artifact.id
+      contentRef.current = next
+      draftEtagRef.current = serverEtag ?? ''
+      localDirtyRef.current = false
+      actionBusyRef.current = false
+      setContent(next)
+      setSaving(false)
+      setActionBusy(false)
+      if (switched) {
+        setConflict(false)
+        setLocalError(null)
+        setSavedAt(null)
+      }
+      return
+    }
+    const serverPayload = JSON.stringify(next)
+    const localPayload = JSON.stringify(contentRef.current)
+    if (serverPayload === localPayload) {
+      if (serverEtag) draftEtagRef.current = serverEtag
+      return
+    }
+    const currentSave = saveTaskRef.current
+    const savingCurrentArtifact = currentSave?.session === editSessionRef.current
+      && currentSave.artifactId === resource.artifact.id
+    if (!localDirtyRef.current && !savingCurrentArtifact && !conflict) {
+      contentRef.current = next
+      draftEtagRef.current = serverEtag ?? draftEtagRef.current
+      setContent(next)
+    }
+  }, [conflict, resource, selectedBlueprintId, serverContent, serverEtag])
 
   useEffect(() => {
     const selectedExists = nodes.some((node) => node.id === selectedBlueprintNodeId)
@@ -223,33 +336,105 @@ export function BlueprintEditor() {
   useEffect(() => {
     if (!resource) {
       setDetails(null)
+      setDetailsArtifactId('')
       return
     }
+    const artifactId = resource.artifact.id
+    setDetails(null)
+    setDetailsArtifactId('')
     let active = true
-    void workspace.loadDetails<BlueprintContentDto>(resource.artifact.id)
-      .then((next) => { if (active) setDetails(next) })
+    void workspace.loadDetails<BlueprintContentDto>(artifactId)
+      .then((next) => {
+        if (!active) return
+        setDetails(next)
+        setDetailsArtifactId(artifactId)
+      })
       .catch((error) => { if (active) setLocalError(errorMessage(error, t('teamPlatform.blueprint.operationFailed'))) })
     return () => { active = false }
   }, [resource?.artifact.id, t, workspace.loadDetails])
 
+  const saveDraft = useCallback(async (nextContent = contentRef.current) => {
+    const session = editSessionRef.current
+    const artifactId = activeArtifactRef.current
+    const etag = draftEtagRef.current
+    if (!artifactId || !nextContent || !etag || !canEdit || actionBusyRef.current) return null
+    const initial = normalizeBlueprintContent(nextContent)
+    const activeTask = saveTaskRef.current
+    if (activeTask?.session === session && activeTask.artifactId === artifactId) {
+      activeTask.latestContent = initial
+      return null
+    }
+    const task: BlueprintSaveTask = {
+      session,
+      artifactId,
+      etag,
+      latestContent: initial,
+    }
+    saveTaskRef.current = task
+    setSaving(true)
+    setLocalError(null)
+    try {
+      let lastResult: Awaited<ReturnType<typeof workspace.saveBlueprintDraft>> | null = null
+      let pending: BlueprintContentDto | null = initial
+      while (pending) {
+        const savedPayload: string = JSON.stringify(pending)
+        lastResult = await workspace.saveBlueprintDraft(
+          task.artifactId,
+          pending,
+          task.etag,
+        )
+        const nextEtag = lastResult.data.draft?.etag ?? lastResult.etag
+        if (!nextEtag) throw new Error(t('teamPlatform.blueprint.missingDraftEtag'))
+        task.etag = nextEtag
+        const latest = normalizeBlueprintContent(task.latestContent)
+        pending = JSON.stringify(latest) !== savedPayload
+          ? latest
+          : null
+      }
+      if (task.session === editSessionRef.current && task.artifactId === activeArtifactRef.current) {
+        draftEtagRef.current = task.etag
+        localDirtyRef.current = false
+        setSavedAt(new Date().toLocaleTimeString(locale))
+        setConflict(false)
+      }
+      return lastResult
+    } catch (error) {
+      if (task.session === editSessionRef.current && task.artifactId === activeArtifactRef.current) {
+        if (error instanceof ArtifactWorkspaceConflictError) setConflict(true)
+        setLocalError(errorMessage(error, t('teamPlatform.blueprint.operationFailed')))
+      }
+      return null
+    } finally {
+      if (saveTaskRef.current === task) saveTaskRef.current = null
+      if (task.session === editSessionRef.current && task.artifactId === activeArtifactRef.current) {
+        setSaving(false)
+      }
+    }
+  }, [canEdit, locale, t, workspace.saveBlueprintDraft])
+
   useEffect(() => {
-    if (!resource || !content || !serverEtag || !dirty || conflict || !collaboration.can('edit')) return
-    const timer = window.setTimeout(() => {
-      setSaving(true)
-      setLocalError(null)
-      void workspace.saveBlueprintDraft(resource.artifact.id, normalizeBlueprintContent(content), serverEtag)
-        .then(() => {
-          setSavedAt(new Date().toLocaleTimeString(locale))
-          setConflict(false)
-        })
-        .catch((error) => {
-          if (error instanceof ArtifactWorkspaceConflictError) setConflict(true)
-          setLocalError(errorMessage(error, t('teamPlatform.blueprint.operationFailed')))
-        })
-        .finally(() => setSaving(false))
-    }, 700)
+    saveDraftRef.current = saveDraft
+  }, [saveDraft])
+
+  useEffect(() => {
+    if (!localDirtyRef.current) return
+    const currentSave = saveTaskRef.current
+    const savingCurrentArtifact = currentSave?.session === editSessionRef.current
+      && currentSave.artifactId === activeArtifactRef.current
+    if (!dirty && !savingCurrentArtifact) {
+      localDirtyRef.current = false
+      return
+    }
+    if (!content || conflict || !canEdit) return
+    const timer = window.setTimeout(() => void saveDraft(content), 700)
     return () => window.clearTimeout(timer)
-  }, [collaboration, conflict, content, dirty, locale, resource, serverEtag, t, workspace.saveBlueprintDraft])
+  }, [canEdit, conflict, content, dirty, saveDraft])
+
+  useEffect(() => () => {
+    if (localDirtyRef.current && contentRef.current) {
+      void saveDraftRef.current(contentRef.current)
+    }
+  }, [])
 
   if (!collaboration.session.signedIn) {
     return <Unavailable title={t('teamPlatform.blueprint.signInTitle')} detail={t('teamPlatform.blueprint.signInDetail')} />
@@ -264,7 +449,26 @@ export function BlueprintEditor() {
     return <Unavailable title={t('teamPlatform.blueprint.noArtifactsTitle')} detail={t('teamPlatform.blueprint.noArtifactsDetail')} action={t('teamPlatform.dashboard.createBlueprint')} onAction={() => void workspace.createBlueprint(t('teamPlatform.blueprint.productBlueprint'))} />
   }
 
-  const readOnly = !collaboration.can('edit')
+  const readOnly = !canEdit || actionBusy
+  const navigationLocked = dirty || saving || actionBusy || conflict
+
+  function recordEditedContent(next: BlueprintContentDto) {
+    contentRef.current = next
+    localDirtyRef.current = true
+    const currentSave = saveTaskRef.current
+    if (
+      currentSave?.session === editSessionRef.current
+      && currentSave.artifactId === activeArtifactRef.current
+    ) {
+      currentSave.latestContent = next
+    }
+  }
+
+  function replaceEditedContent(next: BlueprintContentDto) {
+    const normalizedNext = normalizeBlueprintContent(next)
+    recordEditedContent(normalizedNext)
+    setContent(normalizedNext)
+  }
 
   function mutateBlueprint(
     update: (
@@ -284,14 +488,15 @@ export function BlueprintEditor() {
       const currentEdges = currentNormalized.semantic?.edges ?? []
       const currentLayout = currentNormalized.layout ?? emptyBlueprintLayout()
       const next = update(currentNodes, currentEdges, currentLayout)
-      return materializeBlueprintContent(
+      const result = materializeBlueprintContent(
         currentNormalized,
         next.nodes ?? currentNodes,
         next.edges ?? currentEdges,
         next.layout ?? currentLayout,
       )
+      recordEditedContent(result)
+      return result
     })
-    setConflict(false)
   }
 
   function addNode(kind: BlueprintNodeKind = 'feature') {
@@ -329,10 +534,9 @@ export function BlueprintEditor() {
   ) {
     if (!content) return
     const inserted = insertBlueprintModule(content, localizedModuleTemplate(template, t), origin, stableId)
-    setContent(inserted.content)
+    replaceEditedContent(inserted.content)
     setSelectedNodeIds(inserted.nodeIds)
     setSelectedBlueprintNodeId(inserted.nodeIds[0] ?? null)
-    setConflict(false)
   }
 
   function groupSelection() {
@@ -340,8 +544,7 @@ export function BlueprintEditor() {
     const title = selectedNodeIds.length === 1
       ? nodes.find((node) => node.id === selectedNodeIds[0])?.title ?? t('teamPlatform.blueprint.capability')
       : t('teamPlatform.blueprint.capabilityNumber', { number: (layout.groups.length + 1).toLocaleString(locale) })
-    setContent(groupBlueprintNodes(content, selectedNodeIds, title, stableId('group')))
-    setConflict(false)
+    replaceEditedContent(groupBlueprintNodes(content, selectedNodeIds, title, stableId('group')))
   }
 
   function selectCapabilityGroup(group: BlueprintLayoutDto['groups'][number]) {
@@ -429,23 +632,131 @@ export function BlueprintEditor() {
   }
 
   async function createRevision() {
-    if (!content || !revisionReady) return
+    const currentSave = saveTaskRef.current
+    const session = editSessionRef.current
+    const artifactId = activeArtifactRef.current
+    if (
+      !content
+      || !artifactId
+      || !revisionReady
+      || dirty
+      || saving
+      || conflict
+      || actionBusyRef.current
+      || (currentSave?.session === session && currentSave.artifactId === artifactId)
+    ) return
+    const revisionContent = normalizeBlueprintContent(content)
+    actionBusyRef.current = true
+    setActionBusy(true)
     setSaving(true)
     setLocalError(null)
     try {
-      await workspace.createBlueprintRevision(resource!.artifact.id, normalizeBlueprintContent(content))
-      setDetails(await workspace.loadDetails<BlueprintContentDto>(resource!.artifact.id))
+      await workspace.createBlueprintRevision(artifactId, revisionContent)
+      if (session !== editSessionRef.current || artifactId !== activeArtifactRef.current) return
+      localDirtyRef.current = false
+      const nextDetails = await workspace.loadDetails<BlueprintContentDto>(artifactId)
+      if (session !== editSessionRef.current || artifactId !== activeArtifactRef.current) return
+      setDetails(nextDetails)
+      setDetailsArtifactId(artifactId)
+      setTab('versions')
     } catch (error) {
-      setLocalError(errorMessage(error, t('teamPlatform.blueprint.operationFailed')))
+      if (session === editSessionRef.current && artifactId === activeArtifactRef.current) {
+        setLocalError(errorMessage(error, t('teamPlatform.blueprint.operationFailed')))
+      }
     } finally {
-      setSaving(false)
+      if (session === editSessionRef.current && artifactId === activeArtifactRef.current) {
+        actionBusyRef.current = false
+        setActionBusy(false)
+        setSaving(false)
+      }
     }
   }
 
   async function reloadServerDraft() {
+    localDirtyRef.current = false
     setConflict(false)
     setLocalError(null)
     await workspace.refresh()
+  }
+
+  async function applyProposal(proposal: ProposalDto) {
+    const currentSave = saveTaskRef.current
+    const session = editSessionRef.current
+    const artifactId = activeArtifactRef.current
+    if (
+      !canEdit
+      || !artifactId
+      || dirty
+      || saving
+      || conflict
+      || actionBusyRef.current
+      || (currentSave?.session === session && currentSave.artifactId === artifactId)
+    ) return
+    actionBusyRef.current = true
+    setActionBusy(true)
+    setSaving(true)
+    setLocalError(null)
+    try {
+      await workspace.applyProposal(proposal.id, selectedOperations[proposal.id] ?? [])
+      if (session !== editSessionRef.current || artifactId !== activeArtifactRef.current) return
+      const nextDetails = await workspace.loadDetails<BlueprintContentDto>(artifactId)
+      if (session !== editSessionRef.current || artifactId !== activeArtifactRef.current) return
+      setDetails(nextDetails)
+      setDetailsArtifactId(artifactId)
+      setSavedAt(null)
+    } catch (error) {
+      if (session === editSessionRef.current && artifactId === activeArtifactRef.current) {
+        setLocalError(errorMessage(error, t('teamPlatform.blueprint.operationFailed')))
+      }
+    } finally {
+      if (session === editSessionRef.current && artifactId === activeArtifactRef.current) {
+        actionBusyRef.current = false
+        setActionBusy(false)
+        setSaving(false)
+      }
+    }
+  }
+
+  async function submitAppliedProposalRevision() {
+    const session = editSessionRef.current
+    const artifactId = activeArtifactRef.current
+    if (
+      !appliedProposalRevisionRef
+      || !appliedRevisionSubmissionNode
+      || !artifactId
+      || appliedProposalRevisionRef.artifactId !== artifactId
+      || dirty
+      || saving
+      || conflict
+      || flow.busy
+      || actionBusyRef.current
+    ) return
+    actionBusyRef.current = true
+    setActionBusy(true)
+    setSaving(true)
+    setLocalError(null)
+    try {
+      const submitted = await flow.submitNodeRevision(
+        appliedRevisionSubmissionNode,
+        appliedProposalRevisionRef,
+      )
+      if (session !== editSessionRef.current || artifactId !== activeArtifactRef.current) return
+      if (!submitted) {
+        setLocalError(t('teamPlatform.blueprint.nextStep.submitFailed'))
+        return
+      }
+      setSurface('workbench')
+    } catch (error) {
+      if (session === editSessionRef.current && artifactId === activeArtifactRef.current) {
+        setLocalError(errorMessage(error, t('teamPlatform.blueprint.nextStep.submitFailed')))
+      }
+    } finally {
+      if (session === editSessionRef.current && artifactId === activeArtifactRef.current) {
+        actionBusyRef.current = false
+        setActionBusy(false)
+        setSaving(false)
+      }
+    }
   }
 
   async function loadImpact() {
@@ -600,11 +911,17 @@ export function BlueprintEditor() {
       <aside className="w-60 shrink-0 overflow-y-auto border-r border-border bg-panel p-3 scrollbar-thin max-lg:max-h-48 max-lg:w-full max-lg:border-b max-lg:border-r-0">
         <div className="flex items-center justify-between gap-2">
           <span className="text-xs font-semibold text-foreground">{t('teamPlatform.blueprint.platformBlueprints')}</span>
-          <button type="button" onClick={() => void workspace.createBlueprint(t('teamPlatform.blueprint.untitledBlueprint'))} disabled={readOnly} className="rounded border border-border p-1.5 text-primary-bright disabled:opacity-40" aria-label={t('teamPlatform.dashboard.createBlueprint')} title={t('teamPlatform.dashboard.createBlueprint')}><FilePlus2 className="size-3.5" /></button>
+          <button type="button" onClick={() => void workspace.createBlueprint(t('teamPlatform.blueprint.untitledBlueprint'))} disabled={readOnly || navigationLocked} className="rounded border border-border p-1.5 text-primary-bright disabled:opacity-40" aria-label={t('teamPlatform.dashboard.createBlueprint')} title={t('teamPlatform.dashboard.createBlueprint')}><FilePlus2 className="size-3.5" /></button>
         </div>
         <div className="mt-3 space-y-1">
           {workspace.blueprints.map((item) => (
-            <button key={item.artifact.id} type="button" onClick={() => setSelectedBlueprintId(item.artifact.id)} className={cn('block w-full rounded-md px-2.5 py-2 text-left', item.artifact.id === resource.artifact.id ? 'bg-primary/15' : 'hover:bg-white/5')}>
+            <button
+              key={item.artifact.id}
+              type="button"
+              onClick={() => setSelectedBlueprintId(item.artifact.id)}
+              disabled={navigationLocked && item.artifact.id !== resource.artifact.id}
+              className={cn('block w-full rounded-md px-2.5 py-2 text-left disabled:cursor-not-allowed disabled:opacity-50', item.artifact.id === resource.artifact.id ? 'bg-primary/15' : 'hover:bg-white/5')}
+            >
               <span className="block truncate text-[11px] font-medium text-foreground">{item.artifact.title}</span>
               <span className="mt-0.5 block text-[9px] text-faint-foreground">{artifactStatusLabel(item.artifact.status, t)} · {t('teamPlatform.blueprint.revisionNumber', { number: (item.latestRevision?.revisionNumber ?? 0).toLocaleString(locale) })}</span>
             </button>
@@ -618,17 +935,87 @@ export function BlueprintEditor() {
           <span className="min-w-0 flex-1"><span className="block truncate text-sm font-semibold text-foreground">{resource.artifact.title}</span><span className="block text-[9px] text-faint-foreground">{resource.artifact.id} · {t('teamPlatform.blueprint.headerMeta', { etag: serverEtag ?? t('teamPlatform.common.missing'), semantic: nodes.length.toLocaleString(locale), layout: Object.keys(layout.nodePositions).length.toLocaleString(locale) })}</span></span>
           {resource.artifact.status === 'needsSync' && <span className="rounded bg-warning/10 px-2 py-1 text-[9px] text-warning">{t('doc.status.needsSync')}</span>}
           <span className={cn('inline-flex items-center gap-1 rounded px-2 py-1 text-[9px]', conflict ? 'bg-warning/10 text-warning' : saving ? 'bg-primary/10 text-primary-bright' : dirty ? 'bg-warning/10 text-warning' : 'bg-success/10 text-success')}>{saving ? <Loader2 className="size-3 animate-spin" /> : conflict ? <AlertTriangle className="size-3" /> : <Save className="size-3" />}{conflict ? t('teamPlatform.editor.conflict') : saving ? t('teamPlatform.blueprint.saving') : dirty ? t('teamPlatform.editor.pendingAutosave') : savedAt ? t('teamPlatform.editor.savedAt', { time: savedAt }) : t('teamPlatform.editor.serverDraft')}</span>
-          <button type="button" onClick={() => void workspace.refresh()} className="rounded border border-border p-1.5 text-muted-foreground" aria-label={t('teamPlatform.blueprint.refresh')} title={t('teamPlatform.blueprint.refresh')}><RefreshCw className="size-3.5" /></button>
+          <button type="button" onClick={() => void workspace.refresh()} disabled={navigationLocked} className="rounded border border-border p-1.5 text-muted-foreground disabled:opacity-40" aria-label={t('teamPlatform.blueprint.refresh')} title={t('teamPlatform.blueprint.refresh')}><RefreshCw className="size-3.5" /></button>
         </header>
 
         {(localError || conflict) && <div role="alert" className="border-b border-warning/30 bg-warning/10 px-4 py-2 text-[10px] text-warning">{localError}{conflict && <button type="button" onClick={() => void reloadServerDraft()} className="ml-3 underline">{t('teamPlatform.blueprint.reloadServerDraft')}</button>}</div>}
         {selectionMessage && <div role="status" className="border-b border-success/30 bg-success/10 px-4 py-2 text-[10px] text-success">{selectionMessage}</div>}
+        {appliedProposalAwaitingRevision && (
+          <div role="status" className="flex flex-wrap items-center gap-3 border-b border-primary/30 bg-primary/10 px-4 py-3">
+            <CheckCircle2 className="size-4 shrink-0 text-primary-bright" />
+            <div className="min-w-0 flex-1">
+              <p className="text-[11px] font-semibold text-foreground">
+                {t('teamPlatform.blueprint.nextStep.proposalApplied')}
+              </p>
+              <p className="mt-0.5 text-[9px] text-muted-foreground">
+                {t('teamPlatform.blueprint.nextStep.createRevisionDetail', {
+                  id: appliedProposalAwaitingRevision.id.slice(0, 12),
+                })}
+              </p>
+              {!conflict && (dirty || saving) && (
+                <p className="mt-1 text-[9px] text-warning">
+                  {t('teamPlatform.blueprint.nextStep.waitAutosave')}
+                </p>
+              )}
+              {conflict && (
+                <p className="mt-1 text-[9px] text-warning">
+                  {t('teamPlatform.blueprint.nextStep.resolveConflict')}
+                </p>
+              )}
+              {!revisionReady && (
+                <p className="mt-1 text-[9px] text-warning">
+                  {t('teamPlatform.blueprint.nextStep.resolveGate', {
+                    count: clientGate.length.toLocaleString(locale),
+                  })}
+                </p>
+              )}
+            </div>
+            <button
+              type="button"
+              onClick={() => void createRevision()}
+              disabled={readOnly || dirty || saving || conflict || !revisionReady}
+              className="inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-2 text-[10px] font-semibold text-primary-foreground disabled:opacity-40"
+            >
+              <GitBranch className="size-3.5" />
+              {t('teamPlatform.blueprint.nextStep.createRevision')}
+            </button>
+          </div>
+        )}
+        {!appliedProposalAwaitingRevision && appliedProposalRevision && (
+          <div role="status" className="flex flex-wrap items-center gap-3 border-b border-success/30 bg-success/10 px-4 py-3">
+            <CheckCircle2 className="size-4 shrink-0 text-success" />
+            <div className="min-w-0 flex-1">
+              <p className="text-[11px] font-semibold text-foreground">{t('teamPlatform.blueprint.nextStep.revisionCreated')}</p>
+              <p className="mt-0.5 text-[9px] text-muted-foreground">{t('teamPlatform.blueprint.nextStep.submitDetail', { number: appliedProposalRevision.revisionNumber.toLocaleString(locale) })}</p>
+              {!appliedRevisionSubmissionNode && (
+                <p className="mt-1 text-[9px] text-warning">
+                  {t('teamPlatform.blueprint.nextStep.exactNodeUnavailable')}
+                </p>
+              )}
+            </div>
+            <button type="button" onClick={() => setTab('review')} disabled={navigationLocked || !currentDetails} className="rounded-md border border-success/40 px-3 py-2 text-[10px] font-semibold text-success disabled:opacity-40">{t('teamPlatform.blueprint.nextStep.requestReview')}</button>
+            <button
+              type="button"
+              onClick={() => void submitAppliedProposalRevision()}
+              disabled={
+                navigationLocked
+                || flow.busy
+                || !appliedRevisionSubmissionNode
+                || appliedRevisionSubmissionNodes.length !== 1
+              }
+              className="inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-2 text-[10px] font-semibold text-primary-foreground disabled:opacity-40"
+            >
+              <Send className="size-3.5" />
+              {t('teamPlatform.blueprint.nextStep.returnWorkbench')}
+            </button>
+          </div>
+        )}
 
         <nav className="flex overflow-x-auto border-b border-border bg-panel p-1 scrollbar-thin">
           {([
             ['canvas', t('teamPlatform.blueprint.tab.graph', { count: nodes.length.toLocaleString(locale) })],
             ['pages', t('teamPlatform.blueprint.tab.pageSpecs', { count: pageSpecs.length.toLocaleString(locale) })],
-            ['versions', t('teamPlatform.editor.tab.versions', { count: (details?.versions.length ?? 0).toLocaleString(locale) })],
+            ['versions', t('teamPlatform.editor.tab.versions', { count: (currentDetails?.versions.length ?? 0).toLocaleString(locale) })],
             ['proposal', t('teamPlatform.editor.tab.proposals', { count: proposals.length.toLocaleString(locale) })],
             ['impact', t('teamPlatform.blueprint.tab.impact')],
             ['trace', t('teamPlatform.editor.tab.trace', { count: workspace.traces.length.toLocaleString(locale) })],
@@ -748,15 +1135,15 @@ export function BlueprintEditor() {
             }
           }} />}
 
-          {tab === 'versions' && <section className="mx-auto max-w-4xl space-y-3 p-5"><GatePanel clientIssues={clientGate} serverGate={details?.reviewGate} /><button type="button" onClick={() => void createRevision()} disabled={readOnly || !revisionReady || saving} className="inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-2 text-[11px] font-semibold text-primary-foreground disabled:opacity-50"><GitBranch className="size-3.5" />{t('teamPlatform.editor.createRevision')}</button>{details?.versions.map((version) => <div key={version.id} className="rounded-lg border border-border bg-panel p-3"><div className="flex items-center gap-2"><FileClock className="size-4 text-primary-bright" /><span className="text-[11px] font-medium text-foreground">{t('teamPlatform.editor.revisionNumber', { number: version.revisionNumber.toLocaleString(locale) })}</span><code className="ml-auto text-[9px] text-faint-foreground">{version.contentHash.slice(0, 16)}</code></div><p className="mt-1 text-[10px] text-muted-foreground">{formatDate(version.createdAt, locale)} · {t('teamPlatform.blueprint.pinnedRequirements', { count: (version.sourceVersions?.length ?? 0).toLocaleString(locale) })}</p></div>)}</section>}
+          {tab === 'versions' && <section className="mx-auto max-w-4xl space-y-3 p-5"><GatePanel clientIssues={clientGate} serverGate={currentDetails?.reviewGate} /><button type="button" onClick={() => void createRevision()} disabled={readOnly || !revisionReady || dirty || saving || conflict} className="inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-2 text-[11px] font-semibold text-primary-foreground disabled:opacity-50"><GitBranch className="size-3.5" />{t('teamPlatform.editor.createRevision')}</button>{currentDetails?.versions.map((version) => <div key={version.id} className="rounded-lg border border-border bg-panel p-3"><div className="flex items-center gap-2"><FileClock className="size-4 text-primary-bright" /><span className="text-[11px] font-medium text-foreground">{t('teamPlatform.editor.revisionNumber', { number: version.revisionNumber.toLocaleString(locale) })}</span><code className="ml-auto text-[9px] text-faint-foreground">{version.contentHash.slice(0, 16)}</code></div><p className="mt-1 text-[10px] text-muted-foreground">{formatDate(version.createdAt, locale)} · {t('teamPlatform.blueprint.pinnedRequirements', { count: (version.sourceVersions?.length ?? 0).toLocaleString(locale) })}</p></div>)}</section>}
 
-          {tab === 'proposal' && <ProposalPanel proposals={proposals} selected={selectedOperations} onSelected={setSelectedOperations} instruction={proposalInstruction} onInstruction={setProposalInstruction} canEdit={!readOnly} canCreate={Boolean(latestVersion) && !dirty} onCreate={() => void workspace.createProposal({ jobType: 'blueprint.patch', targetRevision: latestVersion!, instruction: proposalInstruction, inputVersions: resource.draft?.sourceVersions ?? [], outputSchemaVersion: 'blueprint.patch.v1' }).catch((error) => setLocalError(errorMessage(error, t('teamPlatform.blueprint.operationFailed'))))} onApply={(proposal) => void workspace.applyProposal(proposal.id, selectedOperations[proposal.id] ?? []).catch((error) => setLocalError(errorMessage(error, t('teamPlatform.blueprint.operationFailed'))))} />}
+          {tab === 'proposal' && <ProposalPanel proposals={proposals} selected={selectedOperations} onSelected={setSelectedOperations} instruction={proposalInstruction} onInstruction={setProposalInstruction} canEdit={!readOnly && !dirty && !saving && !conflict} canCreate={Boolean(latestVersion) && !dirty && !saving && !conflict} onCreate={() => void workspace.createProposal({ jobType: 'blueprint.patch', targetRevision: latestVersion!, instruction: proposalInstruction, inputVersions: resource.draft?.sourceVersions ?? [], outputSchemaVersion: 'blueprint.patch.v1' }).catch((error) => setLocalError(errorMessage(error, t('teamPlatform.blueprint.operationFailed'))))} onApply={(proposal) => void applyProposal(proposal)} />}
 
           {tab === 'impact' && <section className="mx-auto max-w-4xl space-y-3 p-5"><div className="flex items-center justify-between gap-3"><div><h2 className="text-sm font-semibold text-foreground">{t('teamPlatform.blueprint.impactTitle')}</h2><p className="mt-1 text-[10px] text-muted-foreground">{t('teamPlatform.blueprint.impactDetail')}</p></div><button type="button" onClick={() => void loadImpact()} className="rounded-md bg-primary px-3 py-2 text-[10px] font-semibold text-primary-foreground"><RefreshCw className="mr-1 inline size-3" />{t('teamPlatform.blueprint.analyzeImpact')}</button></div>{resource.artifact.status === 'needsSync' && <div className="rounded-md border border-warning/30 bg-warning/10 p-3 text-[10px] text-warning"><AlertTriangle className="mr-1 inline size-3" />{t('teamPlatform.blueprint.serverNeedsSync')}</div>}{impact?.items.length === 0 && <p className="rounded border border-dashed border-border p-4 text-[10px] text-faint-foreground">{t('teamPlatform.blueprint.noImpact')}</p>}{impact?.items.map((item, index) => <div key={`${item.targetArtifactId}-${index}`} className={cn('rounded-md border bg-panel p-3 text-[10px]', item.needsSync ? 'border-warning/40' : 'border-border')}><div className="flex items-center gap-2"><code className="text-primary-bright">{item.targetKind}:{item.targetArtifactId}</code><span className="ml-auto rounded bg-white/5 px-1.5 py-0.5">{impactSeverityLabel(item.severity, t)}</span>{item.needsSync && <span className="rounded bg-warning/10 px-1.5 py-0.5 text-warning">{t('doc.status.needsSync')}</span>}</div><p className="mt-1 text-muted-foreground">{item.reason}</p><p className="mt-1 text-faint-foreground">{t('teamPlatform.blueprint.impactSource', { id: item.source.artifactId, revision: item.source.revisionNumber?.toLocaleString(locale) ?? t('teamPlatform.common.unknown'), hash: item.source.contentHash.slice(0, 12) })}</p></div>)}</section>}
 
-          {tab === 'trace' && <section className="mx-auto max-w-4xl space-y-2 p-5">{details?.dependencies.map((dependency) => <div key={dependency.id} className="rounded-md border border-border bg-panel p-3 text-[10px]"><Link2 className="mr-2 inline size-3.5 text-primary-bright" />{dependency.source.artifactId}{dependency.source.revisionNumber ? `@${dependency.source.revisionNumber.toLocaleString(locale)}` : ''} <b>{relationLabel(dependency.relation, t)}</b> {dependency.target.artifactId}{dependency.target.revisionNumber ? `@${dependency.target.revisionNumber.toLocaleString(locale)}` : ''}{dependency.required && <span className="ml-2 text-warning">{t('blueprint.required')}</span>}</div>)}{workspace.traces.filter((trace) => trace.source.artifactId === resource.artifact.id || trace.target.artifactId === resource.artifact.id).map((trace) => <div key={trace.id} className="rounded-md border border-border bg-panel p-3 text-[10px]"><code>{trace.source.artifactId}:{trace.source.revisionId}</code> → {relationLabel(trace.relation, t)} → <code>{trace.target.artifactId}:{trace.target.revisionId}</code></div>)}</section>}
+          {tab === 'trace' && <section className="mx-auto max-w-4xl space-y-2 p-5">{currentDetails?.dependencies.map((dependency) => <div key={dependency.id} className="rounded-md border border-border bg-panel p-3 text-[10px]"><Link2 className="mr-2 inline size-3.5 text-primary-bright" />{dependency.source.artifactId}{dependency.source.revisionNumber ? `@${dependency.source.revisionNumber.toLocaleString(locale)}` : ''} <b>{relationLabel(dependency.relation, t)}</b> {dependency.target.artifactId}{dependency.target.revisionNumber ? `@${dependency.target.revisionNumber.toLocaleString(locale)}` : ''}{dependency.required && <span className="ml-2 text-warning">{t('blueprint.required')}</span>}</div>)}{workspace.traces.filter((trace) => trace.source.artifactId === resource.artifact.id || trace.target.artifactId === resource.artifact.id).map((trace) => <div key={trace.id} className="rounded-md border border-border bg-panel p-3 text-[10px]"><code>{trace.source.artifactId}:{trace.source.revisionId}</code> → {relationLabel(trace.relation, t)} → <code>{trace.target.artifactId}:{trace.target.revisionId}</code></div>)}</section>}
 
-          {tab === 'review' && <section className="mx-auto max-w-4xl space-y-3 p-5"><GatePanel clientIssues={clientGate} serverGate={details?.reviewGate} />{!latestVersion && <p className="rounded-md border border-dashed border-border p-4 text-[10px] text-faint-foreground">{t('teamPlatform.editor.createRevisionFirst')}</p>}{latestVersion && <div className="grid gap-2 sm:grid-cols-[1fr_auto]"><input value={comment} onChange={(event) => setComment(event.target.value)} placeholder={t('teamPlatform.blueprint.commentPlaceholder')} aria-label={t('teamPlatform.blueprint.commentPlaceholder')} className="h-9 rounded-md border border-border bg-background px-2 text-[10px] text-foreground" /><button type="button" onClick={() => void collaboration.addComment(comment, undefined, latestVersion).then((ok) => ok && setComment(''))} disabled={!comment.trim() || !collaboration.can('comment')} className="rounded-md bg-primary px-3 text-[10px] font-semibold text-primary-foreground disabled:opacity-50"><MessageSquare className="mr-1 inline size-3" />{t('teamPlatform.editor.comment')}</button></div>}{latestVersion && <div className="grid gap-2 sm:grid-cols-[1fr_180px_auto]"><input value={reviewSummary} onChange={(event) => setReviewSummary(event.target.value)} aria-label={t('teamPlatform.reviews.summary')} className="h-9 rounded-md border border-border bg-background px-2 text-[10px] text-foreground" /><select value={effectiveReviewerId} onChange={(event) => setReviewerId(event.target.value)} disabled={collaboration.project?.governanceMode === 'solo'} aria-label={t('reviews.reviewer')} className="h-9 rounded-md border border-border bg-background px-2 text-[10px] text-foreground disabled:opacity-75"><option value="">{t('reviews.reviewer')}</option>{governanceReviewers.map((member) => <option key={member.user.id} value={member.user.id}>{member.user.name}</option>)}</select><button type="button" onClick={() => void collaboration.requestReview(reviewSummary, latestVersion, [effectiveReviewerId])} disabled={!gatePassed || !effectiveReviewerId || !reviewSummary.trim()} className="rounded-md bg-primary px-3 text-[10px] font-semibold text-primary-foreground disabled:opacity-50"><Send className="mr-1 inline size-3" />{t('editor.requestReview')}</button></div>}{comments.map((thread) => <div key={thread.id} className="rounded-md border border-border bg-panel p-3"><span className="text-[10px] font-medium text-foreground">{thread.author.name}</span><p className="mt-1 text-[10px] text-muted-foreground">{thread.body}</p><p className="mt-1 text-[9px] text-faint-foreground">{t('teamPlatform.blueprint.pinnedToRevision', { number: thread.target?.revisionNumber?.toLocaleString(locale) ?? t('teamPlatform.common.unknown') })}</p></div>)}{reviews.map((review) => <div key={review.id} className="rounded-md border border-border bg-panel p-3 text-[10px]"><span className="font-medium text-foreground">{reviewStateLabel(review.state ?? 'pending', t)}</span><span className="ml-2 text-muted-foreground">{review.summary}</span><span className="ml-2 text-faint-foreground">{t('teamPlatform.blueprint.revisionNumber', { number: review.target?.revisionNumber?.toLocaleString(locale) ?? t('teamPlatform.common.unknown') })}</span></div>)}</section>}
+          {tab === 'review' && <section className="mx-auto max-w-4xl space-y-3 p-5"><GatePanel clientIssues={clientGate} serverGate={currentDetails?.reviewGate} />{!latestVersion && <p className="rounded-md border border-dashed border-border p-4 text-[10px] text-faint-foreground">{t('teamPlatform.editor.createRevisionFirst')}</p>}{latestVersion && <div className="grid gap-2 sm:grid-cols-[1fr_auto]"><input value={comment} onChange={(event) => setComment(event.target.value)} placeholder={t('teamPlatform.blueprint.commentPlaceholder')} aria-label={t('teamPlatform.blueprint.commentPlaceholder')} className="h-9 rounded-md border border-border bg-background px-2 text-[10px] text-foreground" /><button type="button" onClick={() => void collaboration.addComment(comment, undefined, latestVersion).then((ok) => ok && setComment(''))} disabled={!comment.trim() || !collaboration.can('comment') || saving || actionBusy} className="rounded-md bg-primary px-3 text-[10px] font-semibold text-primary-foreground disabled:opacity-50"><MessageSquare className="mr-1 inline size-3" />{t('teamPlatform.editor.comment')}</button></div>}{latestVersion && <div className="grid gap-2 sm:grid-cols-[1fr_180px_auto]"><input value={reviewSummary} onChange={(event) => setReviewSummary(event.target.value)} aria-label={t('teamPlatform.reviews.summary')} className="h-9 rounded-md border border-border bg-background px-2 text-[10px] text-foreground" /><select value={effectiveReviewerId} onChange={(event) => setReviewerId(event.target.value)} disabled={collaboration.project?.governanceMode === 'solo' || saving || actionBusy} aria-label={t('reviews.reviewer')} className="h-9 rounded-md border border-border bg-background px-2 text-[10px] text-foreground disabled:opacity-75"><option value="">{t('reviews.reviewer')}</option>{governanceReviewers.map((member) => <option key={member.user.id} value={member.user.id}>{member.user.name}</option>)}</select><button type="button" onClick={() => void collaboration.requestReview(reviewSummary, latestVersion, [effectiveReviewerId])} disabled={!gatePassed || !effectiveReviewerId || !reviewSummary.trim() || dirty || saving || actionBusy || conflict || !currentDetails} className="rounded-md bg-primary px-3 text-[10px] font-semibold text-primary-foreground disabled:opacity-50"><Send className="mr-1 inline size-3" />{t('editor.requestReview')}</button></div>}{comments.map((thread) => <div key={thread.id} className="rounded-md border border-border bg-panel p-3"><span className="text-[10px] font-medium text-foreground">{thread.author.name}</span><p className="mt-1 text-[10px] text-muted-foreground">{thread.body}</p><p className="mt-1 text-[9px] text-faint-foreground">{t('teamPlatform.blueprint.pinnedToRevision', { number: thread.target?.revisionNumber?.toLocaleString(locale) ?? t('teamPlatform.common.unknown') })}</p></div>)}{reviews.map((review) => <div key={review.id} className="rounded-md border border-border bg-panel p-3 text-[10px]"><span className="font-medium text-foreground">{reviewStateLabel(review.state ?? 'pending', t)}</span><span className="ml-2 text-muted-foreground">{review.summary}</span><span className="ml-2 text-faint-foreground">{t('teamPlatform.blueprint.revisionNumber', { number: review.target?.revisionNumber?.toLocaleString(locale) ?? t('teamPlatform.common.unknown') })}</span></div>)}</section>}
         </div>
       </main>
     </div>

@@ -28,13 +28,14 @@ const NAV: {
 
 const WORKBENCH_DEEP_LINK_KEYS = [
   'runId',
+  'workbenchNodeKey',
   'bundleId',
   'proposalId',
   'workspaceRevisionId',
   'conversationId',
 ] as const
 
-const TEAM_DEEP_LINK_KEYS = ['artifactId'] as const
+const TEAM_DEEP_LINK_KEYS = ['runId', 'workbenchNodeKey', 'artifactId'] as const
 
 export function AppShell() {
   const {

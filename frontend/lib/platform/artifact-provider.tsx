@@ -54,6 +54,62 @@ export { createEmptyPageSpecContent, createEmptyPrototypeContent } from './artif
 
 export type ArtifactWorkspaceStatus = 'idle' | 'loading' | 'ready' | 'error'
 
+type ArtifactWorkspaceRefreshMode = 'foreground' | 'background'
+
+function createArtifactWorkspaceBackgroundRevalidator(
+  load: () => Promise<void>,
+) {
+  let active: Promise<void> | null = null
+  let queued = false
+
+  return () => {
+    if (active) {
+      queued = true
+      return active
+    }
+
+    const run = async () => {
+      do {
+        queued = false
+        await load()
+      } while (queued)
+    }
+    const operation = run()
+    const tracked = operation.finally(() => {
+      if (active === tracked) active = null
+    })
+    active = tracked
+    return tracked
+  }
+}
+
+interface ArtifactWorkspaceProjectScope {
+  readonly projectId: string | null
+  readonly signedIn: boolean
+  readonly generation: symbol | null
+}
+
+function artifactWorkspaceResourceIsAtLeastAsFresh<TContent>(
+  candidate: VersionedArtifactDto<TContent>,
+  current: VersionedArtifactDto<TContent>,
+) {
+  const versionDelta = candidate.artifact.version - current.artifact.version
+  if (versionDelta !== 0) return versionDelta > 0
+
+  const draftDelta = (candidate.draft?.revision ?? -1) - (current.draft?.revision ?? -1)
+  if (draftDelta !== 0) return draftDelta > 0
+
+  const latestDelta = (candidate.latestRevision?.revisionNumber ?? -1)
+    - (current.latestRevision?.revisionNumber ?? -1)
+  if (latestDelta !== 0) return latestDelta > 0
+
+  const approvedDelta = (candidate.approvedRevision?.revisionNumber ?? -1)
+    - (current.approvedRevision?.revisionNumber ?? -1)
+  if (approvedDelta !== 0) return approvedDelta > 0
+
+  return candidate.artifact.updatedAt >= current.artifact.updatedAt
+}
+
 interface ArtifactWorkspaceContextState extends ArtifactWorkspaceSnapshot {
   readonly status: ArtifactWorkspaceStatus
   readonly error: string | null
@@ -144,61 +200,182 @@ export function ArtifactWorkspaceProvider({ children }: { children: ReactNode })
   } = useWorksflow()
   const gateway = useMemo(() => new ArtifactWorkspaceGateway(platformClient), [platformClient])
   const [snapshot, setSnapshot] = useState<ArtifactWorkspaceSnapshot>(EMPTY_SNAPSHOT)
+  // Snapshot ownership is state so project and session switches are gated during render.
+  const [snapshotScope, setSnapshotScope] = useState<ArtifactWorkspaceProjectScope>({
+    projectId: null,
+    signedIn: false,
+    generation: null,
+  })
   const [status, setStatus] = useState<ArtifactWorkspaceStatus>('idle')
   const [error, setError] = useState<string | null>(null)
   const requestId = useRef(0)
+  const activeLoadRequestId = useRef<number | null>(null)
+  const loadedProjectId = useRef<string | null>(null)
+  const activeProjectScope = useMemo<ArtifactWorkspaceProjectScope>(() => ({
+    projectId: project?.id ?? null,
+    signedIn: session.signedIn,
+    generation: Symbol('artifact-workspace-project'),
+  }), [project?.id, session.signedIn])
+  const activeProjectScopeRef = useRef(activeProjectScope)
+  const snapshotScopeRef = useRef(snapshotScope)
+  const foregroundRefresh = useRef<Promise<void> | null>(null)
+  const performRefreshRef = useRef<(
+    mode: ArtifactWorkspaceRefreshMode,
+  ) => Promise<void>>(async () => {})
+  const backgroundLoadRef = useRef<() => Promise<void>>(async () => {})
+  const backgroundRevalidate = useRef<(() => Promise<void>) | null>(null)
   const refreshRef = useRef<() => Promise<void>>(async () => {})
+  const revalidateRef = useRef<() => Promise<void>>(async () => {})
 
-  const refresh = useCallback(async () => {
+  snapshotScopeRef.current = snapshotScope
+
+  const markSnapshotScope = useCallback((scope: ArtifactWorkspaceProjectScope) => {
+    snapshotScopeRef.current = scope
+    setSnapshotScope(scope)
+  }, [])
+
+  const performRefresh = useCallback(async (mode: ArtifactWorkspaceRefreshMode) => {
+    const refreshScope = activeProjectScope
+    if (
+      activeProjectScopeRef.current.generation !== refreshScope.generation
+      || refreshScope.projectId !== (project?.id ?? null)
+      || refreshScope.signedIn !== session.signedIn
+    ) return
+
     if (!session.signedIn || !project) {
-      setSnapshot(EMPTY_SNAPSHOT)
-      setStatus('idle')
+      if (mode === 'foreground') {
+        requestId.current += 1
+        activeLoadRequestId.current = null
+        loadedProjectId.current = null
+        setSnapshot(EMPTY_SNAPSHOT)
+        markSnapshotScope(refreshScope)
+        setStatus('idle')
+        setError(null)
+      }
       return
     }
+    if (mode === 'background' && loadedProjectId.current !== project.id) return
     const currentRequest = ++requestId.current
-    setStatus('loading')
-    setError(null)
-    beginPlatformTeamFacts(project.id)
+    activeLoadRequestId.current = currentRequest
+    if (mode === 'foreground') {
+      loadedProjectId.current = null
+      setStatus('loading')
+      setError(null)
+      beginPlatformTeamFacts(project.id)
+    }
     try {
       const next = await gateway.load(project.id)
-      if (currentRequest !== requestId.current) return
+      if (
+        currentRequest !== requestId.current
+        || activeProjectScopeRef.current.generation !== refreshScope.generation
+      ) return
+      loadedProjectId.current = project.id
       setSnapshot(next)
+      markSnapshotScope(refreshScope)
       setStatus('ready')
+      setError(null)
     } catch (cause) {
-      if (currentRequest !== requestId.current) return
+      if (
+        currentRequest !== requestId.current
+        || activeProjectScopeRef.current.generation !== refreshScope.generation
+      ) return
       const message = collaborationErrorMessage(cause, t('runtime.artifact.loadFailed'))
+      if (mode === 'background') {
+        setError(message)
+        return
+      }
+      loadedProjectId.current = null
       setSnapshot(EMPTY_SNAPSHOT)
+      markSnapshotScope(refreshScope)
       setStatus('error')
       setError(message)
       failPlatformTeamFacts(project.id, message)
+    } finally {
+      if (activeLoadRequestId.current === currentRequest) {
+        activeLoadRequestId.current = null
+      }
     }
   }, [
+    activeProjectScope,
     beginPlatformTeamFacts,
     failPlatformTeamFacts,
     gateway,
+    markSnapshotScope,
     project,
     session.signedIn,
     t,
   ])
+  performRefreshRef.current = performRefresh
+
+  const refresh = useCallback(() => {
+    const operation = performRefresh('foreground')
+    const tracked = operation.finally(() => {
+      if (foregroundRefresh.current === tracked) foregroundRefresh.current = null
+    })
+    foregroundRefresh.current = tracked
+    return tracked
+  }, [performRefresh])
   refreshRef.current = refresh
 
+  backgroundLoadRef.current = async () => {
+    const foreground = foregroundRefresh.current
+    if (foreground) await foreground
+    const currentScope = activeProjectScopeRef.current
+    if (
+      !currentScope.signedIn
+      || !currentScope.projectId
+      || loadedProjectId.current !== currentScope.projectId
+    ) return
+    await performRefreshRef.current('background')
+  }
+  if (!backgroundRevalidate.current) {
+    backgroundRevalidate.current = createArtifactWorkspaceBackgroundRevalidator(
+      () => backgroundLoadRef.current(),
+    )
+  }
+  const revalidate = useCallback(() => backgroundRevalidate.current!(), [])
+  revalidateRef.current = revalidate
+
+  const snapshotIsCurrent = Boolean(
+    session.signedIn
+    && project
+    && snapshotScope.projectId === project.id
+    && snapshotScope.signedIn
+    && snapshotScope.generation === activeProjectScope.generation
+  )
+  const currentSnapshot = snapshotIsCurrent ? snapshot : EMPTY_SNAPSHOT
+  const currentStatus: ArtifactWorkspaceStatus = !session.signedIn || !project
+    ? 'idle'
+    : snapshotIsCurrent
+      ? status
+      : 'loading'
+  const currentError = snapshotIsCurrent ? error : null
+
   useEffect(() => {
-    void refreshRef.current()
+    activeProjectScopeRef.current = activeProjectScope
+  }, [activeProjectScope])
+
+  useEffect(() => {
+    void refreshRef.current().catch(() => undefined)
   }, [project?.id, session.signedIn])
 
   useEffect(() => {
-    if (status !== 'ready' || !project) return
-    applyPlatformTeamFacts(projectSnapshotAsLegacy(project.id, project.name, snapshot))
-  }, [applyPlatformTeamFacts, project, snapshot, status])
+    if (currentStatus !== 'ready' || !project) return
+    applyPlatformTeamFacts(projectSnapshotAsLegacy(project.id, project.name, currentSnapshot))
+  }, [applyPlatformTeamFacts, currentSnapshot, currentStatus, project])
 
   useEffect(() => {
     if (!session.signedIn || !project) return
     const unsubscribe = platformClient.websocket.subscribeProject(
       project.id,
       (event) => {
-        if (artifactWorkspaceEventRequiresRefresh(event.type)) void refreshRef.current()
+        if (artifactWorkspaceEventRequiresRefresh(event.type)) {
+          void revalidateRef.current().catch(() => undefined)
+        }
       },
-      () => void refreshRef.current(),
+      () => {
+        void revalidateRef.current().catch(() => undefined)
+      },
     )
     platformClient.websocket.connect()
     return unsubscribe
@@ -208,30 +385,66 @@ export function ArtifactWorkspaceProvider({ children }: { children: ReactNode })
     collection: ArtifactWorkspaceResourceCollection,
     artifactId: string,
     resource: VersionedArtifactDto<TContent>,
+    mutationScope: ArtifactWorkspaceProjectScope,
   ) => {
-    setSnapshot((current) => replaceArtifactWorkspaceSnapshotResource(
-      current,
-      collection,
-      artifactId,
-      resource,
-    ))
+    const resourceProjectId = resource.artifact.projectId
+    if (
+      !mutationScope.signedIn
+      || mutationScope.projectId !== resourceProjectId
+      || activeProjectScopeRef.current.generation !== mutationScope.generation
+      || snapshotScopeRef.current.generation !== mutationScope.generation
+    ) return
+
+    const interruptedRefresh = activeLoadRequestId.current !== null
+    // Invalidate GETs started before this response; the merge below also rejects stale saves.
+    requestId.current += 1
+    loadedProjectId.current = resourceProjectId
+    setSnapshot((current) => {
+      if (
+        activeProjectScopeRef.current.generation !== mutationScope.generation
+        || snapshotScopeRef.current.generation !== mutationScope.generation
+      ) return current
+      const currentResource = current[collection].find((item) =>
+        item.artifact.id === artifactId,
+      ) as VersionedArtifactDto<TContent> | undefined
+      if (
+        currentResource
+        && !artifactWorkspaceResourceIsAtLeastAsFresh(resource, currentResource)
+      ) return current
+      return replaceArtifactWorkspaceSnapshotResource(
+        current,
+        collection,
+        artifactId,
+        resource,
+      )
+    })
+    setStatus('ready')
+    setError(null)
+    if (interruptedRefresh) {
+      void revalidateRef.current().catch(() => undefined)
+    }
   }, [])
 
+  const loadDetails = useCallback(
+    <TContent,>(artifactId: string) => gateway.details<TContent>(artifactId),
+    [gateway],
+  )
+
   const value = useMemo<ArtifactWorkspaceContextState>(() => ({
-    ...snapshot,
-    status,
-    error,
+    ...currentSnapshot,
+    status: currentStatus,
+    error: currentError,
     refresh,
     createDocument: async (title, kind = 'requirement') => {
       if (!project) return null
       const result = await gateway.createDocument(project.id, title, createEmptyDocumentContent(kind))
-      await refreshRef.current()
+      await revalidateRef.current()
       return result.data.artifact.id
     },
     createBlueprint: async (title) => {
       if (!project) return null
       const approvedSources = approvedRequirementBaselineSources(
-        snapshot.documents,
+        currentSnapshot.documents,
         t('runtime.artifact.approveRequirements'),
       )
       const baselineResult = await gateway.compileRequirementBaseline(project.id, approvedSources)
@@ -248,12 +461,12 @@ export function ArtifactWorkspaceProvider({ children }: { children: ReactNode })
         requirementVersions,
         createEmptyBlueprintContent(),
       )
-      await refreshRef.current()
+      await revalidateRef.current()
       return result.data.artifact.id
     },
     createPageSpec: async (blueprintArtifactId, blueprintPageNodeId, title, route, userGoal) => {
       if (!project) return null
-      const blueprint = snapshot.blueprints.find((item) => item.artifact.id === blueprintArtifactId)
+      const blueprint = currentSnapshot.blueprints.find((item) => item.artifact.id === blueprintArtifactId)
       const revision = blueprint?.approvedRevision
       if (!revision) {
         throw new Error(t('runtime.artifact.approveBlueprint'))
@@ -271,12 +484,12 @@ export function ArtifactWorkspaceProvider({ children }: { children: ReactNode })
         blueprintPageNodeId,
         createEmptyPageSpecContent(blueprintPageNodeId, title, route, userGoal),
       )
-      await refreshRef.current()
+      await revalidateRef.current()
       return result.data.artifact.id
     },
     createPrototype: async (pageSpecArtifactId, title, exploratory = false) => {
       if (!project) return null
-      const pageSpec = snapshot.pageSpecs.find((item) => item.artifact.id === pageSpecArtifactId)
+      const pageSpec = currentSnapshot.pageSpecs.find((item) => item.artifact.id === pageSpecArtifactId)
       const revision = exploratory
         ? pageSpec?.approvedRevision ?? pageSpec?.latestRevision
         : pageSpec?.approvedRevision
@@ -299,35 +512,39 @@ export function ArtifactWorkspaceProvider({ children }: { children: ReactNode })
         reference,
         createEmptyPrototypeContent(reference, revision.content, exploratory),
       )
-      await refreshRef.current()
+      await revalidateRef.current()
       return result.data.artifact.id
     },
     saveDocumentDraft: async (artifactId, content, etag) => {
+      const mutationScope = activeProjectScope
       const result = await gateway.saveDocumentDraft(artifactId, content, etag)
-      updateSnapshotResource('documents', artifactId, result.data)
+      updateSnapshotResource('documents', artifactId, result.data, mutationScope)
       return result
     },
     saveBlueprintDraft: async (artifactId, content, etag) => {
+      const mutationScope = activeProjectScope
       const result = await gateway.saveBlueprintDraft(artifactId, content, etag)
-      updateSnapshotResource('blueprints', artifactId, result.data)
+      updateSnapshotResource('blueprints', artifactId, result.data, mutationScope)
       return result
     },
     savePageSpecDraft: async (artifactId, content, etag) => {
+      const mutationScope = activeProjectScope
       const result = await gateway.savePageSpecDraft(
         artifactId,
         content,
         etag,
       )
-      updateSnapshotResource('pageSpecs', artifactId, result.data)
+      updateSnapshotResource('pageSpecs', artifactId, result.data, mutationScope)
       return result
     },
     savePrototypeDraft: async (artifactId, content, etag) => {
+      const mutationScope = activeProjectScope
       const result = await gateway.savePrototypeDraft(artifactId, content, etag)
-      updateSnapshotResource('prototypes', artifactId, result.data)
+      updateSnapshotResource('prototypes', artifactId, result.data, mutationScope)
       return result
     },
     createDocumentRevision: async (artifactId, content) => {
-      const resource = snapshot.documents.find((item) => item.artifact.id === artifactId)
+      const resource = currentSnapshot.documents.find((item) => item.artifact.id === artifactId)
       const draftEtag = resource?.draft?.etag ?? resource?.artifact.etag
       if (!draftEtag) throw new Error(t('runtime.artifact.refreshDocumentDraft'))
       const saved = await gateway.saveDocumentDraft(
@@ -338,11 +555,11 @@ export function ArtifactWorkspaceProvider({ children }: { children: ReactNode })
       const revisionEtag = saved.data.draft?.etag ?? saved.etag
       if (!revisionEtag) throw new Error(t('runtime.artifact.missingSavedDraftEtag'))
       const result = await gateway.createDocumentRevision(artifactId, revisionEtag)
-      await refreshRef.current()
+      await revalidateRef.current()
       return result.data
     },
     createBlueprintRevision: async (artifactId, content) => {
-      const resource = snapshot.blueprints.find((item) => item.artifact.id === artifactId)
+      const resource = currentSnapshot.blueprints.find((item) => item.artifact.id === artifactId)
       const draftEtag = resource?.draft?.etag ?? resource?.artifact.etag
       if (!draftEtag) throw new Error(t('runtime.artifact.refreshBlueprintDraft'))
       const saved = await gateway.saveBlueprintDraft(
@@ -353,11 +570,11 @@ export function ArtifactWorkspaceProvider({ children }: { children: ReactNode })
       const revisionEtag = saved.data.draft?.etag ?? saved.etag
       if (!revisionEtag) throw new Error(t('runtime.artifact.missingSavedDraftEtag'))
       const result = await gateway.createBlueprintRevision(artifactId, revisionEtag)
-      await refreshRef.current()
+      await revalidateRef.current()
       return result.data
     },
     createPageSpecRevision: async (artifactId, content) => {
-      const resource = snapshot.pageSpecs.find((item) => item.artifact.id === artifactId)
+      const resource = currentSnapshot.pageSpecs.find((item) => item.artifact.id === artifactId)
       const draftEtag = resource?.draft?.etag ?? resource?.artifact.etag
       if (!draftEtag) throw new Error(t('runtime.artifact.refreshPageSpecDraft'))
       const saved = await gateway.savePageSpecDraft(
@@ -368,11 +585,11 @@ export function ArtifactWorkspaceProvider({ children }: { children: ReactNode })
       const revisionEtag = saved.data.draft?.etag ?? saved.etag
       if (!revisionEtag) throw new Error(t('runtime.artifact.missingSavedDraftEtag'))
       const result = await gateway.createPageSpecRevision(artifactId, revisionEtag)
-      await refreshRef.current()
+      await revalidateRef.current()
       return result.data
     },
     createPrototypeRevision: async (artifactId, content) => {
-      const resource = snapshot.prototypes.find((item) => item.artifact.id === artifactId)
+      const resource = currentSnapshot.prototypes.find((item) => item.artifact.id === artifactId)
       const draftEtag = resource?.draft?.etag ?? resource?.artifact.etag
       if (!draftEtag) throw new Error(t('runtime.artifact.refreshPrototypeDraft'))
       const saved = await gateway.savePrototypeDraft(
@@ -383,14 +600,14 @@ export function ArtifactWorkspaceProvider({ children }: { children: ReactNode })
       const revisionEtag = saved.data.draft?.etag ?? saved.etag
       if (!revisionEtag) throw new Error(t('runtime.artifact.missingSavedDraftEtag'))
       const result = await gateway.createPrototypeRevision(artifactId, revisionEtag)
-      await refreshRef.current()
+      await revalidateRef.current()
       return result.data
     },
-    loadDetails: <TContent,>(artifactId: string) => gateway.details<TContent>(artifactId),
+    loadDetails,
     createProposal: async (input) => {
       if (!project) throw new Error(t('runtime.artifact.selectProjectBeforeProposal'))
       const result = await gateway.createProposal(project.id, input)
-      await refreshRef.current()
+      await revalidateRef.current()
       return result.data
     },
     applyProposal: async (proposalId, acceptedOperationIds) => {
@@ -398,7 +615,7 @@ export function ArtifactWorkspaceProvider({ children }: { children: ReactNode })
         rejectedReason: t('runtime.artifact.proposalNotSelected'),
         invalidSelection: t('runtime.artifact.proposalSelectionInvalid'),
       })
-      await refreshRef.current()
+      await revalidateRef.current()
       return result.data
     },
     decideProposalOperation: async (proposal, operationId, decision, reason) => {
@@ -408,17 +625,19 @@ export function ArtifactWorkspaceProvider({ children }: { children: ReactNode })
         decision,
         reason,
       )
-      await refreshRef.current()
+      await revalidateRef.current()
       return result.data
     },
     impact: async (artifactId) => (await gateway.impact(artifactId)).data,
   }), [
-    error,
+    activeProjectScope,
+    currentError,
+    currentSnapshot,
+    currentStatus,
     gateway,
+    loadDetails,
     project,
     refresh,
-    snapshot,
-    status,
     t,
     updateSnapshotResource,
   ])
