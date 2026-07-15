@@ -46,6 +46,7 @@ import type {
   ImpactReportDto,
   JsonValue,
   PageSpecContentDto,
+  ProposalDraftSnapshotDto,
   ProposalDto,
   PrototypeContentDto,
   VersionRefDto,
@@ -174,6 +175,7 @@ interface ArtifactWorkspaceContextState extends ArtifactWorkspaceSnapshot {
   readonly applyProposal: (
     proposalId: string,
     acceptedOperationIds: readonly string[],
+    discardDraftSnapshot?: ProposalDraftSnapshotDto,
   ) => Promise<ArtifactDraftDto<JsonValue>>
   readonly decideProposalOperation: (
     proposal: Pick<ProposalDto, 'id' | 'version'>,
@@ -663,11 +665,12 @@ export function ArtifactWorkspaceProvider({ children }: { children: ReactNode })
       await revalidateRef.current()
       return result.data
     },
-    applyProposal: async (proposalId, acceptedOperationIds) => {
+    applyProposal: async (proposalId, acceptedOperationIds, discardDraftSnapshot) => {
       const mutationScope = activeProjectScope
       const result = await gateway.applyProposal(proposalId, acceptedOperationIds, {
         rejectedReason: t('runtime.artifact.proposalNotSelected'),
         invalidSelection: t('runtime.artifact.proposalSelectionInvalid'),
+        discardDraftSnapshot,
       })
       updateSnapshotProposalApply(result.appliedProposal, result.data, mutationScope)
       await revalidateRef.current()

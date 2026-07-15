@@ -49,11 +49,12 @@ import {
   reviewGateReadyForRequest,
 } from '@/lib/platform/artifact-workspace'
 import type {
+  ArtifactRevisionDto,
   ArtifactReviewGateDto,
   JsonObject,
   JsonValue,
   PrototypeContentDto,
-  PrototypeFixtureDto,
+  ProposalDraftSnapshotDto,
   PrototypeLayerDto,
   PrototypeLayerKind,
   ProposalDto,
@@ -67,7 +68,11 @@ import {
   isRequiredPrototypeBreakpoint,
   normalizePrototypeContent,
   prototypeFrameCoverageGaps,
+  prototypeLayerIdentityIssues,
+  prototypePageSpecAuthority,
+  prototypePayloadIntegrityIssues,
   prototypeReviewIssues,
+  prototypeVisibleViewport,
   removePrototypeBreakpoint,
   removePrototypeState,
   repairPrototypeFrameCoverage,
@@ -82,6 +87,19 @@ import { reviewCandidatesForGovernance } from '@/lib/worksflow/project-governanc
 type PrototypeMode = 'wireframe' | 'design' | 'component' | 'handoff'
 type Panel = 'properties' | 'variants' | 'data' | 'trace'
 type SaveState = 'idle' | 'dirty' | 'saving' | 'saved' | 'conflict' | 'error'
+type EditorMutationKind = 'createPrototype' | 'applyProposal' | 'revisionReview'
+
+interface EditorMutationLock {
+  readonly token: number
+  readonly kind: EditorMutationKind
+  readonly artifactId: string
+  readonly generation: number
+}
+
+interface PendingPrototypeReview {
+  readonly revision: ArtifactRevisionDto<PrototypeContentDto>
+  readonly draftEtag: string
+}
 
 const MODES: readonly { id: PrototypeMode; labelKey: MessageKey; icon: typeof Frame }[] = [
   { id: 'wireframe', labelKey: 'prototypePlatform.mode.wireframe', icon: Frame },
@@ -131,7 +149,12 @@ export function PrototypeStudio() {
   const [activeArtifactId, setActiveArtifactId] = useState('')
   const [content, setContent] = useState<PrototypeContentDto | null>(null)
   const [draftEtag, setDraftEtag] = useState('')
-  const [saveState, setSaveState] = useState<SaveState>('idle')
+  const [saveState, setSaveStateValue] = useState<SaveState>('idle')
+  const saveStateRef = useRef<SaveState>('idle')
+  const setSaveState = useCallback((next: SaveState) => {
+    saveStateRef.current = next
+    setSaveStateValue(next)
+  }, [])
   const [error, setError] = useState<string | null>(null)
   const [mode, setMode] = useState<PrototypeMode>('wireframe')
   const [panel, setPanel] = useState<Panel>('properties')
@@ -144,6 +167,7 @@ export function PrototypeStudio() {
   const [selectedPageSpecId, setSelectedPageSpecId] = useState('')
   const [newPrototypeTitle, setNewPrototypeTitle] = useState('')
   const [proposalBusyId, setProposalBusyId] = useState('')
+  const [editorMutationBusy, setEditorMutationBusy] = useState(false)
   const [drag, setDrag] = useState<{
     id: string
     pointerX: number
@@ -151,13 +175,89 @@ export function PrototypeStudio() {
     originX: number
     originY: number
   } | null>(null)
-  const saveSequence = useRef(0)
+  const contentRef = useRef<PrototypeContentDto | null>(null)
+  const draftEtagRef = useRef('')
+  const editGeneration = useRef(0)
+  const saveInFlight = useRef<Promise<void> | null>(null)
+  const editorMutationRef = useRef<EditorMutationLock | null>(null)
+  const editorMutationSequence = useRef(0)
+  const pendingPrototypeReviews = useRef(new Map<string, PendingPrototypeReview>())
   const proposalFocusKey = useRef('')
+  const hydratedArtifactId = useRef('')
   const activeResource = workspace.prototypes.find((item) => item.artifact.id === activeArtifactId)
     ?? workspace.prototypes[0]
   const activeId = activeResource?.artifact.id ?? ''
+  const activeIdRef = useRef(activeId)
+  activeIdRef.current = activeId
   const canEdit = collaboration.session.signedIn && collaboration.can('edit')
+  const effectiveCanEdit = canEdit && !editorMutationBusy
   const canReview = collaboration.session.signedIn && collaboration.can('publish')
+
+  function beginEditorMutation(kind: EditorMutationKind, artifactId: string) {
+    if (editorMutationRef.current) return null
+    const lock: EditorMutationLock = {
+      token: ++editorMutationSequence.current,
+      kind,
+      artifactId,
+      generation: editGeneration.current,
+    }
+    editorMutationRef.current = lock
+    setEditorMutationBusy(true)
+    setDrag(null)
+    return lock
+  }
+
+  function editorMutationSnapshotCurrent(lock: EditorMutationLock) {
+    return editorMutationTokenCurrent(lock)
+      && editGeneration.current === lock.generation
+  }
+
+  function editorMutationTokenCurrent(lock: EditorMutationLock) {
+    return editorMutationRef.current !== null
+      && editorMutationRef.current.token === lock.token
+  }
+
+  function draftSaveIsInFlight() {
+    return saveStateRef.current === 'saving'
+  }
+
+  async function exactRevisionHasReview(
+    lock: EditorMutationLock,
+    revision: ArtifactRevisionDto<PrototypeContentDto>,
+  ) {
+    const matches = (target?: { artifactId: string; revisionId: string; contentHash: string }) =>
+      target?.artifactId === revision.artifactId
+        && target.revisionId === revision.id
+        && target.contentHash === revision.contentHash
+    if (collaboration.reviews.some((review) => matches(review.target))) return true
+    const projectId = collaboration.project?.id
+    if (!projectId) throw new Error(t('prototypePlatform.error.serviceRequestFailed'))
+    const result = await collaboration.platformClient.reviews.list(
+      projectId,
+      revision.artifactId,
+      { limit: 100 },
+    )
+    if (!editorMutationOwnsActiveArtifact(lock)) return false
+    return result.data.items.some((review) => matches({
+      artifactId: review.artifactId,
+      revisionId: review.revisionId,
+      contentHash: review.contentHash,
+    }))
+  }
+
+  function editorMutationOwnsActiveArtifact(
+    lock: EditorMutationLock,
+    allowedArtifactIds: readonly string[] = [lock.artifactId],
+  ) {
+    return editorMutationSnapshotCurrent(lock)
+      && allowedArtifactIds.includes(activeIdRef.current)
+  }
+
+  function endEditorMutation(lock: EditorMutationLock) {
+    if (editorMutationRef.current?.token !== lock.token) return
+    editorMutationRef.current = null
+    setEditorMutationBusy(false)
+  }
 
   useEffect(() => {
     const referenced = artifactReference()
@@ -172,6 +272,10 @@ export function PrototypeStudio() {
 
   useEffect(() => {
     if (!activeResource || !serverContent) {
+      hydratedArtifactId.current = ''
+      contentRef.current = null
+      draftEtagRef.current = ''
+      editGeneration.current = 0
       setContent(null)
       setDraftEtag('')
       setSelectedLayerId('')
@@ -180,10 +284,17 @@ export function PrototypeStudio() {
       setDetails(null)
       return
     }
-    if (saveState === 'dirty' || saveState === 'saving' || saveState === 'conflict') return
+    if (proposalDraftStateBlocked(saveStateRef.current) || editorMutationRef.current) return
+    const sameArtifact = hydratedArtifactId.current === activeResource.artifact.id
     const normalizedContent = normalizePrototypeContent(serverContent)
-    setContent(cloneContent(normalizedContent))
-    setDraftEtag(activeResource.draft?.etag ?? activeResource.artifact.etag)
+    const localContent = cloneContent(normalizedContent)
+    const nextDraftEtag = activeResource.draft?.etag ?? activeResource.artifact.etag
+    contentRef.current = localContent
+    draftEtagRef.current = nextDraftEtag
+    editGeneration.current = 0
+    hydratedArtifactId.current = activeResource.artifact.id
+    setContent(localContent)
+    setDraftEtag(nextDraftEtag)
     setSelectedLayerId((current) => current && normalizedContent.layers[current]
       ? current
       : normalizedContent.frames[0]?.rootLayerId ?? Object.keys(normalizedContent.layers)[0] ?? '')
@@ -193,69 +304,127 @@ export function PrototypeStudio() {
     setSelectedBreakpointId((current) => normalizedContent.breakpoints.some((item) => item.id === current)
       ? current
       : normalizedContent.breakpoints[0]?.id ?? '')
-    setSaveState('idle')
+    setSaveState(sameArtifact && saveStateRef.current === 'saved' ? 'saved' : 'idle')
     void workspace.loadDetails<PrototypeContentDto>(activeResource.artifact.id)
       .then(setDetails)
       .catch((cause) => setError(message(cause, t('prototypePlatform.error.serviceRequestFailed'))))
-  }, [activeResource, saveState, serverContent, t, workspace])
+  }, [activeResource, editorMutationBusy, serverContent, setSaveState, t, workspace])
 
-  const saveDraft = useCallback(async (nextContent = content) => {
-    if (!activeResource || !nextContent || !draftEtag || !canEdit) return null
-    const sequence = ++saveSequence.current
-    setSaveState('saving')
-    setError(null)
-    try {
-      const result = await workspace.savePrototypeDraft(activeResource.artifact.id, nextContent, draftEtag)
-      if (sequence !== saveSequence.current) return result
-      const nextEtag = result.data.draft?.etag ?? result.etag
-      if (nextEtag) setDraftEtag(nextEtag)
-      setSaveState('saved')
-      try {
-        const nextDetails = await workspace.loadDetails<PrototypeContentDto>(activeResource.artifact.id)
-        if (sequence !== saveSequence.current) return result
-        setDetails(nextDetails)
-      } catch (cause) {
-        if (sequence === saveSequence.current) {
-          setDetails(null)
-          setError(t('prototypePlatform.error.draftSavedGateRefresh', {
-            message: message(cause, t('prototypePlatform.error.serviceRequestFailed')),
-          }))
+  const saveDraft = useCallback(async () => {
+    if (!activeResource || !contentRef.current || !draftEtagRef.current || !canEdit) return
+    if (saveInFlight.current) {
+      await saveInFlight.current
+      return
+    }
+    const artifactId = activeResource.artifact.id
+    const run = async () => {
+      while (activeIdRef.current === artifactId) {
+        const nextContent = contentRef.current
+        const nextDraftEtag = draftEtagRef.current
+        if (!nextContent || !nextDraftEtag) return
+        if (prototypePayloadIntegrityIssues(nextContent).length > 0) {
+          setSaveState('error')
+          setError(t('prototypePlatform.error.invalidPayloadIntegrity'))
+          return
+        }
+        if (prototypeLayerIdentityIssues(nextContent).length > 0) {
+          setSaveState('error')
+          setError(t('prototypePlatform.error.invalidLayerIdentity'))
+          return
+        }
+        const generation = editGeneration.current
+        setSaveState('saving')
+        setError(null)
+        try {
+          const result = await workspace.savePrototypeDraft(artifactId, nextContent, nextDraftEtag)
+          if (activeIdRef.current !== artifactId) return
+          const savedEtag = result.data.draft?.etag ?? result.etag
+          if (!savedEtag) {
+            setSaveState('error')
+            setError(t('prototypePlatform.error.serviceMissingEtag'))
+            return
+          }
+          draftEtagRef.current = savedEtag
+          setDraftEtag(savedEtag)
+          if (editGeneration.current !== generation) continue
+          try {
+            const nextDetails = await workspace.loadDetails<PrototypeContentDto>(artifactId)
+            if (activeIdRef.current !== artifactId) return
+            setDetails(nextDetails)
+          } catch (cause) {
+            if (activeIdRef.current !== artifactId) return
+            setDetails(null)
+            setError(t('prototypePlatform.error.draftSavedGateRefresh', {
+              message: message(cause, t('prototypePlatform.error.serviceRequestFailed')),
+            }))
+          }
+          if (editGeneration.current !== generation) continue
+          setSaveState('saved')
+          return
+        } catch (cause) {
+          if (activeIdRef.current !== artifactId) return
+          if (cause instanceof ArtifactWorkspaceConflictError) {
+            setSaveState('conflict')
+            setError(t('prototypePlatform.error.draftConflict'))
+          } else {
+            setSaveState('error')
+            setError(message(cause, t('prototypePlatform.error.serviceRequestFailed')))
+          }
+          return
         }
       }
-      return result
-    } catch (cause) {
-      if (sequence !== saveSequence.current) return null
-      if (cause instanceof ArtifactWorkspaceConflictError) {
-        setSaveState('conflict')
-        setError(t('prototypePlatform.error.draftConflict'))
-      } else {
-        setSaveState('error')
-        setError(message(cause, t('prototypePlatform.error.serviceRequestFailed')))
-      }
-      return null
     }
-  }, [activeResource, canEdit, content, draftEtag, t, workspace])
+    const pending = run()
+    saveInFlight.current = pending
+    try {
+      await pending
+    } finally {
+      if (saveInFlight.current === pending) saveInFlight.current = null
+    }
+  }, [activeResource, canEdit, t, workspace])
 
   useEffect(() => {
     if (saveState !== 'dirty' || !content || !canEdit) return
-    const timer = window.setTimeout(() => void saveDraft(content), 750)
+    const timer = window.setTimeout(() => void saveDraft(), 750)
     return () => window.clearTimeout(timer)
   }, [canEdit, content, saveDraft, saveState])
 
   const updateContent = useCallback((updater: (current: PrototypeContentDto) => PrototypeContentDto) => {
-    if (!canEdit) return
-    setContent((current) => current ? updater(current) : current)
+    if (!canEdit || editorMutationRef.current) return
+    const current = contentRef.current
+    if (!current) return
+    const next = updater(current)
+    contentRef.current = next
+    editGeneration.current += 1
+    setContent(next)
     setSaveState('dirty')
     setError(null)
   }, [canEdit])
 
+  function discardLocalAndReloadServerDraft() {
+    if (!activeResource || !serverContent || editorMutationRef.current) return
+    const localContent = cloneContent(normalizePrototypeContent(serverContent))
+    const nextDraftEtag = activeResource.draft?.etag ?? activeResource.artifact.etag
+    contentRef.current = localContent
+    draftEtagRef.current = nextDraftEtag
+    editGeneration.current = 0
+    setContent(localContent)
+    setDraftEtag(nextDraftEtag)
+    setSaveState('idle')
+    setError(null)
+    void workspace.refresh()
+  }
+
   const selectedLayer = content?.layers[selectedLayerId]
   const breakpoint = content?.breakpoints.find((item) => item.id === selectedBreakpointId)
     ?? content?.breakpoints[0]
+  const canvasViewport = breakpoint ? prototypeVisibleViewport(breakpoint) : undefined
   const state = content?.states.find((item) => item.id === selectedStateId)
     ?? content?.states[0]
   const frame = content?.frames.find((item) =>
-    item.stateId === state?.id && item.breakpointId === breakpoint?.id,
+    item.stateId === state?.id
+      && item.breakpointId === breakpoint?.id
+      && Boolean(content.layers[item.rootLayerId]),
   )
   const visibleLayers = useMemo(
     () => content ? layerTree(content.layers, frame?.rootLayerId) : [],
@@ -265,14 +434,25 @@ export function PrototypeStudio() {
   const actionableProposal = proposals.find((proposal) =>
     proposal.status === 'open' || proposal.status === 'reviewing' || proposal.status === 'ready')
   const review = collaboration.reviews.find((item) => item.target?.artifactId === activeId)
+  const pageSpecAuthority = useMemo(() => {
+    if (!content) return undefined
+    const pageSpec = workspace.pageSpecs.find((item) =>
+      item.artifact.id === content.pageSpecRevision.artifactId)
+    const exactRevision = [pageSpec?.approvedRevision, pageSpec?.latestRevision].find((revision) =>
+      revision?.id === content.pageSpecRevision.revisionId
+        && revision.contentHash === content.pageSpecRevision.contentHash)
+    return prototypePageSpecAuthority(exactRevision?.content as unknown)
+  }, [content, workspace.pageSpecs])
   const clientIssues = useMemo(
-    () => content ? prototypeReviewIssues(content) : [],
-    [content],
+    () => content ? prototypeReviewIssues(content, { pageSpecAuthority }) : [],
+    [content, pageSpecAuthority],
   )
   const serverGateIssues = useMemo(
     () => reviewGateIssues(details?.reviewGate),
     [details?.reviewGate],
   )
+  const editorTransitionBlocked = proposalDraftStateBlocked(saveState) || editorMutationBusy
+  const proposalActionsBlocked = editorTransitionBlocked
   const revisionReady = clientIssues.length === 0
   const requestReady = reviewGateReadyForRequest(details?.reviewGate)
 
@@ -394,7 +574,7 @@ export function PrototypeStudio() {
   }
 
   function startDrag(event: ReactPointerEvent<HTMLButtonElement>, item: PrototypeLayerDto) {
-    if (!canEdit || booleanValue(item.properties.locked)) return
+    if (!effectiveCanEdit || editorMutationRef.current || booleanValue(item.properties.locked)) return
     event.currentTarget.setPointerCapture(event.pointerId)
     setSelectedLayerId(item.id)
     setDrag({
@@ -423,6 +603,14 @@ export function PrototypeStudio() {
   }
 
   async function createPrototype() {
+    if (editorMutationRef.current) {
+      setError(t('prototypePlatform.error.editorMutationInProgress'))
+      return
+    }
+    if (proposalDraftStateBlocked(saveStateRef.current)) {
+      setError(t('prototypePlatform.error.finishDraftBeforeArtifactChange'))
+      return
+    }
     const pageSpec = workspace.pageSpecs.find((item) => item.artifact.id === selectedPageSpecId)
       ?? workspace.pageSpecs.find((item) => item.approvedRevision)
       ?? workspace.pageSpecs[0]
@@ -431,20 +619,47 @@ export function PrototypeStudio() {
       setError(t('prototypePlatform.error.approvePageSpec'))
       return
     }
+    const originArtifactId = activeIdRef.current
+    const title = newPrototypeTitle.trim()
+      || t('prototypePlatform.default.prototypeTitle', { title: pageSpec.artifact.title })
+    const lock = beginEditorMutation('createPrototype', originArtifactId)
+    if (!lock) {
+      setError(t('prototypePlatform.error.editorMutationInProgress'))
+      return
+    }
     setError(null)
     try {
       const id = await workspace.createPrototype(
         pageSpec.artifact.id,
-        newPrototypeTitle.trim() || t('prototypePlatform.default.prototypeTitle', { title: pageSpec.artifact.title }),
+        title,
         false,
       )
-      if (id) {
+      if (id && editorMutationOwnsActiveArtifact(lock, [originArtifactId, id])) {
         setActiveArtifactId(id)
         setNewPrototypeTitle('')
       }
     } catch (cause) {
-      setError(message(cause, t('prototypePlatform.error.serviceRequestFailed')))
+      if (editorMutationOwnsActiveArtifact(lock, [originArtifactId])) {
+        setError(message(cause, t('prototypePlatform.error.serviceRequestFailed')))
+      }
+    } finally {
+      endEditorMutation(lock)
     }
+  }
+
+  function switchPrototype(nextArtifactId: string) {
+    if (!nextArtifactId || nextArtifactId === activeId) return
+    if (editorMutationRef.current) {
+      setError(t('prototypePlatform.error.editorMutationInProgress'))
+      return
+    }
+    if (proposalDraftStateBlocked(saveStateRef.current)) {
+      setError(t('prototypePlatform.error.finishDraftBeforeArtifactChange'))
+      return
+    }
+    setSaveState('idle')
+    setActiveArtifactId(nextArtifactId)
+    setError(null)
   }
 
   async function decideProposalOperation(
@@ -453,7 +668,11 @@ export function PrototypeStudio() {
     decision: 'accepted' | 'rejected',
   ) {
     if (!canEdit || operation.decision !== 'pending') return proposal
-    if (saveState === 'dirty' || saveState === 'saving' || saveState === 'conflict') {
+    if (editorMutationRef.current) {
+      setError(t('prototypePlatform.error.editorMutationInProgress'))
+      return null
+    }
+    if (proposalDraftStateBlocked(saveStateRef.current)) {
       setError(t('prototypePlatform.error.finishDraftBeforeDecision'))
       return null
     }
@@ -478,6 +697,15 @@ export function PrototypeStudio() {
     proposal: ProposalDto,
     decision: 'accepted' | 'rejected',
   ) {
+    if (!canEdit) return
+    if (editorMutationRef.current) {
+      setError(t('prototypePlatform.error.editorMutationInProgress'))
+      return
+    }
+    if (proposalDraftStateBlocked(saveStateRef.current)) {
+      setError(t('prototypePlatform.error.finishDraftBeforeDecision'))
+      return
+    }
     let current: ProposalDto | null = proposal
     for (const operation of proposal.operations) {
       if (!current || operation.decision !== 'pending') continue
@@ -487,8 +715,33 @@ export function PrototypeStudio() {
 
   async function applyPrototypeProposal(proposal: ProposalDto) {
     if (!canEdit || proposal.status !== 'ready') return
-    if (saveState === 'dirty' || saveState === 'saving' || saveState === 'conflict') {
+    if (editorMutationRef.current) {
+      setError(t('prototypePlatform.error.editorMutationInProgress'))
+      return
+    }
+    if (proposalDraftStateBlocked(saveStateRef.current)) {
       setError(t('prototypePlatform.error.finishDraftBeforeApply'))
+      return
+    }
+    const artifactId = activeResource?.artifact.id ?? ''
+    if (!artifactId || proposal.artifactId !== artifactId) return
+    const currentDraft = activeResource?.draft
+    const discardUnrevisionedChanges = Boolean(
+      currentDraft
+      && currentDraft.contentHash !== proposal.baseRevision.contentHash,
+    )
+    if (discardUnrevisionedChanges
+      && !window.confirm(t('prototypePlatform.proposal.confirmDiscardDraft'))) return
+    const discardDraftSnapshot: ProposalDraftSnapshotDto | undefined = discardUnrevisionedChanges && currentDraft
+      ? {
+          expectedDraftId: currentDraft.id,
+          expectedDraftEtag: currentDraft.etag,
+          expectedDraftContentHash: currentDraft.contentHash,
+        }
+      : undefined
+    const lock = beginEditorMutation('applyProposal', artifactId)
+    if (!lock) {
+      setError(t('prototypePlatform.error.editorMutationInProgress'))
       return
     }
     setProposalBusyId(proposal.id)
@@ -499,58 +752,124 @@ export function PrototypeStudio() {
         proposal.operations
           .filter((operation) => operation.decision === 'accepted')
           .map((operation) => operation.id),
+        discardDraftSnapshot,
       )
+      if (draft.artifactId !== artifactId || !editorMutationOwnsActiveArtifact(lock)) return
       const nextContent = normalizePrototypeContent(draft.content as unknown as PrototypeContentDto)
-      setContent(cloneContent(nextContent))
+      const localContent = cloneContent(nextContent)
+      contentRef.current = localContent
+      draftEtagRef.current = draft.etag
+      setContent(localContent)
       setDraftEtag(draft.etag)
       setSaveState('saved')
-      setDetails(await workspace.loadDetails<PrototypeContentDto>(proposal.artifactId))
+      const nextDetails = await workspace.loadDetails<PrototypeContentDto>(artifactId)
+      if (!editorMutationOwnsActiveArtifact(lock)) return
+      setDetails(nextDetails)
     } catch (cause) {
-      setError(message(cause, t('prototypePlatform.error.serviceRequestFailed')))
+      if (editorMutationOwnsActiveArtifact(lock)) {
+        setError(message(cause, t('prototypePlatform.error.serviceRequestFailed')))
+      }
     } finally {
-      setProposalBusyId('')
+      if (editorMutationTokenCurrent(lock)) setProposalBusyId('')
+      endEditorMutation(lock)
     }
   }
 
   async function createRevisionAndRequestReview() {
-    if (!activeResource || !content || !canEdit) return
-    const issues = prototypeReviewIssues(content)
+    if (!activeResource || !canEdit) return
+    if (editorMutationRef.current) {
+      setError(t('prototypePlatform.error.editorMutationInProgress'))
+      return
+    }
+    const snapshotContent = contentRef.current
+    const snapshotEtag = draftEtagRef.current
+    const artifactId = activeResource.artifact.id
+    if (!snapshotContent) return
+    const issues = prototypeReviewIssues(snapshotContent, { pageSpecAuthority })
     if (issues.length > 0) {
       setError(t('prototypePlatform.error.revisionGateBlocked', {
         issues: issues.map((issue) => prototypeIssueLabel(issue, t, formatNumber)).join(' '),
       }))
       return
     }
-    if (!draftEtag) {
+    if (!snapshotEtag) {
       setError(t('prototypePlatform.error.missingDraftEtag'))
       return
     }
-    if (saveState === 'conflict') {
-      setError(t('prototypePlatform.error.resolveConflict'))
+    if (proposalDraftStateBlocked(saveStateRef.current)) {
+      const currentSaveState = saveStateRef.current
+      setError(t(currentSaveState === 'conflict'
+        ? 'prototypePlatform.error.resolveConflict'
+        : currentSaveState === 'error'
+          ? 'prototypePlatform.error.invalidPayloadIntegrity'
+          : 'prototypePlatform.error.waitAutosave'))
       return
     }
-    if (saveState === 'dirty' || saveState === 'saving') {
-      setError(t('prototypePlatform.error.waitAutosave'))
+    const pendingReview = pendingPrototypeReviews.current.get(artifactId)
+    if (pendingReview && pendingReview.draftEtag !== snapshotEtag) {
+      pendingPrototypeReviews.current.delete(artifactId)
+    }
+    const pendingReviewRevision = pendingReview?.draftEtag === snapshotEtag
+      ? pendingReview.revision
+      : undefined
+    const latestRevision = activeResource.latestRevision
+    const activeDraft = activeResource.draft
+    const retryReviewRevision = pendingReviewRevision ?? (latestRevision
+      && activeDraft
+      && latestRevision.status !== 'approved'
+      && latestRevision.artifactId === artifactId
+      && activeDraft.artifactId === artifactId
+      && latestRevision.contentHash === activeDraft.contentHash
+      && snapshotEtag === activeDraft.etag
+      ? latestRevision
+      : undefined)
+    const snapshot = cloneContent(snapshotContent)
+    const title = activeResource.artifact.title
+    const lock = beginEditorMutation('revisionReview', artifactId)
+    if (!lock) {
+      setError(t('prototypePlatform.error.editorMutationInProgress'))
       return
     }
     setSaveState('saving')
     setError(null)
-    let createdRevisionNumber: number | null = null
+    let exactRevision = retryReviewRevision
+    let createdRevisionNumber: number | null = retryReviewRevision?.revisionNumber ?? null
     try {
-      const saved = await workspace.savePrototypeDraft(activeResource.artifact.id, content, draftEtag)
-      const etag = saved.data.draft?.etag ?? saved.etag
-      if (!etag) throw new Error(t('prototypePlatform.error.serviceMissingEtag'))
-      setDraftEtag(etag)
-      const revisionResult = await collaboration.platformClient.prototypes.createRevision(
-        activeResource.artifact.id,
-        { changeSummary: t('prototypePlatform.revision.changeSummary'), changeSource: 'human' },
-        { ifMatch: etag, idempotencyKey: true },
-      )
-      const revision = revisionResult.data
-      createdRevisionNumber = revision.revisionNumber
-      await workspace.refresh()
-      const currentDetails = await workspace.loadDetails<PrototypeContentDto>(activeResource.artifact.id)
+      if (!exactRevision) {
+        const saved = await workspace.savePrototypeDraft(artifactId, snapshot, snapshotEtag)
+        if (!editorMutationOwnsActiveArtifact(lock)) return
+        const etag = saved.data.draft?.etag ?? saved.etag
+        if (!etag) throw new Error(t('prototypePlatform.error.serviceMissingEtag'))
+        draftEtagRef.current = etag
+        setDraftEtag(etag)
+        const revisionResult = await collaboration.platformClient.prototypes.createRevision(
+          artifactId,
+          { changeSummary: t('prototypePlatform.revision.changeSummary'), changeSource: 'human' },
+          { ifMatch: etag, idempotencyKey: true },
+        )
+        const revision = revisionResult.data
+        if (revision.artifactId !== artifactId || !editorMutationOwnsActiveArtifact(lock)) return
+        exactRevision = revision
+        createdRevisionNumber = revision.revisionNumber
+        pendingPrototypeReviews.current.set(artifactId, { revision, draftEtag: etag })
+        await workspace.refresh()
+        if (!editorMutationOwnsActiveArtifact(lock)) return
+      }
+      const revision = exactRevision
+      const currentDetails = await workspace.loadDetails<PrototypeContentDto>(artifactId)
+      if (!editorMutationOwnsActiveArtifact(lock)) return
       setDetails(currentDetails)
+      if (await exactRevisionHasReview(lock, revision)) {
+        if (!editorMutationOwnsActiveArtifact(lock)) return
+        pendingPrototypeReviews.current.delete(artifactId)
+        await collaboration.refresh()
+        if (!editorMutationOwnsActiveArtifact(lock)) return
+        await workspace.refresh()
+        if (!editorMutationOwnsActiveArtifact(lock)) return
+        setSaveState('saved')
+        return
+      }
+      if (!editorMutationOwnsActiveArtifact(lock)) return
       if (!reviewGateReadyForRequest(currentDetails.reviewGate)) {
         const blockers = reviewGateIssues(currentDetails.reviewGate)
         setSaveState('saved')
@@ -568,30 +887,59 @@ export function PrototypeStudio() {
       )
         .map((member) => member.user.id)
       if (reviewerIds.length === 0) {
+        setSaveState('saved')
         setError(t('prototypePlatform.error.addReviewer'))
       } else {
-        await collaboration.requestReview(
+        const requested = await collaboration.requestReview(
           t('prototypePlatform.review.requestSummary'),
           {
             artifactId: revision.artifactId,
             revisionId: revision.id,
             revisionNumber: revision.revisionNumber,
             contentHash: revision.contentHash,
-            title: activeResource.artifact.title,
+            title,
           },
           reviewerIds,
         )
+        if (!editorMutationOwnsActiveArtifact(lock)) return
+        if (!requested) {
+          const createdDespiteFailure = await exactRevisionHasReview(lock, revision)
+          if (!editorMutationOwnsActiveArtifact(lock)) return
+          if (!createdDespiteFailure) {
+            setSaveState('saved')
+            setError(t('prototypePlatform.error.reviewNotRequested', {
+              number: formatNumber(revision.revisionNumber),
+              reason: t('prototypePlatform.error.reviewRequestFailedRetryExact'),
+            }))
+            return
+          }
+          pendingPrototypeReviews.current.delete(artifactId)
+          await collaboration.refresh()
+          if (!editorMutationOwnsActiveArtifact(lock)) return
+        } else {
+          pendingPrototypeReviews.current.delete(artifactId)
+        }
       }
       await workspace.refresh()
+      if (!editorMutationOwnsActiveArtifact(lock)) return
       setSaveState('saved')
     } catch (cause) {
-      setSaveState(createdRevisionNumber === null ? 'error' : 'saved')
-      setError(createdRevisionNumber === null
-        ? message(cause, t('prototypePlatform.error.serviceRequestFailed'))
-        : t('prototypePlatform.error.reviewNotRequested', {
-            number: formatNumber(createdRevisionNumber),
-            reason: message(cause, t('prototypePlatform.error.serviceRequestFailed')),
+      if (editorMutationOwnsActiveArtifact(lock)) {
+        setSaveState(createdRevisionNumber === null ? 'error' : 'saved')
+        setError(createdRevisionNumber === null
+          ? message(cause, t('prototypePlatform.error.serviceRequestFailed'))
+          : t('prototypePlatform.error.reviewNotRequested', {
+              number: formatNumber(createdRevisionNumber),
+              reason: message(cause, t('prototypePlatform.error.serviceRequestFailed')),
           }))
+      }
+    } finally {
+      if (editorMutationTokenCurrent(lock)
+        && activeIdRef.current !== artifactId
+        && draftSaveIsInFlight()) {
+        setSaveState('idle')
+      }
+      endEditorMutation(lock)
     }
   }
 
@@ -608,7 +956,9 @@ export function PrototypeStudio() {
       <StudioGate
         title={t('prototypePlatform.gate.serviceUnavailable')}
         description={workspace.error ?? t('prototypePlatform.gate.serviceUnavailableDescription')}
-        onRetry={workspace.refresh}
+        onRetry={async () => {
+          await Promise.all([collaboration.refresh(), workspace.refresh()])
+        }}
       />
     )
   }
@@ -641,12 +991,9 @@ export function PrototypeStudio() {
             <button
               key={prototype.artifact.id}
               type="button"
-              onClick={() => {
-                setSaveState('idle')
-                setActiveArtifactId(prototype.artifact.id)
-                setError(null)
-              }}
-              className={cn('mb-1 block w-full rounded-md border px-2.5 py-2 text-left', activeId === prototype.artifact.id ? 'border-primary/40 bg-primary/10' : 'border-transparent hover:border-border hover:bg-white/5')}
+              onClick={() => switchPrototype(prototype.artifact.id)}
+              disabled={activeId !== prototype.artifact.id && editorTransitionBlocked}
+              className={cn('mb-1 block w-full rounded-md border px-2.5 py-2 text-left disabled:cursor-not-allowed disabled:opacity-35', activeId === prototype.artifact.id ? 'border-primary/40 bg-primary/10' : 'border-transparent hover:border-border hover:bg-white/5')}
             >
               <span className="block truncate text-[11px] font-medium text-foreground">{prototype.artifact.title}</span>
               <span className="mt-1 flex items-center gap-1.5 text-[8px] text-faint-foreground">
@@ -665,13 +1012,13 @@ export function PrototypeStudio() {
         </div>
         {canEdit && (
           <div className="border-b border-border p-2">
-            <select value={selectedPageSpecId} onChange={(event) => setSelectedPageSpecId(event.target.value)} className="h-7 w-full rounded border border-border bg-background px-1.5 text-[9px] text-foreground outline-none" aria-label={t('prototypePlatform.pageSpec.source')}>
+            <select value={selectedPageSpecId} onChange={(event) => setSelectedPageSpecId(event.target.value)} disabled={editorTransitionBlocked} className="h-7 w-full rounded border border-border bg-background px-1.5 text-[9px] text-foreground outline-none disabled:opacity-35" aria-label={t('prototypePlatform.pageSpec.source')}>
               <option value="">{t('prototypePlatform.pageSpec.selectSource')}</option>
               {workspace.pageSpecs.map((pageSpec) => <option key={pageSpec.artifact.id} value={pageSpec.artifact.id}>{pageSpec.artifact.title} · {pageSpec.approvedRevision ? t('prototypePlatform.pageSpec.approvedRevision', { revision: formatNumber(pageSpec.approvedRevision.revisionNumber) }) : t('prototypePlatform.pageSpec.latestRevision')}</option>)}
             </select>
             <div className="mt-1.5 flex gap-1">
-              <input value={newPrototypeTitle} onChange={(event) => setNewPrototypeTitle(event.target.value)} placeholder={t('prototypePlatform.prototypeTitle')} className="h-7 min-w-0 flex-1 rounded border border-border bg-background px-1.5 text-[9px] text-foreground outline-none" />
-              <button type="button" onClick={() => void createPrototype()} disabled={workspace.pageSpecs.length === 0} className="flex size-7 items-center justify-center rounded bg-primary text-primary-foreground disabled:opacity-35" aria-label={t('prototypePlatform.createPrototype')}><Plus className="size-3.5" /></button>
+              <input value={newPrototypeTitle} onChange={(event) => setNewPrototypeTitle(event.target.value)} disabled={editorTransitionBlocked} placeholder={t('prototypePlatform.prototypeTitle')} className="h-7 min-w-0 flex-1 rounded border border-border bg-background px-1.5 text-[9px] text-foreground outline-none disabled:opacity-35" />
+              <button type="button" onClick={() => void createPrototype()} disabled={workspace.pageSpecs.length === 0 || editorTransitionBlocked} className="flex size-7 items-center justify-center rounded bg-primary text-primary-foreground disabled:opacity-35" aria-label={t('prototypePlatform.createPrototype')}><Plus className="size-3.5" /></button>
             </div>
           </div>
         )}
@@ -680,14 +1027,14 @@ export function PrototypeStudio() {
             <div className="flex items-center gap-2 border-b border-border px-3 py-2 text-[9px] font-semibold uppercase tracking-wider text-faint-foreground"><Layers className="size-3" />{t('prototypePlatform.layers')}<span className="ml-auto font-mono">{formatNumber(Object.keys(content.layers).length)}</span></div>
             <div className="min-h-0 flex-1 overflow-y-auto p-2 scrollbar-thin">
               {visibleLayers.toReversed().map((item) => {
-                const Icon = LAYER_ICONS[item.kind]
+                const Icon = LAYER_ICONS[item.kind] ?? Box
                 return <button key={item.id} type="button" onClick={() => setSelectedLayerId(item.id)} className={cn('mb-0.5 flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-[10px]', selectedLayerId === item.id ? 'bg-primary/10 text-primary-bright' : 'text-muted-foreground hover:bg-white/5 hover:text-foreground')}><Icon className="size-3 shrink-0" /><span className="min-w-0 flex-1 truncate">{item.name}</span>{booleanValue(item.properties.locked) && <Lock className="size-2.5" />}{booleanValue(item.properties.hidden) && <EyeOff className="size-2.5" />}</button>
               })}
             </div>
             {canEdit && (
               <div className="border-t border-border p-2">
                 <div className="grid grid-cols-4 gap-1">
-                  {LAYER_TEMPLATES.map((template) => { const Icon = template.icon; const name = t(template.nameKey); return <button key={`${template.kind}-${template.nameKey}`} type="button" onClick={() => addLayer(template)} className="flex h-12 flex-col items-center justify-center gap-1 rounded border border-border text-[8px] text-faint-foreground hover:border-primary/40 hover:text-foreground" title={t('prototypePlatform.addLayer', { layer: name })}><Icon className="size-3.5" /><span className="max-w-full truncate px-1">{name}</span></button> })}
+                  {LAYER_TEMPLATES.map((template) => { const Icon = template.icon; const name = t(template.nameKey); return <button key={`${template.kind}-${template.nameKey}`} type="button" onClick={() => addLayer(template)} disabled={!effectiveCanEdit} className="flex h-12 flex-col items-center justify-center gap-1 rounded border border-border text-[8px] text-faint-foreground hover:border-primary/40 hover:text-foreground disabled:opacity-35" title={t('prototypePlatform.addLayer', { layer: name })}><Icon className="size-3.5" /><span className="max-w-full truncate px-1">{name}</span></button> })}
                 </div>
               </div>
             )}
@@ -716,7 +1063,7 @@ export function PrototypeStudio() {
               </div>
             </header>
 
-            {error && <div role="alert" className="flex items-center gap-2 border-b border-destructive/30 bg-destructive/10 px-3 py-2 text-[9px] text-destructive"><CircleAlert className="size-3 shrink-0" /><span className="min-w-0 flex-1">{error}</span>{saveState === 'conflict' && <button type="button" onClick={() => { setSaveState('idle'); void workspace.refresh() }} className="rounded border border-destructive/30 px-2 py-1">{t('prototypePlatform.loadServerDraft')}</button>}<button type="button" onClick={() => setError(null)} aria-label={t('prototypePlatform.dismiss')}><X className="size-3" /></button></div>}
+            {error && <div role="alert" className="flex items-center gap-2 border-b border-destructive/30 bg-destructive/10 px-3 py-2 text-[9px] text-destructive"><CircleAlert className="size-3 shrink-0" /><span className="min-w-0 flex-1">{error}</span>{(saveState === 'conflict' || saveState === 'error') && <button type="button" onClick={discardLocalAndReloadServerDraft} disabled={editorMutationBusy} className="rounded border border-destructive/30 px-2 py-1 disabled:opacity-35">{t('prototypePlatform.loadServerDraft')}</button>}<button type="button" onClick={() => setError(null)} aria-label={t('prototypePlatform.dismiss')}><X className="size-3" /></button></div>}
 
             <div className="relative min-h-0 flex-1 overflow-auto bg-[#0b0b0d] p-8 scrollbar-thin" onPointerMove={moveDrag} onPointerUp={() => setDrag(null)} onPointerCancel={() => setDrag(null)}>
               {mode === 'design' && <div className="absolute left-3 top-3 z-20 rounded border border-primary/30 bg-primary/10 px-2 py-1 text-[8px] text-primary-bright">{t('prototypePlatform.banner.design', { count: formatNumber(content.tokenBindings.length) })}</div>}
@@ -730,9 +1077,18 @@ export function PrototypeStudio() {
                   <button type="button" onClick={() => setPanel('trace')} className="mt-3 rounded bg-primary px-3 py-1.5 text-[9px] font-semibold text-primary-foreground">{t('prototypePlatform.proposalWaiting.action')}</button>
                 </div>
               )}
-              {breakpoint && frame && (
-                <div className="relative mx-auto origin-top-left overflow-hidden rounded-xl border border-white/15 bg-[#171719] shadow-2xl" style={{ width: breakpoint.viewportWidth, height: breakpoint.viewportHeight, transform: `scale(${zoom / 100})`, marginBottom: `${breakpoint.viewportHeight * (zoom / 100 - 1)}px`, backgroundImage: showGrid ? 'linear-gradient(rgba(255,255,255,.035) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,.035) 1px, transparent 1px)' : undefined, backgroundSize: showGrid ? '8px 8px' : undefined }}>
-                  {visibleLayers.map((item) => <CanvasLayer key={item.id} layer={item} selected={item.id === selectedLayerId} onSelect={() => setSelectedLayerId(item.id)} onPointerDown={(event) => startDrag(event, item)} />)}
+              {breakpoint && canvasViewport && frame && (
+                <div data-testid="prototype-canvas" className="relative mx-auto origin-top-left overflow-hidden rounded-xl border border-white/15 bg-[#171719] shadow-2xl" style={{ width: canvasViewport.width, height: canvasViewport.height, transform: `scale(${zoom / 100})`, marginBottom: `${canvasViewport.height * (zoom / 100 - 1)}px`, backgroundImage: showGrid ? 'linear-gradient(rgba(255,255,255,.035) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,.035) 1px, transparent 1px)' : undefined, backgroundSize: showGrid ? '8px 8px' : undefined }}>
+                  {visibleLayers.map((item, index) => {
+                    const displayLayer = prototypeCanvasLayer(
+                      item,
+                      index,
+                      canvasViewport.width,
+                      canvasViewport.height,
+                      item.id === frame.rootLayerId,
+                    )
+                    return <CanvasLayer key={item.id} layer={displayLayer} root={item.id === frame.rootLayerId} selected={item.id === selectedLayerId} onSelect={() => setSelectedLayerId(item.id)} onPointerDown={(event) => startDrag(event, displayLayer)} />
+                  })}
                   {state && state.key !== 'ready' && <div className="pointer-events-none absolute inset-0 z-50 flex items-center justify-center bg-black/35"><div className="rounded-lg border border-border bg-panel/95 px-5 py-3 text-center shadow-xl"><p className="text-xs font-semibold text-foreground">{state.title}</p><p className="mt-1 text-[9px] text-faint-foreground">{t('prototypePlatform.fixtureState', { count: formatNumber(state.fixtureIds.length) })}</p></div></div>}
                 </div>
               )}
@@ -741,7 +1097,7 @@ export function PrototypeStudio() {
                   <CircleAlert className="size-6" />
                   <p className="mt-2 text-xs font-semibold">{t('prototypePlatform.missingFrame', { state: state.title, breakpoint: breakpoint.name })}</p>
                   <p className="mt-1 text-[9px] leading-relaxed opacity-80">{t('prototypePlatform.completeCoverageBeforeRevision')}</p>
-                  {canEdit && <button type="button" onClick={() => updateContent((current) => repairPrototypeFrameCoverage(current, stableId))} className="mt-3 rounded bg-warning px-3 py-1.5 text-[9px] font-semibold text-black">{t('prototypePlatform.repairAllCoverage')}</button>}
+                  {canEdit && <button type="button" onClick={() => updateContent((current) => repairPrototypeFrameCoverage(current, stableId))} disabled={!effectiveCanEdit} className="mt-3 rounded bg-warning px-3 py-1.5 text-[9px] font-semibold text-black disabled:opacity-35">{t('prototypePlatform.repairAllCoverage')}</button>}
                 </div>
               )}
             </div>
@@ -758,9 +1114,9 @@ export function PrototypeStudio() {
             <footer className="flex min-h-11 shrink-0 flex-wrap items-center gap-2 border-t border-border bg-panel px-3 py-2">
               <div className="flex items-center gap-2 text-[9px] text-faint-foreground"><ShieldCheck className="size-3 text-success" />{t('prototypePlatform.sourceMeta', { reference: shortRef(content.pageSpecRevision), formality: t(content.exploratory ? 'prototypePlatform.exploratory' : 'prototypePlatform.formal') })}</div>
               <div className="ml-auto flex items-center gap-1.5">
-                <button type="button" onClick={() => void saveDraft()} disabled={!canEdit || saveState === 'saving'} className="inline-flex h-7 items-center gap-1 rounded border border-border px-2 text-[9px] text-muted-foreground hover:text-foreground disabled:opacity-35"><Save className="size-3" />{t('prototypePlatform.saveDraft')}</button>
-                <button type="button" onClick={() => void createRevisionAndRequestReview()} disabled={!canEdit || !draftEtag || (saveState !== 'saved' && saveState !== 'idle') || !revisionReady} title={revisionReady ? t('prototypePlatform.createRevisionTitle') : clientIssues[0] ? prototypeIssueLabel(clientIssues[0], t, formatNumber) : undefined} className="inline-flex h-7 items-center gap-1 rounded border border-primary/35 bg-primary/10 px-2 text-[9px] text-primary-bright disabled:opacity-35"><Send className="size-3" />{t('prototypePlatform.revisionAndReview')}</button>
-                <button type="button" onClick={() => setSurface('workbench')} disabled={!activeResource.approvedRevision} className="inline-flex h-7 items-center gap-1 rounded bg-primary px-2 text-[9px] font-semibold text-primary-foreground disabled:opacity-35" title={t('prototypePlatform.openWorkbenchTitle')}><PackageCheck className="size-3" />{t('prototypePlatform.openWorkbench')}</button>
+                <button type="button" onClick={() => void saveDraft()} disabled={!canEdit || saveState === 'saving' || editorMutationBusy} className="inline-flex h-7 items-center gap-1 rounded border border-border px-2 text-[9px] text-muted-foreground hover:text-foreground disabled:opacity-35"><Save className="size-3" />{t('prototypePlatform.saveDraft')}</button>
+                <button type="button" onClick={() => void createRevisionAndRequestReview()} disabled={!effectiveCanEdit || !draftEtag || (saveState !== 'saved' && saveState !== 'idle') || !revisionReady} title={revisionReady ? t('prototypePlatform.createRevisionTitle') : clientIssues[0] ? prototypeIssueLabel(clientIssues[0], t, formatNumber) : undefined} className="inline-flex h-7 items-center gap-1 rounded border border-primary/35 bg-primary/10 px-2 text-[9px] text-primary-bright disabled:opacity-35"><Send className="size-3" />{t('prototypePlatform.revisionAndReview')}</button>
+                <button type="button" onClick={() => setSurface('workbench')} disabled={!activeResource.approvedRevision || editorMutationBusy} className="inline-flex h-7 items-center gap-1 rounded bg-primary px-2 text-[9px] font-semibold text-primary-foreground disabled:opacity-35" title={t('prototypePlatform.openWorkbenchTitle')}><PackageCheck className="size-3" />{t('prototypePlatform.openWorkbench')}</button>
               </div>
             </footer>
           </main>
@@ -770,10 +1126,10 @@ export function PrototypeStudio() {
               {(['properties', 'variants', 'data', 'trace'] as Panel[]).map((item) => <button key={item} type="button" onClick={() => setPanel(item)} className={cn('rounded px-1 py-1.5 text-[8px]', panel === item ? 'bg-primary/10 text-primary-bright' : 'text-faint-foreground hover:text-foreground')}>{t(`prototypePlatform.panel.${item}` as MessageKey)}</button>)}
             </div>
             <div className="min-h-0 flex-1 overflow-y-auto p-3 scrollbar-thin">
-              {panel === 'properties' && <PropertiesPanel layer={selectedLayer} rootLayerId={frame?.rootLayerId} canEdit={canEdit} onUpdate={updateLayer} onLayout={updateLayerLayout} onStyle={updateLayerStyle} onDuplicate={duplicateLayer} onDelete={deleteLayer} />}
-              {panel === 'variants' && <VariantsPanel content={content} selectedStateId={state?.id} selectedBreakpointId={breakpoint?.id} canEdit={canEdit} onChange={updateContent} onSelectState={setSelectedStateId} onSelectBreakpoint={setSelectedBreakpointId} onError={setError} />}
-              {panel === 'data' && <DataPanel content={content} stateId={state?.id} canEdit={canEdit} onChange={updateContent} />}
-              {panel === 'trace' && <TracePanel resource={activeResource} content={content} details={details} proposals={proposals} review={review} clientIssues={clientIssues} canEdit={canEdit} canReview={canReview} proposalBusyId={proposalBusyId} onDecide={(proposal, operation, decision) => void decideProposalOperation(proposal, operation, decision)} onDecideAll={(proposal, decision) => void decideAllProposalOperations(proposal, decision)} onApply={(proposal) => void applyPrototypeProposal(proposal)} onRefresh={() => void workspace.refresh()} />}
+              {panel === 'properties' && <PropertiesPanel layer={selectedLayer} rootLayerId={frame?.rootLayerId} canEdit={effectiveCanEdit} onUpdate={updateLayer} onLayout={updateLayerLayout} onStyle={updateLayerStyle} onDuplicate={duplicateLayer} onDelete={deleteLayer} />}
+              {panel === 'variants' && <VariantsPanel content={content} selectedStateId={state?.id} selectedBreakpointId={breakpoint?.id} canEdit={effectiveCanEdit} stateStructureLocked={!content.exploratory} onChange={updateContent} onSelectState={setSelectedStateId} onSelectBreakpoint={setSelectedBreakpointId} onError={setError} />}
+              {panel === 'data' && <DataPanel content={content} />}
+              {panel === 'trace' && <TracePanel resource={activeResource} content={content} details={details} proposals={proposals} review={review} clientIssues={clientIssues} canEdit={effectiveCanEdit} canReview={canReview} proposalBusyId={proposalBusyId} proposalActionsBlocked={proposalActionsBlocked} onDecide={(proposal, operation, decision) => void decideProposalOperation(proposal, operation, decision)} onDecideAll={(proposal, decision) => void decideAllProposalOperations(proposal, decision)} onApply={(proposal) => void applyPrototypeProposal(proposal)} onRefresh={() => void workspace.refresh()} />}
             </div>
           </aside>
         </>
@@ -787,6 +1143,7 @@ function VariantsPanel({
   selectedStateId,
   selectedBreakpointId,
   canEdit,
+  stateStructureLocked,
   onChange,
   onSelectState,
   onSelectBreakpoint,
@@ -796,6 +1153,7 @@ function VariantsPanel({
   selectedStateId?: string
   selectedBreakpointId?: string
   canEdit: boolean
+  stateStructureLocked: boolean
   onChange: (updater: (content: PrototypeContentDto) => PrototypeContentDto) => void
   onSelectState: (id: string) => void
   onSelectBreakpoint: (id: string) => void
@@ -826,6 +1184,7 @@ function VariantsPanel({
   }
 
   function createState() {
+    if (stateStructureLocked) return
     const id = stableId('state')
     if (mutate((current) => addPrototypeState(current, {
       id,
@@ -841,6 +1200,7 @@ function VariantsPanel({
   }
 
   function deleteState(stateId: string) {
+    if (stateStructureLocked) return
     const nextSelection = content.states.find((state) => state.id !== stateId)?.id ?? ''
     if (mutate((current) => removePrototypeState(current, stateId))) onSelectState(nextSelection)
   }
@@ -868,16 +1228,17 @@ function VariantsPanel({
     <div className="space-y-5">
       <section>
         <div className="flex items-center justify-between"><PanelLabel>{t('prototypePlatform.states')}</PanelLabel><span className="font-mono text-[8px] text-faint-foreground">{formatNumber(content.states.length)}</span></div>
+        {stateStructureLocked && <p className="mt-2 rounded border border-border bg-background p-2 text-[8px] leading-relaxed text-faint-foreground">{t('prototypePlatform.formalStateAuthorityLocked')}</p>}
         <div className="mt-2 space-y-2">
           {content.states.map((state) => (
             <div key={state.id} className={cn('rounded border p-2', selectedStateId === state.id ? 'border-primary/40 bg-primary/5' : 'border-border bg-background')}>
-              <div className="flex items-center gap-1"><button type="button" onClick={() => onSelectState(state.id)} className="min-w-0 flex-1 truncate text-left font-mono text-[8px] text-faint-foreground">{state.id}</button><button type="button" onClick={() => deleteState(state.id)} disabled={!canEdit || content.states.length <= 1} className="rounded p-1 text-faint-foreground hover:text-destructive disabled:opacity-25" aria-label={t('prototypePlatform.deleteState', { name: state.title })} title={content.states.length <= 1 ? t('prototypePlatform.keepOneState') : t('prototypePlatform.deleteStateDescription')}><Trash2 className="size-3" /></button></div>
-              <div className="mt-1 grid grid-cols-2 gap-1"><input value={state.key} onFocus={() => onSelectState(state.id)} onChange={(event) => mutate((current) => updatePrototypeState(current, state.id, { key: event.target.value }))} disabled={!canEdit} className="h-7 rounded border border-border bg-panel px-1.5 font-mono text-[8px] text-foreground outline-none disabled:opacity-50" aria-label={t('prototypePlatform.stateKey', { name: state.title })} /><input value={state.title} onFocus={() => onSelectState(state.id)} onChange={(event) => mutate((current) => updatePrototypeState(current, state.id, { title: event.target.value }))} disabled={!canEdit} className="h-7 rounded border border-border bg-panel px-1.5 text-[8px] text-foreground outline-none disabled:opacity-50" aria-label={t('prototypePlatform.stateTitle', { key: state.key })} /></div>
-              <label className="mt-1.5 flex items-center gap-1.5 text-[8px] text-faint-foreground"><input type="checkbox" checked={state.required} onChange={(event) => mutate((current) => updatePrototypeState(current, state.id, { required: event.target.checked }))} disabled={!canEdit} />{t('prototypePlatform.requiredCoverage', { count: formatNumber(state.fixtureIds.length) })}</label>
+              <div className="flex items-center gap-1"><button type="button" onClick={() => onSelectState(state.id)} className="min-w-0 flex-1 truncate text-left font-mono text-[8px] text-faint-foreground">{state.id}</button><button type="button" onClick={() => deleteState(state.id)} disabled={!canEdit || stateStructureLocked || content.states.length <= 1} className="rounded p-1 text-faint-foreground hover:text-destructive disabled:opacity-25" aria-label={t('prototypePlatform.deleteState', { name: state.title })} title={stateStructureLocked ? t('prototypePlatform.formalStateAuthorityLocked') : content.states.length <= 1 ? t('prototypePlatform.keepOneState') : t('prototypePlatform.deleteStateDescription')}><Trash2 className="size-3" /></button></div>
+              <div className="mt-1 grid grid-cols-2 gap-1"><input value={state.key} onFocus={() => onSelectState(state.id)} onChange={(event) => mutate((current) => updatePrototypeState(current, state.id, { key: event.target.value }))} disabled={!canEdit || stateStructureLocked} className="h-7 rounded border border-border bg-panel px-1.5 font-mono text-[8px] text-foreground outline-none disabled:opacity-50" aria-label={t('prototypePlatform.stateKey', { name: state.title })} /><input value={state.title} onFocus={() => onSelectState(state.id)} onChange={(event) => mutate((current) => updatePrototypeState(current, state.id, { title: event.target.value }))} disabled={!canEdit} className="h-7 rounded border border-border bg-panel px-1.5 text-[8px] text-foreground outline-none disabled:opacity-50" aria-label={t('prototypePlatform.stateTitle', { key: state.key })} /></div>
+              <label className="mt-1.5 flex items-center gap-1.5 text-[8px] text-faint-foreground"><input type="checkbox" checked={state.required} onChange={(event) => mutate((current) => updatePrototypeState(current, state.id, { required: event.target.checked }))} disabled={!canEdit || stateStructureLocked} />{t('prototypePlatform.requiredCoverage', { count: formatNumber(state.fixtureIds.length) })}</label>
             </div>
           ))}
         </div>
-        {canEdit && <div className="mt-2 rounded border border-dashed border-border p-2"><div className="grid grid-cols-2 gap-1"><input value={newStateKey} onChange={(event) => setNewStateKey(event.target.value)} className="h-7 rounded border border-border bg-background px-1.5 font-mono text-[8px] text-foreground outline-none" placeholder="stable-key" aria-label={t('prototypePlatform.newStateKey')} /><input value={newStateTitle} onChange={(event) => setNewStateTitle(event.target.value)} className="h-7 rounded border border-border bg-background px-1.5 text-[8px] text-foreground outline-none" placeholder={t('prototypePlatform.stateTitlePlaceholder')} aria-label={t('prototypePlatform.newStateTitle')} /></div><button type="button" onClick={createState} disabled={!newStateKey.trim() || !newStateTitle.trim()} className="mt-1.5 inline-flex h-7 w-full items-center justify-center gap-1 rounded bg-primary text-[8px] font-semibold text-primary-foreground disabled:opacity-35"><Plus className="size-3" />{t('prototypePlatform.addState')}</button></div>}
+        {canEdit && !stateStructureLocked && <div className="mt-2 rounded border border-dashed border-border p-2"><div className="grid grid-cols-2 gap-1"><input value={newStateKey} onChange={(event) => setNewStateKey(event.target.value)} className="h-7 rounded border border-border bg-background px-1.5 font-mono text-[8px] text-foreground outline-none" placeholder="stable-key" aria-label={t('prototypePlatform.newStateKey')} /><input value={newStateTitle} onChange={(event) => setNewStateTitle(event.target.value)} className="h-7 rounded border border-border bg-background px-1.5 text-[8px] text-foreground outline-none" placeholder={t('prototypePlatform.stateTitlePlaceholder')} aria-label={t('prototypePlatform.newStateTitle')} /></div><button type="button" onClick={createState} disabled={!newStateKey.trim() || !newStateTitle.trim()} className="mt-1.5 inline-flex h-7 w-full items-center justify-center gap-1 rounded bg-primary text-[8px] font-semibold text-primary-foreground disabled:opacity-35"><Plus className="size-3" />{t('prototypePlatform.addState')}</button></div>}
       </section>
 
       <section>
@@ -910,7 +1271,7 @@ function SmallNumber({ label, value, disabled, onChange }: { label: string; valu
   return <label className="text-[7px] text-faint-foreground">{label}<input type="number" value={value} onChange={(event) => onChange(Number(event.target.value) || 0)} disabled={disabled} className="mt-0.5 h-7 w-full rounded border border-border bg-panel px-1 font-mono text-[8px] text-foreground outline-none disabled:opacity-50" /></label>
 }
 
-function CanvasLayer({ layer, selected, onSelect, onPointerDown }: { layer: PrototypeLayerDto; selected: boolean; onSelect: () => void; onPointerDown: (event: ReactPointerEvent<HTMLButtonElement>) => void }) {
+function CanvasLayer({ layer, root, selected, onSelect, onPointerDown }: { layer: PrototypeLayerDto; root: boolean; selected: boolean; onSelect: () => void; onPointerDown: (event: ReactPointerEvent<HTMLButtonElement>) => void }) {
   const { t } = useI18n()
   const hidden = booleanValue(layer.properties.hidden)
   const locked = booleanValue(layer.properties.locked)
@@ -925,7 +1286,7 @@ function CanvasLayer({ layer, selected, onSelect, onPointerDown }: { layer: Prot
   const opacity = numberValue(layer.style.opacity, 1)
   const text = stringValue(layer.properties.text, layer.name)
   return (
-    <button type="button" onClick={(event) => { event.stopPropagation(); onSelect() }} onPointerDown={onPointerDown} className={cn('absolute overflow-hidden border text-left', selected ? 'z-20 border-primary shadow-[0_0_0_1px_rgba(20,136,252,.5)]' : 'border-white/10', locked ? 'cursor-default' : 'cursor-move')} style={{ left: x, top: y, width, height, background: fill, color, borderRadius: radius, opacity }} title={layer.name}>
+    <button type="button" onClick={(event) => { event.stopPropagation(); onSelect() }} onPointerDown={onPointerDown} className={cn('absolute overflow-hidden border text-left', selected ? 'border-primary shadow-[0_0_0_1px_rgba(20,136,252,.5)]' : 'border-white/10', selected && !root && 'z-20', locked ? 'cursor-default' : 'cursor-move')} style={{ left: x, top: y, width, height, background: fill, color, borderRadius: radius, opacity }} title={layer.name}>
       {layer.kind === 'text' || layer.kind === 'button' ? <span className={cn('flex h-full items-center', layer.kind === 'button' ? 'justify-center px-3 text-xs font-semibold' : 'px-1 font-semibold')} style={{ fontSize: numberValue(layer.style.fontSize, 16) }}>{text}</span> : layer.kind === 'input' ? <span className="flex h-full items-center px-3 text-xs text-white/45">{stringValue(layer.properties.placeholder, t('prototypePlatform.inputFallback'))}</span> : layer.kind === 'image' ? <span className="flex h-full items-center justify-center text-white/30"><ImageIcon className="size-8" /></span> : <span className="flex h-full items-center gap-3 px-4"><span className="size-8 rounded-full border border-white/10 bg-white/5" /><span className="flex-1 space-y-2"><span className="block h-2 w-2/3 rounded bg-white/15" /><span className="block h-2 w-1/2 rounded bg-white/8" /></span></span>}
       {selected && <span className="pointer-events-none absolute left-1 top-1 rounded bg-primary px-1 py-0.5 text-[7px] text-white">{layer.name}</span>}
     </button>
@@ -946,30 +1307,16 @@ function PropertiesPanel({ layer, rootLayerId, canEdit, onUpdate, onLayout, onSt
   </div>
 }
 
-function DataPanel({ content, stateId, canEdit, onChange }: { content: PrototypeContentDto; stateId?: string; canEdit: boolean; onChange: (updater: (content: PrototypeContentDto) => PrototypeContentDto) => void }) {
+function DataPanel({ content }: { content: PrototypeContentDto }) {
   const { formatNumber, t } = useI18n()
-  const [fixtureName, setFixtureName] = useState(() => t('prototypePlatform.default.readyResponse'))
-  const [endpoint, setEndpoint] = useState('/api/resource')
-  const [response, setResponse] = useState('{"items":[]}')
-  const [fixtureError, setFixtureError] = useState<string | null>(null)
-  function addFixture() {
-    if (!stateId) return
-    try {
-      const parsed = JSON.parse(response) as JsonValue
-      const id = stableId('fixture')
-      const fixture: PrototypeFixtureDto = { id, name: fixtureName.trim() || t('prototypePlatform.default.fixture'), stateId, operationId: endpoint.trim(), response: parsed, statusCode: 200, latencyMs: 120, sanitized: true, contentHash: 'pending-server-hash' }
-      onChange((current) => ({ ...current, fixtures: [...current.fixtures, fixture], states: current.states.map((item) => item.id === stateId ? { ...item, fixtureIds: [...item.fixtureIds, id] } : item) }))
-      setFixtureError(null)
-    } catch { setFixtureError(t('prototypePlatform.error.fixtureJson')) }
-  }
   return <div className="space-y-4">
     <section><PanelLabel>{t('prototypePlatform.stateFixtures')}</PanelLabel><div className="mt-2 space-y-1.5">{content.fixtures.map((fixture) => <div key={fixture.id} className="rounded border border-border bg-background p-2"><div className="flex items-center gap-2"><Database className="size-3 text-primary-bright" /><span className="min-w-0 flex-1 truncate text-[9px] text-foreground">{fixture.name}</span><span className="font-mono text-[8px] text-faint-foreground">{formatNumber(fixture.statusCode)}</span></div><div className="mt-1 truncate font-mono text-[8px] text-faint-foreground">{fixture.operationId ?? t('prototypePlatform.localFixture')} · {t('prototypePlatform.fixtureMeta', { latency: formatNumber(fixture.latencyMs), safety: t(fixture.sanitized ? 'prototypePlatform.sanitized' : 'prototypePlatform.unsafe') })}</div></div>)}{content.fixtures.length === 0 && <PanelEmpty text={t('prototypePlatform.noFixture')} />}</div></section>
-    {canEdit && <section><PanelLabel>{t('prototypePlatform.addSanitizedFixture')}</PanelLabel><div className="mt-2 space-y-1.5"><input value={fixtureName} onChange={(event) => setFixtureName(event.target.value)} className="h-8 w-full rounded border border-border bg-background px-2 text-[9px] text-foreground outline-none" placeholder={t('prototypePlatform.fixtureName')} /><input value={endpoint} onChange={(event) => setEndpoint(event.target.value)} className="h-8 w-full rounded border border-border bg-background px-2 font-mono text-[9px] text-foreground outline-none" placeholder={t('prototypePlatform.endpointPlaceholder')} /><textarea value={response} onChange={(event) => setResponse(event.target.value)} className="h-24 w-full resize-none rounded border border-border bg-background p-2 font-mono text-[9px] text-foreground outline-none" />{fixtureError && <p className="text-[8px] text-destructive">{fixtureError}</p>}<button type="button" onClick={addFixture} className="inline-flex h-7 w-full items-center justify-center gap-1 rounded bg-primary text-[9px] font-semibold text-primary-foreground"><Plus className="size-3" />{t('prototypePlatform.addFixture')}</button></div></section>}
+    <section><PanelLabel>{t('prototypePlatform.fixtureGovernance')}</PanelLabel><p className="mt-2 rounded border border-border bg-background p-2 text-[8px] leading-relaxed text-faint-foreground">{t('prototypePlatform.fixtureGovernanceDescription')}</p></section>
     <section><PanelLabel>{t('prototypePlatform.interactionManifest')}</PanelLabel><div className="mt-2 grid grid-cols-2 gap-2"><Info label={t('prototypePlatform.interactions')} value={formatNumber(content.interactions.length)} /><Info label={t('prototypePlatform.overrides')} value={formatNumber(content.overrides.length)} /><Info label={t('prototypePlatform.tokenBindings')} value={formatNumber(content.tokenBindings.length)} /><Info label={t('prototypePlatform.components')} value={formatNumber(content.componentBindings.length)} /></div></section>
   </div>
 }
 
-function TracePanel({ resource, content, details, proposals, review, clientIssues, canEdit, canReview, proposalBusyId, onDecide, onDecideAll, onApply, onRefresh }: { resource: VersionedArtifactDto<PrototypeContentDto>; content: PrototypeContentDto; details: Awaited<ReturnType<ReturnType<typeof useArtifactWorkspace>['loadDetails']>> | null; proposals: ReturnType<typeof useArtifactWorkspace>['proposals']; review?: ReturnType<typeof useCollaboration>['reviews'][number]; clientIssues: readonly string[]; canEdit: boolean; canReview: boolean; proposalBusyId: string; onDecide: (proposal: ProposalDto, operation: ProposalOperationDto, decision: 'accepted' | 'rejected') => void; onDecideAll: (proposal: ProposalDto, decision: 'accepted' | 'rejected') => void; onApply: (proposal: ProposalDto) => void; onRefresh: () => void }) {
+function TracePanel({ resource, content, details, proposals, review, clientIssues, canEdit, canReview, proposalBusyId, proposalActionsBlocked, onDecide, onDecideAll, onApply, onRefresh }: { resource: VersionedArtifactDto<PrototypeContentDto>; content: PrototypeContentDto; details: Awaited<ReturnType<ReturnType<typeof useArtifactWorkspace>['loadDetails']>> | null; proposals: ReturnType<typeof useArtifactWorkspace>['proposals']; review?: ReturnType<typeof useCollaboration>['reviews'][number]; clientIssues: readonly string[]; canEdit: boolean; canReview: boolean; proposalBusyId: string; proposalActionsBlocked: boolean; onDecide: (proposal: ProposalDto, operation: ProposalOperationDto, decision: 'accepted' | 'rejected') => void; onDecideAll: (proposal: ProposalDto, decision: 'accepted' | 'rejected') => void; onApply: (proposal: ProposalDto) => void; onRefresh: () => void }) {
   const { formatNumber, t } = useI18n()
   return <div className="space-y-4">
     <section><div className="flex items-center justify-between"><PanelLabel>{t('prototypePlatform.exactSource')}</PanelLabel><button type="button" onClick={onRefresh} className="rounded p-1 text-faint-foreground hover:text-foreground" aria-label={t('prototypePlatform.refreshTrace')}><RefreshCw className="size-3" /></button></div><div className="mt-2 rounded border border-border bg-background p-2 font-mono text-[8px] leading-relaxed text-faint-foreground">PageSpec<br />{content.pageSpecRevision.artifactId}<br />{content.pageSpecRevision.revisionId}<br />{content.pageSpecRevision.contentHash}</div></section>
@@ -978,6 +1325,7 @@ function TracePanel({ resource, content, details, proposals, review, clientIssue
     <section><PanelLabel>{t('prototypePlatform.reviewGate')}</PanelLabel><div className={cn('mt-2 rounded border p-2 text-[9px]', review?.decision === 'approve' ? 'border-success/30 bg-success/10 text-success' : review?.decision === 'request_changes' ? 'border-destructive/30 bg-destructive/10 text-destructive' : 'border-warning/30 bg-warning/10 text-warning')}><div className="flex items-center gap-2"><CheckCircle2 className="size-3" /><span className="flex-1">{review ? reviewDecisionLabel(review.decision, t) : artifactStatusLabel(resource.artifact.status, t)}</span></div><p className="mt-1 text-[8px] leading-relaxed opacity-80">{review?.summary ?? t('prototypePlatform.reviewFallback')}</p></div>{canReview && <p className="mt-1 text-[8px] text-faint-foreground">{t('prototypePlatform.reviewCenterHint')}</p>}</section>
     <section>
       <PanelLabel>{t('prototypePlatform.aiProposals')}</PanelLabel>
+      {proposalActionsBlocked && <p className="mt-2 rounded border border-warning/30 bg-warning/10 p-2 text-[8px] leading-relaxed text-warning">{t('prototypePlatform.proposal.unsavedDraftBlocked')}</p>}
       <div className="mt-2 space-y-2">
         {proposals.map((proposal) => {
           const pending = proposal.operations.filter((operation) => operation.decision === 'pending')
@@ -1000,8 +1348,8 @@ function TracePanel({ resource, content, details, proposals, review, clientIssue
                     {operation.rationale && <p className="mt-1 text-[8px] leading-relaxed text-faint-foreground">{operation.rationale}</p>}
                     {operation.decision === 'pending' && (
                       <div className="mt-2 grid grid-cols-2 gap-1">
-                        <button type="button" aria-label={t('prototypePlatform.acceptOperation', { id: operation.id })} onClick={() => onDecide(proposal, operation, 'accepted')} disabled={!canEdit || busy} className="rounded bg-success/15 px-1.5 py-1 text-[8px] font-medium text-success disabled:opacity-35">{t('prototypePlatform.accept')}</button>
-                        <button type="button" aria-label={t('prototypePlatform.rejectOperation', { id: operation.id })} onClick={() => onDecide(proposal, operation, 'rejected')} disabled={!canEdit || busy} className="rounded bg-destructive/10 px-1.5 py-1 text-[8px] font-medium text-destructive disabled:opacity-35">{t('prototypePlatform.reject')}</button>
+                        <button type="button" aria-label={t('prototypePlatform.acceptOperation', { id: operation.id })} onClick={() => onDecide(proposal, operation, 'accepted')} disabled={!canEdit || busy || proposalActionsBlocked} className="rounded bg-success/15 px-1.5 py-1 text-[8px] font-medium text-success disabled:opacity-35">{t('prototypePlatform.accept')}</button>
+                        <button type="button" aria-label={t('prototypePlatform.rejectOperation', { id: operation.id })} onClick={() => onDecide(proposal, operation, 'rejected')} disabled={!canEdit || busy || proposalActionsBlocked} className="rounded bg-destructive/10 px-1.5 py-1 text-[8px] font-medium text-destructive disabled:opacity-35">{t('prototypePlatform.reject')}</button>
                       </div>
                     )}
                   </div>
@@ -1009,11 +1357,11 @@ function TracePanel({ resource, content, details, proposals, review, clientIssue
               </div>
               {pending.length > 0 && (
                 <div className="mt-2 grid grid-cols-2 gap-1">
-                  <button type="button" aria-label={t('prototypePlatform.acceptAllAria')} onClick={() => onDecideAll(proposal, 'accepted')} disabled={!canEdit || busy} className="rounded border border-success/25 bg-success/10 px-1.5 py-1 text-[8px] text-success disabled:opacity-35">{t('prototypePlatform.acceptAll')}</button>
-                  <button type="button" aria-label={t('prototypePlatform.rejectAllAria')} onClick={() => onDecideAll(proposal, 'rejected')} disabled={!canEdit || busy} className="rounded border border-destructive/20 bg-destructive/10 px-1.5 py-1 text-[8px] text-destructive disabled:opacity-35">{t('prototypePlatform.rejectAll')}</button>
+                  <button type="button" aria-label={t('prototypePlatform.acceptAllAria')} onClick={() => onDecideAll(proposal, 'accepted')} disabled={!canEdit || busy || proposalActionsBlocked} className="rounded border border-success/25 bg-success/10 px-1.5 py-1 text-[8px] text-success disabled:opacity-35">{t('prototypePlatform.acceptAll')}</button>
+                  <button type="button" aria-label={t('prototypePlatform.rejectAllAria')} onClick={() => onDecideAll(proposal, 'rejected')} disabled={!canEdit || busy || proposalActionsBlocked} className="rounded border border-destructive/20 bg-destructive/10 px-1.5 py-1 text-[8px] text-destructive disabled:opacity-35">{t('prototypePlatform.rejectAll')}</button>
                 </div>
               )}
-              <button type="button" aria-label={t('prototypePlatform.applyProposalAria')} onClick={() => onApply(proposal)} disabled={!canEdit || busy || proposal.status !== 'ready'} className="mt-2 inline-flex h-7 w-full items-center justify-center gap-1 rounded bg-primary text-[8px] font-semibold text-primary-foreground disabled:opacity-35">
+              <button type="button" aria-label={t('prototypePlatform.applyProposalAria')} onClick={() => onApply(proposal)} disabled={!canEdit || busy || proposal.status !== 'ready' || proposalActionsBlocked} className="mt-2 inline-flex h-7 w-full items-center justify-center gap-1 rounded bg-primary text-[8px] font-semibold text-primary-foreground disabled:opacity-35">
                 {busy ? <LoaderCircle className="size-3 animate-spin" /> : <CheckCircle2 className="size-3" />}
                 {t('prototypePlatform.applyProposal')}
               </button>
@@ -1081,9 +1429,11 @@ function IconButton({ icon: Icon, label, onClick, disabled }: { icon: typeof Fra
 function NumberInput({ label, value, onChange, disabled }: { label: string; value: number; onChange: (value: number) => void; disabled?: boolean }) { return <label className="text-[8px] text-faint-foreground">{label}<input type="number" value={value} onChange={(event) => onChange(Number(event.target.value) || 0)} disabled={disabled} className="mt-1 h-8 w-full rounded border border-border bg-background px-2 font-mono text-[9px] text-foreground outline-none disabled:opacity-40" /></label> }
 
 function cloneContent(content: PrototypeContentDto): PrototypeContentDto { return typeof structuredClone === 'function' ? structuredClone(content) : JSON.parse(JSON.stringify(content)) as PrototypeContentDto }
+function proposalDraftStateBlocked(state: SaveState) { return state === 'dirty' || state === 'saving' || state === 'conflict' || state === 'error' }
 function cloneLayer(layer: PrototypeLayerDto, id: string): PrototypeLayerDto { return { ...layer, id, childIds: [], layout: { ...layer.layout }, style: { ...layer.style }, properties: { ...layer.properties }, requirementIds: [...layer.requirementIds], acceptanceCriterionIds: [...layer.acceptanceCriterionIds], fieldMetadata: { ...layer.fieldMetadata } } }
 function layerTree(layers: Readonly<Record<string, PrototypeLayerDto>>, rootId?: string) { if (!rootId || !layers[rootId]) return Object.values(layers); const result: PrototypeLayerDto[] = []; const visited = new Set<string>(); const visit = (id: string) => { if (visited.has(id) || !layers[id]) return; visited.add(id); result.push(layers[id]); layers[id].childIds.forEach(visit) }; visit(rootId); Object.keys(layers).forEach(visit); return result }
-function descendantIds(layers: Readonly<Record<string, PrototypeLayerDto>>, id: string) { const result: string[] = []; const visit = (current: string) => { for (const child of layers[current]?.childIds ?? []) { result.push(child); visit(child) } }; visit(id); return result }
+function prototypeCanvasLayer(layer: PrototypeLayerDto, index: number, viewportWidth: number, viewportHeight: number, root: boolean): PrototypeLayerDto { const fallbackWidth = Math.max(120, Math.min(640, viewportWidth - 48)); return { ...layer, layout: { ...layer.layout, x: numberValue(layer.layout.x, root ? 0 : 24), y: numberValue(layer.layout.y, root ? 0 : 24 + Math.max(0, index - 1) * 52), width: Math.max(1, numberValue(layer.layout.width, root ? viewportWidth : fallbackWidth)), height: Math.max(1, numberValue(layer.layout.height, root ? viewportHeight : 44)) } } }
+function descendantIds(layers: Readonly<Record<string, PrototypeLayerDto>>, id: string) { const result: string[] = []; const visited = new Set<string>([id]); const visit = (current: string) => { for (const child of layers[current]?.childIds ?? []) { if (visited.has(child)) continue; visited.add(child); result.push(child); visit(child) } }; visit(id); return result }
 function fieldMetadataFor(updates: object, userId: string): PrototypeLayerDto['fieldMetadata'] { const now = new Date().toISOString(); const operationId = stableId('edit'); return Object.fromEntries(Object.keys(updates).map((field) => [field, { source: 'human' as const, changedBy: userId || 'anonymous', changedAt: now, operationId, aiPolicy: 'suggestOnly' as const }])) }
 function numberValue(value: JsonValue | undefined, fallback: number) { return typeof value === 'number' && Number.isFinite(value) ? value : fallback }
 function stringValue(value: JsonValue | undefined, fallback: string) { return typeof value === 'string' ? value : fallback }
@@ -1162,6 +1512,8 @@ function prototypeIssueLabel(issue: string, t: Translate, formatNumber: FormatNu
     'Prototype must contain a semantic layer tree.': 'prototypePlatform.issue.semanticLayerTree',
     'Prototype must define a frame for each required state and breakpoint.': 'prototypePlatform.issue.framesRequired',
     'A new state needs a stable ID, key, and title.': 'prototypePlatform.issue.newStateFields',
+    'Exact PageSpec revision content must be an object.': 'prototypePlatform.issue.pageSpecContentAuthority',
+    'Formal Prototype states must preserve the exact PageSpec state ID and key set without downgrading required states.': 'prototypePlatform.issue.formalStateAuthority',
     'State IDs and keys must be unique.': 'prototypePlatform.issue.stateUnique',
     'The selected state no longer exists.': 'prototypePlatform.issue.selectedStateMissing',
     'A prototype must keep at least one state.': 'prototypePlatform.issue.keepOneState',
@@ -1181,6 +1533,10 @@ function prototypeIssueLabel(issue: string, t: Translate, formatNumber: FormatNu
   if (match) return t('prototypePlatform.issue.breakpointFields', { number: formatNumber(Number(match[1])) })
   match = issue.match(/^Breakpoint (\d+) duplicates an existing breakpoint ID or name\.$/)
   if (match) return t('prototypePlatform.issue.breakpointDuplicate', { number: formatNumber(Number(match[1])) })
+  match = issue.match(/^Breakpoint (\d+) must use a nonnegative integer minWidth and an optional integer maxWidth not below minWidth\.$/)
+  if (match) return t('prototypePlatform.issue.breakpointWidthContract', { number: formatNumber(Number(match[1])) })
+  match = issue.match(/^Breakpoint (\d+) viewport width and height must each be integers of at least 240 pixels\.$/)
+  if (match) return t('prototypePlatform.issue.viewportMinimum', { number: formatNumber(Number(match[1])) })
   match = issue.match(/^Prototype must declare the (Desktop|Tablet|Mobile) breakpoint\.$/)
   if (match) {
     const key = `prototype.device.${match[1].toLowerCase()}` as MessageKey
@@ -1188,10 +1544,37 @@ function prototypeIssueLabel(issue: string, t: Translate, formatNumber: FormatNu
   }
   match = issue.match(/^Layer (.+) does not have one unique stable record ID\.$/)
   if (match) return t('prototypePlatform.issue.layerUnique', { id: match[1] })
+  match = issue.match(/^Layer (.+) is an invalid source placeholder\.$/)
+  if (match) return t('prototypePlatform.issue.invalidLayerPlaceholder', { id: match[1] })
+  match = issue.match(/^Prototype data at (.+) must be an object\.$/)
+  if (match) return t('prototypePlatform.issue.dataObject', { path: match[1] })
+  match = issue.match(/^Prototype data at (.+) must be an array of objects\.$/)
+  if (match) return t('prototypePlatform.issue.dataObjectArray', { path: match[1] })
+  match = issue.match(/^Prototype data at (.+) must be an array or object layer collection\.$/)
+  if (match) return t('prototypePlatform.issue.dataLayerCollection', { path: match[1] })
+  match = issue.match(/^Prototype data at (.+) must be a finite number\.$/)
+  if (match) return t('prototypePlatform.issue.dataFiniteNumber', { path: match[1] })
+  match = issue.match(/^Prototype data at (.+) must be a nonnegative integer\.$/)
+  if (match) return t('prototypePlatform.issue.dataNonnegativeInteger', { path: match[1] })
+  match = issue.match(/^Prototype data at (.+) must be a boolean\.$/)
+  if (match) return t('prototypePlatform.issue.dataBoolean', { path: match[1] })
+  match = issue.match(/^Prototype data at (.+) must be an array of non-empty strings\.$/)
+  if (match) return t('prototypePlatform.issue.dataStringArray', { path: match[1] })
+  match = issue.match(/^Prototype data at (.+) must be (?:null or )?a non-empty string(?: when provided)?\.$/)
+  if (match) return t('prototypePlatform.issue.dataString', { path: match[1] })
+  match = issue.match(/^Prototype layer at (.+) must have a stable ID\.$/)
+  if (match) return t('prototypePlatform.issue.layerStableId', { path: match[1] })
+  match = issue.match(/^Prototype layer record (.+) does not match embedded ID (.+)\.$/)
+  if (match) return t('prototypePlatform.issue.layerRecordId', { path: match[1], id: match[2] })
   match = issue.match(/^Layer (.+) parent (.+) does not exist\.$/)
   if (match) return t('prototypePlatform.issue.layerParent', { layer: match[1], parent: match[2] })
   match = issue.match(/^Layer (.+) child (\d+) must reference another existing layer\.$/)
   if (match) return t('prototypePlatform.issue.layerChild', { layer: match[1], number: formatNumber(Number(match[2])) })
+  match = issue.match(/^Layer (.+) layout must declare nonnegative integer x and y values plus positive integer width and height values\.$/)
+  if (match) return t('prototypePlatform.issue.layerLayout', { id: match[1] })
+  if (issue === 'Prototype layer child IDs must form an acyclic semantic tree.') {
+    return t('prototypePlatform.issue.layerCycle')
+  }
   match = issue.match(/^Frame (\d+) must reference an existing state, breakpoint, and root layer\.$/)
   if (match) return t('prototypePlatform.issue.frameReference', { number: formatNumber(Number(match[1])) })
   match = issue.match(/^Frame (\d+) duplicates a state and breakpoint pair\.$/)
@@ -1202,11 +1585,30 @@ function prototypeIssueLabel(issue: string, t: Translate, formatNumber: FormatNu
   if (match) return t('prototypePlatform.issue.fixtureSanitized', { number: formatNumber(Number(match[1])) })
   match = issue.match(/^Fixture (\d+) must reference an existing state\.$/)
   if (match) return t('prototypePlatform.issue.fixtureState', { number: formatNumber(Number(match[1])) })
-  match = issue.match(/^Interaction (\d+) needs a stable ID, existing source layer, and declarative trigger\.$/)
+  match = issue.match(/^Fixture (\d+) needs one unique stable ID\.$/)
+  if (match) return t('prototypePlatform.issue.fixtureId', { number: formatNumber(Number(match[1])) })
+  match = issue.match(/^Fixture (\d+) must declare a name, response, HTTP status, nonnegative integer latency, and canonical SHA-256 content hash\.$/)
+  if (match) return t('prototypePlatform.issue.fixtureContract', { number: formatNumber(Number(match[1])) })
+  match = issue.match(/^Fixture (\d+) operation ID .+$/)
+  if (match) return t('prototypePlatform.issue.fixtureOperation', { number: formatNumber(Number(match[1])) })
+  match = issue.match(/^State (\d+) fixture (\d+) must be a duplicate-free exact reference to a fixture owned by that state\.$/)
+  if (match) return t('prototypePlatform.issue.fixtureStateSet', { state: formatNumber(Number(match[1])), fixture: formatNumber(Number(match[2])) })
+  match = issue.match(/^Fixture (.+) must be declared by exactly one state fixtureIds set\.$/)
+  if (match) return t('prototypePlatform.issue.fixtureUndeclared', { id: match[1] })
+  match = issue.match(/^Interaction (\d+) needs a unique stable ID, existing source layer, and declarative trigger\.$/)
   if (match) return t('prototypePlatform.issue.interactionDefinition', { number: formatNumber(Number(match[1])) })
+  match = issue.match(/^Interaction (\d+) must declare at least one action\.$/)
+  if (match) return t('prototypePlatform.issue.interactionActionRequired', { number: formatNumber(Number(match[1])) })
   match = issue.match(/^Interaction (\d+) action (\d+) is not on the declarative action whitelist\.$/)
   if (match) {
     return t('prototypePlatform.issue.actionWhitelist', {
+      interaction: formatNumber(Number(match[1])),
+      action: formatNumber(Number(match[2])),
+    })
+  }
+  match = issue.match(/^Interaction (\d+) action (\d+) must reference the exact declared state, overlay, binding, fixture, or navigation target\.$/)
+  if (match) {
+    return t('prototypePlatform.issue.actionReference', {
       interaction: formatNumber(Number(match[1])),
       action: formatNumber(Number(match[2])),
     })

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -1054,6 +1055,19 @@ func (s *GORMStore) Commit(ctx context.Context, mutation RunMutation) error {
 				}
 				rows = append(rows, row)
 			}
+			sort.SliceStable(rows, func(left, right int) bool {
+				return deliverySliceMutationLess(rows[left], rows[right])
+			})
+			projectIDs := make([]uuid.UUID, 0, len(rows))
+			for _, row := range rows {
+				projectIDs = append(projectIDs, row.ProjectID)
+			}
+			if err := storage.LockDeliverySliceProjects(tx, projectIDs...); err != nil {
+				return err
+			}
+			if err := lockDeliverySliceMutationTargets(tx, rows); err != nil {
+				return err
+			}
 			if err := tx.Clauses(clause.OnConflict{Columns: []clause.Column{{Name: "project_id"}, {Name: "slice_key"}, {Name: "blueprint_revision_id"}}, DoUpdates: clause.AssignmentColumns([]string{"title", "page_spec_revision_id", "prototype_revision_id", "sync_status", "workflow_status", "owner_id", "blocker_reason", "updated_at"})}).Create(&rows).Error; err != nil {
 				return err
 			}
@@ -1307,6 +1321,58 @@ func toSliceRow(slice SliceRecord) (sliceRow, error) {
 		return sliceRow{}, err
 	}
 	return sliceRow{ID: id, ProjectID: projectID, SliceKey: slice.Key, Title: slice.Title, BlueprintRevisionID: blueprintID, PageSpecRevisionID: pageID, PrototypeRevisionID: prototypeID, SyncStatus: slice.SyncStatus, WorkflowStatus: slice.WorkflowStatus, OwnerID: ownerID, BlockerReason: slice.BlockerReason, UpdatedAt: slice.UpdatedAt}, nil
+}
+
+func deliverySliceMutationLess(left, right sliceRow) bool {
+	if left.ProjectID != right.ProjectID {
+		return left.ProjectID.String() < right.ProjectID.String()
+	}
+	if left.SliceKey != right.SliceKey {
+		return left.SliceKey < right.SliceKey
+	}
+	if left.BlueprintRevisionID != right.BlueprintRevisionID {
+		return left.BlueprintRevisionID.String() < right.BlueprintRevisionID.String()
+	}
+	return left.ID.String() < right.ID.String()
+}
+
+// lockDeliverySliceMutationTargets shares the UUID row-lock protocol used by
+// Impact analysis. Existing rows are resolved through the UPSERT conflict key
+// and locked in their actual primary-key order before any delivery mutation.
+// The caller also sorts new rows by conflict key, covering concurrent inserts
+// for targets that do not exist in either transaction's snapshot yet.
+func lockDeliverySliceMutationTargets(transaction *gorm.DB, rows []sliceRow) error {
+	if len(rows) == 0 {
+		return nil
+	}
+	conditions := make([]string, 0, len(rows))
+	arguments := make([]any, 0, len(rows)*3)
+	type targetKey struct {
+		projectID           uuid.UUID
+		sliceKey            string
+		blueprintRevisionID uuid.UUID
+	}
+	seen := make(map[targetKey]struct{}, len(rows))
+	for _, row := range rows {
+		key := targetKey{
+			projectID: row.ProjectID, sliceKey: row.SliceKey, blueprintRevisionID: row.BlueprintRevisionID,
+		}
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		conditions = append(conditions, "(project_id = ? AND slice_key = ? AND blueprint_revision_id = ?)")
+		arguments = append(arguments, row.ProjectID, row.SliceKey, row.BlueprintRevisionID)
+	}
+	var locked []struct {
+		ID uuid.UUID
+	}
+	return transaction.Model(&sliceRow{}).
+		Select("id").
+		Clauses(clause.Locking{Strength: "UPDATE"}).
+		Where(strings.Join(conditions, " OR "), arguments...).
+		Order("id ASC").
+		Find(&locked).Error
 }
 
 func parseUUID(field, value string) (uuid.UUID, error) {

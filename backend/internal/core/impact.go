@@ -113,6 +113,9 @@ func (s *ImpactService) Analyze(ctx context.Context, projectID, actorID string, 
 	}
 	reportID := uuid.MustParse(report.ID)
 	err = s.database.WithContext(ctx).Transaction(func(transaction *gorm.DB) error {
+		if err := storage.LockDeliverySliceProjects(transaction, projectUUID); err != nil {
+			return err
+		}
 		model := storage.ImpactReportModel{
 			ID: reportID, ProjectID: projectUUID, SourceArtifactID: fromArtifact,
 			FromRevisionID: fromRevisionID, ToRevisionID: toRevisionID, Status: "open",
@@ -124,7 +127,14 @@ func (s *ImpactService) Analyze(ctx context.Context, projectID, actorID string, 
 			}
 			return err
 		}
-		for artifactID, severity := range affected {
+		affectedArtifactIDs := orderedImpactArtifactIDs(affected)
+		// Acquire every health row before touching any delivery slice. Keeping
+		// delivery updates inside this loop would allow a partial-overlap cycle:
+		// one transaction can hold delivery(A) while waiting for health(B), as a
+		// second transaction holds health(B) while waiting for that same delivery
+		// row. The two phases preserve one global health-before-delivery order.
+		for _, artifactID := range affectedArtifactIDs {
+			severity := affected[artifactID]
 			health := storage.ArtifactHealthModel{
 				ArtifactID: artifactID, SyncStatus: severity, DeliveryStatus: "incomplete",
 				FindingCount: 1, BlockingCount: boolInt(severity == "blocked"),
@@ -136,10 +146,27 @@ func (s *ImpactService) Analyze(ctx context.Context, projectID, actorID string, 
 			}).Create(&health).Error; err != nil {
 				return err
 			}
-			if err := transaction.Model(&storage.DeliverySliceModel{}).
-				Where("project_id = ? AND (blueprint_revision_id IN (SELECT id FROM artifact_revisions WHERE artifact_id = ?) OR page_spec_revision_id IN (SELECT id FROM artifact_revisions WHERE artifact_id = ?) OR prototype_revision_id IN (SELECT id FROM artifact_revisions WHERE artifact_id = ?))", projectUUID, artifactID, artifactID, artifactID).
-				Updates(map[string]any{"sync_status": severity, "blocker_reason": "Upstream artifact changed; see impact report " + report.ID, "updated_at": now}).Error; err != nil {
-				return err
+		}
+		deliverySliceIDs, err := lockAffectedDeliverySliceIDs(
+			transaction, projectUUID, affectedArtifactIDs,
+		)
+		if err != nil {
+			return err
+		}
+		// Apply the weaker delivery status first so a slice that references more
+		// than one affected artifact deterministically retains the worst status.
+		// Every target row is already locked, so this severity ordering cannot
+		// reintroduce a row-lock inversion.
+		for _, severity := range []string{"needs_sync", "blocked"} {
+			for _, artifactID := range affectedArtifactIDs {
+				if len(deliverySliceIDs) == 0 || affected[artifactID] != severity {
+					continue
+				}
+				if err := transaction.Model(&storage.DeliverySliceModel{}).
+					Where("id IN ? AND project_id = ? AND (blueprint_revision_id IN (SELECT id FROM artifact_revisions WHERE artifact_id = ?) OR page_spec_revision_id IN (SELECT id FROM artifact_revisions WHERE artifact_id = ?) OR prototype_revision_id IN (SELECT id FROM artifact_revisions WHERE artifact_id = ?))", deliverySliceIDs, projectUUID, artifactID, artifactID, artifactID).
+					Updates(map[string]any{"sync_status": severity, "blocker_reason": "Upstream artifact changed; see impact report " + report.ID, "updated_at": now}).Error; err != nil {
+					return err
+				}
 			}
 		}
 		if err := insertAudit(transaction, projectUUID, actorUUID, "impact.analyzed", "impact_report", report.ID, map[string]any{"affectedArtifacts": len(affected)}); err != nil {
@@ -392,6 +419,50 @@ func mergeSeverity(values map[uuid.UUID]string, id uuid.UUID, severity string) {
 		return
 	}
 	values[id] = severity
+}
+
+// orderedImpactArtifactIDs keeps health and delivery mutations on the same
+// UUID lock order used by approval and Proposal Apply source-closure locks.
+// Iterating the affected map directly can otherwise produce an A/B versus B/A
+// row-lock cycle when those transactions overlap.
+func orderedImpactArtifactIDs(affected map[uuid.UUID]string) []uuid.UUID {
+	artifactIDs := make([]uuid.UUID, 0, len(affected))
+	for artifactID := range affected {
+		artifactIDs = append(artifactIDs, artifactID)
+	}
+	sort.Slice(artifactIDs, func(left, right int) bool {
+		return artifactIDs[left].String() < artifactIDs[right].String()
+	})
+	return artifactIDs
+}
+
+// lockAffectedDeliverySliceIDs freezes the complete delivery-row set in one
+// stable order after every health row has been acquired. The subsequent
+// per-artifact updates are restricted to this snapshot, so neither query-plan
+// row order nor a concurrently-created slice can reintroduce a delivery-row
+// lock inversion between overlapping Impact transactions.
+func lockAffectedDeliverySliceIDs(
+	transaction *gorm.DB,
+	projectID uuid.UUID,
+	artifactIDs []uuid.UUID,
+) ([]uuid.UUID, error) {
+	if len(artifactIDs) == 0 {
+		return nil, nil
+	}
+	var slices []storage.DeliverySliceModel
+	if err := transaction.Model(&storage.DeliverySliceModel{}).
+		Select("id").
+		Clauses(clause.Locking{Strength: "UPDATE"}).
+		Where("project_id = ? AND (blueprint_revision_id IN (SELECT id FROM artifact_revisions WHERE artifact_id IN ?) OR page_spec_revision_id IN (SELECT id FROM artifact_revisions WHERE artifact_id IN ?) OR prototype_revision_id IN (SELECT id FROM artifact_revisions WHERE artifact_id IN ?))", projectID, artifactIDs, artifactIDs, artifactIDs).
+		Order("id ASC").
+		Find(&slices).Error; err != nil {
+		return nil, err
+	}
+	result := make([]uuid.UUID, 0, len(slices))
+	for _, slice := range slices {
+		result = append(result, slice.ID)
+	}
+	return result, nil
 }
 
 func cloneImpactSteps(values []ImpactPathStep) []ImpactPathStep {

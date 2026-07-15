@@ -443,6 +443,59 @@ func TestPrototypeGateRequiresEditorSafeBreakpointLayerAndFrameFields(t *testing
 	}
 }
 
+func TestPrototypeGateRequiresVisibleViewportDimensions(t *testing.T) {
+	t.Parallel()
+	var content map[string]any
+	if err := json.Unmarshal(canonicalPrototypeValidationPayload(), &content); err != nil {
+		t.Fatal(err)
+	}
+	breakpoints := content["breakpoints"].([]any)
+	breakpoints[0].(map[string]any)["viewportWidth"] = 239
+	breakpoints[1].(map[string]any)["viewportHeight"] = 1
+	payload, err := json.Marshal(content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	report := ValidateArtifactContent("prototype", payload)
+	if report.Valid ||
+		!hasFindingAt(report, "prototype.breakpoint_ui_contract", "$.breakpoints[0]") ||
+		!hasFindingAt(report, "prototype.breakpoint_ui_contract", "$.breakpoints[1]") {
+		t.Fatalf("Prototype accepted a viewport below the visible threshold: %#v", report.Findings)
+	}
+}
+
+func TestPrototypeGateRejectsLayerChildCycle(t *testing.T) {
+	t.Parallel()
+	var content map[string]any
+	if err := json.Unmarshal(canonicalPrototypeValidationPayload(), &content); err != nil {
+		t.Fatal(err)
+	}
+	canonicalLayer := func(id string, childID string) map[string]any {
+		return map[string]any{
+			"id": id, "kind": "group", "name": id, "childIds": []any{childID},
+			"layout": map[string]any{"x": 0, "y": 0, "width": 320, "height": 240},
+			"style":  map[string]any{}, "properties": map[string]any{},
+			"requirementIds": []any{}, "acceptanceCriterionIds": []any{},
+			"fieldMetadata": map[string]any{},
+		}
+	}
+	content["layers"] = map[string]any{
+		"layer-a": canonicalLayer("layer-a", "layer-b"),
+		"layer-b": canonicalLayer("layer-b", "layer-a"),
+	}
+	for _, item := range content["frames"].([]any) {
+		item.(map[string]any)["rootLayerId"] = "layer-a"
+	}
+	payload, err := json.Marshal(content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	report := ValidateArtifactContent("prototype", payload)
+	if report.Valid || !hasFindingAt(report, "prototype.layer_cycle", "$.layers") {
+		t.Fatalf("Prototype accepted a cyclic semantic layer tree: %#v", report.Findings)
+	}
+}
+
 func TestPrototypeGateRejectsExecutableInteractionAction(t *testing.T) {
 	t.Parallel()
 	report := ValidateArtifactContent("prototype", json.RawMessage(`{
@@ -459,6 +512,45 @@ func TestPrototypeGateRejectsExecutableInteractionAction(t *testing.T) {
 }`))
 	if report.Valid || !hasFinding(report, "prototype.invalid_action") {
 		t.Fatalf("expected executable prototype action to fail: %#v", report.Findings)
+	}
+}
+
+func TestPrototypeGateRequiresObjectGuardArray(t *testing.T) {
+	t.Parallel()
+	tests := map[string]struct {
+		guards  any
+		present bool
+	}{
+		"missing":          {},
+		"null":             {guards: nil, present: true},
+		"non_array":        {guards: map[string]any{}, present: true},
+		"non_object_entry": {guards: []any{map[string]any{"type": "authenticated"}, false}, present: true},
+	}
+	for name, test := range tests {
+		name, test := name, test
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			var content map[string]any
+			if err := json.Unmarshal(canonicalPrototypeValidationPayload(), &content); err != nil {
+				t.Fatal(err)
+			}
+			interaction := map[string]any{
+				"id": "interaction-1", "sourceLayerId": "layer-root", "trigger": "click",
+				"actions": []any{map[string]any{"type": "closeOverlay"}},
+			}
+			if test.present {
+				interaction["guards"] = test.guards
+			}
+			content["interactions"] = []any{interaction}
+			payload, err := json.Marshal(content)
+			if err != nil {
+				t.Fatal(err)
+			}
+			report := ValidateArtifactContent("prototype", payload)
+			if !hasFindingAt(report, "prototype.interaction_guards", "$.interactions[0].guards") {
+				t.Fatalf("Prototype accepted malformed interaction guards: %#v", report.Findings)
+			}
+		})
 	}
 }
 
@@ -490,6 +582,25 @@ func TestPrototypeFixtureDTORequiresExactIntegerFields(t *testing.T) {
 	}
 	if err := validatePrototypeFixtureDTO(fixture); err == nil {
 		t.Fatal("fractional fixture status/latency fields satisfied the exact DTO")
+	}
+}
+
+func TestPrototypeGateRequiresRenderableLayerGeometry(t *testing.T) {
+	t.Parallel()
+	var content map[string]any
+	if err := json.Unmarshal(canonicalPrototypeValidationPayload(), &content); err != nil {
+		t.Fatal(err)
+	}
+	layers := content["layers"].(map[string]any)
+	layout := layers["layer-root"].(map[string]any)["layout"].(map[string]any)
+	delete(layout, "width")
+	payload, err := json.Marshal(content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	report := ValidateArtifactContent("prototype", payload)
+	if report.Valid || !hasFinding(report, "prototype.layer_layout_contract") {
+		t.Fatalf("Prototype accepted a layer that cannot be rendered: %#v", report.Findings)
 	}
 }
 

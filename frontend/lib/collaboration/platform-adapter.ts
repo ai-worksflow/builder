@@ -276,6 +276,7 @@ export function collaborationErrorMessage(error: unknown, fallback: string) {
 
 export function collaborationBackendUnavailable(error: unknown) {
   return error instanceof PlatformNetworkError
+    || (error instanceof PlatformHttpError && [502, 503, 504].includes(error.status))
 }
 
 export class PlatformCollaborationGateway {

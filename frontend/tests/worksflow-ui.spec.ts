@@ -1,4 +1,5 @@
 import { expect, test, type Page, type Route } from '@playwright/test'
+import type { PrototypeContentDto } from '../lib/platform/dto'
 
 const now = '2026-07-10T08:00:00Z'
 const hash = (character: string) => character.repeat(64)
@@ -254,7 +255,7 @@ const approvedPrototype = {
     sourceVersions: [],
     revision: 3,
     content: prototypeContent(),
-    contentHash: hash('0'),
+    contentHash: approvedPrototypeRevision.contentHash,
     updatedBy: user.id,
     updatedAt: now,
     etag: '"prototype-draft:3"',
@@ -421,6 +422,11 @@ interface MockPlatformOptions {
   readonly pauseBlueprintNodeResume?: boolean
   readonly rejectFirstBlueprintDraftSave?: boolean
   readonly prototypeProposal?: boolean
+  readonly pauseFirstPrototypeDraftSave?: boolean
+  readonly pausePrototypeCreate?: boolean
+  readonly pausePrototypeProposalApply?: boolean
+  readonly pausePrototypeRevisionCreate?: boolean
+  readonly prototypeReviewFirstFailure?: 'before-create' | 'after-create'
   readonly designImportDecisionFails?: boolean
   readonly designImportCreateProcessingOnce?: boolean
   readonly conversationSelectionTarget?: boolean
@@ -438,6 +444,25 @@ type MockDesignImport = Omit<DesignImportRecord, 'status' | 'proposal'> & {
   readonly proposal: Omit<DesignImportRecord['proposal'], 'status'> & {
     readonly status: 'open' | 'applied' | 'rejected'
   }
+}
+
+interface MockReview {
+  id: string
+  projectId: string
+  artifactId: string
+  revisionId: string
+  contentHash: string
+  status: 'open'
+  policy: {
+    reviewerIds: string[]
+    minimumApprovals: number
+    prohibitSelfReview: boolean
+    governanceMode: 'solo' | 'team'
+  }
+  requestedBy: string
+  requestedAt: string
+  decisions: []
+  etag: string
 }
 
 interface MockPlatformState {
@@ -468,6 +493,12 @@ interface MockPlatformState {
   rejectNextBlueprintDraftSave: boolean
   prototypeProposal: ReturnType<typeof artifactProposal> | null
   prototypeCreatedRevision: Record<string, unknown> | null
+  prototypeDraftSaveGate: Deferred | null
+  prototypeCreateGate: Deferred | null
+  prototypeProposalApplyGate: Deferred | null
+  prototypeRevisionCreateGate: Deferred | null
+  prototypeReviews: MockReview[]
+  prototypeReviewRequestAttempts: number
   designImports: MockDesignImport[]
   designImportCreateAttempts: number
   conversations: Array<ReturnType<typeof conversationRecord>>
@@ -572,6 +603,12 @@ async function installPlatformMock(page: Page, options: MockPlatformOptions = {}
     rejectNextBlueprintDraftSave: options.rejectFirstBlueprintDraftSave ?? false,
     prototypeProposal: options.prototypeProposal ? artifactProposal() : null,
     prototypeCreatedRevision: null,
+    prototypeDraftSaveGate: options.pauseFirstPrototypeDraftSave ? deferred() : null,
+    prototypeCreateGate: options.pausePrototypeCreate ? deferred() : null,
+    prototypeProposalApplyGate: options.pausePrototypeProposalApply ? deferred() : null,
+    prototypeRevisionCreateGate: options.pausePrototypeRevisionCreate ? deferred() : null,
+    prototypeReviews: [],
+    prototypeReviewRequestAttempts: 0,
     designImports: [],
     designImportCreateAttempts: 0,
     conversations: [conversationRecord('33333333-3333-4333-8333-333333333333', 'Project discovery')],
@@ -1250,9 +1287,64 @@ async function handlePlatformRoute(
     path.endsWith('/audit') || path.endsWith('/traces') ||
     path.endsWith('/proposals')) {
     if (method === 'POST' && path.endsWith('/reviews')) {
-      await respond({ id: 'review-1', decision: 'pending' }, 201)
+      const input = body as {
+        target?: { artifactId?: string; revisionId?: string; contentHash?: string }
+        summary?: string
+        requiredReviewerIds?: string[]
+      }
+      const target = input.target
+      const isPrototypeReview = Boolean(target?.artifactId && state.prototypes.some((item) =>
+        (item as ReturnType<typeof draftPrototype>).artifact.id === target.artifactId))
+      if (isPrototypeReview) state.prototypeReviewRequestAttempts += 1
+      const failFirst = isPrototypeReview
+        && state.prototypeReviewRequestAttempts === 1
+        ? options.prototypeReviewFirstFailure
+        : undefined
+      if (failFirst === 'before-create') {
+        await respond({
+          title: 'Review request failed',
+          status: 503,
+          detail: 'The review was not created.',
+        }, 503)
+        return
+      }
+      const review: MockReview = {
+        id: `review-${state.prototypeReviews.length + 1}`,
+        projectId: project.id,
+        artifactId: target?.artifactId ?? '',
+        revisionId: target?.revisionId ?? '',
+        contentHash: target?.contentHash ?? '',
+        status: 'open',
+        policy: {
+          reviewerIds: input.requiredReviewerIds ?? [],
+          minimumApprovals: 1,
+          prohibitSelfReview: true,
+          governanceMode: state.governanceMode,
+        },
+        requestedBy: user.id,
+        requestedAt: now,
+        decisions: [],
+        etag: `"review:${state.prototypeReviews.length + 1}"`,
+      }
+      state.prototypeReviews.push(review)
+      if (failFirst === 'after-create') {
+        await respond({
+          title: 'Snapshot refresh failed',
+          status: 503,
+          detail: 'The review was created but the client did not receive confirmation.',
+        }, 503)
+        return
+      }
+      await respond(review, 201)
     } else if (method === 'POST' && path.endsWith('/presence')) {
       await respond({ projectId: project.id, user, state: 'active', updatedAt: now })
+    } else if (method === 'GET' && path.endsWith('/reviews')) {
+      const artifactId = url.searchParams.get('artifactId')
+      await respond({
+        items: artifactId
+          ? state.prototypeReviews.filter((review) => review.artifactId === artifactId)
+          : state.prototypeReviews,
+      })
     } else {
       await respond({ items: [] })
     }
@@ -1651,7 +1743,17 @@ async function handlePlatformRoute(
     return
   }
   if (artifactProposalApply && method === 'POST' && state.prototypeProposal) {
-    const current = state.prototypes[0] as typeof approvedPrototype
+    const proposal = state.prototypeProposal
+    const currentIndex = state.prototypes.findIndex((item) =>
+      (item as typeof approvedPrototype).artifact.id === proposal.artifactId)
+    const current = state.prototypes[currentIndex] as typeof approvedPrototype | undefined
+    if (!current) {
+      await respond({ title: 'Not found', status: 404 }, 404)
+      return
+    }
+    const gate = state.prototypeProposalApplyGate
+    state.prototypeProposalApplyGate = null
+    if (gate) await gate.promise
     const appliedContent = {
       ...current.draft.content,
       layers: {
@@ -1670,29 +1772,51 @@ async function handlePlatformRoute(
       contentHash: hash('p'),
       etag: `"prototype-draft:${current.draft.revision + 1}:proposal"`,
     }
-    state.prototypes = [{ ...current, draft }]
+    state.prototypes = state.prototypes.map((item, index) => index === currentIndex
+      ? { ...current, draft }
+      : item)
     state.prototypeProposal = {
-      ...state.prototypeProposal,
+      ...proposal,
       status: 'applied',
-      operations: state.prototypeProposal.operations.map((operation) => ({
+      operations: proposal.operations.map((operation) => ({
         ...operation,
         decision: operation.decision === 'accepted' ? 'applied' : operation.decision,
       })),
-      version: state.prototypeProposal.version + 1,
+      version: proposal.version + 1,
       appliedAt: now,
     }
     await respond(draft)
     return
   }
   if (path === `/v1/projects/${project.id}/prototypes` && method === 'POST') {
+    const gate = state.prototypeCreateGate
+    state.prototypeCreateGate = null
+    if (gate) await gate.promise
     const created = draftPrototype('prototype-created')
     state.prototypes = [created]
     await respond(created, 201, { etag: '"prototype-created:1"' })
     return
   }
-  if (/\/v1\/prototypes\/[^/]+\/draft$/.test(path) && method === 'PATCH') {
+  const prototypeDraftPath = path.match(/^\/v1\/prototypes\/([^/]+)\/draft$/)
+  if (prototypeDraftPath && method === 'PATCH') {
     const input = body as { content: ReturnType<typeof prototypeContent> }
-    const current = (state.prototypes[0] as ReturnType<typeof draftPrototype>) ?? draftPrototype('prototype-created')
+    const currentIndex = state.prototypes.findIndex((item) =>
+      (item as ReturnType<typeof draftPrototype>).artifact.id === prototypeDraftPath[1])
+    const current = currentIndex >= 0
+      ? state.prototypes[currentIndex] as ReturnType<typeof draftPrototype>
+      : draftPrototype(prototypeDraftPath[1])
+    if (route.request().headers()['if-match'] !== current.draft.etag) {
+      await respond({
+        type: 'about:blank',
+        title: 'Precondition Failed',
+        status: 412,
+        detail: 'The prototype draft ETag is stale.',
+      }, 412)
+      return
+    }
+    const gate = state.prototypeDraftSaveGate
+    state.prototypeDraftSaveGate = null
+    if (gate) await gate.promise
     const next = {
       ...current,
       draft: {
@@ -1703,17 +1827,32 @@ async function handlePlatformRoute(
         etag: `"prototype-draft:${current.draft.revision + 1}"`,
       },
     }
-    state.prototypes = [next]
+    state.prototypes = currentIndex >= 0
+      ? state.prototypes.map((item, index) => index === currentIndex ? next : item)
+      : [...state.prototypes, next]
     await respond(next, 200, { etag: next.draft.etag })
     return
   }
-  if (/\/v1\/prototypes\/[^/]+\/revisions$/.test(path) && method === 'POST') {
-    const current = state.prototypes[0] as ReturnType<typeof draftPrototype>
+  const prototypeRevisionPath = path.match(/^\/v1\/prototypes\/([^/]+)\/revisions$/)
+  if (prototypeRevisionPath && method === 'POST') {
+    const currentIndex = state.prototypes.findIndex((item) =>
+      (item as ReturnType<typeof draftPrototype>).artifact.id === prototypeRevisionPath[1])
+    const current = state.prototypes[currentIndex] as (ReturnType<typeof draftPrototype> & {
+      latestRevision?: { revisionNumber: number }
+    }) | undefined
+    if (!current) {
+      await respond({ title: 'Not found', status: 404 }, 404)
+      return
+    }
+    const gate = state.prototypeRevisionCreateGate
+    state.prototypeRevisionCreateGate = null
+    if (gate) await gate.promise
+    const revisionNumber = (current.latestRevision?.revisionNumber ?? 0) + 1
     const revision = {
-      id: 'prototype-created-r1',
+      id: `prototype-created-r${revisionNumber}`,
       artifactId: current.artifact.id,
-      revisionNumber: 1,
-      contentHash: hash('8'),
+      revisionNumber,
+      contentHash: current.draft.contentHash,
       status: 'in_review',
       content: current.draft.content,
       createdBy: user.id,
@@ -1727,7 +1866,9 @@ async function handlePlatformRoute(
           proposalId: state.prototypeProposal.id,
         }
       : revision
-    state.prototypes = [{ ...current, latestRevision: attributedRevision }]
+    state.prototypes = state.prototypes.map((item, index) => index === currentIndex
+      ? { ...current, latestRevision: attributedRevision }
+      : item)
     state.prototypeCreatedRevision = attributedRevision
     await respond(attributedRevision, 201)
     return
@@ -4048,6 +4189,88 @@ test('Prototype Studio creates from an approved PageSpec and persists an ETag dr
   })
 })
 
+test('Prototype Studio safely reads an exact historical PageSpec without dataBindings', async ({ page }) => {
+  const errors: Error[] = []
+  page.on('pageerror', (error) => errors.push(error))
+  const state = await installPlatformMock(page, { authenticated: true })
+  const historical = structuredClone(state.pageSpec)
+  for (const revision of [historical.approvedRevision, historical.latestRevision]) {
+    delete (revision.content as unknown as Record<string, unknown>).dataBindings
+  }
+  state.pageSpec = historical
+
+  await page.goto(`/team/acme/project/${project.id}/prototype`)
+
+  await expect(page.getByTitle('Page')).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Revision + review' })).toBeEnabled()
+  expect(errors).toEqual([])
+})
+
+test('formal Prototype state structure stays locked to its exact PageSpec authority', async ({ page }) => {
+  await installPlatformMock(page, { authenticated: true })
+  await page.goto(`/team/acme/project/${project.id}/prototype`)
+  await page.getByRole('button', { name: 'Manage states & breakpoints' }).click()
+
+  await expect(page.getByText('Formal Prototype state IDs, keys, required flags, and membership')).toBeVisible()
+  await expect(page.getByLabel('State key Ready')).toBeDisabled()
+  await expect(page.getByLabel('Delete state Ready')).toBeDisabled()
+  await expect(page.getByText('Required coverage · 0 fixtures').first().locator('input')).toBeDisabled()
+  await expect(page.getByLabel('State title ready')).toBeEnabled()
+  await expect(page.getByLabel('New state key')).toHaveCount(0)
+  await expect(page.getByRole('button', { name: 'Revision + review' })).toBeEnabled()
+})
+
+test('Prototype Studio blocks cross-artifact switching and creation until the local save is safe', async ({ page }) => {
+  const state = await installPlatformMock(page, {
+    authenticated: true,
+    pauseFirstPrototypeDraftSave: true,
+  })
+  const gate = state.prototypeDraftSaveGate
+  if (!gate) throw new Error('Expected a prototype draft save gate')
+  const current = state.prototypes[0] as typeof approvedPrototype
+  const secondContent = structuredClone(current.draft.content)
+  secondContent.states[0] = { ...secondContent.states[0], title: 'Second Ready' }
+  const secondId = 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeff'
+  const secondBase = draftPrototype(secondId)
+  const second = {
+    ...secondBase,
+    artifact: {
+      ...secondBase.artifact,
+      title: 'Second Prototype',
+    },
+    draft: {
+      ...secondBase.draft,
+      content: secondContent,
+      etag: '"prototype-second-draft:1"',
+    },
+  }
+  state.prototypes = [current, second]
+
+  await page.goto(`/team/acme/project/${project.id}/prototype`)
+  await page.getByRole('button', { name: 'Manage states & breakpoints' }).click()
+  const titleInput = page.getByLabel('State title ready')
+  await titleInput.fill('Newest local Ready')
+
+  const secondButton = page.getByRole('button', { name: /Second Prototype/ })
+  const createButton = page.getByRole('button', { name: 'Create server prototype' })
+  await expect(secondButton).toBeDisabled()
+  await expect(createButton).toBeDisabled()
+  await expect(titleInput).toHaveValue('Newest local Ready')
+
+  await expect.poll(() => state.requests.some((item) =>
+    item.method === 'PATCH' && item.path === `/v1/prototypes/${current.artifact.id}/draft`,
+  )).toBe(true)
+  await expect(page.getByText('Saving exact draft…', { exact: true })).toBeVisible()
+  await expect(secondButton).toBeDisabled()
+  gate.release()
+
+  await expect(page.getByText('Saved', { exact: true })).toBeVisible()
+  await expect(secondButton).toBeEnabled()
+  await expect(createButton).toBeEnabled()
+  await secondButton.click()
+  await expect(page.getByLabel('State title ready')).toHaveValue('Second Ready')
+})
+
 test('Prototype Studio safely opens an incomplete workflow target and directs the user to its Proposal', async ({ page }) => {
   const errors: Error[] = []
   page.on('pageerror', (error) => errors.push(error))
@@ -4088,6 +4311,614 @@ test('Prototype Studio safely opens an incomplete workflow target and directs th
   await page.getByRole('button', { name: 'Data', exact: true }).click()
   await expect(page.getByText('Token bindings')).toBeVisible()
   expect(errors).toEqual([])
+})
+
+test('Prototype Studio gives legacy semantic layers a visible fallback canvas layout', async ({ page }) => {
+  const state = await installPlatformMock(page, { authenticated: true })
+  const current = state.prototypes[0] as typeof approvedPrototype
+  const baseContent = structuredClone(current.draft.content) as unknown as PrototypeContentDto
+  const content: PrototypeContentDto = {
+    ...baseContent,
+    layers: {
+      ...baseContent.layers,
+      'layer-root': {
+        ...baseContent.layers['layer-root'],
+        childIds: ['legacy-title', 'legacy-input'],
+        layout: {},
+      },
+      'legacy-title': {
+        id: 'legacy-title',
+        parentId: 'layer-root',
+        childIds: [],
+        kind: 'text',
+        name: 'Legacy title',
+        layout: {},
+        style: {},
+        properties: { text: 'Visible legacy title' },
+        requirementIds: [],
+        acceptanceCriterionIds: [],
+        fieldMetadata: {},
+      },
+      'legacy-input': {
+        id: 'legacy-input',
+        parentId: 'layer-root',
+        childIds: [],
+        kind: 'input',
+        name: 'Legacy input',
+        layout: {},
+        style: {},
+        properties: { placeholder: 'Visible legacy input' },
+        requirementIds: [],
+        acceptanceCriterionIds: [],
+        fieldMetadata: {},
+      },
+    },
+  }
+  state.prototypes = [{ ...current, draft: { ...current.draft, content } }]
+
+  await page.goto(`/team/acme/project/${project.id}/prototype`)
+
+  const titleLayer = page.getByTitle('Legacy title')
+  const inputLayer = page.getByTitle('Legacy input')
+  await expect(titleLayer).toBeVisible()
+  await expect(inputLayer).toBeVisible()
+  const titleBox = await titleLayer.boundingBox()
+  const inputBox = await inputLayer.boundingBox()
+  expect(titleBox?.y).not.toBe(inputBox?.y)
+  if (!titleBox || !inputBox) throw new Error('Expected legacy layers to have canvas bounds')
+  for (const [layer, box] of [[titleLayer, titleBox], [inputLayer, inputBox]] as const) {
+    const hitTitle = await page.evaluate(({ x, y }) =>
+      (document.elementFromPoint(x, y)?.closest('button') as HTMLButtonElement | null)?.title,
+    { x: box.x + box.width / 2, y: box.y + box.height / 2 })
+    expect(hitTitle).toBe(await layer.getAttribute('title'))
+  }
+})
+
+test('Prototype Studio uses visible viewport defaults, scene fallback layers, and an unknown-kind icon fallback', async ({ page }) => {
+  const errors: Error[] = []
+  page.on('pageerror', (error) => errors.push(error))
+  const state = await installPlatformMock(page, { authenticated: true })
+  const current = state.prototypes[0] as typeof approvedPrototype
+  const baseContent = structuredClone(current.draft.content) as unknown as PrototypeContentDto
+  const root = baseContent.layers['layer-root']
+  const content = {
+    ...baseContent,
+    breakpoints: baseContent.breakpoints.map((breakpoint) => ({
+      id: breakpoint.id,
+      name: breakpoint.name,
+      minWidth: breakpoint.minWidth,
+      ...(breakpoint.maxWidth === undefined ? {} : { maxWidth: breakpoint.maxWidth }),
+    })),
+    layers: [],
+    scene: {
+      layers: [{
+        ...root,
+        childIds: ['layer-carousel'],
+        layout: {},
+      }, {
+        id: 'layer-carousel',
+        parentId: root.id,
+        childIds: [],
+        kind: 'carousel',
+        name: 'Custom carousel',
+        layout: {},
+        style: {},
+        properties: {},
+        requirementIds: [],
+        acceptanceCriterionIds: [],
+        fieldMetadata: {},
+      }],
+    },
+  } as unknown as PrototypeContentDto
+  state.prototypes = [{ ...current, draft: { ...current.draft, content } }]
+
+  await page.goto(`/team/acme/project/${project.id}/prototype`)
+
+  await expect(page.getByTitle('Custom carousel')).toBeVisible()
+  await expect(page.getByLabel('Prototype breakpoint').locator('option')).toHaveText([
+    'Desktop · 1,440×900',
+    'Tablet · 768×1,024',
+    'Mobile · 390×844',
+  ])
+  expect(errors).toEqual([])
+})
+
+test('Prototype Studio preserves a tiny viewport while rendering a visible review-blocked canvas', async ({ page }) => {
+  const state = await installPlatformMock(page, { authenticated: true })
+  const current = state.prototypes[0] as typeof approvedPrototype
+  const baseContent = structuredClone(current.draft.content) as unknown as PrototypeContentDto
+  const content: PrototypeContentDto = {
+    ...baseContent,
+    breakpoints: baseContent.breakpoints.map((breakpoint, index) => index === 0
+      ? { ...breakpoint, viewportWidth: 0, viewportHeight: 1 }
+      : breakpoint),
+  }
+  state.prototypes = [{ ...current, draft: { ...current.draft, content } }]
+
+  await page.goto(`/team/acme/project/${project.id}/prototype`)
+
+  await expect(page.getByLabel('Prototype breakpoint').locator('option').first()).toHaveText('Desktop · 0×1')
+  const canvas = page.getByTestId('prototype-canvas')
+  await expect(canvas).toBeVisible()
+  const canvasBox = await canvas.boundingBox()
+  expect(canvasBox?.width).toBeGreaterThan(1000)
+  expect(canvasBox?.height).toBeGreaterThan(700)
+  await expect(page.getByText('Breakpoint 1 viewport width and height must each be integers of at least 240 pixels.'))
+    .toBeVisible()
+  await expect(page.getByRole('button', { name: 'Revision + review' })).toBeDisabled()
+
+  await page.getByRole('button', { name: 'Save draft' }).click()
+  await expect.poll(() => state.requests.some((item) =>
+    item.method === 'PATCH' && item.path === `/v1/prototypes/${current.artifact.id}/draft`,
+  )).toBe(true)
+  const saveRequest = state.requests.findLast((item) =>
+    item.method === 'PATCH' && item.path === `/v1/prototypes/${current.artifact.id}/draft`)
+  const savedContent = (saveRequest?.body as { content?: PrototypeContentDto } | undefined)?.content
+  expect(savedContent?.breakpoints[0]).toMatchObject({ viewportWidth: 0, viewportHeight: 1 })
+})
+
+test('Prototype Studio retains malformed collection diagnostics and blocks autosave after ordinary edits', async ({ page }) => {
+  const errors: Error[] = []
+  page.on('pageerror', (error) => errors.push(error))
+  const state = await installPlatformMock(page, { authenticated: true })
+  const current = state.prototypes[0] as typeof approvedPrototype
+  const baseContent = structuredClone(current.draft.content) as unknown as PrototypeContentDto
+  const root = baseContent.layers['layer-root']
+  const content = {
+    ...baseContent,
+    states: [...baseContent.states, null],
+    tokenBindings: [...baseContent.tokenBindings, null],
+    layers: [
+      root,
+      null,
+      { name: 'Missing layer identity' },
+    ],
+    scene: {
+      layers: [{
+        ...root,
+        id: 'scene-lure',
+        name: 'Scene lure must not render',
+      }],
+    },
+  } as unknown as PrototypeContentDto
+  state.prototypes = [{ ...current, draft: { ...current.draft, content } }]
+
+  await page.goto(`/team/acme/project/${project.id}/prototype`)
+
+  await expect(page.getByText('Invalid layer 2', { exact: true }).first()).toBeVisible()
+  await expect(page.getByText('Missing layer identity', { exact: true }).first()).toBeVisible()
+  await expect(page.getByText('Scene lure must not render', { exact: true })).toBeHidden()
+  await expect(page.getByText(`Prototype data at states[${baseContent.states.length + 1}] must be an object.`))
+    .toBeVisible()
+  await expect(page.getByRole('button', { name: 'Revision + review' })).toBeDisabled()
+
+  const patchCount = state.requests.filter((item) =>
+    item.method === 'PATCH' && item.path === `/v1/prototypes/${current.artifact.id}/draft`).length
+  await page.getByRole('button', { name: 'Manage states & breakpoints' }).click()
+  await page.getByLabel('State title ready').fill('Ready edited')
+  await expect(page.getByRole('alert').filter({ hasText: 'Cannot save: the server prototype' }))
+    .toContainText('cannot be normalized safely')
+  expect(state.requests.filter((item) =>
+    item.method === 'PATCH' && item.path === `/v1/prototypes/${current.artifact.id}/draft`)).toHaveLength(patchCount)
+  expect(errors).toEqual([])
+})
+
+test('Prototype Studio blocks every Proposal mutation after a failed local save until explicit server reload', async ({ page }) => {
+  const state = await installPlatformMock(page, {
+    authenticated: true,
+    prototypeProposal: true,
+  })
+  const current = state.prototypes[0] as typeof approvedPrototype
+  const serverTitle = current.draft.content.states[0].title
+  const malformed = {
+    ...current,
+    draft: {
+      ...current.draft,
+      content: {
+        ...current.draft.content,
+        exploratory: null,
+      } as unknown as ReturnType<typeof prototypeContent>,
+    },
+  }
+  const secondId = 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeaa'
+  const secondBase = draftPrototype(secondId)
+  const second = {
+    ...secondBase,
+    artifact: { ...secondBase.artifact, title: 'Error-safe second Prototype' },
+  }
+  state.prototypes = [malformed, second]
+
+  await page.goto(`/team/acme/project/${project.id}/prototype`)
+  await page.getByRole('button', { name: 'Trace', exact: true }).click()
+
+  const acceptOperation = page.getByRole('button', {
+    name: 'Accept proposal operation prototype-operation-name',
+  })
+  const rejectOperation = page.getByRole('button', {
+    name: 'Reject proposal operation prototype-operation-name',
+  })
+  await expect(acceptOperation).toBeEnabled()
+  await expect(rejectOperation).toBeEnabled()
+  await expect(page.getByRole('button', { name: 'Accept all pending proposal operations' })).toBeEnabled()
+  await expect(page.getByRole('button', { name: 'Reject all pending proposal operations' })).toBeEnabled()
+
+  await page.getByRole('button', { name: 'Manage states & breakpoints' }).click()
+  const titleInput = page.getByLabel('State title ready')
+  await titleInput.fill('Ready local unsaved change')
+  await expect(page.getByRole('alert').filter({ hasText: 'Cannot save: the server prototype' }))
+    .toContainText('cannot be normalized safely')
+  await expect(titleInput).toHaveValue('Ready local unsaved change')
+
+  await page.getByRole('button', { name: 'Trace', exact: true }).click()
+  await expect(page.getByText('The local draft has not been saved safely.')).toContainText(
+    'reload the server draft before deciding or applying an AI proposal',
+  )
+  await expect(acceptOperation).toBeDisabled()
+  await expect(rejectOperation).toBeDisabled()
+  await expect(page.getByRole('button', { name: 'Accept all pending proposal operations' })).toBeDisabled()
+  await expect(page.getByRole('button', { name: 'Reject all pending proposal operations' })).toBeDisabled()
+  const secondPrototype = page.getByRole('button', { name: /Error-safe second Prototype/ })
+  await expect(secondPrototype).toBeDisabled()
+  await expect(page.getByRole('button', { name: 'Create server prototype' })).toBeDisabled()
+
+  state.prototypeProposal = artifactProposal('ready', ['accepted', 'accepted'], 3)
+  await page.getByRole('button', { name: 'Refresh trace' }).click()
+  const apply = page.getByRole('button', { name: 'Apply reviewed prototype proposal' })
+  await expect(apply).toBeDisabled()
+  expect(state.requests.filter((item) =>
+    item.path.includes('/output-proposals/prototype-proposal-1/')
+      && item.method === 'POST')).toHaveLength(0)
+
+  await page.getByRole('button', { name: 'Discard local changes and reload server draft' }).click()
+  await expect(page.getByRole('alert').filter({ hasText: 'Cannot save: the server prototype' })).toBeHidden()
+  await expect(apply).toBeEnabled()
+  await expect(secondPrototype).toBeEnabled()
+  await expect(page.getByRole('button', { name: 'Create server prototype' })).toBeEnabled()
+  await page.getByRole('button', { name: 'Manage states & breakpoints' }).click()
+  await expect(page.getByLabel('State title ready')).toHaveValue(serverTitle)
+})
+
+test('Prototype Studio serializes overlapping autosaves and keeps the newest local edit', async ({ page }) => {
+  const state = await installPlatformMock(page, {
+    authenticated: true,
+    pauseFirstPrototypeDraftSave: true,
+  })
+  const gate = state.prototypeDraftSaveGate
+  if (!gate) throw new Error('Expected a prototype draft save gate')
+  const current = state.prototypes[0] as typeof approvedPrototype
+  const draftPath = `/v1/prototypes/${current.artifact.id}/draft`
+
+  await page.goto(`/team/acme/project/${project.id}/prototype`)
+  await page.getByRole('button', { name: 'Manage states & breakpoints' }).click()
+  const titleInput = page.getByLabel('State title ready')
+  await titleInput.fill('Ready edit A')
+  await expect.poll(() => state.requests.filter((item) =>
+    item.method === 'PATCH' && item.path === draftPath).length).toBe(1)
+
+  await titleInput.fill('Ready edit B')
+  await expect(titleInput).toHaveValue('Ready edit B')
+  gate.release()
+
+  await expect.poll(() => state.requests.filter((item) =>
+    item.method === 'PATCH' && item.path === draftPath).length).toBe(2)
+  const saves = state.requests.filter((item) =>
+    item.method === 'PATCH' && item.path === draftPath)
+  const firstContent = (saves[0].body as { content: PrototypeContentDto }).content
+  const secondContent = (saves[1].body as { content: PrototypeContentDto }).content
+  expect(firstContent.states[0].title).toBe('Ready edit A')
+  expect(secondContent.states[0].title).toBe('Ready edit B')
+  expect(saves[0].headers['if-match']).toBe(current.draft.etag)
+  expect(saves[1].headers['if-match']).toBe('"prototype-draft:4"')
+  await expect(titleInput).toHaveValue('Ready edit B')
+  await expect(page.getByText('Saved', { exact: true })).toBeVisible()
+  await expect(page.getByText('Draft conflict')).toBeHidden()
+})
+
+test('Prototype Studio locks every editor transition while prototype creation is pending', async ({ page }) => {
+  const state = await installPlatformMock(page, {
+    authenticated: true,
+    pausePrototypeCreate: true,
+  })
+  const gate = state.prototypeCreateGate
+  if (!gate) throw new Error('Expected a prototype create gate')
+  const current = state.prototypes[0] as typeof approvedPrototype
+  const second = titledDraftPrototype(
+    'eeeeeeee-eeee-4eee-8eee-eeeeeeeeee01',
+    'Creation-lock second Prototype',
+  )
+  state.prototypes = [current, second]
+
+  await page.goto(`/team/acme/project/${project.id}/prototype`)
+  await page.getByRole('button', { name: 'Manage states & breakpoints' }).click()
+  const stateTitle = page.getByLabel('State title ready')
+  const secondPrototype = page.getByRole('button', { name: /Creation-lock second Prototype/ })
+  const createButton = page.getByRole('button', { name: 'Create server prototype' })
+  await page.getByLabel('PageSpec source').selectOption(pageSpec.artifact.id)
+  await page.getByPlaceholder('Prototype title').fill('Delayed Prototype')
+  await createButton.click()
+
+  await expect.poll(() => state.requests.filter((item) =>
+    item.method === 'POST' && item.path === `/v1/projects/${project.id}/prototypes`).length).toBe(1)
+  await expect(createButton).toBeDisabled()
+  await expect(page.getByLabel('PageSpec source')).toBeDisabled()
+  await expect(page.getByPlaceholder('Prototype title')).toBeDisabled()
+  await expect(secondPrototype).toBeDisabled()
+  await expect(stateTitle).toBeDisabled()
+  await expect(page.getByTitle('Add Heading')).toBeDisabled()
+  await expect(page.getByRole('button', { name: 'Save draft' })).toBeDisabled()
+  await expect(page.getByRole('button', { name: 'Revision + review' })).toBeDisabled()
+
+  gate.release()
+  await expect(page.getByText('Server-created Prototype', { exact: true }).first()).toBeVisible()
+  await expect(page.getByTitle('Add Heading')).toBeEnabled()
+  await expect(stateTitle).toBeEnabled()
+  expect(state.requests.filter((item) =>
+    item.method === 'POST' && item.path === `/v1/projects/${project.id}/prototypes`)).toHaveLength(1)
+})
+
+test('Prototype Studio keeps a delayed Proposal apply exclusive at a nonzero edit generation', async ({ page }) => {
+  const state = await installPlatformMock(page, {
+    authenticated: true,
+    prototypeProposal: true,
+    pausePrototypeProposalApply: true,
+  })
+  const gate = state.prototypeProposalApplyGate
+  if (!gate) throw new Error('Expected a prototype Proposal apply gate')
+  const current = state.prototypes[0] as typeof approvedPrototype
+  const second = titledDraftPrototype(
+    'eeeeeeee-eeee-4eee-8eee-eeeeeeeeee02',
+    'Apply-lock second Prototype',
+  )
+  state.prototypes = [current, second]
+  state.prototypeProposal = artifactProposal('ready', ['accepted', 'accepted'], 3)
+
+  await page.goto(`/team/acme/project/${project.id}/prototype`)
+  await page.getByRole('button', { name: 'Manage states & breakpoints' }).click()
+  const stateTitle = page.getByLabel('State title ready')
+  await stateTitle.fill('Ready before delayed apply')
+  await expect(page.getByText('Saved', { exact: true })).toBeVisible()
+
+  await page.getByRole('button', { name: 'Trace', exact: true }).click()
+  page.once('dialog', (dialog) => void dialog.accept())
+  const apply = page.getByRole('button', { name: 'Apply reviewed prototype proposal' })
+  await apply.click()
+  await expect.poll(() => state.requests.filter((item) =>
+    item.method === 'POST'
+      && item.path === '/v1/output-proposals/prototype-proposal-1/apply').length).toBe(1)
+
+  await expect(apply).toBeDisabled()
+  await expect(page.getByRole('button', { name: /Apply-lock second Prototype/ })).toBeDisabled()
+  await expect(page.getByRole('button', { name: 'Create server prototype' })).toBeDisabled()
+  await expect(page.getByTitle('Add Heading')).toBeDisabled()
+  await expect(page.getByRole('button', { name: 'Revision + review' })).toBeDisabled()
+  await page.getByRole('button', { name: 'Manage states & breakpoints' }).click()
+  await expect(stateTitle).toBeDisabled()
+  await expect(stateTitle).toHaveValue('Ready before delayed apply')
+
+  gate.release()
+  await expect(page.getByText('AI-reviewed Page', { exact: true }).first()).toBeVisible()
+  await expect(stateTitle).toBeEnabled()
+  await expect(stateTitle).toHaveValue('Ready before delayed apply')
+  expect(state.requests.filter((item) =>
+    item.method === 'POST'
+      && item.path === '/v1/output-proposals/prototype-proposal-1/apply')).toHaveLength(1)
+})
+
+test('Prototype Studio freezes the captured revision snapshot until revision and review complete', async ({ page }) => {
+  const state = await installPlatformMock(page, {
+    authenticated: true,
+    pausePrototypeRevisionCreate: true,
+  })
+  const gate = state.prototypeRevisionCreateGate
+  if (!gate) throw new Error('Expected a prototype revision gate')
+  const current = state.prototypes[0] as typeof approvedPrototype
+  const second = titledDraftPrototype(
+    'eeeeeeee-eeee-4eee-8eee-eeeeeeeeee03',
+    'Revision-lock second Prototype',
+  )
+  state.prototypes = [current, second]
+
+  await page.goto(`/team/acme/project/${project.id}/prototype`)
+  await page.getByRole('button', { name: 'Manage states & breakpoints' }).click()
+  const stateTitle = page.getByLabel('State title ready')
+  const capturedTitle = await stateTitle.inputValue()
+  const revision = page.getByRole('button', { name: 'Revision + review' })
+  await revision.click()
+
+  const revisionPath = `/v1/prototypes/${current.artifact.id}/revisions`
+  await expect.poll(() => state.requests.filter((item) =>
+    item.method === 'POST' && item.path === revisionPath).length).toBe(1)
+  await expect(revision).toBeDisabled()
+  await expect(page.getByRole('button', { name: /Revision-lock second Prototype/ })).toBeDisabled()
+  await expect(page.getByRole('button', { name: 'Create server prototype' })).toBeDisabled()
+  await expect(page.getByTitle('Add Heading')).toBeDisabled()
+  await expect(stateTitle).toBeDisabled()
+  await expect(stateTitle).toHaveValue(capturedTitle)
+
+  gate.release()
+  await expect.poll(() => state.prototypeCreatedRevision).not.toBeNull()
+  await expect(page.getByText('Saved', { exact: true })).toBeVisible()
+  await expect(stateTitle).toBeEnabled()
+  await expect(stateTitle).toHaveValue(capturedTitle)
+  expect((state.prototypeCreatedRevision as { content?: PrototypeContentDto } | null)?.content?.states[0].title)
+    .toBe(capturedTitle)
+  expect(state.requests.filter((item) =>
+    item.method === 'POST' && item.path === revisionPath)).toHaveLength(1)
+})
+
+test('Prototype Studio retries review for the same immutable revision after a 503', async ({ page }) => {
+  const state = await installPlatformMock(page, {
+    authenticated: true,
+    prototypeReviewFirstFailure: 'before-create',
+  })
+  const revisionPath = `/v1/prototypes/${approvedPrototype.artifact.id}/revisions`
+  const reviewPath = `/v1/projects/${project.id}/reviews`
+
+  await page.goto(`/team/acme/project/${project.id}/prototype`)
+  await page.getByRole('button', { name: 'Revision + review' }).click()
+
+  await expect.poll(() => state.requests.filter((item) =>
+    item.method === 'POST' && item.path === reviewPath).length).toBe(1)
+  await expect(page.getByRole('heading', { name: 'Artifact service unavailable' })).toBeVisible()
+  expect(state.prototypeReviews).toHaveLength(0)
+  expect(state.requests.filter((item) =>
+    item.method === 'POST' && item.path === revisionPath)).toHaveLength(1)
+
+  await page.getByRole('button', { name: 'Retry' }).click()
+  await expect(page.getByRole('button', { name: 'Revision + review' })).toBeVisible()
+  await expect(page.getByRole('alert').filter({ hasText: 'without creating another revision' }))
+    .toBeVisible()
+  await page.getByRole('button', { name: 'Revision + review' }).click()
+
+  await expect.poll(() => state.requests.filter((item) =>
+    item.method === 'POST' && item.path === reviewPath).length).toBe(2)
+  await expect.poll(() => state.prototypeReviews.length).toBe(1)
+  const revisionRequests = state.requests.filter((item) =>
+    item.method === 'POST' && item.path === revisionPath)
+  const reviewRequests = state.requests.filter((item) =>
+    item.method === 'POST' && item.path === reviewPath)
+  expect(revisionRequests).toHaveLength(1)
+  expect(state.prototypeCreatedRevision).not.toBeNull()
+  const exactTarget = {
+    artifactId: state.prototypeCreatedRevision?.artifactId,
+    revisionId: state.prototypeCreatedRevision?.id,
+    contentHash: state.prototypeCreatedRevision?.contentHash,
+  }
+  expect(reviewRequests.map((request) => (request.body as { target?: unknown }).target))
+    .toEqual([exactTarget, exactTarget])
+})
+
+test('Prototype Studio does not duplicate a review when requestReview returns false after creation', async ({ page }) => {
+  const state = await installPlatformMock(page, {
+    authenticated: true,
+    prototypeReviewFirstFailure: 'after-create',
+  })
+  const revisionPath = `/v1/prototypes/${approvedPrototype.artifact.id}/revisions`
+  const reviewPath = `/v1/projects/${project.id}/reviews`
+
+  await page.goto(`/team/acme/project/${project.id}/prototype`)
+  const revision = page.getByRole('button', { name: 'Revision + review' })
+  await revision.click()
+
+  await expect.poll(() => state.prototypeReviews.length).toBe(1)
+  await expect(page.getByText('Saved', { exact: true })).toBeVisible()
+  expect(state.requests.filter((item) =>
+    item.method === 'POST' && item.path === revisionPath)).toHaveLength(1)
+  expect(state.requests.filter((item) =>
+    item.method === 'POST' && item.path === reviewPath)).toHaveLength(1)
+
+  await revision.click()
+  await expect(page.getByText('Saved', { exact: true })).toBeVisible()
+  expect(state.requests.filter((item) =>
+    item.method === 'POST' && item.path === revisionPath)).toHaveLength(1)
+  expect(state.requests.filter((item) =>
+    item.method === 'POST' && item.path === reviewPath)).toHaveLength(1)
+})
+
+test('Prototype Studio keeps cyclic layer deletion bounded and exposes only frozen fixture governance', async ({ page }) => {
+  const errors: Error[] = []
+  page.on('pageerror', (error) => errors.push(error))
+  const state = await installPlatformMock(page, { authenticated: true })
+  const current = state.prototypes[0] as typeof approvedPrototype
+  const baseContent = structuredClone(current.draft.content) as unknown as PrototypeContentDto
+  const root = baseContent.layers['layer-root']
+  const childId = 'layer-cycle-child'
+  const content: PrototypeContentDto = {
+    ...baseContent,
+    layers: {
+      ...baseContent.layers,
+      [root.id]: { ...root, childIds: [childId] },
+      [childId]: {
+        id: childId,
+        parentId: root.id,
+        childIds: [root.id],
+        kind: 'group',
+        name: 'Cycle child',
+        layout: { x: 20, y: 20, width: 200, height: 120 },
+        style: {},
+        properties: {},
+        requirementIds: [],
+        acceptanceCriterionIds: [],
+        fieldMetadata: {},
+      },
+    },
+  }
+  state.prototypes = [{ ...current, draft: { ...current.draft, content } }]
+
+  await page.goto(`/team/acme/project/${project.id}/prototype`)
+  await page.getByTitle('Cycle child').click()
+  await page.getByRole('button', { name: 'Delete', exact: true }).click()
+  await expect(page.getByTitle('Cycle child')).toBeHidden()
+
+  await page.getByRole('button', { name: 'Data', exact: true }).click()
+  await expect(page.getByText('Fixture governance')).toBeVisible()
+  await expect(page.getByText('This panel only displays frozen fixtures')).toContainText(
+    'cannot invent ad-hoc fixture IDs',
+  )
+  await expect(page.getByRole('button', { name: 'Add fixture to draft' })).toHaveCount(0)
+  await expect(page.getByPlaceholder('operationId or endpoint')).toHaveCount(0)
+  expect(errors).toEqual([])
+})
+
+test('Prototype Studio keeps duplicate array layers visible but blocks saving them', async ({ page }) => {
+  const state = await installPlatformMock(page, { authenticated: true })
+  const current = state.prototypes[0] as typeof approvedPrototype
+  const baseContent = structuredClone(current.draft.content) as unknown as PrototypeContentDto
+  const root = baseContent.layers['layer-root']
+  const duplicate = {
+    id: 'layer-duplicate',
+    parentId: root.id,
+    childIds: [],
+    kind: 'text',
+    name: 'Duplicate layer',
+    layout: {},
+    style: {},
+    properties: { text: 'Duplicate layer' },
+    requirementIds: [],
+    acceptanceCriterionIds: [],
+    fieldMetadata: {},
+  }
+  const content = {
+    ...baseContent,
+    layers: [
+      { ...root, childIds: [duplicate.id] },
+      duplicate,
+      { ...duplicate, name: 'Duplicate layer copy' },
+    ],
+  } as unknown as PrototypeContentDto
+  state.prototypes = [{ ...current, draft: { ...current.draft, content } }]
+
+  await page.goto(`/team/acme/project/${project.id}/prototype`)
+
+  await expect(page.getByTitle('Duplicate layer', { exact: true })).toBeVisible()
+  await expect(page.getByTitle('Duplicate layer copy', { exact: true })).toBeVisible()
+  const patchCount = state.requests.filter((item) =>
+    item.method === 'PATCH' && item.path === `/v1/prototypes/${current.artifact.id}/draft`).length
+  await page.getByRole('button', { name: 'Save draft' }).click()
+  await expect(page.getByRole('alert').filter({ hasText: 'Cannot save: the prototype' }))
+    .toContainText('duplicate or inconsistent layer IDs')
+  expect(state.requests.filter((item) =>
+    item.method === 'PATCH' && item.path === `/v1/prototypes/${current.artifact.id}/draft`)).toHaveLength(patchCount)
+})
+
+test('Prototype Studio treats a frame with a missing root as repairable missing coverage', async ({ page }) => {
+  const state = await installPlatformMock(page, { authenticated: true })
+  const current = state.prototypes[0] as typeof approvedPrototype
+  const baseContent = structuredClone(current.draft.content) as unknown as PrototypeContentDto
+  const content: PrototypeContentDto = {
+    ...baseContent,
+    frames: baseContent.frames.map((frame, index) => index === 0
+      ? { ...frame, rootLayerId: 'missing-root' }
+      : frame),
+  }
+  state.prototypes = [{ ...current, draft: { ...current.draft, content } }]
+
+  await page.goto(`/team/acme/project/${project.id}/prototype`)
+
+  await expect(page.getByText('Missing Ready · Desktop frame')).toBeVisible()
+  await page.getByRole('button', { name: 'Repair all frame coverage' }).click()
+  await expect(page.getByText('Missing Ready · Desktop frame')).toBeHidden()
+  await expect(page.getByTitle('Page')).toBeVisible()
 })
 
 test('Prototype Studio decides and applies an AI proposal before freezing its attributed revision', async ({ page }) => {
@@ -4139,10 +4970,44 @@ test('Prototype Studio decides and applies an AI proposal before freezing its at
   const applyIndex = state.requests.findIndex((item) =>
     item.method === 'POST'
       && item.path === '/v1/output-proposals/prototype-proposal-1/apply')
+  expect(state.requests[applyIndex]?.body).toEqual({ version: 3 })
   const revisionIndex = state.requests.findIndex((item) =>
     item.method === 'POST'
       && item.path === `/v1/prototypes/${approvedPrototype.artifact.id}/revisions`)
   expect(revisionIndex).toBeGreaterThan(applyIndex)
+})
+
+test('Prototype Studio explicitly confirms before replacing unrevisioned draft changes with a Proposal', async ({ page }) => {
+  const state = await installPlatformMock(page, {
+    authenticated: true,
+    prototypeProposal: true,
+  })
+  const current = state.prototypes[0] as typeof approvedPrototype
+  state.prototypes = [{
+    ...current,
+    draft: { ...current.draft, contentHash: hash('0') },
+  }]
+  state.prototypeProposal = artifactProposal('ready', ['accepted', 'accepted'], 3)
+
+  await page.goto(`/team/acme/project/${project.id}/prototype`)
+  await page.getByRole('button', { name: 'Trace', exact: true }).click()
+  page.once('dialog', async (dialog) => {
+    expect(dialog.message()).toContain('working draft contains changes that have not been revisioned')
+    await dialog.accept()
+  })
+  await page.getByRole('button', { name: 'Apply reviewed prototype proposal' }).click()
+
+  await expect(page.getByText('Applied to the server draft.')).toBeVisible()
+  const request = state.requests.find((item) =>
+    item.method === 'POST'
+      && item.path === '/v1/output-proposals/prototype-proposal-1/apply')
+  expect(request?.body).toEqual({
+    version: 3,
+    discardUnrevisionedChanges: true,
+    expectedDraftId: current.draft.id,
+    expectedDraftEtag: current.draft.etag,
+    expectedDraftContentHash: hash('0'),
+  })
 })
 
 test('Blueprint PageSpec editor autosaves, versions, and requests exact revision review', async ({ page }) => {
@@ -5303,15 +6168,24 @@ function exactRevision(artifactId: string, revisionId: string, revisionNumber: n
 }
 
 function prototypeContent() {
+  const states = pageSpecRevision.content.states.map((state) => ({
+    id: state.id,
+    key: state.key,
+    title: state.title,
+    required: state.required,
+    fixtureIds: [...state.fixtureIds],
+    pageStateId: state.id,
+  }))
+  const breakpoints = [
+    { id: 'breakpoint-desktop', name: 'Desktop', minWidth: 1024, viewportWidth: 1280, viewportHeight: 800 },
+    { id: 'breakpoint-tablet', name: 'Tablet', minWidth: 768, maxWidth: 1023, viewportWidth: 834, viewportHeight: 1112 },
+    { id: 'breakpoint-mobile', name: 'Mobile', minWidth: 0, maxWidth: 767, viewportWidth: 390, viewportHeight: 844 },
+  ]
   return {
     pageSpecRevision: exactRevision(pageSpecRevision.artifactId, pageSpecRevision.id, 2, pageSpecRevision.contentHash),
     exploratory: false,
-    states: [{ id: 'prototype-state-ready', key: 'ready', title: 'Ready', required: true, fixtureIds: [] }],
-    breakpoints: [
-      { id: 'breakpoint-desktop', name: 'Desktop', minWidth: 1024, viewportWidth: 1280, viewportHeight: 800 },
-      { id: 'breakpoint-tablet', name: 'Tablet', minWidth: 768, maxWidth: 1023, viewportWidth: 834, viewportHeight: 1112 },
-      { id: 'breakpoint-mobile', name: 'Mobile', minWidth: 0, maxWidth: 767, viewportWidth: 390, viewportHeight: 844 },
-    ],
+    states,
+    breakpoints,
     layers: {
       'layer-root': {
         id: 'layer-root',
@@ -5326,11 +6200,13 @@ function prototypeContent() {
         fieldMetadata: {},
       },
     },
-    frames: [
-      { id: 'frame-ready-desktop', stateId: 'prototype-state-ready', breakpointId: 'breakpoint-desktop', rootLayerId: 'layer-root', title: 'Ready · Desktop' },
-      { id: 'frame-ready-tablet', stateId: 'prototype-state-ready', breakpointId: 'breakpoint-tablet', rootLayerId: 'layer-root', title: 'Ready · Tablet' },
-      { id: 'frame-ready-mobile', stateId: 'prototype-state-ready', breakpointId: 'breakpoint-mobile', rootLayerId: 'layer-root', title: 'Ready · Mobile' },
-    ],
+    frames: states.flatMap((state) => breakpoints.map((breakpoint) => ({
+      id: `frame-${state.id}-${breakpoint.id}`,
+      stateId: state.id,
+      breakpointId: breakpoint.id,
+      rootLayerId: 'layer-root',
+      title: `${state.title} · ${breakpoint.name}`,
+    }))),
     overrides: [],
     interactions: [],
     fixtures: [],
@@ -5365,6 +6241,17 @@ function draftPrototype(id: string) {
       updatedBy: user.id,
       updatedAt: now,
       etag: `"prototype-draft:1"`,
+    },
+  }
+}
+
+function titledDraftPrototype(id: string, title: string) {
+  const prototype = draftPrototype(id)
+  return {
+    ...prototype,
+    artifact: {
+      ...prototype.artifact,
+      title,
     },
   }
 }

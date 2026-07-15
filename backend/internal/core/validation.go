@@ -552,8 +552,10 @@ func validatePrototype(value map[string]any) []ValidationFinding {
 			findings = append(findings, blocker("prototype.invalid_breakpoint", fmt.Sprintf("$.breakpoints[%d]", index), "Every breakpoint needs a stable ID and name."))
 		}
 		minWidth, validMinWidth := nonNegativeInteger(breakpoint["minWidth"])
-		_, validViewportWidth := positiveInteger(breakpoint["viewportWidth"])
-		_, validViewportHeight := positiveInteger(breakpoint["viewportHeight"])
+		viewportWidth, validViewportWidth := positiveInteger(breakpoint["viewportWidth"])
+		viewportHeight, validViewportHeight := positiveInteger(breakpoint["viewportHeight"])
+		validViewportWidth = validViewportWidth && viewportWidth >= 240
+		validViewportHeight = validViewportHeight && viewportHeight >= 240
 		validMaxWidth := true
 		if rawMaxWidth, exists := breakpoint["maxWidth"]; exists {
 			maxWidth, valid := nonNegativeInteger(rawMaxWidth)
@@ -562,7 +564,7 @@ func validatePrototype(value map[string]any) []ValidationFinding {
 		if !validMinWidth || !validMaxWidth || !validViewportWidth || !validViewportHeight {
 			findings = append(findings, blocker(
 				"prototype.breakpoint_ui_contract", fmt.Sprintf("$.breakpoints[%d]", index),
-				"Every breakpoint must declare a nonnegative integer minWidth, an optional maxWidth not below minWidth, and positive integer viewportWidth and viewportHeight values.",
+				"Every breakpoint must declare a nonnegative integer minWidth, an optional maxWidth not below minWidth, and integer viewportWidth and viewportHeight values of at least 240 pixels.",
 			))
 		}
 		if breakpointIDs[identifier] || breakpointNames[name] {
@@ -584,6 +586,7 @@ func validatePrototype(value map[string]any) []ValidationFinding {
 		findings = append(findings, blocker("prototype.layers", "$.layers", "Prototype must contain a semantic layer tree."))
 	}
 	seen := map[string]bool{}
+	childAdjacency := make(map[string][]string, len(layerObjects))
 	for id, layer := range layerObjects {
 		embeddedID := firstString(layer, "id")
 		if id == "" || seen[id] || embeddedID == "" || embeddedID != id {
@@ -605,6 +608,18 @@ func validatePrototype(value map[string]any) []ValidationFinding {
 				))
 			}
 		}
+		if layout, ok := layer["layout"].(map[string]any); ok {
+			_, validX := nonNegativeInteger(layout["x"])
+			_, validY := nonNegativeInteger(layout["y"])
+			_, validWidth := positiveInteger(layout["width"])
+			_, validHeight := positiveInteger(layout["height"])
+			if !validX || !validY || !validWidth || !validHeight {
+				findings = append(findings, blocker(
+					"prototype.layer_layout_contract", "$.layers."+id+".layout",
+					"Prototype layer layout must declare nonnegative integer x and y values plus positive integer width and height values.",
+				))
+			}
+		}
 		if !validPrototypeFieldMetadata(layer["fieldMetadata"]) {
 			findings = append(findings, blocker(
 				"prototype.layer_field_metadata", "$.layers."+id+".fieldMetadata",
@@ -615,6 +630,7 @@ func validatePrototype(value map[string]any) []ValidationFinding {
 			findings = append(findings, blocker("prototype.layer_parent", "$.layers."+id+".parentId", "Layer parentId must reference an existing layer."))
 		}
 		for childIndex, childID := range stringSlice(layer["childIds"]) {
+			childAdjacency[id] = append(childAdjacency[id], childID)
 			if layerObjects[childID] == nil || childID == id {
 				findings = append(findings, blocker("prototype.layer_child", fmt.Sprintf("$.layers.%s.childIds[%d]", id, childIndex), "Layer childIds must reference another existing layer."))
 			}
@@ -624,6 +640,11 @@ func validatePrototype(value map[string]any) []ValidationFinding {
 				findings = append(findings, blocker("prototype.layer_array_contract", "$.layers."+id+"."+field, "Prototype layer trace and child fields must contain only stable string IDs."))
 			}
 		}
+	}
+	if hasDirectedCycle(childAdjacency) {
+		findings = append(findings, blocker(
+			"prototype.layer_cycle", "$.layers", "Prototype layer childIds must form an acyclic semantic tree.",
+		))
 	}
 	frames := objectSlice(value["frames"])
 	if len(frames) == 0 {
@@ -702,6 +723,9 @@ func validatePrototype(value map[string]any) []ValidationFinding {
 			findings = append(findings, blocker("prototype.invalid_interaction", fmt.Sprintf("$.interactions[%d]", index), "Interactions require a stable ID, existing source layer, and whitelisted trigger."))
 		}
 		interactionIDs[interactionID] = true
+		if !isJSONObjectArray(interaction["guards"]) {
+			findings = append(findings, blocker("prototype.interaction_guards", fmt.Sprintf("$.interactions[%d].guards", index), "Prototype interaction guards must be an array containing only declarative guard objects."))
+		}
 		actions := objectSlice(interaction["actions"])
 		if !isJSONObjectArray(interaction["actions"]) {
 			findings = append(findings, blocker("prototype.interaction_actions", fmt.Sprintf("$.interactions[%d].actions", index), "Prototype interaction actions must be an array containing only declarative action objects."))

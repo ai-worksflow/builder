@@ -12,6 +12,7 @@ import type {
   ImpactReportDto,
   JsonObject,
   PageSpecContentDto,
+  ProposalDraftSnapshotDto,
   ProposalDto,
   PrototypeContentDto,
   RequirementItemDto,
@@ -883,6 +884,7 @@ export class ArtifactWorkspaceGateway {
     messages: {
       rejectedReason?: string
       invalidSelection?: string
+      discardDraftSnapshot?: ProposalDraftSnapshotDto
     } = {},
   ) {
     const accepted = new Set(acceptedOperationIds)
@@ -909,7 +911,15 @@ export class ArtifactWorkspaceGateway {
           ?? 'At least one operation must be accepted and every operation must be decided before apply.',
       )
     }
-    const applied = await this.client.proposals.apply(proposalId, { version: current.version }, {
+    const applied = await this.client.proposals.apply(proposalId, {
+      version: current.version,
+      ...(messages.discardDraftSnapshot
+        ? {
+            discardUnrevisionedChanges: true,
+            ...messages.discardDraftSnapshot,
+          }
+        : {}),
+    }, {
       ifMatch: proposalEtag(current),
       idempotencyKey: true,
     })

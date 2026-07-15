@@ -43,126 +43,385 @@ const PROTOTYPE_LAYER_KINDS = new Set<PrototypeLayerKind>([
   'slot',
 ])
 
+const INVALID_DUPLICATE_LAYER_ID_PREFIX = '__invalid_duplicate_layer__'
+const INVALID_LAYER_ENTRY_ID_PREFIX = '__invalid_layer_entry__'
+const PROTOTYPE_COMPATIBILITY_ISSUES_FIELD = '__prototypeCompatibilityIssues'
+
+type PrototypeContentWithCompatibilityIssues = PrototypeContentDto & {
+  readonly __prototypeCompatibilityIssues?: readonly string[]
+}
+
+export interface PrototypePageSpecStateAuthority {
+  readonly id: string
+  readonly key: string
+  readonly required: boolean
+}
+
+export interface PrototypePageSpecAuthority {
+  readonly states: readonly PrototypePageSpecStateAuthority[]
+  readonly allowedFixtureOperationIds: ReadonlySet<string>
+  readonly issues: readonly string[]
+}
+
+export function prototypePageSpecAuthority(value: unknown): PrototypePageSpecAuthority {
+  const issues: string[] = []
+  if (!isObjectValue(value)) {
+    return {
+      states: [],
+      allowedFixtureOperationIds: new Set(),
+      issues: ['Exact PageSpec revision content must be an object.'],
+    }
+  }
+
+  const states: PrototypePageSpecStateAuthority[] = []
+  const rawStates = value.states
+  if (Array.isArray(rawStates)) {
+    for (const rawState of rawStates) {
+      if (!isObjectValue(rawState)) continue
+      const id = textValue(rawState.id)
+      const key = textValue(rawState.key) || textValue(rawState.name)
+      if (!id || !key) continue
+      states.push({ id, key, required: rawState.required === true })
+    }
+  }
+
+  const allowedFixtureOperationIds = new Set<string>()
+  const rawBindings = value.dataBindings
+  if (Array.isArray(rawBindings)) {
+    for (const rawBinding of rawBindings) {
+      if (!isObjectValue(rawBinding)) continue
+      const source = textValue(rawBinding.source)
+      const operationId = textValue(rawBinding.operationId)
+      if (source === 'api' && operationId) allowedFixtureOperationIds.add(operationId)
+    }
+  }
+
+  return {
+    states,
+    allowedFixtureOperationIds,
+    issues: uniqueStrings(issues),
+  }
+}
+
 // Platform payloads are runtime data even when the HTTP client has a generic
 // TypeScript return type. Keep the editor usable for incomplete historical
 // drafts while the canonical server gate continues to reject missing semantic
 // content such as states, layers, and frames.
 export function normalizePrototypeContent(content: PrototypeContentDto): PrototypeContentDto {
   const raw = objectValue(content)
-  const pageSpecRevision = objectValue(raw.pageSpecRevision)
-  const states = objectArrayValue(raw.states).map((state) => {
-    const id = textValue(state.id)
-    const key = textValue(state.key) || id
-    return {
+  const compatibilityIssues = compatibilityIssueValues(raw[PROTOTYPE_COMPATIBILITY_ISSUES_FIELD])
+  const objectArray = (value: unknown, path: string) =>
+    objectArrayValue(value, path, compatibilityIssues)
+  const pageSpecRevisionPresent = hasOwn(raw, 'pageSpecRevision')
+  const pageSpecRevisionValid = isObjectValue(raw.pageSpecRevision)
+  if (pageSpecRevisionPresent && !pageSpecRevisionValid) {
+    compatibilityIssues.push('Prototype data at pageSpecRevision must be an object.')
+  }
+  const pageSpecRevision: Record<string, unknown> = pageSpecRevisionValid
+    ? raw.pageSpecRevision as Record<string, unknown>
+    : {}
+  const states = objectArray(raw.states, 'states').map(({ value: state, path }) => {
+    const id = requiredStringFieldValue(state, 'id', '', `${path}.id`, compatibilityIssues)
+    const key = requiredStringFieldValue(state, 'key', id, `${path}.key`, compatibilityIssues)
+    const title = requiredStringFieldValue(
+      state,
+      'title',
+      key || id,
+      `${path}.title`,
+      compatibilityIssues,
+    )
+    const pageStateId = optionalStringFieldValue(
+      state,
+      'pageStateId',
+      `${path}.pageStateId`,
+      compatibilityIssues,
+    )
+    const normalizedState: Record<string, unknown> = {
       ...state,
       id,
       key,
-      title: textValue(state.title) || key || id,
-      required: state.required === true,
-      fixtureIds: stringArrayValue(state.fixtureIds),
-      ...(textValue(state.pageStateId) ? { pageStateId: textValue(state.pageStateId) } : {}),
+      title,
+      required: booleanFieldValue(state, 'required', false, `${path}.required`, compatibilityIssues),
+      fixtureIds: stringArrayValue(state.fixtureIds, `${path}.fixtureIds`, compatibilityIssues),
+      ...(pageStateId ? { pageStateId } : {}),
     }
+    if (!pageStateId) delete normalizedState.pageStateId
+    return normalizedState as unknown as PrototypeStateDto
   })
-  const breakpoints = objectArrayValue(raw.breakpoints).map((breakpoint) => {
-    const id = textValue(breakpoint.id)
-    const name = textValue(breakpoint.name)
-      || textValue(breakpoint.title)
-      || textValue(breakpoint.key)
-      || id
-    return {
+  const breakpoints = objectArray(raw.breakpoints, 'breakpoints').map(({ value: breakpoint, path }) => {
+    const id = hasOwn(breakpoint, 'id')
+      ? requiredStringFieldValue(breakpoint, 'id', '', `${path}.id`, compatibilityIssues)
+      : requiredStringFieldValue(breakpoint, 'key', '', `${path}.key`, compatibilityIssues)
+    const name = hasOwn(breakpoint, 'name')
+      ? requiredStringFieldValue(breakpoint, 'name', '', `${path}.name`, compatibilityIssues)
+      : hasOwn(breakpoint, 'title')
+        ? requiredStringFieldValue(breakpoint, 'title', '', `${path}.title`, compatibilityIssues)
+        : hasOwn(breakpoint, 'key')
+          ? requiredStringFieldValue(breakpoint, 'key', '', `${path}.key`, compatibilityIssues)
+          : id
+    const defaultViewport = defaultBreakpointViewport(name)
+    const maxWidth = optionalNonNegativeIntegerField(
+      breakpoint,
+      'maxWidth',
+      `${path}.maxWidth`,
+      compatibilityIssues,
+    )
+    const normalizedBreakpoint: Record<string, unknown> = {
       ...breakpoint,
       id,
       name,
-      minWidth: numericValue(breakpoint.minWidth, defaultBreakpointMinWidth(name)),
-      ...(hasFiniteNumber(breakpoint.maxWidth)
-        ? { maxWidth: numericValue(breakpoint.maxWidth, 0) }
-        : {}),
-      viewportWidth: Math.max(1, numericValue(
+      minWidth: nonNegativeIntegerField(
+        breakpoint,
+        'minWidth',
+        defaultBreakpointMinWidth(name),
+        `${path}.minWidth`,
+        compatibilityIssues,
+      ),
+      ...(maxWidth === undefined ? {} : { maxWidth }),
+      viewportWidth: normalizedViewportDimension(
+        breakpoint,
+        'viewportWidth',
+        'width',
         breakpoint.viewportWidth,
-        numericValue(breakpoint.width, 1),
-      )),
-      viewportHeight: Math.max(1, numericValue(
+        breakpoint.width,
+        defaultViewport.width,
+        `${path}.viewportWidth`,
+        compatibilityIssues,
+      ),
+      viewportHeight: normalizedViewportDimension(
+        breakpoint,
+        'viewportHeight',
+        'height',
         breakpoint.viewportHeight,
-        numericValue(breakpoint.height, 1),
-      )),
+        breakpoint.height,
+        defaultViewport.height,
+        `${path}.viewportHeight`,
+        compatibilityIssues,
+      ),
     }
+    if (maxWidth === undefined) delete normalizedBreakpoint.maxWidth
+    return normalizedBreakpoint as unknown as PrototypeBreakpointDto
   })
-  const rawLayers = layerCollectionValue(raw.layers, objectValue(raw.scene).layers)
-  const layers = Object.fromEntries(rawLayers.flatMap(([recordId, layer], index) => {
-    const id = textValue(layer.id) || textValue(layer.layerId) || recordId
-    if (!id) return []
-    const kind = prototypeLayerKind(layer.kind ?? layer.type)
-    const legacyProperties = objectValue(layer.props)
-    const properties = {
-      ...legacyProperties,
-      ...objectValue(layer.properties),
+  const primaryLayers = layerCollectionValue(raw.layers, 'layers', compatibilityIssues)
+  let rawLayers = primaryLayers.entries
+  if (primaryLayers.useFallback) {
+    if (raw.scene !== undefined && !isObjectValue(raw.scene)) {
+      compatibilityIssues.push('Prototype data at scene must be an object.')
+      rawLayers = []
+    } else {
+      rawLayers = layerCollectionValue(
+        objectValue(raw.scene).layers,
+        'scene.layers',
+        compatibilityIssues,
+      ).entries
     }
-    if (kind === 'button' && !textValue(properties.text) && textValue(properties.label)) {
-      properties.text = textValue(properties.label)
+  }
+  const layers: Record<string, PrototypeLayerDto> = {}
+  const layerIds = new Set<string>()
+  rawLayers.forEach(([recordId, layer, path], index) => {
+    const sourceId = recordId
+    if (!sourceId) return
+    const textCompatibilityIssues = sourceId.startsWith(INVALID_LAYER_ENTRY_ID_PREFIX)
+      ? []
+      : compatibilityIssues
+    const id = layerIds.has(sourceId)
+      ? duplicateLayerId(sourceId, index, layerIds)
+      : sourceId
+    layerIds.add(id)
+    const kindText = hasOwn(layer, 'kind')
+      ? requiredStringFieldValue(layer, 'kind', '', `${path}.kind`, textCompatibilityIssues)
+      : requiredStringFieldValue(layer, 'type', '', `${path}.type`, textCompatibilityIssues)
+    const kind = prototypeLayerKind(kindText)
+    const properties: Record<string, JsonObject[string]> = {
+      ...(hasOwn(layer, 'properties')
+        ? jsonObjectValue(layer.properties, `${path}.properties`, compatibilityIssues)
+        : jsonObjectValue(layer.props, `${path}.props`, compatibilityIssues)),
     }
-    const parentId = textValue(layer.parentId)
-    const semanticRole = textValue(layer.semanticRole) || textValue(properties.role)
-    return [[id, {
+    if (kind === 'button' && !hasOwn(properties, 'text') && hasOwn(properties, 'label')) {
+      properties.text = requiredStringFieldValue(
+        properties,
+        'label',
+        '',
+        `${path}.properties.label`,
+        textCompatibilityIssues,
+      )
+    }
+    const parentId = optionalStringFieldValue(
+      layer,
+      'parentId',
+      `${path}.parentId`,
+      compatibilityIssues,
+    )
+    const semanticRole = hasOwn(layer, 'semanticRole')
+      ? requiredStringFieldValue(
+          layer,
+          'semanticRole',
+          '',
+          `${path}.semanticRole`,
+          textCompatibilityIssues,
+        )
+      : hasOwn(properties, 'role')
+        ? requiredStringFieldValue(
+            properties,
+            'role',
+            '',
+            `${path}.properties.role`,
+            textCompatibilityIssues,
+          )
+        : ''
+    const dataBindingId = optionalStringFieldValue(
+      layer,
+      'dataBindingId',
+      `${path}.dataBindingId`,
+      textCompatibilityIssues,
+    )
+    const componentRef = layer.componentRef
+    if (hasOwn(layer, 'componentRef')
+      && componentRef !== undefined
+      && componentRef !== null
+      && !isObjectValue(componentRef)) {
+      compatibilityIssues.push(`Prototype data at ${path}.componentRef must be an object.`)
+    }
+    const normalizedLayer: Record<string, unknown> = {
       ...layer,
       id,
       ...(parentId ? { parentId } : {}),
-      childIds: stringArrayValue(layer.childIds),
+      childIds: stringArrayValue(layer.childIds, `${path}.childIds`, compatibilityIssues),
       kind,
-      name: textValue(layer.name) || `Layer ${index + 1}`,
+      name: requiredStringFieldValue(
+        layer,
+        'name',
+        `Layer ${index + 1}`,
+        `${path}.name`,
+        textCompatibilityIssues,
+      ),
       ...(semanticRole ? { semanticRole } : {}),
-      layout: jsonObjectValue(layer.layout),
-      style: jsonObjectValue(layer.style),
+      layout: jsonObjectValue(layer.layout, `${path}.layout`, compatibilityIssues),
+      style: jsonObjectValue(layer.style, `${path}.style`, compatibilityIssues),
       properties: properties as JsonObject,
-      ...(textValue(layer.dataBindingId) ? { dataBindingId: textValue(layer.dataBindingId) } : {}),
-      ...(isObjectValue(layer.componentRef) ? { componentRef: layer.componentRef } : {}),
-      requirementIds: stringArrayValue(layer.requirementIds),
-      acceptanceCriterionIds: stringArrayValue(layer.acceptanceCriterionIds),
-      fieldMetadata: objectValue(layer.fieldMetadata),
-    }]]
-  })) as Readonly<Record<string, PrototypeLayerDto>>
+      ...(dataBindingId ? { dataBindingId } : {}),
+      ...(isObjectValue(componentRef) ? { componentRef } : {}),
+      requirementIds: stringArrayValue(layer.requirementIds, `${path}.requirementIds`, compatibilityIssues),
+      acceptanceCriterionIds: stringArrayValue(layer.acceptanceCriterionIds, `${path}.acceptanceCriterionIds`, compatibilityIssues),
+      fieldMetadata: objectFieldValue(layer.fieldMetadata, `${path}.fieldMetadata`, compatibilityIssues),
+    }
+    if (!parentId) delete normalizedLayer.parentId
+    if (!semanticRole) delete normalizedLayer.semanticRole
+    if (!dataBindingId) delete normalizedLayer.dataBindingId
+    if (!isObjectValue(componentRef)) delete normalizedLayer.componentRef
+    layers[id] = normalizedLayer as unknown as PrototypeLayerDto
+  })
   const stateTitles = new Map(states.map((state) => [state.id, state.title]))
   const breakpointNames = new Map(breakpoints.map((breakpoint) => [breakpoint.id, breakpoint.name]))
 
-  return {
+  const normalized: Record<string, unknown> = {
     ...raw,
     pageSpecRevision: {
-      artifactId: textValue(pageSpecRevision.artifactId) || textValue(raw.sourcePageSpecArtifactId),
-      revisionId: textValue(pageSpecRevision.revisionId) || textValue(raw.sourcePageSpecRevisionId),
-      contentHash: textValue(pageSpecRevision.contentHash) || textValue(raw.sourcePageSpecHash),
+      artifactId: canonicalStringWithLegacyFallback(
+        pageSpecRevision,
+        'artifactId',
+        raw,
+        'sourcePageSpecArtifactId',
+        'pageSpecRevision.artifactId',
+        'sourcePageSpecArtifactId',
+        compatibilityIssues,
+        !pageSpecRevisionPresent || pageSpecRevisionValid,
+      ),
+      revisionId: canonicalStringWithLegacyFallback(
+        pageSpecRevision,
+        'revisionId',
+        raw,
+        'sourcePageSpecRevisionId',
+        'pageSpecRevision.revisionId',
+        'sourcePageSpecRevisionId',
+        compatibilityIssues,
+        !pageSpecRevisionPresent || pageSpecRevisionValid,
+      ),
+      contentHash: canonicalStringWithLegacyFallback(
+        pageSpecRevision,
+        'contentHash',
+        raw,
+        'sourcePageSpecHash',
+        'pageSpecRevision.contentHash',
+        'sourcePageSpecHash',
+        compatibilityIssues,
+        !pageSpecRevisionPresent || pageSpecRevisionValid,
+      ),
     },
-    exploratory: raw.exploratory === true,
+    exploratory: booleanFieldValue(raw, 'exploratory', false, 'exploratory', compatibilityIssues),
     states,
     breakpoints,
     layers,
-    frames: objectArrayValue(raw.frames).map((frame) => ({
-      ...frame,
-      id: textValue(frame.id),
-      stateId: textValue(frame.stateId),
-      breakpointId: textValue(frame.breakpointId),
-      rootLayerId: textValue(frame.rootLayerId),
-      title: textValue(frame.title)
-        || `${stateTitles.get(textValue(frame.stateId)) || 'State'} · ${breakpointNames.get(textValue(frame.breakpointId)) || 'Breakpoint'}`,
-    })),
-    overrides: objectArrayValue(raw.overrides),
-    interactions: objectArrayValue(raw.interactions).map((interaction) => ({
+    frames: objectArray(raw.frames, 'frames').map(({ value: frame, path }) => {
+      const id = requiredStringFieldValue(frame, 'id', '', `${path}.id`, compatibilityIssues)
+      const stateId = requiredStringFieldValue(
+        frame,
+        'stateId',
+        '',
+        `${path}.stateId`,
+        compatibilityIssues,
+      )
+      const breakpointId = requiredStringFieldValue(
+        frame,
+        'breakpointId',
+        '',
+        `${path}.breakpointId`,
+        compatibilityIssues,
+      )
+      const rootLayerId = requiredStringFieldValue(
+        frame,
+        'rootLayerId',
+        '',
+        `${path}.rootLayerId`,
+        compatibilityIssues,
+      )
+      return {
+        ...frame,
+        id,
+        stateId,
+        breakpointId,
+        rootLayerId,
+        title: requiredStringFieldValue(
+          frame,
+          'title',
+          `${stateTitles.get(stateId) || 'State'} · ${breakpointNames.get(breakpointId) || 'Breakpoint'}`,
+          `${path}.title`,
+          compatibilityIssues,
+        ),
+      }
+    }),
+    overrides: objectArray(raw.overrides, 'overrides').map(({ value }) => value),
+    interactions: objectArray(raw.interactions, 'interactions').map(({ value: interaction, path }) => ({
       ...interaction,
-      guards: objectArrayValue(interaction.guards),
-      actions: objectArrayValue(interaction.actions),
+      guards: objectArray(interaction.guards, `${path}.guards`).map(({ value }) => value),
+      actions: objectArray(interaction.actions, `${path}.actions`).map(({ value }) => value),
     })),
-    fixtures: objectArrayValue(raw.fixtures),
-    tokenBindings: objectArrayValue(raw.tokenBindings),
-    componentBindings: objectArrayValue(raw.componentBindings).map((binding) => ({
+    fixtures: objectArray(raw.fixtures, 'fixtures').map(({ value }) => value),
+    tokenBindings: objectArray(raw.tokenBindings, 'tokenBindings').map(({ value }) => value),
+    componentBindings: objectArray(raw.componentBindings, 'componentBindings').map(({ value: binding, path }) => ({
       ...binding,
-      propertyMapping: jsonObjectValue(binding.propertyMapping),
+      propertyMapping: jsonObjectValue(binding.propertyMapping, `${path}.propertyMapping`, compatibilityIssues),
     })),
-    assets: objectArrayValue(raw.assets),
-    traceLinks: objectArrayValue(raw.traceLinks),
-  } as unknown as PrototypeContentDto
+    assets: objectArray(raw.assets, 'assets').map(({ value }) => value),
+    traceLinks: objectArray(raw.traceLinks, 'traceLinks').map(({ value }) => value),
+  }
+  delete normalized[PROTOTYPE_COMPATIBILITY_ISSUES_FIELD]
+  const uniqueCompatibilityIssues = uniqueStrings(compatibilityIssues)
+  if (uniqueCompatibilityIssues.length > 0) {
+    normalized[PROTOTYPE_COMPATIBILITY_ISSUES_FIELD] = uniqueCompatibilityIssues
+  }
+  return normalized as unknown as PrototypeContentDto
 }
 
-export function prototypeReviewIssues(content: PrototypeContentDto) {
+export function prototypeReviewIssues(
+  content: PrototypeContentDto,
+  options: {
+    readonly allowedFixtureOperationIds?: ReadonlySet<string>
+    readonly pageSpecAuthority?: PrototypePageSpecAuthority
+  } = {},
+) {
   content = normalizePrototypeContent(content)
-  const issues: string[] = []
+  const issues: string[] = [...prototypePayloadIntegrityIssues(content)]
   const pageSpecRevision = content.pageSpecRevision
   if (!pageSpecRevision
     || !nonEmpty(pageSpecRevision.artifactId)
@@ -187,6 +446,20 @@ export function prototypeReviewIssues(content: PrototypeContentDto) {
     stateIds.add(id)
     stateKeys.add(key)
   })
+  if (!content.exploratory && options.pageSpecAuthority) {
+    issues.push(...options.pageSpecAuthority.issues)
+    const expectedStates = new Map(options.pageSpecAuthority.states.map((state) => [state.id, state]))
+    const exactStateSet = states.length === expectedStates.size
+      && states.every((state) => {
+        const expected = expectedStates.get(trimmed(state.id))
+        return expected
+          && trimmed(state.key) === expected.key
+          && (!expected.required || state.required === true)
+      })
+    if (!exactStateSet) {
+      issues.push('Formal Prototype states must preserve the exact PageSpec state ID and key set without downgrading required states.')
+    }
+  }
 
   const breakpoints = arrayValue(content.breakpoints)
   if (breakpoints.length < 3) {
@@ -198,6 +471,21 @@ export function prototypeReviewIssues(content: PrototypeContentDto) {
     const id = trimmed(breakpoint.id)
     const name = normalizedBreakpointName(breakpoint.name)
     if (!id || !name) issues.push(`Breakpoint ${index + 1} needs a stable ID and name.`)
+    const validMinWidth = Number.isInteger(breakpoint.minWidth) && breakpoint.minWidth >= 0
+    const validMaxWidth = breakpoint.maxWidth === undefined
+      || (Number.isInteger(breakpoint.maxWidth)
+        && breakpoint.maxWidth >= 0
+        && validMinWidth
+        && breakpoint.maxWidth >= breakpoint.minWidth)
+    if (!validMinWidth || !validMaxWidth) {
+      issues.push(`Breakpoint ${index + 1} must use a nonnegative integer minWidth and an optional integer maxWidth not below minWidth.`)
+    }
+    if (!Number.isInteger(breakpoint.viewportWidth)
+      || !Number.isInteger(breakpoint.viewportHeight)
+      || breakpoint.viewportWidth < 240
+      || breakpoint.viewportHeight < 240) {
+      issues.push(`Breakpoint ${index + 1} viewport width and height must each be integers of at least 240 pixels.`)
+    }
     if (breakpointIds.has(id) || breakpointNames.has(name)) {
       issues.push(`Breakpoint ${index + 1} duplicates an existing breakpoint ID or name.`)
     }
@@ -213,16 +501,12 @@ export function prototypeReviewIssues(content: PrototypeContentDto) {
   const layers = recordValue(content.layers)
   const layerEntries = Object.entries(layers)
   if (layerEntries.length === 0) issues.push('Prototype must contain a semantic layer tree.')
-  const seenLayerIds = new Set<string>()
-  for (const [recordId, layer] of layerEntries) {
-    const id = trimmed(recordId)
-    const embeddedId = trimmed(layer.id)
-    if (!id || seenLayerIds.has(id) || (embeddedId && embeddedId !== id)) {
-      issues.push(`Layer ${recordId || '(missing ID)'} does not have one unique stable record ID.`)
-    }
-    seenLayerIds.add(id)
-  }
+  issues.push(...prototypeLayerIdentityIssues(content))
   for (const [id, layer] of layerEntries) {
+    const kind = trimmed(layer.kind)
+    if (!PROTOTYPE_LAYER_KINDS.has(kind as PrototypeLayerKind)) {
+      issues.push(`Layer ${id} has unsupported kind ${kind || '(missing kind)'}.`)
+    }
     const parentId = trimmed(layer.parentId)
     if (parentId && !layers[parentId]) {
       issues.push(`Layer ${id} parent ${parentId} does not exist.`)
@@ -233,6 +517,16 @@ export function prototypeReviewIssues(content: PrototypeContentDto) {
         issues.push(`Layer ${id} child ${childIndex + 1} must reference another existing layer.`)
       }
     })
+    const layout = layer.layout
+    if (!nonNegativeIntegerValue(layout.x)
+      || !nonNegativeIntegerValue(layout.y)
+      || !positiveIntegerValue(layout.width)
+      || !positiveIntegerValue(layout.height)) {
+      issues.push(`Layer ${id} layout must declare nonnegative integer x and y values plus positive integer width and height values.`)
+    }
+  }
+  if (hasPrototypeLayerCycle(layers)) {
+    issues.push('Prototype layer child IDs must form an acyclic semantic tree.')
   }
 
   const frames = arrayValue(content.frames)
@@ -240,21 +534,24 @@ export function prototypeReviewIssues(content: PrototypeContentDto) {
     issues.push('Prototype must define a frame for each required state and breakpoint.')
   } else {
     const coverage = new Set<string>()
+    const seenPairs = new Set<string>()
     frames.forEach((frame, index) => {
       const stateId = trimmed(frame.stateId)
       const breakpointId = trimmed(frame.breakpointId)
       const rootLayerId = trimmed(frame.rootLayerId)
       const pair = framePair(stateId, breakpointId)
-      if (!nonEmpty(frame.id)
-        || !stateIds.has(stateId)
-        || !breakpointIds.has(breakpointId)
-        || !layers[rootLayerId]) {
+      const valid = nonEmpty(frame.id)
+        && stateIds.has(stateId)
+        && breakpointIds.has(breakpointId)
+        && Boolean(layers[rootLayerId])
+      if (!valid) {
         issues.push(`Frame ${index + 1} must reference an existing state, breakpoint, and root layer.`)
       }
-      if (coverage.has(pair)) {
+      if (seenPairs.has(pair)) {
         issues.push(`Frame ${index + 1} duplicates a state and breakpoint pair.`)
       }
-      coverage.add(pair)
+      seenPairs.add(pair)
+      if (valid) coverage.add(pair)
     })
     for (const state of states) {
       if (state.required === false) continue
@@ -268,23 +565,98 @@ export function prototypeReviewIssues(content: PrototypeContentDto) {
     }
   }
 
+  const fixtureIds = new Set<string>()
+  const fixtureStateIds = new Map<string, string>()
   arrayValue(content.fixtures).forEach((fixture, index) => {
+    const fixtureId = trimmed(fixture.id)
+    if (!fixtureId || fixtureIds.has(fixtureId)) {
+      issues.push(`Fixture ${index + 1} needs one unique stable ID.`)
+    }
+    if (fixtureId) {
+      fixtureIds.add(fixtureId)
+      fixtureStateIds.set(fixtureId, trimmed(fixture.stateId))
+    }
     if (fixture.sanitized !== true) issues.push(`Fixture ${index + 1} must be marked sanitized.`)
     if (!stateIds.has(trimmed(fixture.stateId))) {
       issues.push(`Fixture ${index + 1} must reference an existing state.`)
     }
+    if (!nonEmpty(fixture.name)
+      || !hasOwn(fixture, 'response')
+      || !Number.isInteger(fixture.statusCode)
+      || fixture.statusCode < 100
+      || fixture.statusCode > 599
+      || !Number.isInteger(fixture.latencyMs)
+      || fixture.latencyMs < 0
+      || !canonicalSha256Hash(fixture.contentHash)) {
+      issues.push(`Fixture ${index + 1} must declare a name, response, HTTP status, nonnegative integer latency, and canonical SHA-256 content hash.`)
+    }
+    if (hasOwn(fixture, 'operationId')) {
+      const operationId = trimmed(fixture.operationId)
+      if (!operationId) {
+        issues.push(`Fixture ${index + 1} operation ID must be non-empty when provided.`)
+      } else if ((options.pageSpecAuthority?.allowedFixtureOperationIds
+        ?? options.allowedFixtureOperationIds)?.has(operationId) === false) {
+        issues.push(`Fixture ${index + 1} operation ID ${operationId} is not declared by the exact PageSpec revision.`)
+      }
+    }
   })
 
+  const declaredFixtureStates = new Map<string, string>()
+  states.forEach((state, stateIndex) => {
+    arrayValue(state.fixtureIds).forEach((rawFixtureId, fixtureIndex) => {
+      const fixtureId = trimmed(rawFixtureId)
+      const stateId = trimmed(state.id)
+      const alreadyDeclared = declaredFixtureStates.has(fixtureId)
+      if (!fixtureId
+        || !fixtureIds.has(fixtureId)
+        || fixtureStateIds.get(fixtureId) !== stateId
+        || alreadyDeclared) {
+        issues.push(`State ${stateIndex + 1} fixture ${fixtureIndex + 1} must be a duplicate-free exact reference to a fixture owned by that state.`)
+      }
+      if (fixtureId) declaredFixtureStates.set(fixtureId, stateId)
+    })
+  })
+  for (const fixtureId of fixtureIds) {
+    if (!declaredFixtureStates.has(fixtureId)) {
+      issues.push(`Fixture ${fixtureId} must be declared by exactly one state fixtureIds set.`)
+    }
+  }
+
+  const interactionIds = new Set<string>()
   arrayValue(content.interactions).forEach((interaction, index) => {
+    const interactionId = trimmed(interaction.id)
     const trigger = trimmed(interaction.trigger)
-    if (!nonEmpty(interaction.id)
+    if (!interactionId
+      || interactionIds.has(interactionId)
       || !layers[trimmed(interaction.sourceLayerId)]
       || !ALLOWED_PROTOTYPE_TRIGGERS.has(trigger)) {
-      issues.push(`Interaction ${index + 1} needs a stable ID, existing source layer, and declarative trigger.`)
+      issues.push(`Interaction ${index + 1} needs a unique stable ID, existing source layer, and declarative trigger.`)
     }
-    arrayValue(interaction.actions).forEach((action, actionIndex) => {
-      if (!ALLOWED_PROTOTYPE_ACTIONS.has(actionType(action))) {
+    if (interactionId) interactionIds.add(interactionId)
+    const actions = arrayValue(interaction.actions)
+    if (actions.length === 0) {
+      issues.push(`Interaction ${index + 1} must declare at least one action.`)
+    }
+    actions.forEach((action, actionIndex) => {
+      const type = actionType(action)
+      if (!ALLOWED_PROTOTYPE_ACTIONS.has(type)) {
         issues.push(`Interaction ${index + 1} action ${actionIndex + 1} is not on the declarative action whitelist.`)
+        return
+      }
+      const value = objectValue(action)
+      const validReference = type === 'navigate'
+        ? Boolean(trimmed(value.targetPageNodeId) || trimmed(value.targetPageSpecId))
+        : type === 'setState'
+          ? stateIds.has(trimmed(value.stateId))
+          : type === 'openOverlay'
+            ? normalizedBreakpointName(layers[trimmed(value.layerId)]?.kind) === 'overlay'
+            : type === 'updateBinding'
+              ? Boolean(trimmed(value.bindingId)) && hasOwn(value, 'value')
+              : type === 'submitFixture'
+                ? fixtureIds.has(trimmed(value.fixtureId))
+                : true
+      if (!validReference) {
+        issues.push(`Interaction ${index + 1} action ${actionIndex + 1} must reference the exact declared state, overlay, binding, fixture, or navigation target.`)
       }
     })
   })
@@ -292,16 +664,69 @@ export function prototypeReviewIssues(content: PrototypeContentDto) {
 }
 
 export function prototypeFrameCoverageGaps(content: PrototypeContentDto) {
-  const coverage = new Set(arrayValue(content.frames).map((frame) =>
-    framePair(trimmed(frame.stateId), trimmed(frame.breakpointId)),
-  ))
-  return arrayValue(content.states).flatMap((state) =>
-    arrayValue(content.breakpoints).flatMap((breakpoint) =>
+  const states = arrayValue(content.states)
+  const breakpoints = arrayValue(content.breakpoints)
+  const stateIds = new Set(states.map((state) => trimmed(state.id)).filter(Boolean))
+  const breakpointIds = new Set(breakpoints.map((breakpoint) => trimmed(breakpoint.id)).filter(Boolean))
+  const layers = recordValue(content.layers)
+  const coverage = new Set(arrayValue(content.frames).flatMap((frame) => {
+    const stateId = trimmed(frame.stateId)
+    const breakpointId = trimmed(frame.breakpointId)
+    return nonEmpty(frame.id)
+      && stateIds.has(stateId)
+      && breakpointIds.has(breakpointId)
+      && Boolean(layers[trimmed(frame.rootLayerId)])
+      ? [framePair(stateId, breakpointId)]
+      : []
+  }))
+  return states.flatMap((state) =>
+    breakpoints.flatMap((breakpoint) =>
       coverage.has(framePair(trimmed(state.id), trimmed(breakpoint.id)))
         ? []
         : [{ stateId: state.id, breakpointId: breakpoint.id }],
     ),
   )
+}
+
+export function prototypeLayerIdentityIssues(content: PrototypeContentDto) {
+  const issues: string[] = []
+  const seenEmbeddedIds = new Set<string>()
+  for (const [recordId, layer] of Object.entries(recordValue(content.layers))) {
+    const id = trimmed(recordId)
+    const embeddedId = trimmed(layer.id)
+    const duplicate = id.startsWith(INVALID_DUPLICATE_LAYER_ID_PREFIX)
+      || embeddedId.startsWith(INVALID_DUPLICATE_LAYER_ID_PREFIX)
+    if (duplicate) {
+      issues.push(`Layer ${duplicateLayerSourceId(embeddedId || id)} duplicates an existing layer ID.`)
+      continue
+    }
+    if (id.startsWith(INVALID_LAYER_ENTRY_ID_PREFIX)
+      || embeddedId.startsWith(INVALID_LAYER_ENTRY_ID_PREFIX)) {
+      issues.push(`Layer ${recordId || '(missing ID)'} is an invalid source placeholder.`)
+      continue
+    }
+    if (!id || !embeddedId || embeddedId !== id || seenEmbeddedIds.has(embeddedId)) {
+      issues.push(`Layer ${recordId || '(missing ID)'} does not have one unique stable record ID.`)
+    }
+    if (embeddedId) seenEmbeddedIds.add(embeddedId)
+  }
+  return issues
+}
+
+export function prototypePayloadIntegrityIssues(content: PrototypeContentDto) {
+  const stored = storedCompatibilityIssues(content)
+  if (stored.length > 0) return stored
+  return storedCompatibilityIssues(normalizePrototypeContent(content))
+}
+
+export function prototypeVisibleViewport(
+  breakpoint: Pick<PrototypeBreakpointDto, 'name' | 'viewportWidth' | 'viewportHeight'>,
+) {
+  const fallback = defaultBreakpointViewport(breakpoint.name)
+  return {
+    width: visibleViewportDimension(breakpoint.viewportWidth, fallback.width),
+    height: visibleViewportDimension(breakpoint.viewportHeight, fallback.height),
+  }
 }
 
 export function addPrototypeState(
@@ -530,8 +955,8 @@ function normalizedBreakpoint(breakpoint: PrototypeBreakpointDto): PrototypeBrea
     name: breakpoint.name.trim(),
     minWidth,
     ...(maxWidth === undefined ? { maxWidth: undefined } : { maxWidth }),
-    viewportWidth: Math.max(1, finiteNonNegative(breakpoint.viewportWidth)),
-    viewportHeight: Math.max(1, finiteNonNegative(breakpoint.viewportHeight)),
+    viewportWidth: finiteNonNegative(breakpoint.viewportWidth),
+    viewportHeight: finiteNonNegative(breakpoint.viewportHeight),
   }
 }
 
@@ -568,16 +993,47 @@ function objectValue(value: unknown): Record<string, unknown> {
   return isObjectValue(value) ? value : {}
 }
 
-function objectArrayValue(value: unknown): Record<string, unknown>[] {
-  return Array.isArray(value) ? value.filter(isObjectValue) : []
+function objectArrayValue(
+  value: unknown,
+  path: string,
+  issues: string[],
+): { value: Record<string, unknown>; path: string }[] {
+  if (value === undefined) return []
+  if (!Array.isArray(value)) {
+    issues.push(`Prototype data at ${path} must be an array of objects.`)
+    return []
+  }
+  return value.flatMap((item, index) => {
+    const itemPath = `${path}[${index + 1}]`
+    if (isObjectValue(item)) return [{ value: item, path: itemPath }]
+    issues.push(`Prototype data at ${itemPath} must be an object.`)
+    return []
+  })
 }
 
-function jsonObjectValue(value: unknown): JsonObject {
-  return objectValue(value) as JsonObject
+function jsonObjectValue(value: unknown, path: string, issues: string[]): JsonObject {
+  return objectFieldValue(value, path, issues) as JsonObject
 }
 
-function stringArrayValue(value: unknown): string[] {
-  return Array.isArray(value) ? value.map(textValue).filter(Boolean) : []
+function objectFieldValue(value: unknown, path: string, issues: string[]) {
+  if (value === undefined) return {}
+  if (isObjectValue(value)) return value
+  issues.push(`Prototype data at ${path} must be an object.`)
+  return {}
+}
+
+function stringArrayValue(value: unknown, path: string, issues: string[]): string[] {
+  if (value === undefined) return []
+  if (!Array.isArray(value)) {
+    issues.push(`Prototype data at ${path} must be an array of non-empty strings.`)
+    return []
+  }
+  return value.flatMap((item, index) => {
+    const normalized = textValue(item)
+    if (normalized) return [normalized]
+    issues.push(`Prototype data at ${path}[${index + 1}] must be a non-empty string.`)
+    return []
+  })
 }
 
 function textValue(value: unknown) {
@@ -588,8 +1044,122 @@ function hasFiniteNumber(value: unknown): value is number {
   return typeof value === 'number' && Number.isFinite(value)
 }
 
-function numericValue(value: unknown, fallback: number) {
-  return hasFiniteNumber(value) ? Math.max(0, Math.round(value)) : fallback
+function booleanFieldValue(
+  source: Record<string, unknown>,
+  field: string,
+  fallback: boolean,
+  path: string,
+  issues: string[],
+) {
+  const value = source[field]
+  if (!hasOwn(source, field) || value === undefined) return fallback
+  if (typeof value === 'boolean') return value
+  issues.push(`Prototype data at ${path} must be a boolean.`)
+  return fallback
+}
+
+function requiredStringFieldValue(
+  source: Record<string, unknown>,
+  field: string,
+  fallback: string,
+  path: string,
+  issues: string[],
+) {
+  if (!hasOwn(source, field) || source[field] === undefined) return fallback
+  const normalized = textValue(source[field])
+  if (normalized) return normalized
+  issues.push(`Prototype data at ${path} must be a non-empty string.`)
+  return ''
+}
+
+function canonicalStringWithLegacyFallback(
+  canonicalSource: Record<string, unknown>,
+  canonicalField: string,
+  legacySource: Record<string, unknown>,
+  legacyField: string,
+  canonicalPath: string,
+  legacyPath: string,
+  issues: string[],
+  allowLegacy: boolean,
+) {
+  if (hasOwn(canonicalSource, canonicalField)) {
+    return requiredStringFieldValue(
+      canonicalSource,
+      canonicalField,
+      '',
+      canonicalPath,
+      issues,
+    )
+  }
+  return allowLegacy
+    ? requiredStringFieldValue(legacySource, legacyField, '', legacyPath, issues)
+    : ''
+}
+
+function nonNegativeIntegerField(
+  source: Record<string, unknown>,
+  field: string,
+  fallback: number,
+  path: string,
+  issues: string[],
+) {
+  const value = source[field]
+  if (!hasOwn(source, field) || value === undefined) return fallback
+  if (hasFiniteNumber(value) && Number.isInteger(value) && value >= 0) return value
+  issues.push(`Prototype data at ${path} must be a nonnegative integer.`)
+  return fallback
+}
+
+function optionalNonNegativeIntegerField(
+  source: Record<string, unknown>,
+  field: string,
+  path: string,
+  issues: string[],
+) {
+  const value = source[field]
+  if (!hasOwn(source, field) || value === undefined) return undefined
+  if (hasFiniteNumber(value) && Number.isInteger(value) && value >= 0) return value
+  issues.push(`Prototype data at ${path} must be a nonnegative integer.`)
+  return undefined
+}
+
+function optionalStringFieldValue(
+  source: Record<string, unknown>,
+  field: string,
+  path: string,
+  issues: string[],
+) {
+  const value = source[field]
+  if (!hasOwn(source, field) || value === undefined || value === null) return ''
+  const normalized = textValue(value)
+  if (normalized) return normalized
+  issues.push(`Prototype data at ${path} must be null or a non-empty string.`)
+  return ''
+}
+
+function normalizedViewportDimension(
+  source: Record<string, unknown>,
+  field: string,
+  legacyField: string,
+  value: unknown,
+  legacyValue: unknown,
+  fallback: number,
+  path: string,
+  issues: string[],
+) {
+  if (hasFiniteNumber(value)) return value
+  if (hasOwn(source, field) && value !== undefined) {
+    issues.push(`Prototype data at ${path} must be a finite number.`)
+  }
+  if (hasFiniteNumber(legacyValue)) return legacyValue
+  if (hasOwn(source, legacyField) && legacyValue !== undefined) {
+    issues.push(`Prototype data at ${path.replace(field, legacyField)} must be a finite number.`)
+  }
+  return fallback
+}
+
+function visibleViewportDimension(value: number, fallback: number) {
+  return Number.isFinite(value) && value >= 240 ? Math.round(value) : fallback
 }
 
 function defaultBreakpointMinWidth(name: string) {
@@ -597,6 +1167,15 @@ function defaultBreakpointMinWidth(name: string) {
   case 'desktop': return 1024
   case 'tablet': return 768
   default: return 0
+  }
+}
+
+function defaultBreakpointViewport(name: string) {
+  switch (name.trim().toLowerCase()) {
+  case 'desktop': return { width: 1440, height: 900 }
+  case 'tablet': return { width: 768, height: 1024 }
+  case 'mobile': return { width: 390, height: 844 }
+  default: return { width: 1440, height: 900 }
   }
 }
 
@@ -612,21 +1191,149 @@ function prototypeLayerKind(value: unknown): PrototypeLayerKind {
   case 'heading':
   case 'label':
   case 'paragraph': return 'text'
-  default: return 'group'
+  default: return kind as PrototypeLayerKind
   }
 }
 
-function layerCollectionValue(primary: unknown, legacy: unknown): [string, Record<string, unknown>][] {
-  const value = primary ?? legacy
+function layerCollectionValue(
+  value: unknown,
+  path: string,
+  issues: string[],
+): { entries: [string, Record<string, unknown>, string][]; useFallback: boolean } {
+  if (value === undefined || value === null) return { entries: [], useFallback: true }
   if (Array.isArray(value)) {
-    return value.filter(isObjectValue).map((layer) => [
-      textValue(layer.id) || textValue(layer.layerId),
-      layer,
-    ])
+    if (value.length === 0) return { entries: [], useFallback: true }
+    return { entries: value.map((item, index) => {
+      if (!isObjectValue(item)) {
+        const id = invalidLayerEntryId(index)
+        const itemPath = `${path}[${index + 1}]`
+        issues.push(`Prototype data at ${itemPath} must be an object.`)
+        return [id, invalidLayerPlaceholder(id, index), itemPath]
+      }
+      const layer = item
+      const itemPath = `${path}[${index + 1}]`
+      const canonicalPresent = hasOwn(layer, 'id')
+      const legacyPresent = hasOwn(layer, 'layerId')
+      const id = canonicalPresent
+        ? requiredStringFieldValue(layer, 'id', '', `${itemPath}.id`, issues)
+        : requiredStringFieldValue(layer, 'layerId', '', `${itemPath}.layerId`, issues)
+      if (id) return [id, layer, itemPath]
+      const placeholderId = invalidLayerEntryId(index)
+      if (!canonicalPresent && !legacyPresent) {
+        issues.push(`Prototype layer at ${itemPath} must have a stable ID.`)
+      }
+      return [placeholderId, { ...layer, id: placeholderId }, itemPath]
+    }), useFallback: false }
   }
-  return Object.entries(objectValue(value)).flatMap(([id, layer]) =>
-    isObjectValue(layer) ? [[id, layer]] : [],
-  )
+  if (isObjectValue(value)) {
+    const records = Object.entries(value)
+    if (records.length === 0) return { entries: [], useFallback: true }
+    return { entries: records.map(([recordId, item], index) => {
+      const normalizedRecordId = textValue(recordId)
+      if (!isObjectValue(item)) {
+        const id = invalidLayerEntryId(index, normalizedRecordId)
+        const itemPath = `${path}.${recordId || '(empty key)'}`
+        issues.push(`Prototype data at ${itemPath} must be an object.`)
+        return [id, invalidLayerPlaceholder(id, index), itemPath]
+      }
+      const itemPath = `${path}.${recordId || '(empty key)'}`
+      const canonicalId = hasOwn(item, 'id')
+        ? requiredStringFieldValue(item, 'id', '', `${itemPath}.id`, issues)
+        : ''
+      const legacyId = hasOwn(item, 'layerId')
+        ? requiredStringFieldValue(item, 'layerId', '', `${itemPath}.layerId`, issues)
+        : ''
+      const embeddedId = hasOwn(item, 'id') ? canonicalId : legacyId
+      const id = embeddedId || normalizedRecordId
+      if (!id) {
+        const placeholderId = invalidLayerEntryId(index)
+        issues.push(`Prototype layer at ${itemPath} must have a stable ID.`)
+        return [placeholderId, { ...item, id: placeholderId }, itemPath]
+      }
+      for (const explicitId of [canonicalId, legacyId]) {
+        if (explicitId && normalizedRecordId && explicitId !== normalizedRecordId) {
+          issues.push(`Prototype layer record ${path}.${recordId} does not match embedded ID ${explicitId}.`)
+        }
+      }
+      return [recordId, item, itemPath]
+    }), useFallback: false }
+  }
+  const id = invalidLayerEntryId(0)
+  issues.push(`Prototype data at ${path} must be an array or object layer collection.`)
+  return { entries: [[id, invalidLayerPlaceholder(id, 0), path]], useFallback: false }
+}
+
+function invalidLayerEntryId(index: number, sourceId = '') {
+  return `${INVALID_LAYER_ENTRY_ID_PREFIX}${index + 1}${sourceId ? `__${sourceId}` : ''}`
+}
+
+function invalidLayerPlaceholder(id: string, index: number): Record<string, unknown> {
+  return {
+    id,
+    childIds: [],
+    name: `Invalid layer ${index + 1}`,
+    layout: {},
+    style: {},
+    properties: {},
+  }
+}
+
+function compatibilityIssueValues(value: unknown) {
+  return Array.isArray(value)
+    ? value.filter((issue): issue is string => typeof issue === 'string' && issue.trim() !== '')
+    : []
+}
+
+function storedCompatibilityIssues(content: PrototypeContentDto) {
+  const raw = content as PrototypeContentWithCompatibilityIssues
+  return uniqueStrings(compatibilityIssueValues(raw.__prototypeCompatibilityIssues))
+}
+
+function nonNegativeIntegerValue(value: unknown) {
+  return typeof value === 'number' && Number.isInteger(value) && value >= 0
+}
+
+function positiveIntegerValue(value: unknown) {
+  return typeof value === 'number' && Number.isInteger(value) && value > 0
+}
+
+function canonicalSha256Hash(value: unknown) {
+  return typeof value === 'string' && /^(?:sha256:)?[a-f\d]{64}$/i.test(value.trim())
+}
+
+function hasPrototypeLayerCycle(layers: Readonly<Record<string, PrototypeLayerDto>>) {
+  const visiting = new Set<string>()
+  const visited = new Set<string>()
+  const visit = (id: string): boolean => {
+    if (visiting.has(id)) return true
+    if (visited.has(id) || !layers[id]) return false
+    visiting.add(id)
+    for (const childId of arrayValue(layers[id].childIds)) {
+      if (layers[childId] && visit(childId)) return true
+    }
+    visiting.delete(id)
+    visited.add(id)
+    return false
+  }
+  return Object.keys(layers).some(visit)
+}
+
+function hasOwn(value: object, key: string) {
+  return Object.prototype.hasOwnProperty.call(value, key)
+}
+
+function duplicateLayerId(sourceId: string, index: number, existing: ReadonlySet<string>) {
+  const base = `${INVALID_DUPLICATE_LAYER_ID_PREFIX}${index + 1}__${sourceId}`
+  let id = base
+  let suffix = 1
+  while (existing.has(id)) id = `${base}__${++suffix}`
+  return id
+}
+
+function duplicateLayerSourceId(id: string) {
+  if (!id.startsWith(INVALID_DUPLICATE_LAYER_ID_PREFIX)) return id
+  const marker = id.indexOf('__', INVALID_DUPLICATE_LAYER_ID_PREFIX.length)
+  return marker < 0 ? id : id.slice(marker + 2)
 }
 
 function recordValue<T>(value: Readonly<Record<string, T>> | null | undefined) {

@@ -687,7 +687,14 @@ func TestArtifactRevisionFreezesAppliedOutputProposalIdentity(t *testing.T) {
 	ctx := context.Background()
 	store, artifacts, projectID, userID := newArtifactLineageFixture(t, database)
 	created, err := artifacts.Create(ctx, projectID.String(), userID.String(), CreateArtifactInput{
-		Kind: "product_requirements", Title: "Requirements", Content: json.RawMessage(`{"title":"Before"}`),
+		Kind: "product_requirements", Title: "Requirements", Content: json.RawMessage(`{
+  "summary":"Before",
+  "blocks":[{
+    "id":"requirement-1","type":"requirement","requirementId":"REQ-1",
+    "priority":"must","text":"Keep Proposal lineage immutable.",
+    "acceptanceCriteria":[{"id":"AC-1","statement":"The revision freezes the applied Proposal identity."}]
+  }]
+}`),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -715,13 +722,13 @@ func TestArtifactRevisionFreezesAppliedOutputProposalIdentity(t *testing.T) {
 	}
 	proposal, err := proposals.CreateProposal(ctx, projectID.String(), userID.String(), CreateProposalInput{
 		ManifestID: manifest.ID, ArtifactID: created.Artifact.ID,
-		Operations: []domain.ProposalOperation{{ID: "title", Kind: domain.OperationReplace, Path: "/title", Value: json.RawMessage(`"After"`)}},
+		Operations: []domain.ProposalOperation{{ID: "summary", Kind: domain.OperationReplace, Path: "/summary", Value: json.RawMessage(`"After"`)}},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	proposal, err = proposals.Decide(ctx, proposal.ID, userID.String(), DecideProposalInput{
-		OperationID: "title", Decision: domain.DecisionAccepted, Version: proposal.Version,
+		OperationID: "summary", Decision: domain.DecisionAccepted, Version: proposal.Version,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -746,7 +753,7 @@ func TestArtifactRevisionFreezesAppliedOutputProposalIdentity(t *testing.T) {
 	}
 }
 
-func TestPrototypeRevisionAcceptsAppliedProposalFromPageSpecReviewOutput(t *testing.T) {
+func TestPrototypeProposalApplyCanonicalizesLegacyContentFromPageSpecReviewOutput(t *testing.T) {
 	database, cleanup := baselinePostgresDatabase(t)
 	defer cleanup()
 
@@ -802,7 +809,7 @@ func TestPrototypeRevisionAcceptsAppliedProposalFromPageSpecReviewOutput(t *test
 	proposal, err := proposals.CreateProposal(ctx, projectID.String(), userID.String(), CreateProposalInput{
 		ManifestID: manifest.ID, ArtifactID: created.Artifact.ID,
 		Operations: []domain.ProposalOperation{{
-			ID: "replace-prototype", Kind: domain.OperationReplace, Value: prototypeLineageCoveragePayload(t, pageSpecRef),
+			ID: "replace-prototype", Kind: domain.OperationReplace, Value: prototypeLegacyLineageCoveragePayload(t, pageSpecRef),
 		}},
 	})
 	if err != nil {
@@ -814,10 +821,102 @@ func TestPrototypeRevisionAcceptsAppliedProposalFromPageSpecReviewOutput(t *test
 	if err != nil {
 		t.Fatal(err)
 	}
-	draft, err := proposals.Apply(ctx, proposal.ID, userID.String(), ApplyProposalInput{Version: proposal.Version})
+	var dirtyContent map[string]any
+	if err := json.Unmarshal(prototypeLineagePayload(t, pageSpecRef, false), &dirtyContent); err != nil {
+		t.Fatal(err)
+	}
+	dirtyContent["manualDraftNote"] = "discard only after explicit confirmation"
+	dirtyPayload, err := json.Marshal(dirtyContent)
 	if err != nil {
 		t.Fatal(err)
 	}
+	dirtyDraft, err := artifacts.UpdateDraft(
+		ctx, created.Draft.ID, userID.String(), created.Draft.ETag,
+		UpdateDraftInput{Content: dirtyPayload},
+	)
+	if err != nil {
+		t.Fatalf("create divergent working draft: %v", err)
+	}
+	if _, err := proposals.Apply(
+		ctx, proposal.ID, userID.String(), ApplyProposalInput{Version: proposal.Version},
+	); !errors.Is(err, ErrProposalStale) {
+		t.Fatalf("Proposal silently discarded an unrevisioned draft without confirmation: %v", err)
+	}
+	if _, err := proposals.Apply(ctx, proposal.ID, userID.String(), ApplyProposalInput{
+		Version: proposal.Version, DiscardUnrevisionedChanges: true,
+	}); !errors.Is(err, ErrInvalidInput) {
+		t.Fatalf("Proposal replacement did not require the exact confirmed draft identity: %v", err)
+	}
+	dirtyContent["manualDraftNote"] = "saved after the confirmation snapshot"
+	dirtyPayload, err = json.Marshal(dirtyContent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	latestDirtyDraft, err := artifacts.UpdateDraft(
+		ctx, dirtyDraft.ID, userID.String(), dirtyDraft.ETag,
+		UpdateDraftInput{Content: dirtyPayload},
+	)
+	if err != nil {
+		t.Fatalf("save a concurrent draft update: %v", err)
+	}
+	if _, err := proposals.Apply(ctx, proposal.ID, userID.String(), ApplyProposalInput{
+		Version: proposal.Version, DiscardUnrevisionedChanges: true,
+		ExpectedDraftID: dirtyDraft.ID, ExpectedDraftETag: dirtyDraft.ETag,
+		ExpectedDraftContentHash: dirtyDraft.ContentHash,
+	}); !errors.Is(err, ErrConflict) {
+		t.Fatalf("Proposal replacement overwrote a draft saved after confirmation: %v", err)
+	}
+	draft, err := proposals.Apply(ctx, proposal.ID, userID.String(), ApplyProposalInput{
+		Version: proposal.Version, DiscardUnrevisionedChanges: true,
+		ExpectedDraftID: latestDirtyDraft.ID, ExpectedDraftETag: latestDirtyDraft.ETag,
+		ExpectedDraftContentHash: latestDirtyDraft.ContentHash,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertCanonicalizedLegacyPrototype(t, draft.Content)
+	var appliedContent map[string]any
+	if err := json.Unmarshal(draft.Content, &appliedContent); err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := appliedContent["manualDraftNote"]; exists {
+		t.Fatal("explicit Proposal replacement retained the discarded draft-only field")
+	}
+	var audit storage.AuditEventModel
+	if err := database.Where(
+		"action = ? AND target_type = ? AND target_id = ?",
+		"proposal.applied", "output_proposal", proposal.ID,
+	).Order("created_at DESC").Take(&audit).Error; err != nil {
+		t.Fatal(err)
+	}
+	var auditMetadata map[string]any
+	if err := json.Unmarshal(audit.Metadata, &auditMetadata); err != nil {
+		t.Fatal(err)
+	}
+	if auditMetadata["discardedUnrevisionedChanges"] != true {
+		t.Fatalf("Proposal audit did not record the explicit draft replacement: %#v", auditMetadata)
+	}
+	if auditMetadata["discardedDraftId"] != latestDirtyDraft.ID ||
+		auditMetadata["discardedDraftEtag"] != latestDirtyDraft.ETag ||
+		auditMetadata["discardedDraftContentHash"] != latestDirtyDraft.ContentHash ||
+		auditMetadata["discardedDraftUpdatedBy"] != latestDirtyDraft.UpdatedBy ||
+		auditMetadata["discardedDraftSequence"] != float64(latestDirtyDraft.Sequence) {
+		t.Fatalf("Proposal audit did not freeze the discarded draft identity: %#v", auditMetadata)
+	}
+	if auditMetadata["canonicalizationContract"] != "prototype-proposal-v1" ||
+		auditMetadata["reviewedPatchedContentHash"] == "" ||
+		auditMetadata["appliedContentHash"] != draft.ContentHash {
+		t.Fatalf("Proposal audit did not record the reviewed-to-canonical transform: %#v", auditMetadata)
+	}
+	var persistedDraft storage.ArtifactDraftModel
+	if err := database.Where("id = ?", uuid.MustParse(draft.ID)).Take(&persistedDraft).Error; err != nil {
+		t.Fatal(err)
+	}
+	storedDraft, err := store.Get(ctx, persistedDraft.ContentRef, persistedDraft.ContentHash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertCanonicalizedLegacyPrototype(t, storedDraft.Payload)
 	if len(draft.SourceVersions) != 1 || draft.SourceVersions[0].Purpose != "workflow_node:custom-page-review" {
 		t.Fatalf("Proposal apply did not preserve the frozen PageSpec review source: %#v", draft.SourceVersions)
 	}
@@ -1066,6 +1165,114 @@ func prototypeLineageCoveragePayload(t *testing.T, pageSpec VersionRef) json.Raw
 	return payload
 }
 
+func prototypeLegacyLineageCoveragePayload(t *testing.T, pageSpec VersionRef) json.RawMessage {
+	t.Helper()
+	var content map[string]any
+	if err := json.Unmarshal(prototypeLineageCoveragePayload(t, pageSpec), &content); err != nil {
+		t.Fatal(err)
+	}
+	for _, item := range content["breakpoints"].([]any) {
+		breakpoint := item.(map[string]any)
+		name := firstString(breakpoint, "name")
+		breakpoint["key"] = name
+		breakpoint["title"] = strings.ToUpper(name[:1]) + name[1:]
+		breakpoint["width"] = breakpoint["viewportWidth"]
+		breakpoint["height"] = breakpoint["viewportHeight"]
+		breakpoint["legacyScale"] = "preserved"
+		delete(breakpoint, "name")
+		delete(breakpoint, "minWidth")
+		delete(breakpoint, "maxWidth")
+		delete(breakpoint, "viewportWidth")
+		delete(breakpoint, "viewportHeight")
+	}
+	layer := content["layers"].(map[string]any)["layer-orders"].(map[string]any)
+	layer["type"] = "screen"
+	layer["props"] = map[string]any{"role": "main", "legacyCopy": "preserved"}
+	layer["legacyPluginField"] = "preserved"
+	for _, field := range []string{
+		"kind", "layout", "style", "properties", "requirementIds",
+		"acceptanceCriterionIds", "fieldMetadata",
+	} {
+		delete(layer, field)
+	}
+	for _, item := range content["frames"].([]any) {
+		delete(item.(map[string]any), "title")
+	}
+	for _, field := range []string{"overrides", "tokenBindings", "componentBindings", "assets", "traceLinks"} {
+		delete(content, field)
+	}
+	content["legacyExtension"] = map[string]any{"preserved": true}
+	payload, err := json.Marshal(content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return payload
+}
+
+func assertCanonicalizedLegacyPrototype(t *testing.T, payload json.RawMessage) {
+	t.Helper()
+	if report := ValidateArtifactContent("prototype", payload); !report.Valid {
+		t.Fatalf("persisted legacy Prototype was not canonical: %#v", report.Findings)
+	}
+	var content map[string]any
+	if err := json.Unmarshal(payload, &content); err != nil {
+		t.Fatal(err)
+	}
+	if len(content["states"].([]any)) != 4 || len(content["frames"].([]any)) != 12 ||
+		len(content["layers"].(map[string]any)) != 1 {
+		t.Fatal("Prototype compatibility migration invented or discarded semantic states, frames, or layers")
+	}
+	for _, field := range []string{"overrides", "tokenBindings", "componentBindings", "assets", "traceLinks"} {
+		if collection, ok := content[field].([]any); !ok || len(collection) != 0 {
+			t.Fatalf("canonical auxiliary collection %s was not persisted as an empty array: %#v", field, content[field])
+		}
+	}
+	breakpoint := content["breakpoints"].([]any)[0].(map[string]any)
+	if breakpoint["id"] != "breakpoint-desktop" || breakpoint["name"] != "Desktop" ||
+		breakpoint["minWidth"] != float64(1024) || breakpoint["viewportWidth"] != float64(1440) ||
+		breakpoint["viewportHeight"] != float64(900) || breakpoint["key"] != "desktop" ||
+		breakpoint["legacyScale"] != "preserved" {
+		t.Fatalf("legacy breakpoint was not canonicalized while preserving aliases: %#v", breakpoint)
+	}
+	layer := content["layers"].(map[string]any)["layer-orders"].(map[string]any)
+	properties := layer["properties"].(map[string]any)
+	if layer["kind"] != "frame" || layer["name"] != "Orders" || properties["role"] != "main" ||
+		properties["legacyCopy"] != "preserved" || layer["legacyPluginField"] != "preserved" {
+		t.Fatalf("legacy layer aliases or unknown fields were not preserved canonically: %#v", layer)
+	}
+	for _, field := range []string{"layout", "style", "fieldMetadata"} {
+		if _, ok := layer[field].(map[string]any); !ok {
+			t.Fatalf("canonical layer object %s is missing: %#v", field, layer[field])
+		}
+	}
+	layout := layer["layout"].(map[string]any)
+	if _, validX := nonNegativeInteger(layout["x"]); !validX {
+		t.Fatalf("legacy layer did not receive a renderable x coordinate: %#v", layout)
+	}
+	if _, validY := nonNegativeInteger(layout["y"]); !validY {
+		t.Fatalf("legacy layer did not receive a renderable y coordinate: %#v", layout)
+	}
+	if _, validWidth := positiveInteger(layout["width"]); !validWidth {
+		t.Fatalf("legacy layer did not receive a renderable width: %#v", layout)
+	}
+	if _, validHeight := positiveInteger(layout["height"]); !validHeight {
+		t.Fatalf("legacy layer did not receive a renderable height: %#v", layout)
+	}
+	for _, field := range []string{"childIds", "requirementIds", "acceptanceCriterionIds"} {
+		if _, ok := layer[field].([]any); !ok {
+			t.Fatalf("canonical layer array %s is missing: %#v", field, layer[field])
+		}
+	}
+	frame := content["frames"].([]any)[0].(map[string]any)
+	if frame["title"] != "Ready · Desktop" {
+		t.Fatalf("legacy frame title was not derived deterministically: %#v", frame)
+	}
+	legacyExtension, ok := content["legacyExtension"].(map[string]any)
+	if !ok || legacyExtension["preserved"] != true {
+		t.Fatalf("unknown top-level fields were discarded: %#v", content["legacyExtension"])
+	}
+}
+
 func prototypeLineageFrames() []any {
 	frames := make([]any, 0, 12)
 	for _, stateID := range []string{"state-ready", "state-loading", "state-empty", "state-error"} {
@@ -1096,7 +1303,7 @@ func prototypeLineageReviewIncompletePayload(t *testing.T, pageSpec VersionRef) 
 		"layers": map[string]any{
 			"layer-root": map[string]any{
 				"id": "layer-root", "childIds": []any{}, "kind": "frame", "name": "Page",
-				"layout": map[string]any{}, "style": map[string]any{}, "properties": map[string]any{},
+				"layout": map[string]any{"x": 0, "y": 0, "width": 1440, "height": 900}, "style": map[string]any{}, "properties": map[string]any{},
 				"requirementIds": []any{}, "acceptanceCriterionIds": []any{}, "fieldMetadata": map[string]any{},
 			},
 		},

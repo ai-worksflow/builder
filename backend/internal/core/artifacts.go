@@ -607,8 +607,8 @@ func (s *ArtifactService) UpdateDraft(ctx context.Context, draftID, actorID, exp
 		return ArtifactDraft{}, fmt.Errorf("%w: actor id", ErrInvalidInput)
 	}
 	now := s.now().UTC()
-	nextSequence := current.Sequence + 1
-	nextETag := draftETag(draftUUID, nextSequence, contentRef.ContentHash)
+	var nextSequence uint64
+	var nextETag string
 	replacementSources := existingSources
 	if input.SourceVersions != nil {
 		replacementSources, err = s.validateSourceModels(ctx, projectUUID, draftUUID, actorUUID, input.SourceVersions)
@@ -617,6 +617,37 @@ func (s *ArtifactService) UpdateDraft(ctx context.Context, draftID, actorID, exp
 		}
 	}
 	err = s.database.WithContext(ctx).Transaction(func(transaction *gorm.DB) error {
+		// Keep every draft mutation on the same lock order used by Proposal Apply
+		// and revision creation: artifact first, then its active draft. Without
+		// this lock, autosave could hold the draft while Apply held the artifact
+		// and PostgreSQL would have to break the cycle with a 40P01 deadlock.
+		var lockedArtifact storage.ArtifactModel
+		if err := transaction.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("id = ?", current.ArtifactID).Take(&lockedArtifact).Error; err != nil {
+			return err
+		}
+		if lockedArtifact.ProjectID != projectUUID || lockedArtifact.Kind != artifact.Kind {
+			return ErrConflict
+		}
+		if err := ensureGenericArtifactMutationAllowed(lockedArtifact.Kind); err != nil {
+			return err
+		}
+		if lockedArtifact.LatestDraftID == nil || *lockedArtifact.LatestDraftID != draftUUID {
+			return ErrConflict
+		}
+		var lockedDraft storage.ArtifactDraftModel
+		if err := transaction.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("id = ? AND artifact_id = ?", draftUUID, lockedArtifact.ID).Take(&lockedDraft).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return ErrConflict
+			}
+			return err
+		}
+		if expectedETag == "" || lockedDraft.ETag != expectedETag || lockedDraft.Status != "draft" {
+			return ErrConflict
+		}
+		nextSequence = lockedDraft.Sequence + 1
+		nextETag = draftETag(draftUUID, nextSequence, contentRef.ContentHash)
 		result := transaction.Model(&storage.ArtifactDraftModel{}).
 			Where("id = ? AND etag = ? AND status = 'draft'", draftUUID, expectedETag).
 			Updates(map[string]any{
@@ -630,6 +661,7 @@ func (s *ArtifactService) UpdateDraft(ctx context.Context, draftID, actorID, exp
 		if result.RowsAffected != 1 {
 			return ErrConflict
 		}
+		current = lockedDraft
 		if input.SourceVersions != nil {
 			if err := transaction.Where("draft_id = ?", draftUUID).Delete(&storage.ArtifactDraftSourceModel{}).Error; err != nil {
 				return err

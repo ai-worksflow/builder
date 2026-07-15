@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -59,7 +60,11 @@ type DecideProposalInput struct {
 }
 
 type ApplyProposalInput struct {
-	Version uint64 `json:"version"`
+	Version                    uint64 `json:"version"`
+	DiscardUnrevisionedChanges bool   `json:"discardUnrevisionedChanges,omitempty"`
+	ExpectedDraftID            string `json:"expectedDraftId,omitempty"`
+	ExpectedDraftETag          string `json:"expectedDraftEtag,omitempty"`
+	ExpectedDraftContentHash   string `json:"expectedDraftContentHash,omitempty"`
 }
 
 type ProposalService struct {
@@ -148,8 +153,19 @@ func ensureExactCleanProposalDraft(
 	draft storage.ArtifactDraftModel,
 	base storage.ArtifactRevisionModel,
 ) error {
+	if draft.ContentHash != base.ContentHash {
+		return ErrProposalStale
+	}
+	return ensureProposalDraftLineage(database, draft, base)
+}
+
+func ensureProposalDraftLineage(
+	database *gorm.DB,
+	draft storage.ArtifactDraftModel,
+	base storage.ArtifactRevisionModel,
+) error {
 	if draft.ArtifactID != base.ArtifactID || draft.BaseRevisionID == nil || *draft.BaseRevisionID != base.ID ||
-		draft.Status != "draft" || draft.SchemaVersion != base.SchemaVersion || draft.ContentHash != base.ContentHash {
+		draft.Status != "draft" || draft.SchemaVersion != base.SchemaVersion {
 		return ErrProposalStale
 	}
 	var draftSources []storage.ArtifactDraftSourceModel
@@ -182,12 +198,205 @@ func ensureExactCleanProposalDraft(
 	return nil
 }
 
+func ensureExpectedDiscardDraft(input ApplyProposalInput, draft storage.ArtifactDraftModel) error {
+	if strings.TrimSpace(input.ExpectedDraftID) == "" || input.ExpectedDraftETag == "" ||
+		strings.TrimSpace(input.ExpectedDraftContentHash) == "" {
+		return fmt.Errorf("%w: expected draft identity is required when discarding unrevisioned changes", ErrInvalidInput)
+	}
+	if draft.ID.String() != strings.TrimSpace(input.ExpectedDraftID) || draft.ETag != input.ExpectedDraftETag ||
+		draft.ContentHash != strings.TrimSpace(input.ExpectedDraftContentHash) {
+		return ErrConflict
+	}
+	return nil
+}
+
+func ensureNoOtherAppliedProposalOnDraft(
+	database *gorm.DB,
+	draftID uuid.UUID,
+	proposalID uuid.UUID,
+	baseRevisionID uuid.UUID,
+) error {
+	var count int64
+	// A draft ID is intentionally reused across revision rounds. Immutable
+	// revision ancestry is the authority for whether an older applied Proposal
+	// has already been frozen; timestamps cannot prove that relationship and
+	// excluding only the direct base Proposal would make still older rounds
+	// block forever.
+	if err := database.Raw(`
+WITH RECURSIVE base_history AS (
+  SELECT id, artifact_id, parent_revision_id, proposal_id
+  FROM artifact_revisions
+  WHERE id = ?
+  UNION
+  SELECT parent.id, parent.artifact_id, parent.parent_revision_id, parent.proposal_id
+  FROM artifact_revisions AS parent
+  JOIN base_history AS child
+    ON child.parent_revision_id = parent.id
+   AND child.artifact_id = parent.artifact_id
+)
+SELECT count(*)
+FROM output_proposals AS proposal
+WHERE proposal.base_draft_id = ?
+  AND proposal.id <> ?
+  AND proposal.status IN ('applied', 'partially_applied')
+  AND NOT EXISTS (
+    SELECT 1
+    FROM base_history
+    WHERE base_history.proposal_id = proposal.id
+  )
+`, baseRevisionID, draftID, proposalID).Scan(&count).Error; err != nil {
+		return err
+	}
+	if count > 0 {
+		return fmt.Errorf("%w: draft already contains another applied proposal", ErrConflict)
+	}
+	return nil
+}
+
+func proposalPayloadHash(payload json.RawMessage) string {
+	digest := sha256.Sum256(payload)
+	return fmt.Sprintf("sha256:%x", digest)
+}
+
 func proposalDraftSourceKey(source storage.ArtifactDraftSourceModel) string {
 	return source.SourceArtifactID.String() + "\x00" + source.SourceRevisionID.String() + "\x00" + source.Purpose
 }
 
 func proposalRevisionSourceKey(source storage.ArtifactRevisionSourceModel) string {
 	return source.SourceArtifactID.String() + "\x00" + source.SourceRevisionID.String() + "\x00" + source.Purpose
+}
+
+// lockProposalApplyLineage freezes the target and every immutable source that
+// can influence the patched draft before the transaction-local lineage check.
+// It deliberately follows the approval lock protocol: all artifacts in UUID
+// order, then all revisions in UUID order, then all health rows in UUID order.
+// Including the target artifact and base revision in the same sorted sets
+// avoids acquiring the target ahead of a source that another approval already
+// treats as part of one closure.
+func lockProposalApplyLineage(
+	ctx context.Context,
+	transaction *gorm.DB,
+	projectID uuid.UUID,
+	targetArtifactID uuid.UUID,
+	baseRevisionID uuid.UUID,
+	sources []storage.ArtifactDraftSourceModel,
+) (artifactApprovalLocks, error) {
+	revisionArtifacts := map[uuid.UUID]uuid.UUID{baseRevisionID: targetArtifactID}
+	frontier := make([]uuid.UUID, 0, len(sources))
+	for _, source := range sources {
+		if artifactID, exists := revisionArtifacts[source.SourceRevisionID]; exists && artifactID != source.SourceArtifactID {
+			return artifactApprovalLocks{}, fmt.Errorf("%w: proposal source revision belongs to conflicting artifacts", ErrBlockingGate)
+		}
+		revisionArtifacts[source.SourceRevisionID] = source.SourceArtifactID
+		frontier = append(frontier, source.SourceRevisionID)
+	}
+
+	visited := make(map[uuid.UUID]struct{})
+	for len(frontier) > 0 {
+		frontier = stableUniqueApprovalUUIDs(frontier)
+		unvisited := frontier[:0]
+		for _, revisionID := range frontier {
+			if _, ok := visited[revisionID]; ok {
+				continue
+			}
+			visited[revisionID] = struct{}{}
+			unvisited = append(unvisited, revisionID)
+		}
+		if len(unvisited) == 0 {
+			break
+		}
+
+		var sourceModels []storage.ArtifactRevisionSourceModel
+		if err := transaction.WithContext(ctx).
+			Where("revision_id IN ?", unvisited).
+			Order("revision_id ASC, source_revision_id ASC, purpose ASC").
+			Find(&sourceModels).Error; err != nil {
+			return artifactApprovalLocks{}, fmt.Errorf("load proposal source closure: %w", err)
+		}
+		next := make([]uuid.UUID, 0, len(sourceModels))
+		for _, source := range sourceModels {
+			if artifactID, exists := revisionArtifacts[source.SourceRevisionID]; exists && artifactID != source.SourceArtifactID {
+				return artifactApprovalLocks{}, fmt.Errorf("%w: proposal source revision belongs to conflicting artifacts", ErrBlockingGate)
+			}
+			revisionArtifacts[source.SourceRevisionID] = source.SourceArtifactID
+			if _, ok := visited[source.SourceRevisionID]; !ok {
+				next = append(next, source.SourceRevisionID)
+			}
+		}
+		if len(revisionArtifacts) > maxApprovalSourceClosureRevisions {
+			return artifactApprovalLocks{}, fmt.Errorf("%w: proposal source closure exceeds %d revisions", ErrBlockingGate, maxApprovalSourceClosureRevisions)
+		}
+		frontier = next
+	}
+
+	artifactSet := make(map[uuid.UUID]struct{}, len(revisionArtifacts))
+	revisionIDs := make([]uuid.UUID, 0, len(revisionArtifacts))
+	for revisionID, artifactID := range revisionArtifacts {
+		artifactSet[artifactID] = struct{}{}
+		revisionIDs = append(revisionIDs, revisionID)
+	}
+	artifactIDs := make([]uuid.UUID, 0, len(artifactSet))
+	for artifactID := range artifactSet {
+		artifactIDs = append(artifactIDs, artifactID)
+	}
+	artifactIDs = stableUniqueApprovalUUIDs(artifactIDs)
+	revisionIDs = stableUniqueApprovalUUIDs(revisionIDs)
+
+	var artifactModels []storage.ArtifactModel
+	if err := transaction.WithContext(ctx).
+		Clauses(clause.Locking{Strength: "UPDATE"}).
+		Where("id IN ?", artifactIDs).
+		Order("id ASC").
+		Find(&artifactModels).Error; err != nil {
+		return artifactApprovalLocks{}, fmt.Errorf("lock proposal source artifacts: %w", err)
+	}
+	if len(artifactModels) != len(artifactIDs) {
+		return artifactApprovalLocks{}, fmt.Errorf("%w: proposal source artifact is missing", ErrBlockingGate)
+	}
+	artifacts := make(map[uuid.UUID]storage.ArtifactModel, len(artifactModels))
+	for _, artifact := range artifactModels {
+		if artifact.ProjectID != projectID {
+			return artifactApprovalLocks{}, fmt.Errorf("%w: proposal source artifact belongs to another project", ErrBlockingGate)
+		}
+		artifacts[artifact.ID] = artifact
+	}
+
+	var revisionModels []storage.ArtifactRevisionModel
+	if err := transaction.WithContext(ctx).
+		Clauses(clause.Locking{Strength: "UPDATE"}).
+		Where("id IN ?", revisionIDs).
+		Order("id ASC").
+		Find(&revisionModels).Error; err != nil {
+		return artifactApprovalLocks{}, fmt.Errorf("lock proposal source revisions: %w", err)
+	}
+	if len(revisionModels) != len(revisionIDs) {
+		return artifactApprovalLocks{}, fmt.Errorf("%w: proposal source revision is missing", ErrBlockingGate)
+	}
+	revisions := make(map[uuid.UUID]storage.ArtifactRevisionModel, len(revisionModels))
+	for _, revision := range revisionModels {
+		if revision.ArtifactID != revisionArtifacts[revision.ID] {
+			return artifactApprovalLocks{}, fmt.Errorf("%w: proposal source revision does not belong to its pinned artifact", ErrBlockingGate)
+		}
+		revisions[revision.ID] = revision
+	}
+
+	var healthModels []storage.ArtifactHealthModel
+	if err := transaction.WithContext(ctx).
+		Clauses(clause.Locking{Strength: "UPDATE"}).
+		Where("artifact_id IN ?", artifactIDs).
+		Order("artifact_id ASC").
+		Find(&healthModels).Error; err != nil {
+		return artifactApprovalLocks{}, fmt.Errorf("lock proposal source health: %w", err)
+	}
+	if len(healthModels) != len(artifactIDs) {
+		return artifactApprovalLocks{}, fmt.Errorf("%w: proposal source health is missing", ErrBlockingGate)
+	}
+	health := make(map[uuid.UUID]storage.ArtifactHealthModel, len(healthModels))
+	for _, model := range healthModels {
+		health[model.ArtifactID] = model
+	}
+
+	return artifactApprovalLocks{artifacts: artifacts, revisions: revisions, health: health}, nil
 }
 
 func (s *ProposalService) CreateManifest(ctx context.Context, projectID, actorID string, input CreateManifestInput) (domain.InputManifest, error) {
@@ -732,26 +941,73 @@ func (s *ProposalService) Apply(ctx context.Context, proposalID, actorID string,
 	if err := ensureGenericArtifactMutationAllowed(artifact.Kind); err != nil {
 		return ArtifactDraft{}, err
 	}
+	discardUnrevisionedChanges := artifact.Kind == "prototype" && input.DiscardUnrevisionedChanges
+	reviewedPatchedContentHash := proposalPayloadHash(patched)
+	patched, err = canonicalizeProposalPatchedContent(artifact.Kind, patched)
+	if err != nil {
+		return ArtifactDraft{}, err
+	}
 	if err := validateProposalPatchedContent(artifact.Kind, patched); err != nil {
 		return ArtifactDraft{}, err
 	}
 	if artifact.LatestRevisionID == nil || *artifact.LatestRevisionID != base.ID {
 		return ArtifactDraft{}, ErrProposalStale
 	}
+	discardedUnrevisionedChanges := false
 	if artifact.LatestDraftID != nil {
 		var draft storage.ArtifactDraftModel
 		if err := s.database.WithContext(ctx).Where("id = ?", *artifact.LatestDraftID).Take(&draft).Error; err != nil {
 			return ArtifactDraft{}, err
 		}
-		if err := ensureExactCleanProposalDraft(s.database.WithContext(ctx), draft, base); err != nil {
+		validateDraft := ensureExactCleanProposalDraft
+		if discardUnrevisionedChanges {
+			validateDraft = ensureProposalDraftLineage
+		}
+		if err := validateDraft(s.database.WithContext(ctx), draft, base); err != nil {
 			return ArtifactDraft{}, err
+		}
+		if discardUnrevisionedChanges {
+			if err := ensureExpectedDiscardDraft(input, draft); err != nil {
+				return ArtifactDraft{}, err
+			}
 		}
 		existingDraft = &draft
 		draftID = draft.ID
 	}
+	sourceInputs := make([]ArtifactSourceInput, 0, len(manifest.Sources))
+	for _, source := range manifest.Sources {
+		anchor := source.Ref.AnchorID
+		var anchorPointer *string
+		if anchor != "" {
+			anchorPointer = &anchor
+		}
+		sourceInputs = append(sourceInputs, ArtifactSourceInput{
+			Ref:     VersionRef{ArtifactID: source.Ref.ArtifactID, RevisionID: source.Ref.RevisionID, ContentHash: source.Ref.ContentHash, AnchorID: anchorPointer},
+			Purpose: source.Purpose, Required: true,
+		})
+	}
+	artifactService := &ArtifactService{database: s.database, contents: s.contents, access: s.access, now: s.now}
+	sourceModels, err := artifactService.validateSourceModels(
+		ctx, proposalModel.ProjectID, draftID, actorUUID, sourceInputs,
+	)
+	if err != nil {
+		return ArtifactDraft{}, err
+	}
+	if err := artifactService.validateArtifactLineage(
+		ctx, s.database.WithContext(ctx), proposalModel.ProjectID, artifact.Kind, patched, sourceInputs,
+	); err != nil {
+		return ArtifactDraft{}, err
+	}
 	draftContentRef, err := s.contents.PutPending(ctx, proposalModel.ProjectID.String(), "artifact_draft", draftID.String(), base.SchemaVersion, patched)
 	if err != nil {
 		return ArtifactDraft{}, err
+	}
+	// An applied Proposal must be freezeable into a new immutable Revision.
+	// Marking a no-op as applied would leave it permanently unfrozen because
+	// CreateRevision rejects a draft whose content hash equals its base.
+	if draftContentRef.ContentHash == base.ContentHash {
+		_ = s.contents.Abort(context.Background(), draftContentRef.ID)
+		return ArtifactDraft{}, fmt.Errorf("%w: proposal produces no revisionable changes", ErrConflict)
 	}
 	if err := proposal.MarkApplied(input.Version, s.now().UTC()); err != nil {
 		_ = s.contents.Abort(context.Background(), draftContentRef.ID)
@@ -775,27 +1031,21 @@ func (s *ProposalService) Apply(ctx context.Context, proposalID, actorID string,
 	}()
 	now := s.now().UTC()
 	var draftModel storage.ArtifactDraftModel
-	sourceInputs := make([]ArtifactSourceInput, 0, len(manifest.Sources))
-	for _, source := range manifest.Sources {
-		anchor := source.Ref.AnchorID
-		var anchorPointer *string
-		if anchor != "" {
-			anchorPointer = &anchor
-		}
-		sourceInputs = append(sourceInputs, ArtifactSourceInput{
-			Ref:     VersionRef{ArtifactID: source.Ref.ArtifactID, RevisionID: source.Ref.RevisionID, ContentHash: source.Ref.ContentHash, AnchorID: anchorPointer},
-			Purpose: source.Purpose, Required: true,
-		})
-	}
-	sourceModels, err := (&ArtifactService{database: s.database, contents: s.contents, access: s.access, now: s.now}).
-		validateSourceModels(ctx, proposalModel.ProjectID, draftID, actorUUID, sourceInputs)
-	if err != nil {
-		return ArtifactDraft{}, err
-	}
+	var discardedDraftID, discardedDraftETag, discardedDraftContentHash, discardedDraftUpdatedBy string
+	var discardedDraftSequence uint64
 	err = s.database.WithContext(ctx).Transaction(func(transaction *gorm.DB) error {
-		var lockedArtifact storage.ArtifactModel
-		if err := transaction.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id = ?", artifact.ID).Take(&lockedArtifact).Error; err != nil {
+		locks, err := lockProposalApplyLineage(
+			ctx, transaction, proposalModel.ProjectID, artifact.ID, base.ID, sourceModels,
+		)
+		if err != nil {
 			return err
+		}
+		lockedArtifact, artifactOK := locks.artifacts[artifact.ID]
+		lockedBase, baseOK := locks.revisions[base.ID]
+		if !artifactOK || !baseOK || lockedBase.ArtifactID != lockedArtifact.ID ||
+			lockedArtifact.Kind != artifact.Kind || lockedBase.ContentHash != base.ContentHash ||
+			lockedBase.SchemaVersion != base.SchemaVersion {
+			return ErrProposalStale
 		}
 		if lockedArtifact.LatestRevisionID == nil || *lockedArtifact.LatestRevisionID != base.ID {
 			return ErrProposalStale
@@ -803,6 +1053,11 @@ func (s *ProposalService) Apply(ctx context.Context, proposalID, actorID string,
 		if (existingDraft == nil && lockedArtifact.LatestDraftID != nil) ||
 			(existingDraft != nil && (lockedArtifact.LatestDraftID == nil || *lockedArtifact.LatestDraftID != existingDraft.ID)) {
 			return ErrProposalStale
+		}
+		if err := artifactService.validateArtifactLineage(
+			ctx, transaction, proposalModel.ProjectID, lockedArtifact.Kind, patched, sourceInputs,
+		); err != nil {
+			return err
 		}
 		if existingDraft == nil {
 			draftModel = storage.ArtifactDraftModel{
@@ -820,18 +1075,46 @@ func (s *ProposalService) Apply(ctx context.Context, proposalID, actorID string,
 			if err := transaction.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id = ?", existingDraft.ID).Take(&locked).Error; err != nil {
 				return err
 			}
-			if err := ensureExactCleanProposalDraft(transaction, locked, base); err != nil {
+			validateDraft := ensureExactCleanProposalDraft
+			if discardUnrevisionedChanges {
+				validateDraft = ensureProposalDraftLineage
+			}
+			if err := validateDraft(transaction, locked, base); err != nil {
 				return err
+			}
+			if discardUnrevisionedChanges {
+				if err := ensureExpectedDiscardDraft(input, locked); err != nil {
+					return err
+				}
+			}
+			// A reused draft may look clean after a user manually saves the base
+			// payload back over a previously applied Proposal. Protect every applied
+			// Proposal that is not frozen in the current base ancestry before any
+			// subsequent Apply, regardless of the draft's current content hash.
+			if err := ensureNoOtherAppliedProposalOnDraft(transaction, locked.ID, proposalModel.ID, base.ID); err != nil {
+				return err
+			}
+			discardedUnrevisionedChanges = discardUnrevisionedChanges && locked.ContentHash != base.ContentHash
+			if discardedUnrevisionedChanges {
+				discardedDraftID = locked.ID.String()
+				discardedDraftETag = locked.ETag
+				discardedDraftContentHash = locked.ContentHash
+				discardedDraftSequence = locked.Sequence
+				discardedDraftUpdatedBy = locked.UpdatedBy.String()
 			}
 			nextSequence := locked.Sequence + 1
 			nextETag := draftETag(locked.ID, nextSequence, draftContentRef.ContentHash)
-			if err := transaction.Model(&storage.ArtifactDraftModel{}).Where("id = ? AND etag = ?", locked.ID, locked.ETag).
+			result := transaction.Model(&storage.ArtifactDraftModel{}).Where("id = ? AND etag = ?", locked.ID, locked.ETag).
 				Updates(map[string]any{
 					"sequence": nextSequence, "etag": nextETag, "content_ref": draftContentRef.ID,
 					"content_hash": draftContentRef.ContentHash, "byte_size": draftContentRef.ByteSize,
 					"updated_by": actorUUID, "updated_at": now,
-				}).Error; err != nil {
-				return err
+				})
+			if result.Error != nil {
+				return result.Error
+			}
+			if result.RowsAffected != 1 {
+				return ErrConflict
 			}
 			locked.Sequence = nextSequence
 			locked.ETag = nextETag
@@ -869,13 +1152,39 @@ func (s *ProposalService) Apply(ctx context.Context, proposalID, actorID string,
 		if result.RowsAffected != 1 {
 			return ErrConflict
 		}
-		if err := insertAudit(transaction, proposalModel.ProjectID, actorUUID, "proposal.applied", "output_proposal", proposalID, map[string]any{"draftId": draftModel.ID.String()}); err != nil {
+		auditMetadata := map[string]any{"draftId": draftModel.ID.String()}
+		if artifact.Kind == "prototype" {
+			auditMetadata["canonicalizationContract"] = "prototype-proposal-v1"
+			auditMetadata["reviewedPatchedContentHash"] = reviewedPatchedContentHash
+			auditMetadata["appliedContentHash"] = draftContentRef.ContentHash
+		}
+		if discardedUnrevisionedChanges {
+			auditMetadata["discardedUnrevisionedChanges"] = true
+			auditMetadata["discardedDraftId"] = discardedDraftID
+			auditMetadata["discardedDraftEtag"] = discardedDraftETag
+			auditMetadata["discardedDraftContentHash"] = discardedDraftContentHash
+			auditMetadata["discardedDraftSequence"] = discardedDraftSequence
+			auditMetadata["discardedDraftUpdatedBy"] = discardedDraftUpdatedBy
+		}
+		if err := insertAudit(transaction, proposalModel.ProjectID, actorUUID, "proposal.applied", "output_proposal", proposalID, auditMetadata); err != nil {
 			return err
 		}
-		return enqueue(transaction, "output_proposal", proposalID, "proposal.applied", "worksflow.proposal.applied", map[string]any{
+		eventPayload := map[string]any{
 			"projectId": proposalModel.ProjectID.String(), "artifactId": artifact.ID.String(),
 			"proposalId": proposalID, "draftId": draftModel.ID.String(),
-		})
+		}
+		if artifact.Kind == "prototype" {
+			eventPayload["canonicalizationContract"] = "prototype-proposal-v1"
+			eventPayload["reviewedPatchedContentHash"] = reviewedPatchedContentHash
+			eventPayload["appliedContentHash"] = draftContentRef.ContentHash
+		}
+		if discardedUnrevisionedChanges {
+			eventPayload["discardedUnrevisionedChanges"] = true
+			eventPayload["discardedDraftId"] = discardedDraftID
+			eventPayload["discardedDraftContentHash"] = discardedDraftContentHash
+			eventPayload["discardedDraftSequence"] = discardedDraftSequence
+		}
+		return enqueue(transaction, "output_proposal", proposalID, "proposal.applied", "worksflow.proposal.applied", eventPayload)
 	})
 	if err != nil {
 		return ArtifactDraft{}, err

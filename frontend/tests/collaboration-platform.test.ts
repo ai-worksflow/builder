@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import {
+  collaborationBackendUnavailable,
   collaborationErrorMessage,
   PlatformCollaborationGateway,
 } from '../lib/collaboration/platform-adapter'
@@ -42,6 +43,22 @@ test('forbidden origin errors are not mislabeled as project-role failures', () =
   })
 
   assert.equal(collaborationErrorMessage(error, 'Request failed.'), 'Origin is not allowed.')
+})
+
+test('transient gateway HTTP failures mark the collaboration backend unavailable', () => {
+  const unavailable = new PlatformHttpError({
+    type: 'about:blank',
+    title: 'Service unavailable',
+    status: 503,
+  })
+  const forbidden = new PlatformHttpError({
+    type: 'about:blank',
+    title: 'Forbidden',
+    status: 403,
+  })
+
+  assert.equal(collaborationBackendUnavailable(unavailable), true)
+  assert.equal(collaborationBackendUnavailable(forbidden), false)
 })
 
 function project(role: 'owner' | 'admin' | 'editor' | 'commenter' | 'viewer' = 'owner') {

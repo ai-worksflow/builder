@@ -855,6 +855,16 @@ export interface ProposalDto {
 
 export interface ApplyProposalInputDto {
   readonly version: number
+  readonly discardUnrevisionedChanges?: boolean
+  readonly expectedDraftId?: EntityId
+  readonly expectedDraftEtag?: string
+  readonly expectedDraftContentHash?: ContentHash
+}
+
+export interface ProposalDraftSnapshotDto {
+  readonly expectedDraftId: EntityId
+  readonly expectedDraftEtag: string
+  readonly expectedDraftContentHash: ContentHash
 }
 
 export interface DecideProposalInputDto {
