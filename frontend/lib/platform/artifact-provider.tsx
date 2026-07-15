@@ -48,6 +48,7 @@ import type {
   PageSpecContentDto,
   ProposalDto,
   PrototypeContentDto,
+  VersionRefDto,
   VersionedArtifactDto,
 } from './dto'
 
@@ -144,6 +145,10 @@ interface ArtifactWorkspaceContextState extends ArtifactWorkspaceSnapshot {
     content: PageSpecContentDto,
     etag: string,
   ) => ReturnType<ArtifactWorkspaceGateway['savePageSpecDraft']>
+  readonly restorePageSpecDraftToRevision: (
+    artifactId: string,
+    baseRevision: VersionRefDto,
+  ) => Promise<ArtifactDraftDto<PageSpecContentDto>>
   readonly savePrototypeDraft: (
     artifactId: string,
     content: PrototypeContentDto,
@@ -159,7 +164,6 @@ interface ArtifactWorkspaceContextState extends ArtifactWorkspaceSnapshot {
   ) => Promise<ArtifactRevisionDto<BlueprintContentDto>>
   readonly createPageSpecRevision: (
     artifactId: string,
-    content: PageSpecContentDto,
   ) => Promise<ArtifactRevisionDto<PageSpecContentDto>>
   readonly createPrototypeRevision: (
     artifactId: string,
@@ -564,6 +568,30 @@ export function ArtifactWorkspaceProvider({ children }: { children: ReactNode })
       updateSnapshotResource('pageSpecs', artifactId, result.data, mutationScope)
       return result
     },
+    restorePageSpecDraftToRevision: async (artifactId, baseRevision) => {
+      const mutationScope = activeProjectScope
+      const resource = currentSnapshot.pageSpecs.find((item) => item.artifact.id === artifactId)
+      if (!resource?.draft) throw new Error(t('runtime.artifact.refreshPageSpecDraft'))
+      if (
+        resource.latestRevision?.id !== baseRevision.revisionId
+        || resource.latestRevision.contentHash !== baseRevision.contentHash
+        || resource.draft.baseRevisionId !== baseRevision.revisionId
+      ) {
+        throw new Error(t('teamPlatform.pageSpec.workflowProposalBaseUnavailable'))
+      }
+      const result = await gateway.restorePageSpecDraftToRevision(
+        artifactId,
+        resource.draft.id,
+        baseRevision,
+        resource.draft.etag,
+      )
+      updateSnapshotResource('pageSpecs', artifactId, {
+        ...resource,
+        draft: result.data,
+      }, mutationScope)
+      await revalidateRef.current()
+      return result.data
+    },
     savePrototypeDraft: async (artifactId, content, etag) => {
       const mutationScope = activeProjectScope
       const result = await gateway.savePrototypeDraft(artifactId, content, etag)
@@ -600,21 +628,14 @@ export function ArtifactWorkspaceProvider({ children }: { children: ReactNode })
       await revalidateRef.current()
       return result.data
     },
-    createPageSpecRevision: async (artifactId, content) => {
+    createPageSpecRevision: async (artifactId) => {
       const mutationScope = activeProjectScope
       const resource = currentSnapshot.pageSpecs.find((item) => item.artifact.id === artifactId)
-      const draftEtag = resource?.draft?.etag ?? resource?.artifact.etag
+      const draftEtag = resource?.draft?.etag
       if (!draftEtag) throw new Error(t('runtime.artifact.refreshPageSpecDraft'))
-      const saved = await gateway.savePageSpecDraft(
-        artifactId,
-        content,
-        draftEtag,
-      )
-      const revisionEtag = saved.data.draft?.etag ?? saved.etag
-      if (!revisionEtag) throw new Error(t('runtime.artifact.missingSavedDraftEtag'))
-      const result = await gateway.createPageSpecRevision(artifactId, revisionEtag)
+      const result = await gateway.createPageSpecRevision(artifactId, draftEtag)
       updateSnapshotResource('pageSpecs', artifactId, {
-        ...saved.data,
+        ...resource,
         latestRevision: result.data,
       }, mutationScope)
       await revalidateRef.current()

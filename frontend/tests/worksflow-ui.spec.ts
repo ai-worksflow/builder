@@ -1439,6 +1439,30 @@ async function handlePlatformRoute(
     await respond(state.pageSpec, 200, { etag: state.pageSpec.draft.etag })
     return
   }
+  if (path === `/v1/drafts/${state.pageSpec.draft?.id}` && method === 'PATCH') {
+    const input = body as {
+      content: typeof pageSpecRevision.content
+      sourceVersions?: Array<{
+        version: typeof blueprintRevision
+        purpose: string
+        required: boolean
+      }>
+    }
+    const currentDraft = state.pageSpec.draft!
+    const nextDraftRevision = currentDraft.revision + 1
+    const draft = {
+      ...currentDraft,
+      revision: nextDraftRevision,
+      content: input.content,
+      sourceVersions: input.sourceVersions?.map((source) => source.version) ?? currentDraft.sourceVersions,
+      contentHash: state.pageSpec.latestRevision.contentHash as string,
+      updatedAt: now,
+      etag: `"page-spec-draft:${nextDraftRevision}:restored"`,
+    }
+    state.pageSpec = { ...state.pageSpec, draft }
+    await respond(draft, 200, { etag: draft.etag })
+    return
+  }
   if (path === `/v1/page-specs/${pageSpec.artifact.id}/revisions` && method === 'POST') {
     const revision = {
       id: 'dddddddd-dddd-4ddd-8ddd-ddddddddddd4',
@@ -1483,12 +1507,60 @@ async function handlePlatformRoute(
     return
   }
   const artifactProposalItem = path.match(/^\/v1\/output-proposals\/([^/]+)$/)
+  const pageSpecProposal = state.pageSpecProposals.find((proposal) =>
+    proposal.id === artifactProposalItem?.[1])
+  if (pageSpecProposal && method === 'GET') {
+    await respond(pageSpecProposal)
+    return
+  }
   const blueprintProposal = state.blueprintProposal
   if (blueprintProposal && artifactProposalItem?.[1] === blueprintProposal.id && method === 'GET') {
     await respond(blueprintProposal)
     return
   }
   const artifactProposalApply = path.match(/^\/v1\/output-proposals\/([^/]+)\/apply$/)
+  const appliedPageSpecProposal = state.pageSpecProposals.find((proposal) =>
+    proposal.id === artifactProposalApply?.[1])
+  if (appliedPageSpecProposal && method === 'POST') {
+    const baseContent = structuredClone(
+      state.pageSpec.latestRevision.content as typeof pageSpecRevision.content,
+    )
+    for (const operation of appliedPageSpecProposal.operations) {
+      if (operation.decision !== 'accepted' && operation.decision !== 'applied') continue
+      if (operation.path === '/userGoal' && typeof operation.value === 'string') {
+        baseContent.userGoal = operation.value
+      }
+      if (operation.path === '/acceptanceCriterionIds' && Array.isArray(operation.value)) {
+        baseContent.acceptanceCriterionIds = operation.value
+      }
+    }
+    const currentDraft = state.pageSpec.draft!
+    const nextDraftRevision = currentDraft.revision + 1
+    const draft = {
+      ...currentDraft,
+      revision: nextDraftRevision,
+      content: baseContent,
+      contentHash: hash('q'),
+      updatedAt: now,
+      etag: `"page-spec-draft:${nextDraftRevision}:proposal"`,
+    }
+    state.pageSpec = { ...state.pageSpec, draft }
+    state.pageSpecProposals = state.pageSpecProposals.map((proposal) =>
+      proposal.id !== appliedPageSpecProposal.id
+        ? proposal
+        : {
+            ...proposal,
+            status: 'applied' as const,
+            operations: proposal.operations.map((operation) => ({
+              ...operation,
+              decision: operation.decision === 'accepted' ? 'applied' as const : operation.decision,
+            })),
+            version: proposal.version + 1,
+            appliedAt: now,
+          })
+    await respond(draft, 200, { etag: draft.etag })
+    return
+  }
   if (blueprintProposal && artifactProposalApply?.[1] === blueprintProposal.id && method === 'POST') {
     const gate = state.blueprintProposalApplyGate
     state.blueprintProposalApplyGate = null
@@ -4107,6 +4179,103 @@ test('PageSpec workflow deep link prioritizes the exact Proposal and locks histo
   )).toBeVisible()
 })
 
+test('PageSpec workflow can explicitly restore an exact Proposal base without normalized autosave', async ({ page }) => {
+  const state = await installPlatformMock(page, { authenticated: true })
+  const rawBaseContent = {
+    blueprintPageNodeId: 'page-dashboard',
+    title: 'Dashboard',
+    route: '/dashboard',
+    userGoal: 'Inspect work.',
+    states: pageSpecRevision.content.states,
+    dataBindings: [],
+    interactions: [],
+    schemaVersion: 1,
+  } as unknown as typeof pageSpecRevision.content
+  const baseRevision = {
+    ...pageSpecRevision,
+    content: rawBaseContent,
+    contentHash: hash('b'),
+  }
+  state.pageSpec = {
+    ...state.pageSpec,
+    latestRevision: baseRevision,
+    draft: {
+      ...state.pageSpec.draft!,
+      baseRevisionId: baseRevision.id,
+      content: {
+        ...rawBaseContent,
+        entryPoints: [],
+        exitPoints: [],
+        requiredRoles: [],
+        acceptanceCriterionIds: [],
+        nonFunctionalConstraints: [],
+      },
+      contentHash: hash('c'),
+      revision: 7,
+      etag: '"page-spec-draft:7"',
+    },
+  }
+  const linkedProposal = {
+    ...pageSpecArtifactProposal('page-spec-workflow-recovery'),
+    baseRevision: exactRevision(
+      baseRevision.artifactId,
+      baseRevision.id,
+      baseRevision.revisionNumber,
+      baseRevision.contentHash,
+    ),
+  }
+  state.pageSpecProposals = [linkedProposal]
+
+  await page.goto(
+    `/team/acme/project/${project.id}/blueprint?artifactId=${pageSpec.artifact.id}&proposalId=${linkedProposal.id}`,
+  )
+
+  const guide = page.getByTestId('page-spec-workflow-proposal-guide')
+  await expect(guide).toContainText('Restore the exact base before applying the proposal.')
+  await page.getByRole('button', { name: 'Restore Proposal base' }).click()
+  await expect(guide).toContainText('This discards all current unversioned draft changes')
+  await page.getByRole('button', { name: 'Confirm restore' }).click()
+
+  await expect(guide).toContainText('Revision creation stays locked until apply succeeds.')
+  const recoveryPatch = state.requests.find((request) =>
+    request.method === 'PATCH'
+      && request.path === `/v1/drafts/${pageSpec.draft.id}`,
+  )
+  expect(recoveryPatch?.headers['if-match']).toBe('"page-spec-draft:7"')
+  const recoveryContent = (recoveryPatch?.body as { content?: Record<string, unknown> })?.content
+  expect(recoveryContent).toEqual(rawBaseContent)
+  expect(recoveryContent).not.toHaveProperty('entryPoints')
+  expect(recoveryContent).not.toHaveProperty('acceptanceCriterionIds')
+
+  await page.waitForTimeout(850)
+  expect(state.requests.filter((request) =>
+    request.method === 'PATCH'
+      && request.path === `/v1/page-specs/${pageSpec.artifact.id}/draft`,
+  )).toHaveLength(0)
+  const apply = page.getByRole('button', { name: 'Apply selected operations' })
+  await expect(apply).toBeEnabled()
+  await apply.click()
+
+  await expect(guide).toContainText('The proposal is applied.')
+  const createRevision = page.getByRole('button', { name: 'Create immutable revision' })
+  await expect(createRevision).toBeEnabled()
+  await createRevision.click()
+  await expect(guide).toContainText('The immutable Revision is ready.')
+
+  const applyIndex = state.requests.findIndex((request) =>
+    request.method === 'POST'
+      && request.path === `/v1/output-proposals/${linkedProposal.id}/apply`)
+  const revisionIndex = state.requests.findIndex((request) =>
+    request.method === 'POST'
+      && request.path === `/v1/page-specs/${pageSpec.artifact.id}/revisions`)
+  expect(applyIndex).toBeGreaterThan(-1)
+  expect(revisionIndex).toBeGreaterThan(applyIndex)
+  expect(state.requests.filter((request) =>
+    request.method === 'PATCH'
+      && request.path === `/v1/page-specs/${pageSpec.artifact.id}/draft`,
+  )).toHaveLength(0)
+})
+
 test('Blueprint type selects persist canonical values instead of translated labels', async ({ page }) => {
   const state = await installPlatformMock(page, { authenticated: true })
   await page.goto(`/team/acme/project/${project.id}/blueprint`)
@@ -5454,7 +5623,8 @@ function blueprintArtifactProposal(
   }
 }
 
-function pageSpecArtifactProposal(id: string) {
+function pageSpecArtifactProposal(id: string, status: 'ready' | 'applied' = 'ready') {
+  const decision: 'accepted' | 'applied' = status === 'applied' ? 'applied' : 'accepted'
   return {
     id,
     projectId: project.id,
@@ -5467,19 +5637,29 @@ function pageSpecArtifactProposal(id: string) {
       pageSpec.draft.contentHash,
     ),
     payloadHash: hash('9'),
-    status: 'ready' as const,
-    operations: [{
-      id: `${id}-operation-goal`,
-      kind: 'replace' as const,
-      path: '/userGoal',
-      value: 'Inspect order health and resolve exceptions.',
-      rationale: 'Make the reviewed workflow goal explicit.',
-      decision: 'accepted' as const,
-    }],
-    version: 1,
+    status,
+    operations: [
+      {
+        id: `${id}-operation-goal`,
+        kind: 'replace' as const,
+        path: '/userGoal',
+        value: 'Inspect order health and resolve exceptions.',
+        rationale: 'Make the reviewed workflow goal explicit.',
+        decision,
+      },
+      {
+        id: `${id}-operation-acceptance`,
+        kind: 'add' as const,
+        path: '/acceptanceCriterionIds',
+        value: ['AC-DASHBOARD-001'],
+        rationale: 'Preserve exact acceptance traceability.',
+        decision,
+      },
+    ],
+    version: status === 'applied' ? 2 : 1,
     createdBy: user.id,
     createdAt: now,
-    appliedAt: undefined as string | undefined,
+    appliedAt: status === 'applied' ? now : undefined,
   }
 }
 

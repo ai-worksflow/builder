@@ -49,7 +49,7 @@ export interface CollaborationPlatformClient {
   readonly members: Pick<PlatformClient['members'], 'list' | 'add' | 'update' | 'remove' | 'invite'>
   readonly artifacts: Pick<
     PlatformClient['artifacts'],
-    'list' | 'get' | 'getRevision' | 'listRevisions' | 'listDependencies' | 'createDependency' | 'compileRequirementBaseline' | 'reviewGate'
+    'list' | 'get' | 'getRevision' | 'updateDraft' | 'listRevisions' | 'listDependencies' | 'createDependency' | 'compileRequirementBaseline' | 'reviewGate'
   >
   readonly documents: PlatformClient['documents']
   readonly blueprints: PlatformClient['blueprints']

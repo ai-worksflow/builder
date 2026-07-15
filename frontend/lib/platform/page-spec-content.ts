@@ -4,6 +4,7 @@ export const REQUIRED_PAGE_STATE_KEYS = ['ready', 'loading', 'empty', 'error'] a
 
 export function normalizePageSpecContent(content: PageSpecContentDto): PageSpecContentDto {
   return {
+    ...content,
     blueprintPageNodeId: content.blueprintPageNodeId ?? '',
     title: content.title ?? '',
     route: content.route ?? '',
@@ -12,6 +13,7 @@ export function normalizePageSpecContent(content: PageSpecContentDto): PageSpecC
     exitPoints: uniqueStrings(content.exitPoints ?? []),
     requiredRoles: uniqueStrings(content.requiredRoles ?? []),
     states: (content.states ?? []).map((state) => ({
+      ...state,
       id: state.id,
       key: state.key ?? state.id,
       title: state.title ?? state.key ?? state.id,
@@ -22,6 +24,7 @@ export function normalizePageSpecContent(content: PageSpecContentDto): PageSpecC
       acceptanceCriterionIds: uniqueStrings(state.acceptanceCriterionIds ?? []),
     })),
     dataBindings: (content.dataBindings ?? []).map((binding) => ({
+      ...binding,
       id: binding.id,
       name: binding.name ?? '',
       source: binding.source,
@@ -29,15 +32,20 @@ export function normalizePageSpecContent(content: PageSpecContentDto): PageSpecC
       ...(binding.schema ? { schema: binding.schema } : {}),
       required: Boolean(binding.required),
     })),
-    interactions: (content.interactions ?? []).map((interaction) => ({
-      id: interaction.id,
-      trigger: interaction.trigger ?? '',
-      outcome: interaction.outcome ?? '',
-      ...(interaction.targetPageNodeId || interaction.targetPageSpecId
-        ? { targetPageNodeId: interaction.targetPageNodeId ?? interaction.targetPageSpecId }
-        : {}),
-      acceptanceCriterionIds: uniqueStrings(interaction.acceptanceCriterionIds ?? []),
-    })),
+    interactions: (content.interactions ?? []).map((interaction) => {
+      const normalized = {
+        ...interaction,
+        id: interaction.id,
+        trigger: interaction.trigger ?? '',
+        outcome: interaction.outcome ?? '',
+        ...(interaction.targetPageNodeId || interaction.targetPageSpecId
+          ? { targetPageNodeId: interaction.targetPageNodeId ?? interaction.targetPageSpecId }
+          : {}),
+        acceptanceCriterionIds: uniqueStrings(interaction.acceptanceCriterionIds ?? []),
+      }
+      delete normalized.targetPageSpecId
+      return normalized
+    }),
     acceptanceCriterionIds: uniqueStrings(content.acceptanceCriterionIds ?? []),
     nonFunctionalConstraints: uniqueStrings(content.nonFunctionalConstraints ?? []),
   }

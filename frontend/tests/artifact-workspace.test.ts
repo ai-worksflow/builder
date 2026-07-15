@@ -445,6 +445,139 @@ test('PageSpec drafts and revisions preserve source pins and concurrency headers
   })
 })
 
+test('PageSpec Proposal recovery restores the exact raw revision and full lineage', async () => {
+  const calls: Array<{ path: string; method: string; headers: Headers; body: unknown }> = []
+  const rawContent = {
+    blueprintPageNodeId: 'page-orders',
+    title: 'Orders',
+    route: '/orders',
+    userGoal: 'Review customer orders.',
+    states: [],
+    dataBindings: [],
+    interactions: [],
+    schemaVersion: 1,
+  } as unknown as PageSpecContentDto
+  const baseRevision = {
+    id: 'page-spec-revision-2',
+    artifactId: 'page-spec-1',
+    revisionNumber: 2,
+    schemaVersion: 1,
+    content: rawContent,
+    contentHash: 'sha256:page-spec-base',
+    sourceVersions: [{
+      artifactId: 'blueprint-1',
+      revisionId: 'blueprint-revision-3',
+      contentHash: 'sha256:blueprint-3',
+      anchorId: 'page-orders',
+      purpose: 'blueprint',
+      required: true,
+    }],
+    createdBy: 'user-1',
+    createdAt: '2026-07-10T00:00:00Z',
+  }
+  const restoredDraft: ArtifactDraftDto<PageSpecContentDto> = {
+    id: 'page-spec-draft-1',
+    artifactId: 'page-spec-1',
+    baseRevisionId: baseRevision.id,
+    sourceVersions: baseRevision.sourceVersions,
+    revision: 8,
+    content: rawContent,
+    contentHash: baseRevision.contentHash,
+    updatedBy: 'user-1',
+    updatedAt: '2026-07-10T00:00:08Z',
+    etag: '"page-spec-draft:8"',
+  }
+  const client = new PlatformClient({
+    http: {
+      baseUrl: 'https://platform.example.test',
+      fetch: (async (input, init) => {
+        const path = new URL(input.toString()).pathname
+        calls.push({
+          path,
+          method: init?.method ?? 'GET',
+          headers: new Headers(init?.headers),
+          body: typeof init?.body === 'string' ? JSON.parse(init.body) as unknown : undefined,
+        })
+        if (path === `/v1/revisions/${baseRevision.id}`) return json(baseRevision)
+        return json(restoredDraft, 200, { etag: restoredDraft.etag })
+      }) as FetchLike,
+    },
+  })
+
+  const result = await new ArtifactWorkspaceGateway(client).restorePageSpecDraftToRevision(
+    'page-spec-1',
+    restoredDraft.id,
+    {
+      artifactId: baseRevision.artifactId,
+      revisionId: baseRevision.id,
+      revisionNumber: baseRevision.revisionNumber,
+      contentHash: baseRevision.contentHash,
+    },
+    '"page-spec-draft:7"',
+  )
+
+  assert.equal(result.data.contentHash, baseRevision.contentHash)
+  assert.deepEqual(calls.map(({ path, method }) => ({ path, method })), [
+    { path: `/v1/revisions/${baseRevision.id}`, method: 'GET' },
+    { path: `/v1/drafts/${restoredDraft.id}`, method: 'PATCH' },
+  ])
+  assert.equal(calls[1].headers.get('if-match'), '"page-spec-draft:7"')
+  assert.deepEqual(calls[1].body, {
+    schemaVersion: 1,
+    content: rawContent,
+    sourceVersions: [{
+      version: {
+        artifactId: 'blueprint-1',
+        revisionId: 'blueprint-revision-3',
+        contentHash: 'sha256:blueprint-3',
+        anchorId: 'page-orders',
+      },
+      purpose: 'blueprint',
+      required: true,
+    }],
+  })
+  const sentContent = (calls[1].body as unknown as { content: Record<string, unknown> }).content
+  assert.equal(Object.hasOwn(sentContent, 'entryPoints'), false)
+  assert.equal(Object.hasOwn(sentContent, 'acceptanceCriterionIds'), false)
+})
+
+test('PageSpec Proposal recovery refuses a mismatched immutable revision before PATCH', async () => {
+  const paths: string[] = []
+  const client = new PlatformClient({
+    http: {
+      baseUrl: 'https://platform.example.test',
+      fetch: (async (input) => {
+        paths.push(new URL(input.toString()).pathname)
+        return json({
+          id: 'page-spec-revision-2',
+          artifactId: 'page-spec-1',
+          revisionNumber: 2,
+          content: pageSpecContent(),
+          contentHash: 'sha256:unexpected',
+          createdBy: 'user-1',
+          createdAt: '2026-07-10T00:00:00Z',
+        })
+      }) as FetchLike,
+    },
+  })
+
+  await assert.rejects(
+    new ArtifactWorkspaceGateway(client).restorePageSpecDraftToRevision(
+      'page-spec-1',
+      'page-spec-draft-1',
+      {
+        artifactId: 'page-spec-1',
+        revisionId: 'page-spec-revision-2',
+        revisionNumber: 2,
+        contentHash: 'sha256:page-spec-base',
+      },
+      '"page-spec-draft:7"',
+    ),
+    /does not match the Proposal base/,
+  )
+  assert.deepEqual(paths, ['/v1/revisions/page-spec-revision-2'])
+})
+
 test('PageSpec snapshot updates replace only the targeted canonical resource', () => {
   const current = versionedPageSpec()
   const replacement = versionedPageSpec({

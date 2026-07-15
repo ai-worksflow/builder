@@ -4,6 +4,7 @@ import type {
   ArtifactDraftDto,
   ArtifactReviewGateDto,
   ArtifactRevisionDto,
+  ArtifactSourceDto,
   AcceptanceCriterionDto,
   BlueprintContentDto,
   DocumentBlockDto,
@@ -704,6 +705,63 @@ export class ArtifactWorkspaceGateway {
     }
   }
 
+  async restorePageSpecDraftToRevision(
+    artifactId: string,
+    draftId: string,
+    baseRevision: VersionRefDto,
+    etag: string,
+  ) {
+    if (baseRevision.artifactId !== artifactId) {
+      throw new Error('The PageSpec recovery revision belongs to a different artifact.')
+    }
+    let recoveryContent: PageSpecContentDto | null = null
+    try {
+      const revision = (await this.client.artifacts.getRevision<PageSpecContentDto>(
+        baseRevision.revisionId,
+      )).data
+      if (
+        revision.artifactId !== baseRevision.artifactId
+        || revision.id !== baseRevision.revisionId
+        || revision.contentHash !== baseRevision.contentHash
+      ) {
+        throw new Error('The PageSpec recovery revision does not match the Proposal base.')
+      }
+      recoveryContent = revision.content
+      const result = await this.client.artifacts.updateDraft<PageSpecContentDto>(
+        draftId,
+        {
+          ...(revision.schemaVersion === undefined
+            ? {}
+            : { schemaVersion: revision.schemaVersion }),
+          // Proposal apply requires the exact frozen content hash. Keep the
+          // raw immutable revision payload here; editor normalization adds
+          // compatibility fields and would make the restored draft dirty.
+          content: revision.content,
+          sourceVersions: (revision.sourceVersions ?? []).map((source) => ({
+            version: wireVersionRef(source),
+            purpose: source.purpose,
+            required: source.required,
+          })),
+        },
+        { ifMatch: etag },
+      )
+      if (
+        result.data.artifactId !== artifactId
+        || result.data.baseRevisionId !== baseRevision.revisionId
+        || result.data.contentHash !== baseRevision.contentHash
+        || !artifactSourcesEqual(result.data.sourceVersions, revision.sourceVersions ?? [])
+      ) {
+        throw new Error('PageSpec recovery did not restore the exact Proposal base.')
+      }
+      return result
+    } catch (error) {
+      if (error instanceof PlatformHttpError && [409, 412, 428].includes(error.status)) {
+        throw new ArtifactWorkspaceConflictError(artifactId, recoveryContent)
+      }
+      throw error
+    }
+  }
+
   async savePrototypeDraft(
     artifactId: string,
     content: PrototypeContentDto,
@@ -898,6 +956,26 @@ export class ArtifactWorkspaceGateway {
 
 function proposalEtag(proposal: Pick<ProposalDto, 'id' | 'version'>) {
   return `"output-proposal:${proposal.id}:${proposal.version}"`
+}
+
+function artifactSourcesEqual(
+  left: readonly ArtifactSourceDto[],
+  right: readonly ArtifactSourceDto[],
+) {
+  if (left.length !== right.length) return false
+  const keys = (sources: readonly ArtifactSourceDto[]) => sources
+    .map((source) => JSON.stringify([
+      source.artifactId,
+      source.revisionId,
+      source.contentHash,
+      source.anchorId ?? '',
+      source.purpose,
+      source.required,
+    ]))
+    .sort()
+  const leftKeys = keys(left)
+  const rightKeys = keys(right)
+  return leftKeys.every((key, index) => key === rightKeys[index])
 }
 
 function uniqueVersionRefs(references: readonly VersionRefDto[]) {

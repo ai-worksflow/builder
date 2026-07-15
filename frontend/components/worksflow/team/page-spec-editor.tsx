@@ -42,6 +42,7 @@ import {
   MousePointerClick,
   Plus,
   RefreshCw,
+  RotateCcw,
   Save,
   Send,
   ShieldCheck,
@@ -80,6 +81,8 @@ export function PageSpecEditor({
   const [reviewSummary, setReviewSummary] = useState(() => t('teamPlatform.pageSpec.defaultReviewSummary'))
   const [reviewerId, setReviewerId] = useState('')
   const [proposalBusyId, setProposalBusyId] = useState('')
+  const [proposalBaseRestoreBusy, setProposalBaseRestoreBusy] = useState(false)
+  const [confirmProposalBaseRestore, setConfirmProposalBaseRestore] = useState(false)
   const [confirmedAppliedProposalId, setConfirmedAppliedProposalId] = useState('')
   const [createdWorkflowRevisionId, setCreatedWorkflowRevisionId] = useState('')
   const activeArtifactRef = useRef('')
@@ -111,10 +114,27 @@ export function PageSpecEditor({
     resource?.approvedRevision,
     ...(details?.versions ?? []),
   ].find((revision) => revision?.proposalId === workflowProposalId)
+  const linkedProposalBaseIsLatest = Boolean(
+    linkedProposal
+    && resource?.latestRevision
+    && resource.latestRevision.id === linkedProposal.baseRevision.revisionId
+    && resource.latestRevision.contentHash === linkedProposal.baseRevision.contentHash,
+  )
   const workflowRevisionReady = Boolean(linkedProposalRevision || createdWorkflowRevisionId)
   const linkedProposalBaseMatchesDraft = Boolean(
     linkedProposal
     && (resource?.draft?.contentHash ?? resource?.latestRevision?.contentHash) === linkedProposal.baseRevision.contentHash,
+  )
+  const dirty = Boolean(content && serverContent && JSON.stringify(content) !== JSON.stringify(normalizePageSpecContent(serverContent)))
+  const linkedProposalBaseRecoverable = Boolean(
+    linkedProposal
+    && !linkedProposalApplied
+    && !linkedProposalBaseMatchesDraft
+    && linkedProposalBaseIsLatest
+    && resource?.draft
+    && resource.draft.baseRevisionId === linkedProposal.baseRevision.revisionId
+    && !dirty
+    && !['dirty', 'saving', 'conflict'].includes(saveState),
   )
   const contentCanEdit = canEdit && (!workflowProposalId || linkedProposalApplied)
   const comments = collaboration.comments.filter((thread) =>
@@ -127,7 +147,6 @@ export function PageSpecEditor({
   )
   const currentUserId = collaboration.session.signedIn ? collaboration.session.user.id : null
   const clientIssues = content ? pageSpecReviewIssues(content) : []
-  const dirty = Boolean(content && serverContent && JSON.stringify(content) !== JSON.stringify(normalizePageSpecContent(serverContent)))
   const draftMatchesLatest = Boolean(
     latestVersion
     && (!resource?.draft || resource.draft.contentHash === latestVersion.contentHash),
@@ -142,6 +161,7 @@ export function PageSpecEditor({
   useEffect(() => {
     setConfirmedAppliedProposalId('')
     setCreatedWorkflowRevisionId('')
+    setConfirmProposalBaseRestore(false)
   }, [artifactId, workflowProposalId])
 
   useEffect(() => {
@@ -271,7 +291,7 @@ export function PageSpecEditor({
     setSaveState('saving')
     setError(null)
     try {
-      const revision = await workspace.createPageSpecRevision(resource.artifact.id, content)
+      const revision = await workspace.createPageSpecRevision(resource.artifact.id)
       if (workflowProposalId) setCreatedWorkflowRevisionId(revision.id)
       setSaveState('saved')
       await loadDetails()
@@ -310,6 +330,40 @@ export function PageSpecEditor({
       setError(errorMessage(cause, t('teamPlatform.pageSpec.operationFailed')))
     } finally {
       setProposalBusyId('')
+    }
+  }
+
+  async function restoreLinkedProposalBase() {
+    if (
+      proposalBaseRestoreBusy
+      || proposalBusyId
+      || saveInFlightRef.current
+      || !linkedProposal
+      || !linkedProposalBaseRecoverable
+      || !resource
+    ) return
+    setProposalBaseRestoreBusy(true)
+    setError(null)
+    try {
+      const restored = await workspace.restorePageSpecDraftToRevision(
+        resource.artifact.id,
+        linkedProposal.baseRevision,
+      )
+      const restoredContent = normalizePageSpecContent(restored.content)
+      queuedContentRef.current = null
+      contentRef.current = restoredContent
+      draftEtagRef.current = restored.etag
+      setContent(restoredContent)
+      setDraftEtag(restored.etag)
+      setSaveState('saved')
+      setConfirmProposalBaseRestore(false)
+      setTab('proposal')
+      await loadDetails()
+    } catch (cause) {
+      if (cause instanceof ArtifactWorkspaceConflictError) setSaveState('conflict')
+      setError(errorMessage(cause, t('teamPlatform.pageSpec.operationFailed')))
+    } finally {
+      setProposalBaseRestoreBusy(false)
     }
   }
 
@@ -374,9 +428,35 @@ export function PageSpecEditor({
                     ? t('teamPlatform.pageSpec.workflowProposalApplied')
                     : linkedProposalBaseMatchesDraft
                       ? t('teamPlatform.pageSpec.workflowProposalReview')
-                      : t('teamPlatform.pageSpec.workflowProposalStaleDraft')}
+                      : linkedProposalBaseRecoverable
+                        ? t('teamPlatform.pageSpec.workflowProposalStaleDraft')
+                        : t('teamPlatform.pageSpec.workflowProposalBaseUnavailable')}
             </p>
           </div>
+          {linkedProposalBaseRecoverable && (
+            <div className="flex max-w-sm flex-col items-end gap-1.5">
+              {confirmProposalBaseRestore ? (
+                <>
+                  <p className="text-right text-[8px] leading-relaxed text-warning">
+                    {t('teamPlatform.pageSpec.restoreProposalBaseWarning')}
+                  </p>
+                  <span className="flex gap-1.5">
+                    <button type="button" onClick={() => setConfirmProposalBaseRestore(false)} disabled={proposalBaseRestoreBusy} className="rounded border border-border px-2.5 py-1.5 text-[9px] text-muted-foreground disabled:opacity-40">
+                      {t('common.cancel')}
+                    </button>
+                    <button type="button" onClick={() => void restoreLinkedProposalBase()} disabled={proposalBaseRestoreBusy || Boolean(proposalBusyId)} className="rounded bg-warning px-2.5 py-1.5 text-[9px] font-semibold text-warning-foreground disabled:opacity-40">
+                      {proposalBaseRestoreBusy ? <Loader2 className="mr-1 inline size-3 animate-spin" /> : <RotateCcw className="mr-1 inline size-3" />}
+                      {proposalBaseRestoreBusy ? t('teamPlatform.pageSpec.restoringProposalBase') : t('teamPlatform.pageSpec.confirmRestoreProposalBase')}
+                    </button>
+                  </span>
+                </>
+              ) : (
+                <button type="button" onClick={() => setConfirmProposalBaseRestore(true)} disabled={proposalBaseRestoreBusy || Boolean(proposalBusyId)} className="rounded border border-warning/40 bg-warning/10 px-2.5 py-1.5 text-[9px] font-semibold text-warning disabled:opacity-40">
+                  <RotateCcw className="mr-1 inline size-3" />{t('teamPlatform.pageSpec.restoreProposalBase')}
+                </button>
+              )}
+            </div>
+          )}
           {workflowRevisionReady && (
             <button type="button" onClick={() => setSurface('workbench')} className="rounded bg-primary px-2.5 py-1.5 text-[9px] font-semibold text-primary-foreground">
               <Send className="mr-1 inline size-3" />{t('teamPlatform.pageSpec.returnToWorkflow')}
@@ -426,7 +506,7 @@ export function PageSpecEditor({
             canCreate={Boolean(latestVersion) && !workflowProposalId && draftMatchesLatest && !dirty && saveState !== 'saving' && saveState !== 'conflict'}
             linkedProposalId={workflowProposalId}
             proposalBusyId={proposalBusyId}
-            applyBlocked={dirty || saveState === 'saving' || saveState === 'conflict' || Boolean(workflowProposalId && !linkedProposalBaseMatchesDraft)}
+            applyBlocked={dirty || saveState === 'saving' || saveState === 'conflict' || proposalBaseRestoreBusy || Boolean(workflowProposalId && !linkedProposalBaseMatchesDraft)}
             onCreate={() => void workspace.createProposal({
               jobType: 'page_spec.patch',
               targetRevision: latestVersion!,

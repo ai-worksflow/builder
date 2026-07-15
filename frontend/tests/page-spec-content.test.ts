@@ -91,6 +91,37 @@ test('PageSpec normalization migrates legacy navigation targets to Blueprint pag
   assert.equal(Object.hasOwn(normalized.interactions[0] ?? {}, 'targetPageSpecId'), false)
 })
 
+test('PageSpec normalization preserves forward-compatible Proposal fields', () => {
+  const content = createEmptyPageSpecContent(
+    'page-node-orders',
+    'Orders PageSpec',
+    '/orders',
+    'Review and resolve order exceptions.',
+  )
+  const forwardCompatible = {
+    ...content,
+    schemaVersion: 1,
+    requirementIds: ['REQ-ORDER-001'],
+    states: content.states.map((state) => ({
+      ...state,
+      transitionPolicy: 'server-authoritative',
+    })),
+  } as typeof content & {
+    readonly schemaVersion: number
+    readonly requirementIds: readonly string[]
+  }
+
+  const normalized = normalizePageSpecContent(forwardCompatible) as typeof forwardCompatible
+
+  assert.equal(normalized.schemaVersion, 1)
+  assert.deepEqual(normalized.requirementIds, ['REQ-ORDER-001'])
+  assert.equal(
+    (normalized.states[0] as typeof normalized.states[0] & { transitionPolicy?: string })
+      .transitionPolicy,
+    'server-authoritative',
+  )
+})
+
 test('PageSpec review gate blocks missing stable states, traces, and binding identity', () => {
   const content = {
     ...createEmptyPageSpecContent('page-node-orders', 'Orders', 'orders', ''),
