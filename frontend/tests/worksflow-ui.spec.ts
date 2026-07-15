@@ -458,6 +458,7 @@ interface MockPlatformState {
   workbenchBundle: ReturnType<typeof buildManifest>
   multiWorkbench: ReturnType<typeof multiWorkbenchState> | null
   blueprintProposal: ReturnType<typeof blueprintArtifactProposal> | null
+  pageSpecProposals: Array<ReturnType<typeof pageSpecArtifactProposal>>
   blueprintCreatedRevision: MockBlueprintRevision | null
   blueprintDraftSaveGate: Deferred | null
   blueprintListGate: Deferred | null
@@ -559,6 +560,7 @@ async function installPlatformMock(page: Page, options: MockPlatformOptions = {}
       ? multiGroupWorkbenchState()
       : options.multiBundleWorkbench ? multiWorkbenchState() : null,
     blueprintProposal: options.blueprintProposal ? blueprintArtifactProposal() : null,
+    pageSpecProposals: [],
     blueprintCreatedRevision: null,
     blueprintDraftSaveGate: options.pauseFirstBlueprintDraftSave ? deferred() : null,
     blueprintListGate: null,
@@ -1477,7 +1479,7 @@ async function handlePlatformRoute(
     return
   }
   if (path === `/v1/projects/${project.id}/output-proposals` && method === 'GET') {
-    await respond({ items: [state.blueprintProposal, state.prototypeProposal].filter(Boolean) })
+    await respond({ items: [state.blueprintProposal, ...state.pageSpecProposals, state.prototypeProposal].filter(Boolean) })
     return
   }
   const artifactProposalItem = path.match(/^\/v1\/output-proposals\/([^/]+)$/)
@@ -4064,6 +4066,47 @@ test('Blueprint PageSpec editor autosaves, versions, and requests exact revision
   )).toBe(true)
 })
 
+test('PageSpec workflow deep link prioritizes the exact Proposal and locks historical apply and revision creation', async ({ page }) => {
+  const state = await installPlatformMock(page, { authenticated: true })
+  const linkedProposal = pageSpecArtifactProposal('page-spec-workflow-proposal')
+  const historicalProposal = pageSpecArtifactProposal('page-spec-historical-proposal')
+  state.pageSpecProposals = [historicalProposal, linkedProposal]
+
+  await page.goto(
+    `/team/acme/project/${project.id}/blueprint?artifactId=${pageSpec.artifact.id}&proposalId=${linkedProposal.id}`,
+  )
+
+  const guide = page.getByTestId('page-spec-workflow-proposal-guide')
+  await expect(guide).toContainText('Exact workflow-linked PageSpec proposal')
+  await expect(guide).toContainText(linkedProposal.id)
+  await expect(guide).toContainText('Revision creation stays locked until apply succeeds.')
+
+  const proposalCards = page.locator('article').filter({ hasText: 'page-spec-' })
+  await expect(proposalCards).toHaveCount(2)
+  await expect(proposalCards.nth(0)).toContainText(linkedProposal.id)
+  await expect(proposalCards.nth(0).getByText('Workflow linked', { exact: true })).toBeVisible()
+
+  const linkedApply = proposalCards.nth(0).getByRole('button', {
+    name: 'Apply selected operations',
+  })
+  await expect(linkedApply).toBeEnabled()
+
+  const historicalCard = proposalCards.filter({ hasText: historicalProposal.id })
+  await expect(historicalCard).toContainText(
+    'This historical proposal is not linked to the current workflow node and cannot be applied from this entry point.',
+  )
+  await expect(historicalCard.getByRole('button', {
+    name: 'Apply selected operations',
+  })).toBeDisabled()
+
+  await page.getByRole('button', { name: 'Versions 1' }).last().click()
+  await expect(page.getByRole('button', { name: 'Create immutable revision' })).toBeDisabled()
+  await expect(page.getByText(
+    'Review and apply the exact workflow-linked proposal in the Proposal tab first.',
+    { exact: true },
+  )).toBeVisible()
+})
+
 test('Blueprint type selects persist canonical values instead of translated labels', async ({ page }) => {
   const state = await installPlatformMock(page, { authenticated: true })
   await page.goto(`/team/acme/project/${project.id}/blueprint`)
@@ -5408,6 +5451,37 @@ function blueprintArtifactProposal(
     createdBy: user.id,
     createdAt: now,
     appliedAt: status === 'applied' ? now : undefined,
+  }
+}
+
+function pageSpecArtifactProposal(id: string) {
+  return {
+    id,
+    projectId: project.id,
+    artifactId: pageSpec.artifact.id,
+    manifest: { id: `${id}-manifest`, hash: hash('8') },
+    baseRevision: exactRevision(
+      pageSpecRevision.artifactId,
+      pageSpecRevision.id,
+      pageSpecRevision.revisionNumber,
+      pageSpec.draft.contentHash,
+    ),
+    payloadHash: hash('9'),
+    status: 'ready' as const,
+    operations: [{
+      id: `${id}-operation-goal`,
+      kind: 'replace' as const,
+      path: '/userGoal',
+      value: 'Inspect order health and resolve exceptions.',
+      rationale: 'Make the reviewed workflow goal explicit.',
+      decision: 'accepted' as const,
+    }],
+    assumptions: [],
+    questions: [],
+    version: 1,
+    createdBy: user.id,
+    createdAt: now,
+    appliedAt: undefined as string | undefined,
   }
 }
 

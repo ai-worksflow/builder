@@ -689,6 +689,94 @@ test('PageSpec branch Human Edit selects the exact applied PageSpec revision', (
   assert.deepEqual(resolution.candidates.map((candidate) => candidate.ref), [revisionRefFixture(pageSpec.latestRevision)])
 })
 
+test('PageSpec Human Edit exposes the exact open Proposal edit target', () => {
+  const pageSpec = versionedResource('page-open', 'page-open-r1', 'Open PageSpec', {
+    blueprintPageNodeId: 'page-node-open',
+    title: 'Open Page',
+  })
+  Object.assign(pageSpec.artifact, { kind: 'page_spec' })
+  const linkedProposal = {
+    ...proposal('page-spec-proposal-open', 'page-spec-payload-open', pageSpec.artifact.id, pageSpec.latestRevision),
+    status: 'open' as const,
+  }
+  delete (pageSpec.latestRevision as typeof pageSpec.latestRevision & { proposalId?: string }).proposalId
+  const node = {
+    id: 'page-spec-node-open', runId: 'run-1', key: 'page-spec-edit:slice-open',
+    definitionNodeId: 'page-spec-edit', sliceId: 'slice-open', type: 'human_edit',
+    status: 'waiting_input', attempt: 1,
+  }
+  const definitionNode = {
+    id: 'page-spec-edit', name: 'Edit PageSpec', type: 'human_edit',
+    humanEdit: { artifactType: 'blueprint', artifactKind: 'page_spec', requiredRole: 'editor' },
+  }
+  const run = workflowRun(node, [lineageBinding(
+    [],
+    { id: linkedProposal.id, payloadHash: linkedProposal.payloadHash },
+    [deliverySliceRef('slice-open', pageSpec.artifact.id, 'prototype-open')],
+  )])
+
+  const resolution = revisionCandidates(
+    definitionNode as never,
+    node as never,
+    run as never,
+    artifactSnapshot({ pageSpecs: [pageSpec], proposals: [linkedProposal] }) as never,
+  )
+
+  assert.deepEqual(resolution.editorTarget, {
+    artifactId: pageSpec.artifact.id,
+    artifactKind: 'page_spec',
+    proposalId: linkedProposal.id,
+    proposalStatus: 'open',
+  })
+  assert.equal(resolution.candidates.length, 0)
+  assert.match(resolution.error ?? '', /Review and apply the linked Proposal/i)
+})
+
+test('PageSpec Human Edit retains the applied Proposal target while awaiting its immutable revision', () => {
+  const pageSpec = versionedResource('page-awaiting-revision', 'page-awaiting-revision-r1', 'Awaiting PageSpec', {
+    blueprintPageNodeId: 'page-node-awaiting-revision',
+    title: 'Awaiting Page',
+  })
+  Object.assign(pageSpec.artifact, { kind: 'page_spec' })
+  const linkedProposal = proposal(
+    'page-spec-proposal-awaiting-revision',
+    'page-spec-payload-awaiting-revision',
+    pageSpec.artifact.id,
+    pageSpec.latestRevision,
+  )
+  delete (pageSpec.latestRevision as typeof pageSpec.latestRevision & { proposalId?: string }).proposalId
+  const node = {
+    id: 'page-spec-node-awaiting-revision', runId: 'run-1', key: 'page-spec-edit:slice-awaiting-revision',
+    definitionNodeId: 'page-spec-edit', sliceId: 'slice-awaiting-revision', type: 'human_edit',
+    status: 'waiting_input', attempt: 1,
+  }
+  const definitionNode = {
+    id: 'page-spec-edit', name: 'Edit PageSpec', type: 'human_edit',
+    humanEdit: { artifactType: 'blueprint', artifactKind: 'page_spec', requiredRole: 'editor' },
+  }
+  const run = workflowRun(node, [lineageBinding(
+    [],
+    { id: linkedProposal.id, payloadHash: linkedProposal.payloadHash },
+    [deliverySliceRef('slice-awaiting-revision', pageSpec.artifact.id, 'prototype-awaiting-revision')],
+  )])
+
+  const resolution = revisionCandidates(
+    definitionNode as never,
+    node as never,
+    run as never,
+    artifactSnapshot({ pageSpecs: [pageSpec], proposals: [linkedProposal] }) as never,
+  )
+
+  assert.deepEqual(resolution.editorTarget, {
+    artifactId: pageSpec.artifact.id,
+    artifactKind: 'page_spec',
+    proposalId: linkedProposal.id,
+    proposalStatus: 'applied',
+  })
+  assert.equal(resolution.candidates.length, 0)
+  assert.match(resolution.error ?? '', /create an immutable revision before submitting/i)
+})
+
 test('Review Gate readiness requires canonical approval of the exact materialized revision', () => {
   const target = versionedResource('brief-review', 'brief-review-r4', 'Project brief', { kind: 'projectBrief' })
   const revision = revisionRefFixture(target.latestRevision)

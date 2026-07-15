@@ -1,6 +1,7 @@
 import type { CollaborationPlatformClient } from '../collaboration/platform-adapter'
 import type {
   ArtifactDependencyDto,
+  ArtifactDraftDto,
   ArtifactReviewGateDto,
   ArtifactRevisionDto,
   AcceptanceCriterionDto,
@@ -78,6 +79,51 @@ export function replaceArtifactWorkspaceSnapshotResource<TContent>(
       item.artifact.id === artifactId ? resource : item,
     ),
   } as ArtifactWorkspaceSnapshot
+}
+
+export function mergeArtifactWorkspaceProposalApply<TDraft>(
+  snapshot: ArtifactWorkspaceSnapshot,
+  proposal: ProposalDto,
+  draft: ArtifactDraftDto<TDraft>,
+): ArtifactWorkspaceSnapshot {
+  if (proposal.artifactId !== draft.artifactId) {
+    throw new Error('Proposal apply returned a draft for a different artifact.')
+  }
+
+  const existingProposal = snapshot.proposals.find((item) => item.id === proposal.id)
+  const proposals = existingProposal
+    ? snapshot.proposals.map((item) =>
+        item.id === proposal.id && item.version <= proposal.version ? proposal : item,
+      )
+    : [...snapshot.proposals, proposal]
+  const resourcesWithDraft = <TContent,>(
+    resources: readonly VersionedArtifactDto<TContent>[],
+  ): readonly VersionedArtifactDto<TContent>[] => resources.map((resource) => {
+    if (resource.artifact.id !== draft.artifactId) return resource
+    if (
+      resource.draft
+      && (
+        resource.draft.revision > draft.revision
+        || (
+          resource.draft.revision === draft.revision
+          && resource.draft.updatedAt > draft.updatedAt
+        )
+      )
+    ) return resource
+    return {
+      ...resource,
+      draft: draft as unknown as ArtifactDraftDto<TContent>,
+    }
+  })
+
+  return {
+    ...snapshot,
+    documents: resourcesWithDraft(snapshot.documents),
+    blueprints: resourcesWithDraft(snapshot.blueprints),
+    pageSpecs: resourcesWithDraft(snapshot.pageSpecs),
+    prototypes: resourcesWithDraft(snapshot.prototypes),
+    proposals,
+  }
 }
 
 export interface ArtifactDetails<TContent> {
@@ -790,10 +836,26 @@ export class ArtifactWorkspaceGateway {
           ?? 'At least one operation must be accepted and every operation must be decided before apply.',
       )
     }
-    return this.client.proposals.apply(proposalId, { version: current.version }, {
+    const applied = await this.client.proposals.apply(proposalId, { version: current.version }, {
       ifMatch: proposalEtag(current),
       idempotencyKey: true,
     })
+    if (applied.data.artifactId !== current.artifactId) {
+      throw new Error('Proposal apply returned a draft for a different artifact.')
+    }
+    // The apply endpoint returns only the authoritative draft. Mirror the
+    // server's deterministic ready -> applied transition until revalidation.
+    const appliedProposal: ProposalDto = {
+      ...current,
+      status: current.operations.some((operation) => operation.decision === 'rejected')
+        ? 'partially_applied'
+        : 'applied',
+      operations: current.operations.map((operation) => operation.decision === 'accepted'
+        ? { ...operation, decision: 'applied' as const }
+        : operation),
+      version: current.version + 1,
+    }
+    return { ...applied, appliedProposal }
   }
 
   decideProposalOperation(

@@ -66,6 +66,12 @@ export interface WorkflowRevisionCandidate {
 
 export interface WorkflowRevisionCandidateResolution {
   readonly candidates: readonly WorkflowRevisionCandidate[]
+  readonly editorTarget?: {
+    readonly artifactId: string
+    readonly artifactKind?: string
+    readonly proposalId: string
+    readonly proposalStatus: ProposalDto['status']
+  }
   readonly error?: string
 }
 
@@ -837,18 +843,25 @@ export function revisionCandidates(
   const proposalRefs = [soleProposal]
   const proposalTargetIds = new Set<string>()
   const appliedProposalIds = new Set<string>()
+  let editorTarget: WorkflowRevisionCandidateResolution['editorTarget']
   for (const proposalRef of proposalRefs) {
     const proposal = artifacts.proposals.find((item) => item.id === proposalRef.id)
     if (!proposal) return { candidates: [], error: `Proposal ${proposalRef.id} from the typed input lineage is not available in the current workspace snapshot.` }
     if (proposal.payloadHash !== proposalRef.payloadHash) {
       return { candidates: [], error: `Proposal ${proposalRef.id} does not match the payload hash pinned by the typed input lineage.` }
     }
+    editorTarget = {
+      artifactId: proposal.artifactId,
+      artifactKind: allResources.find((resource) => resource.artifact.id === proposal.artifactId)?.artifact.kind ?? kind,
+      proposalId: proposal.id,
+      proposalStatus: proposal.status,
+    }
     if (!exactRef(proposal.baseRevision) || proposal.baseRevision.artifactId !== proposal.artifactId) {
-      return { candidates: [], error: `Proposal ${proposalRef.id} has an invalid target revision.` }
+      return { candidates: [], editorTarget, error: `Proposal ${proposalRef.id} has an invalid target revision.` }
     }
     proposalTargetIds.add(proposal.artifactId)
     if (proposal.status !== 'applied' && proposal.status !== 'partially_applied') {
-      return { candidates: [], error: 'Review and apply the linked Proposal in the corresponding editor before creating an immutable revision.' }
+      return { candidates: [], editorTarget, error: 'Review and apply the linked Proposal in the corresponding editor before creating an immutable revision.' }
     }
     appliedProposalIds.add(proposal.id)
   }
@@ -873,7 +886,7 @@ export function revisionCandidates(
     : sliceTargetIds.size > 0
       ? 'delivery_slice'
       : 'artifact_lineage'
-  if (allowedIds.size === 0) return { candidates: [], error: 'The current typed input contains no artifact, proposal target, or delivery-slice target for this Human Edit type.' }
+  if (allowedIds.size === 0) return { candidates: [], editorTarget, error: 'The current typed input contains no artifact, proposal target, or delivery-slice target for this Human Edit type.' }
   const candidates = resources.flatMap((resource) => {
     if (!allowedIds.has(resource.artifact.id)) return []
     const availableRevisions = uniqueBy(
@@ -897,10 +910,10 @@ export function revisionCandidates(
     }]
   }).sort((left, right) => left.label.localeCompare(right.label))
   return candidates.length > 0
-    ? { candidates }
+    ? { candidates, editorTarget }
     : appliedProposalIds.size > 0
-      ? { candidates, error: 'Apply the linked Proposal in the corresponding editor, then create an immutable revision before submitting this node.' }
-      : { candidates, error: `No immutable ${kind ?? type} revision matches the current node ${lineageSource.replaceAll('_', ' ')}.` }
+      ? { candidates, editorTarget, error: 'Apply the linked Proposal in the corresponding editor, then create an immutable revision before submitting this node.' }
+      : { candidates, editorTarget, error: `No immutable ${kind ?? type} revision matches the current node ${lineageSource.replaceAll('_', ' ')}.` }
 }
 
 export function reviewGateApprovalReadiness(

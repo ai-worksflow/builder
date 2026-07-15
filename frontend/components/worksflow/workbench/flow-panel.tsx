@@ -26,6 +26,7 @@ import { useCollaboration } from '@/lib/collaboration/provider'
 import { useI18n } from '@/lib/i18n'
 import { useArtifactWorkspace } from '@/lib/platform/artifact-provider'
 import { usePlatformFlow } from '@/lib/platform/flow-provider'
+import { useWorksflow } from '@/lib/worksflow/store'
 import type {
   CreateWorkflowDefinitionInputDto,
   WorkflowDefinitionRecordDto,
@@ -355,6 +356,7 @@ function RunNodeCard({ node }: { node: WorkflowNodeRunDto }) {
   const flow = usePlatformFlow()
   const artifacts = useArtifactWorkspace()
   const { can, project } = useCollaboration()
+  const { setSelectedDocId, setSurface, setTeamView } = useWorksflow()
   const { t } = useI18n()
   const [revisionKey, setRevisionKey] = useState('')
   const [reason, setReason] = useState('')
@@ -368,6 +370,7 @@ function RunNodeCard({ node }: { node: WorkflowNodeRunDto }) {
     [artifacts, definitionNode, flow.run, node],
   )
   const candidates = candidateResolution.candidates
+  const editorTarget = candidateResolution.editorTarget
   const selected = resolveLineageSelection(candidates, revisionKey)
   const staleSelection = Boolean(revisionKey && !selected)
   const selectionRequired = candidates.length > 1 && !selected
@@ -415,6 +418,33 @@ function RunNodeCard({ node }: { node: WorkflowNodeRunDto }) {
       return
     }
     void flow.submitNodeRevision(node, stillAllowed.ref)
+  }
+
+  function openLinkedEditor() {
+    if (!editorTarget) return
+    setWorkflowArtifactReference(
+      editorTarget.artifactId,
+      editorTarget.proposalId,
+      node.runId,
+      node.key,
+    )
+    if (
+      editorTarget.artifactKind === 'blueprint'
+      || editorTarget.artifactKind === 'page_spec'
+      || definitionNode?.humanEdit?.artifactType === 'blueprint'
+    ) {
+      setTeamView('blueprint')
+    } else if (
+      editorTarget.artifactKind === 'prototype'
+      || editorTarget.artifactKind === 'prototype_flow'
+      || definitionNode?.humanEdit?.artifactType === 'prototype'
+    ) {
+      setTeamView('prototype')
+    } else {
+      setSelectedDocId(editorTarget.artifactId)
+      setTeamView('editor')
+    }
+    setSurface('team')
   }
 
   return (
@@ -474,9 +504,21 @@ function RunNodeCard({ node }: { node: WorkflowNodeRunDto }) {
               )}
             </>
           ) : (
-            <p className="text-[9px] leading-relaxed text-warning">
-              {candidateResolution.error ?? t('flow.error.noRevision')}
-            </p>
+            <>
+              {editorTarget && (
+                <button
+                  type="button"
+                  onClick={openLinkedEditor}
+                  disabled={!can('edit') || flow.busy}
+                  className="mb-1.5 inline-flex h-7 w-full items-center justify-center gap-1 rounded bg-primary text-[9px] font-semibold text-primary-foreground disabled:opacity-40"
+                >
+                  <PencilLine className="size-3" /> {t('flow.openLinkedEditor')}
+                </button>
+              )}
+              <p className="text-[9px] leading-relaxed text-warning">
+                {candidateResolution.error ?? t('flow.error.noRevision')}
+              </p>
+            </>
           )}
         </div>
       )}
@@ -558,6 +600,21 @@ function RunNodeCard({ node }: { node: WorkflowNodeRunDto }) {
       )}
     </div>
   )
+}
+
+function setWorkflowArtifactReference(
+  artifactId: string,
+  proposalId: string,
+  runId: string,
+  nodeKey: string,
+) {
+  if (typeof window === 'undefined') return
+  const url = new URL(window.location.href)
+  url.searchParams.set('artifactId', artifactId)
+  url.searchParams.set('proposalId', proposalId)
+  url.searchParams.set('runId', runId)
+  url.searchParams.set('workbenchNodeKey', nodeKey)
+  window.history.replaceState(null, '', `${url.pathname}${url.search}${url.hash}`)
 }
 
 function DefinitionEditor({

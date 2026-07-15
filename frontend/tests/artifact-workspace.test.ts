@@ -7,6 +7,7 @@ import {
   createEmptyPageSpecContent,
   createEmptyPrototypeContent,
   documentReviewIssues,
+  mergeArtifactWorkspaceProposalApply,
   normalizeDocumentContent,
   replaceArtifactWorkspaceSnapshotResource,
   reviewGateReadyForRequest,
@@ -19,9 +20,11 @@ import {
 } from '../lib/platform/blueprint-content'
 import { PlatformClient } from '../lib/platform/client'
 import type {
+  ArtifactDraftDto,
   BlueprintContentDto,
   DocumentContentDto,
   PageSpecContentDto,
+  ProposalDto,
   VersionedArtifactDto,
 } from '../lib/platform/dto'
 import { PlatformNetworkError, type FetchLike } from '../lib/platform/http'
@@ -469,6 +472,60 @@ test('PageSpec snapshot updates replace only the targeted canonical resource', (
   assert.strictEqual(next.documents, documents)
 })
 
+test('Proposal apply response updates the local Proposal and returned draft atomically', () => {
+  const pageSpec = versionedPageSpec()
+  const proposal: ProposalDto = {
+    id: 'page-spec-proposal-1',
+    projectId: 'project-1',
+    artifactId: pageSpec.artifact.id,
+    manifest: { id: 'manifest-1', hash: 'sha256:manifest' },
+    baseRevision: {
+      artifactId: pageSpec.artifact.id,
+      revisionId: 'page-spec-revision-1',
+      contentHash: 'sha256:page-spec-revision-1',
+    },
+    payloadHash: 'sha256:proposal',
+    status: 'partially_applied',
+    version: 4,
+    operations: [
+      { id: 'operation-1', kind: 'replace', path: '/userGoal', decision: 'applied' },
+      { id: 'operation-2', kind: 'remove', path: '/interactions/0', decision: 'rejected' },
+    ],
+    assumptions: [],
+    questions: [],
+    createdBy: 'user-1',
+    createdAt: '2026-07-10T00:00:00Z',
+    appliedAt: '2026-07-10T00:00:02Z',
+  }
+  const draft: ArtifactDraftDto<PageSpecContentDto> = {
+    ...pageSpec.draft!,
+    revision: 3,
+    content: { ...pageSpec.draft!.content, userGoal: 'Review applied changes.' },
+    contentHash: 'sha256:page-spec-applied',
+    updatedAt: '2026-07-10T00:00:02Z',
+    etag: '"page-spec-draft-3"',
+  }
+  const snapshot: ArtifactWorkspaceSnapshot = {
+    documents: [],
+    blueprints: [],
+    pageSpecs: [pageSpec],
+    prototypes: [],
+    proposals: [{ ...proposal, status: 'ready', version: 3 }],
+    traces: [],
+  }
+
+  const next = mergeArtifactWorkspaceProposalApply(
+    snapshot,
+    proposal,
+    draft,
+  )
+
+  assert.equal(next.proposals[0].status, 'partially_applied')
+  assert.equal(next.proposals[0].version, 4)
+  assert.equal(next.pageSpecs[0].draft?.etag, '"page-spec-draft-3"')
+  assert.equal(next.pageSpecs[0].draft?.content.userGoal, 'Review applied changes.')
+})
+
 test('PageSpec creation pins an approved Blueprint revision and page-node anchor', async () => {
   let requestBody: unknown
   const content = pageSpecContent()
@@ -746,7 +803,7 @@ test('immutable revisions carry the draft precondition and proposal operations a
   })
   const gateway = new ArtifactWorkspaceGateway(client)
   await gateway.createDocumentRevision('document-1', '"draft-8"', 'Requirements checkpoint')
-  await gateway.applyProposal('proposal-1', ['operation-0', 'operation-2'])
+  const applied = await gateway.applyProposal('proposal-1', ['operation-0', 'operation-2'])
 
   assert.equal(calls[0].path, '/v1/documents/document-1/revisions')
   assert.deepEqual(calls[0].body, {
@@ -770,6 +827,12 @@ test('immutable revisions carry the draft precondition and proposal operations a
   assert.deepEqual(calls[5].body, { version: 4 })
   assert.equal(calls[5].headers.get('if-match'), '"output-proposal:proposal-1:4"')
   assert.ok(calls[5].headers.get('idempotency-key'))
+  assert.equal(applied.appliedProposal.status, 'partially_applied')
+  assert.equal(applied.appliedProposal.version, 5)
+  assert.deepEqual(
+    applied.appliedProposal.operations.map((operation) => operation.decision),
+    ['applied', 'rejected', 'applied'],
+  )
 })
 
 test('blueprints keep semantic facts independent from canvas layout', () => {

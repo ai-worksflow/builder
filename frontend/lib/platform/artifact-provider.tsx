@@ -30,6 +30,7 @@ import {
   artifactWorkspaceEventRequiresRefresh,
   createEmptyPageSpecContent,
   createEmptyPrototypeContent,
+  mergeArtifactWorkspaceProposalApply,
   replaceArtifactWorkspaceSnapshotResource,
   type ArtifactDetails,
   type CreateArtifactProposalInput,
@@ -430,6 +431,32 @@ export function ArtifactWorkspaceProvider({ children }: { children: ReactNode })
     [gateway],
   )
 
+  const updateSnapshotProposalApply = useCallback((
+    proposal: ProposalDto,
+    draft: ArtifactDraftDto<JsonValue>,
+    mutationScope: ArtifactWorkspaceProjectScope,
+  ) => {
+    if (
+      !mutationScope.signedIn
+      || mutationScope.projectId !== proposal.projectId
+      || proposal.artifactId !== draft.artifactId
+      || activeProjectScopeRef.current.generation !== mutationScope.generation
+      || snapshotScopeRef.current.generation !== mutationScope.generation
+    ) return
+
+    requestId.current += 1
+    loadedProjectId.current = proposal.projectId
+    setSnapshot((current) => {
+      if (
+        activeProjectScopeRef.current.generation !== mutationScope.generation
+        || snapshotScopeRef.current.generation !== mutationScope.generation
+      ) return current
+      return mergeArtifactWorkspaceProposalApply(current, proposal, draft)
+    })
+    setStatus('ready')
+    setError(null)
+  }, [])
+
   const value = useMemo<ArtifactWorkspaceContextState>(() => ({
     ...currentSnapshot,
     status: currentStatus,
@@ -574,6 +601,7 @@ export function ArtifactWorkspaceProvider({ children }: { children: ReactNode })
       return result.data
     },
     createPageSpecRevision: async (artifactId, content) => {
+      const mutationScope = activeProjectScope
       const resource = currentSnapshot.pageSpecs.find((item) => item.artifact.id === artifactId)
       const draftEtag = resource?.draft?.etag ?? resource?.artifact.etag
       if (!draftEtag) throw new Error(t('runtime.artifact.refreshPageSpecDraft'))
@@ -585,6 +613,10 @@ export function ArtifactWorkspaceProvider({ children }: { children: ReactNode })
       const revisionEtag = saved.data.draft?.etag ?? saved.etag
       if (!revisionEtag) throw new Error(t('runtime.artifact.missingSavedDraftEtag'))
       const result = await gateway.createPageSpecRevision(artifactId, revisionEtag)
+      updateSnapshotResource('pageSpecs', artifactId, {
+        ...saved.data,
+        latestRevision: result.data,
+      }, mutationScope)
       await revalidateRef.current()
       return result.data
     },
@@ -611,10 +643,12 @@ export function ArtifactWorkspaceProvider({ children }: { children: ReactNode })
       return result.data
     },
     applyProposal: async (proposalId, acceptedOperationIds) => {
+      const mutationScope = activeProjectScope
       const result = await gateway.applyProposal(proposalId, acceptedOperationIds, {
         rejectedReason: t('runtime.artifact.proposalNotSelected'),
         invalidSelection: t('runtime.artifact.proposalSelectionInvalid'),
       })
+      updateSnapshotProposalApply(result.appliedProposal, result.data, mutationScope)
       await revalidateRef.current()
       return result.data
     },
@@ -639,6 +673,7 @@ export function ArtifactWorkspaceProvider({ children }: { children: ReactNode })
     project,
     refresh,
     t,
+    updateSnapshotProposalApply,
     updateSnapshotResource,
   ])
 

@@ -8,6 +8,7 @@ import {
   type ArtifactDetails,
 } from '@/lib/platform/artifact-workspace'
 import { useArtifactWorkspace } from '@/lib/platform/artifact-provider'
+import { useWorksflow } from '@/lib/worksflow/store'
 import {
   normalizePageSpecContent,
   pageSpecReviewIssues,
@@ -61,6 +62,7 @@ export function PageSpecEditor({
   const { locale, t } = useI18n()
   const workspace = useArtifactWorkspace()
   const collaboration = useCollaboration()
+  const { setSurface } = useWorksflow()
   const resource = workspace.pageSpecs.find((item) => item.artifact.id === artifactId)
   const serverContent = resource?.draft?.content
     ?? resource?.latestRevision?.content
@@ -77,17 +79,44 @@ export function PageSpecEditor({
   const [comment, setComment] = useState('')
   const [reviewSummary, setReviewSummary] = useState(() => t('teamPlatform.pageSpec.defaultReviewSummary'))
   const [reviewerId, setReviewerId] = useState('')
+  const [proposalBusyId, setProposalBusyId] = useState('')
+  const [confirmedAppliedProposalId, setConfirmedAppliedProposalId] = useState('')
+  const [createdWorkflowRevisionId, setCreatedWorkflowRevisionId] = useState('')
   const activeArtifactRef = useRef('')
   const contentRef = useRef<PageSpecContentDto | null>(null)
   const draftEtagRef = useRef('')
   const saveInFlightRef = useRef(false)
   const queuedContentRef = useRef<PageSpecContentDto | null>(null)
   const canEdit = collaboration.can('edit')
+  const workflowProposalId = workflowProposalReference(artifactId)
 
   const latestVersion = resource?.latestRevision
     ? versionRef(resource.latestRevision)
     : undefined
-  const proposals = workspace.proposals.filter((proposal) => proposal.artifactId === artifactId)
+  const artifactProposals = workspace.proposals.filter((proposal) => proposal.artifactId === artifactId)
+  const linkedProposal = artifactProposals.find((proposal) => proposal.id === workflowProposalId)
+  const proposals = linkedProposal
+    ? [linkedProposal, ...artifactProposals.filter((proposal) => proposal.id !== linkedProposal.id)]
+    : artifactProposals
+  const linkedProposalApplied = Boolean(
+    linkedProposal
+    && (
+      linkedProposal.status === 'applied'
+      || linkedProposal.status === 'partially_applied'
+      || confirmedAppliedProposalId === linkedProposal.id
+    ),
+  )
+  const linkedProposalRevision = [
+    resource?.latestRevision,
+    resource?.approvedRevision,
+    ...(details?.versions ?? []),
+  ].find((revision) => revision?.proposalId === workflowProposalId)
+  const workflowRevisionReady = Boolean(linkedProposalRevision || createdWorkflowRevisionId)
+  const linkedProposalBaseMatchesDraft = Boolean(
+    linkedProposal
+    && (resource?.draft?.contentHash ?? resource?.latestRevision?.contentHash) === linkedProposal.baseRevision.contentHash,
+  )
+  const contentCanEdit = canEdit && (!workflowProposalId || linkedProposalApplied)
   const comments = collaboration.comments.filter((thread) =>
     thread.target?.artifactId === artifactId
     && thread.target.revisionId === latestVersion?.revisionId,
@@ -109,6 +138,16 @@ export function PageSpecEditor({
   )
   const gatePassed = Boolean(latestVersion) && draftMatchesLatest && !dirty && clientIssues.length === 0
     && reviewGateReadyForRequest(details?.reviewGate)
+
+  useEffect(() => {
+    setConfirmedAppliedProposalId('')
+    setCreatedWorkflowRevisionId('')
+  }, [artifactId, workflowProposalId])
+
+  useEffect(() => {
+    if (!workflowProposalId || !linkedProposal) return
+    setTab(linkedProposalApplied ? 'versions' : 'proposal')
+  }, [linkedProposal?.id, linkedProposalApplied, workflowProposalId])
 
   useEffect(() => {
     if (!resource || !serverContent) {
@@ -205,7 +244,7 @@ export function PageSpecEditor({
     update: Partial<PageSpecContentDto>
       | ((current: PageSpecContentDto) => PageSpecContentDto),
   ) {
-    if (!canEdit) return
+    if (!contentCanEdit) return
     setContent((current) => {
       if (!current) return current
       const next = normalizePageSpecContent(
@@ -219,11 +258,21 @@ export function PageSpecEditor({
   }
 
   async function createRevision() {
-    if (!resource || !content || clientIssues.length > 0 || dirty || saveState === 'saving' || !hasUnversionedChanges) return
+    if (
+      !resource
+      || !content
+      || clientIssues.length > 0
+      || dirty
+      || saveState === 'saving'
+      || saveState === 'conflict'
+      || !hasUnversionedChanges
+      || (workflowProposalId && !linkedProposalApplied)
+    ) return
     setSaveState('saving')
     setError(null)
     try {
-      await workspace.createPageSpecRevision(resource.artifact.id, content)
+      const revision = await workspace.createPageSpecRevision(resource.artifact.id, content)
+      if (workflowProposalId) setCreatedWorkflowRevisionId(revision.id)
       setSaveState('saved')
       await loadDetails()
     } catch (cause) {
@@ -241,12 +290,26 @@ export function PageSpecEditor({
   }
 
   async function applyProposal(proposal: ProposalDto) {
+    if (
+      proposalBusyId
+      || dirty
+      || saveState === 'saving'
+      || saveState === 'conflict'
+      || (workflowProposalId && proposal.id !== workflowProposalId)
+      || (workflowProposalId && !linkedProposalBaseMatchesDraft)
+    ) return
+    setProposalBusyId(proposal.id)
+    setError(null)
     try {
       await workspace.applyProposal(proposal.id, selectedOperations[proposal.id] ?? [])
+      if (proposal.id === workflowProposalId) setConfirmedAppliedProposalId(proposal.id)
       setSaveState('idle')
+      setTab('versions')
       await loadDetails()
     } catch (cause) {
       setError(errorMessage(cause, t('teamPlatform.pageSpec.operationFailed')))
+    } finally {
+      setProposalBusyId('')
     }
   }
 
@@ -296,6 +359,32 @@ export function PageSpecEditor({
         </div>
       )}
 
+      {workflowProposalId && (
+        <div className="flex flex-wrap items-start gap-2 border-b border-primary/25 bg-primary/5 px-3 py-2.5" data-testid="page-spec-workflow-proposal-guide">
+          <ShieldCheck className="mt-0.5 size-3.5 shrink-0 text-primary-bright" />
+          <div className="min-w-0 flex-1">
+            <p className="text-[10px] font-semibold text-foreground">{t('teamPlatform.pageSpec.workflowProposalTitle')}</p>
+            <code className="mt-0.5 block break-all text-[8px] text-faint-foreground">{workflowProposalId}</code>
+            <p className="mt-1 text-[9px] leading-relaxed text-muted-foreground">
+              {!linkedProposal
+                ? t('teamPlatform.pageSpec.workflowProposalUnavailable')
+                : workflowRevisionReady
+                  ? t('teamPlatform.pageSpec.workflowRevisionReady')
+                  : linkedProposalApplied
+                    ? t('teamPlatform.pageSpec.workflowProposalApplied')
+                    : linkedProposalBaseMatchesDraft
+                      ? t('teamPlatform.pageSpec.workflowProposalReview')
+                      : t('teamPlatform.pageSpec.workflowProposalStaleDraft')}
+            </p>
+          </div>
+          {workflowRevisionReady && (
+            <button type="button" onClick={() => setSurface('workbench')} className="rounded bg-primary px-2.5 py-1.5 text-[9px] font-semibold text-primary-foreground">
+              <Send className="mr-1 inline size-3" />{t('teamPlatform.pageSpec.returnToWorkflow')}
+            </button>
+          )}
+        </div>
+      )}
+
       <nav className="flex overflow-x-auto border-b border-border bg-panel p-1 scrollbar-thin">
         {([
           ['content', t('teamPlatform.pageSpec.tab.basics')],
@@ -312,15 +401,16 @@ export function PageSpecEditor({
       </nav>
 
       <div className="max-h-[680px] overflow-y-auto p-4 scrollbar-thin">
-        {tab === 'content' && <BasicsEditor content={content} readOnly={!canEdit} onChange={updateContent} />}
-        {tab === 'states' && <StatesEditor states={content.states} readOnly={!canEdit} onChange={(states) => updateContent({ states })} />}
-        {tab === 'data' && <DataBindingsEditor bindings={content.dataBindings} readOnly={!canEdit} onChange={(dataBindings) => updateContent({ dataBindings })} />}
-        {tab === 'interactions' && <InteractionsEditor interactions={content.interactions} readOnly={!canEdit} onChange={(interactions) => updateContent({ interactions })} />}
+        {tab === 'content' && <BasicsEditor content={content} readOnly={!contentCanEdit} onChange={updateContent} />}
+        {tab === 'states' && <StatesEditor states={content.states} readOnly={!contentCanEdit} onChange={(states) => updateContent({ states })} />}
+        {tab === 'data' && <DataBindingsEditor bindings={content.dataBindings} readOnly={!contentCanEdit} onChange={(dataBindings) => updateContent({ dataBindings })} />}
+        {tab === 'interactions' && <InteractionsEditor interactions={content.interactions} readOnly={!contentCanEdit} onChange={(interactions) => updateContent({ interactions })} />}
         {tab === 'versions' && (
           <div className="space-y-3">
             <ReviewGatePanel clientIssues={clientIssues} serverGate={details?.reviewGate} />
-            <button type="button" onClick={() => void createRevision()} disabled={!canEdit || clientIssues.length > 0 || dirty || !hasUnversionedChanges || saveState === 'saving' || saveState === 'conflict'} className="inline-flex items-center gap-1.5 rounded bg-primary px-3 py-2 text-[10px] font-semibold text-primary-foreground disabled:opacity-40"><GitBranch className="size-3.5" />{t('teamPlatform.pageSpec.createRevision')}</button>
+            <button type="button" onClick={() => void createRevision()} disabled={!canEdit || clientIssues.length > 0 || dirty || !hasUnversionedChanges || saveState === 'saving' || saveState === 'conflict' || Boolean(workflowProposalId && !linkedProposalApplied)} className="inline-flex items-center gap-1.5 rounded bg-primary px-3 py-2 text-[10px] font-semibold text-primary-foreground disabled:opacity-40"><GitBranch className="size-3.5" />{t('teamPlatform.pageSpec.createRevision')}</button>
             {dirty && <p className="text-[9px] text-warning">{t('teamPlatform.pageSpec.waitAutosave')}</p>}
+            {workflowProposalId && !linkedProposalApplied && <p className="text-[9px] text-warning">{t('teamPlatform.pageSpec.applyWorkflowProposalFirst')}</p>}
             {!dirty && !hasUnversionedChanges && <p className="text-[9px] text-faint-foreground">{t('teamPlatform.pageSpec.draftMatchesRevision')}</p>}
             {details?.versions.map((revision) => <RevisionCard key={revision.id} revision={revision} />)}
           </div>
@@ -333,7 +423,10 @@ export function PageSpecEditor({
             instruction={proposalInstruction}
             onInstruction={setProposalInstruction}
             canEdit={canEdit}
-            canCreate={Boolean(latestVersion) && draftMatchesLatest && !dirty && saveState !== 'saving' && saveState !== 'conflict'}
+            canCreate={Boolean(latestVersion) && !workflowProposalId && draftMatchesLatest && !dirty && saveState !== 'saving' && saveState !== 'conflict'}
+            linkedProposalId={workflowProposalId}
+            proposalBusyId={proposalBusyId}
+            applyBlocked={dirty || saveState === 'saving' || saveState === 'conflict' || Boolean(workflowProposalId && !linkedProposalBaseMatchesDraft)}
             onCreate={() => void workspace.createProposal({
               jobType: 'page_spec.patch',
               targetRevision: latestVersion!,
@@ -479,32 +572,37 @@ function InteractionsEditor({ interactions, readOnly, onChange }: { interactions
   )
 }
 
-function ProposalEditor({ proposals, selected, onSelected, instruction, onInstruction, canEdit, canCreate, onCreate, onApply }: { proposals: readonly ProposalDto[]; selected: Record<string, string[]>; onSelected: (next: Record<string, string[]>) => void; instruction: string; onInstruction: (value: string) => void; canEdit: boolean; canCreate: boolean; onCreate: () => void; onApply: (proposal: ProposalDto) => void }) {
+function ProposalEditor({ proposals, selected, onSelected, instruction, onInstruction, canEdit, canCreate, linkedProposalId, proposalBusyId, applyBlocked, onCreate, onApply }: { proposals: readonly ProposalDto[]; selected: Record<string, string[]>; onSelected: (next: Record<string, string[]>) => void; instruction: string; onInstruction: (value: string) => void; canEdit: boolean; canCreate: boolean; linkedProposalId: string; proposalBusyId: string; applyBlocked: boolean; onCreate: () => void; onApply: (proposal: ProposalDto) => void }) {
   const { t } = useI18n()
   return (
     <div className="mx-auto max-w-4xl space-y-3">
-      <div className="rounded-lg border border-border bg-panel p-3">
-        <textarea value={instruction} onChange={(event) => onInstruction(event.target.value)} rows={3} className={textareaClass(false)} aria-label={t('teamPlatform.pageSpec.proposalInstruction')} />
-        <button type="button" onClick={onCreate} disabled={!canEdit || !canCreate || !instruction.trim()} className="mt-2 rounded bg-primary px-3 py-2 text-[10px] font-semibold text-primary-foreground disabled:opacity-40"><Bot className="mr-1 inline size-3" />{t('teamPlatform.pageSpec.askAi')}</button>
-        {!canCreate && <p className="mt-2 text-[9px] text-warning">{t('teamPlatform.pageSpec.revisionBeforeAi')}</p>}
-      </div>
+      {!linkedProposalId && (
+        <div className="rounded-lg border border-border bg-panel p-3">
+          <textarea value={instruction} onChange={(event) => onInstruction(event.target.value)} rows={3} className={textareaClass(false)} aria-label={t('teamPlatform.pageSpec.proposalInstruction')} />
+          <button type="button" onClick={onCreate} disabled={!canEdit || !canCreate || !instruction.trim()} className="mt-2 rounded bg-primary px-3 py-2 text-[10px] font-semibold text-primary-foreground disabled:opacity-40"><Bot className="mr-1 inline size-3" />{t('teamPlatform.pageSpec.askAi')}</button>
+          {!canCreate && <p className="mt-2 text-[9px] text-warning">{t('teamPlatform.pageSpec.revisionBeforeAi')}</p>}
+        </div>
+      )}
       {proposals.map((proposal) => {
         const selectedIds = selected[proposal.id] ?? []
         const hasAccepted = proposal.operations.some((operation) => operation.decision === 'accepted' || selectedIds.includes(operation.id))
+        const isLinked = !linkedProposalId || proposal.id === linkedProposalId
         return (
-          <article key={proposal.id} className="rounded-lg border border-border bg-panel p-3">
-            <div className="flex flex-wrap items-center gap-2"><Wand2 className="size-3.5 text-primary-bright" /><span className="text-[10px] font-semibold text-foreground">{t('teamPlatform.pageSpec.manifest', { id: proposal.manifest.id.slice(0, 12) })}</span><span className="rounded bg-primary/10 px-1.5 py-0.5 text-[8px] text-primary-bright">{proposalStatusLabel(proposal.status, t)}</span><code className="ml-auto text-[8px] text-faint-foreground">{t('teamPlatform.pageSpec.baseHash', { hash: proposal.baseRevision.contentHash.slice(0, 12) })}</code></div>
+          <article key={proposal.id} className={cn('rounded-lg border bg-panel p-3', isLinked ? 'border-primary/35' : 'border-border opacity-70')}>
+            <div className="flex flex-wrap items-center gap-2"><Wand2 className="size-3.5 text-primary-bright" /><span className="text-[10px] font-semibold text-foreground">{t('teamPlatform.pageSpec.manifest', { id: proposal.manifest.id.slice(0, 12) })}</span><span className="rounded bg-primary/10 px-1.5 py-0.5 text-[8px] text-primary-bright">{proposalStatusLabel(proposal.status, t)}</span>{linkedProposalId && isLinked && <span className="rounded bg-success/10 px-1.5 py-0.5 text-[8px] font-semibold text-success">{t('teamPlatform.pageSpec.workflowLinked')}</span>}<code className="ml-auto text-[8px] text-faint-foreground">{t('teamPlatform.pageSpec.baseHash', { hash: proposal.baseRevision.contentHash.slice(0, 12) })}</code></div>
+            <code className="mt-1 block break-all text-[8px] text-faint-foreground">{proposal.id}</code>
             {proposal.assumptions.length > 0 && <p className="mt-2 text-[9px] text-muted-foreground">{t('teamPlatform.pageSpec.assumptions', { values: proposal.assumptions.join(' · ') })}</p>}
             {proposal.questions.length > 0 && <p className="mt-1 text-[9px] text-warning">{t('teamPlatform.pageSpec.questions', { values: proposal.questions.join(' · ') })}</p>}
             <div className="mt-2 space-y-1.5">
               {proposal.operations.map((operation) => (
                 <label key={operation.id} className="flex gap-2 rounded border border-border bg-background p-2 text-[9px] text-muted-foreground">
-                  <input type="checkbox" disabled={operation.decision !== 'pending'} checked={operation.decision === 'accepted' || operation.decision === 'applied' || selectedIds.includes(operation.id)} onChange={(event) => onSelected({ ...selected, [proposal.id]: event.target.checked ? [...selectedIds, operation.id] : selectedIds.filter((id) => id !== operation.id) })} />
+                  <input type="checkbox" disabled={!isLinked || Boolean(proposalBusyId) || operation.decision !== 'pending'} checked={operation.decision === 'accepted' || operation.decision === 'applied' || selectedIds.includes(operation.id)} onChange={(event) => onSelected({ ...selected, [proposal.id]: event.target.checked ? [...selectedIds, operation.id] : selectedIds.filter((id) => id !== operation.id) })} />
                   <span className="min-w-0 flex-1"><code>{proposalOperationLabel(operation.kind, t)} {operation.path || '/'}</code><span className="ml-2 text-faint-foreground">{proposalDecisionLabel(operation.decision, t)}</span>{operation.rationale && <span className="mt-1 block">{operation.rationale}</span>}{operation.value !== undefined && <pre className="mt-1 max-h-36 overflow-auto whitespace-pre-wrap rounded bg-black/20 p-1.5 font-mono text-[8px]">{JSON.stringify(operation.value, null, 2)}</pre>}</span>
                 </label>
               ))}
             </div>
-            <button type="button" onClick={() => onApply(proposal)} disabled={!canEdit || !hasAccepted || !['open', 'reviewing', 'ready'].includes(proposal.status)} className="mt-2 rounded bg-primary px-2.5 py-1.5 text-[9px] font-semibold text-primary-foreground disabled:opacity-40">{t('teamPlatform.pageSpec.applySelected')}</button>
+            <button type="button" onClick={() => onApply(proposal)} disabled={!canEdit || !isLinked || applyBlocked || Boolean(proposalBusyId) || !hasAccepted || !['open', 'reviewing', 'ready'].includes(proposal.status)} className="mt-2 rounded bg-primary px-2.5 py-1.5 text-[9px] font-semibold text-primary-foreground disabled:opacity-40">{proposalBusyId === proposal.id ? t('teamPlatform.pageSpec.applyingProposal') : t('teamPlatform.pageSpec.applySelected')}</button>
+            {linkedProposalId && !isLinked && <p className="mt-1 text-[8px] text-faint-foreground">{t('teamPlatform.pageSpec.notWorkflowProposal')}</p>}
           </article>
         )
       })}
@@ -750,6 +848,13 @@ function stableId(prefix: string) {
     ? crypto.randomUUID()
     : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`
   return `${prefix}-${id}`
+}
+
+function workflowProposalReference(artifactId: string) {
+  if (typeof window === 'undefined') return ''
+  const query = new URLSearchParams(window.location.search)
+  if (query.get('artifactId') !== artifactId) return ''
+  return query.get('proposalId') ?? ''
 }
 
 function commaList(value: string) {

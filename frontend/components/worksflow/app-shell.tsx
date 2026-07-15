@@ -35,7 +35,7 @@ const WORKBENCH_DEEP_LINK_KEYS = [
   'conversationId',
 ] as const
 
-const TEAM_DEEP_LINK_KEYS = ['runId', 'workbenchNodeKey', 'artifactId'] as const
+const TEAM_DEEP_LINK_KEYS = ['runId', 'workbenchNodeKey', 'artifactId', 'proposalId'] as const
 
 export function AppShell() {
   const {
