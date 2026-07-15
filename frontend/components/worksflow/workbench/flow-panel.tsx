@@ -435,7 +435,7 @@ function RunNodeCard({ node }: { node: WorkflowNodeRunDto }) {
           </div>
         </div>
         {node.status === 'failed' && (
-          <button type="button" onClick={() => void flow.retryNode(node, reason)} disabled={!can('edit') || flow.busy} className="rounded p-1 text-warning hover:bg-warning/10" aria-label={t('flow.retryNode')}>
+          <button type="button" onClick={() => void flow.retryNode(node)} disabled={!can('edit') || flow.busy} className="rounded p-1 text-warning hover:bg-warning/10" aria-label={t('flow.retryNode')}>
             <RotateCcw className="size-3" />
           </button>
         )}

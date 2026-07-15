@@ -25,7 +25,7 @@ func TestBaselineNormalizesStructuredRequirementsAndDeduplicatesAnchors(t *testi
 	content := map[string]any{
 		"blocks": []any{
 			map[string]any{"id": "context-1", "type": "actor", "text": "Support agent"},
-			map[string]any{"id": "REQ-001", "type": "requirement", "statement": "Legacy copy"},
+			map[string]any{"id": "REQ-001", "type": "requirement", "text": "Legacy copy"},
 		},
 		"requirements": []any{
 			map[string]any{"id": "REQ-001", "statement": "Structured duplicate"},
@@ -45,12 +45,38 @@ func TestBaselineNormalizesStructuredRequirementsAndDeduplicatesAnchors(t *testi
 	if len(anchors) != 4 {
 		t.Fatalf("expected all unique block and requirement anchors, got %#v", anchors)
 	}
+	var legacy map[string]any
+	if err := json.Unmarshal(baseline.Requirements[0], &legacy); err != nil {
+		t.Fatal(err)
+	}
+	if legacy["requirementId"] != "REQ-001" || legacy["statement"] != "Legacy copy" {
+		t.Fatalf("legacy requirement block was not canonicalized: %#v", legacy)
+	}
 	var criterion map[string]any
 	if err := json.Unmarshal(baseline.Requirements[2], &criterion); err != nil {
 		t.Fatal(err)
 	}
 	if criterion["type"] != "acceptanceCriterion" || criterion["acceptanceCriterionId"] != "AC-001" {
 		t.Fatalf("structured criterion was not canonicalized: %#v", criterion)
+	}
+}
+
+func TestFinalRequirementBaselineAcceptsTextOnlyRequirementBlocks(t *testing.T) {
+	t.Parallel()
+	baseline := baselineValidationFixture()
+	appendBaselineContent(&baseline, map[string]any{
+		"blocks": []any{
+			map[string]any{"id": "REQ-BLOCK", "type": "requirement", "text": "Support mobile interviews."},
+			map[string]any{"id": "AC-BLOCK", "type": "acceptanceCriterion", "text": "The interview completes on mobile."},
+		},
+	})
+
+	payload, err := finalizeRequirementBaselinePayload(baseline)
+	if err != nil {
+		t.Fatalf("expected text-only requirement blocks to compile: %v", err)
+	}
+	if report := ValidateArtifactContent("requirement_baseline", payload); !report.Valid {
+		t.Fatalf("compiled payload must pass the canonical gate: %#v", report.Findings)
 	}
 }
 

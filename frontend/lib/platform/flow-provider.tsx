@@ -1162,13 +1162,14 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
 
   const retryNode = useCallback(async (node: WorkflowNodeRunDto, reason?: string) => {
     if (!projectId || !run || !can('edit')) return false
+    const retryReason = reason?.trim() || flowMessage('runtime.flow.retryReason')
     setBusy(true)
     try {
       await client.retryNode(
         projectId,
         run.id,
         node.key,
-        reason ?? flowMessage('runtime.flow.retryReason'),
+        retryReason,
       )
       await loadRun(run.id)
       return true

@@ -385,6 +385,7 @@ interface MockPlatformOptions {
   readonly conversationCheckpointSourcePageSize?: number
   readonly soloReviewRun?: boolean
   readonly soloProject?: boolean
+  readonly failedRun?: boolean
 }
 
 type DesignImportRecord = ReturnType<typeof designImportRecord>
@@ -444,7 +445,9 @@ async function installPlatformMock(page: Page, options: MockPlatformOptions = {}
     prototypes: options.prototypes === 'none' ? [] : [approvedPrototype],
     brief: staleProjectBrief(options.staleBriefDraft ?? false),
     pageSpec: structuredClone(pageSpec),
-    run: options.soloReviewRun
+    run: options.failedRun
+      ? workflowRun('run-failed', 'failed')
+      : options.soloReviewRun
       ? workflowRun('run-solo-review', 'waiting_review', 'solo')
       : options.multiWorkbenchGroups
         ? multiGroupWorkflowRun()
@@ -1539,6 +1542,10 @@ async function handlePlatformRoute(
     await route.fulfill({ status: 204, headers: corsHeaders() })
     return
   }
+  if (/\/workflow-runs\/[^/]+\/retry$/.test(path) && method === 'POST') {
+    await route.fulfill({ status: 204, headers: corsHeaders() })
+    return
+  }
   if (/\/workflow-runs\/[^/]+\/events$/.test(path)) {
     await respond({ items: state.run ? [{ id: 'event-1', runId: state.run.id, sequence: 1, type: 'run.created', payload: {}, createdAt: now }] : [] })
     return
@@ -1826,6 +1833,24 @@ test('Solo workflow approval requires confirmation and a non-empty reason', asyn
     resolution: 'approve',
     reason: 'Reviewed the exact result locally.',
     soloReviewConfirmed: true,
+  })
+})
+
+test('failed workflow retry supplies a non-empty default reason', async ({ page }) => {
+  const state = await installPlatformMock(page, {
+    authenticated: true,
+    failedRun: true,
+  })
+  await page.goto('/workbench/planning?view=preview')
+
+  await page.getByRole('button', { name: /run-failed/ }).click()
+  await page.getByRole('button', { name: 'Retry node' }).click()
+
+  await expect.poll(() => state.requests.find((request) =>
+    request.method === 'POST' && request.path.endsWith('/workflow-runs/run-failed/retry'),
+  )?.body).toEqual({
+    nodeKey: 'brief-input',
+    reason: 'Retry from Workbench',
   })
 })
 
@@ -4389,7 +4414,7 @@ function draftPrototype(id: string) {
 
 function workflowRun(
   id: string,
-  status: 'waiting_input' | 'waiting_review' | 'running',
+  status: 'waiting_input' | 'waiting_review' | 'running' | 'failed',
   governanceMode: 'solo' | 'team' = 'team',
   reviewRevision: {
     readonly id: string
@@ -4399,6 +4424,7 @@ function workflowRun(
   } = briefRevision,
 ) {
   const waitingReview = status === 'waiting_review'
+  const failed = status === 'failed'
   const reviewRef = exactRevision(
     reviewRevision.artifactId,
     reviewRevision.id,
@@ -4449,8 +4475,9 @@ function workflowRun(
       key: waitingReview ? 'solo-review' : 'brief-input',
       definitionNodeId: waitingReview ? 'solo-review' : 'brief-input',
       type: waitingReview ? 'review_gate' : 'artifact_input',
-      status: waitingReview ? 'waiting_review' : 'waiting_input',
-      attempt: waitingReview ? 1 : 0,
+      status: waitingReview ? 'waiting_review' : failed ? 'failed' : 'waiting_input',
+      attempt: waitingReview || failed ? 1 : 0,
+      ...(failed ? { failure: { code: 'baseline.invalid_requirement_fact' } } : {}),
       availableAt: now,
       createdAt: now,
       updatedAt: now,

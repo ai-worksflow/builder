@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -305,9 +306,14 @@ func appendBaselineContent(baseline *RequirementBaseline, content map[string]any
 			baseline.Actors = append(baseline.Actors, encoded)
 		case "userJourney":
 			baseline.Journeys = append(baseline.Journeys, encoded)
-		case "requirement", "acceptanceCriterion":
+		case "requirement":
 			if appendAnchor(anchor) {
-				baseline.Requirements = append(baseline.Requirements, encoded)
+				baseline.Requirements = append(baseline.Requirements, canonicalBaselineRequirement(block, "requirement", "requirementId", anchor))
+			}
+			continue
+		case "acceptanceCriterion":
+			if appendAnchor(anchor) {
+				baseline.Requirements = append(baseline.Requirements, canonicalBaselineRequirement(block, "acceptanceCriterion", "acceptanceCriterionId", anchor))
 			}
 			continue
 		case "businessRule":
@@ -348,6 +354,11 @@ func canonicalBaselineRequirement(value map[string]any, blockType, key, anchor s
 	canonical := make(map[string]any, len(value)+2)
 	for field, fieldValue := range value {
 		canonical[field] = fieldValue
+	}
+	if strings.TrimSpace(firstString(canonical, "statement")) == "" {
+		if text := strings.TrimSpace(firstString(canonical, "text")); text != "" {
+			canonical["statement"] = text
+		}
 	}
 	canonical["type"] = blockType
 	canonical[key] = anchor
