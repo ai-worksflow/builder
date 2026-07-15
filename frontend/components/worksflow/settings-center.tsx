@@ -1,8 +1,11 @@
 'use client'
 
 import { useEffect, useState } from 'react'
+import type { ProjectGovernanceMode } from '@/lib/collaboration/types'
 import { useI18n } from '@/lib/i18n'
+import { usePlatformFlow } from '@/lib/platform/flow-provider'
 import { useWorksflow } from '@/lib/worksflow/store'
+import { hasActiveGovernanceRun } from '@/lib/worksflow/project-governance'
 import { useLocalizedLabels } from './use-localized-labels'
 import { LanguageToggle } from './language-toggle'
 import { CollaborationCenter } from './collaboration-center'
@@ -18,6 +21,7 @@ import {
   Rocket,
   Settings,
   ShieldCheck,
+  UserRoundCheck,
   Users2,
 } from 'lucide-react'
 
@@ -32,10 +36,27 @@ export function SettingsCenter() {
     updateUserPreferences,
   } = useWorksflow()
   const collaboration = useCollaboration()
+  const flow = usePlatformFlow()
   const { t } = useI18n()
   const labels = useLocalizedLabels()
   const [draftName, setDraftName] = useState(collaboration.project?.name ?? '')
+  const [draftGovernanceMode, setDraftGovernanceMode] = useState<ProjectGovernanceMode>(
+    collaboration.project?.governanceMode ?? 'team',
+  )
+  const [governanceSaved, setGovernanceSaved] = useState(false)
   useEffect(() => setDraftName(collaboration.project?.name ?? ''), [collaboration.project?.id, collaboration.project?.name])
+  useEffect(() => {
+    setDraftGovernanceMode(collaboration.project?.governanceMode ?? 'team')
+  }, [collaboration.project?.governanceMode])
+  useEffect(() => setGovernanceSaved(false), [collaboration.project?.id])
+  const projectRunStatuses = flow.runs
+    .filter((run) => run.projectId === collaboration.project?.id)
+    .map((run) => run.status)
+  const hasActiveRun = hasActiveGovernanceRun(projectRunStatuses)
+  const ownerCount = collaboration.members.filter((member) => member.role === 'owner').length
+  const governanceModeDisabled = collaboration.loading
+    || collaboration.project?.role !== 'owner'
+    || hasActiveRun
   const linkedDocs = linkedDocIds
     .map((id) => documents.find((doc) => doc.id === id))
     .filter(Boolean)
@@ -97,26 +118,91 @@ export function SettingsCenter() {
                   </button>
                 </div>
               </label>
-              <label className="mt-4 block text-[12px] text-muted-foreground">
-                Review governance
-                <select
-                  value={collaboration.project?.governanceMode ?? 'team'}
-                  onChange={(event) => void collaboration.updateProjectGovernanceMode(
-                    event.target.value as 'solo' | 'team',
+
+              <div className="mt-5 border-t border-border pt-4" data-testid="project-governance-settings">
+                <div className="flex items-start gap-2">
+                  <UserRoundCheck className="mt-0.5 size-4 shrink-0 text-primary-bright" />
+                  <span>
+                    <span className="block text-[12px] font-semibold text-foreground">
+                      {t('settings.governance.title')}
+                    </span>
+                    <span className="mt-1 block text-[11px] leading-relaxed text-muted-foreground">
+                      {t('settings.governance.description')}
+                    </span>
+                  </span>
+                </div>
+
+                <div role="radiogroup" aria-label={t('settings.governance.title')} className="mt-3 grid gap-2 sm:grid-cols-2">
+                  {(['solo', 'team'] as const).map((mode) => {
+                    const selected = draftGovernanceMode === mode
+                    return (
+                      <button
+                        key={mode}
+                        type="button"
+                        role="radio"
+                        aria-checked={selected}
+                        disabled={governanceModeDisabled || (mode === 'solo' && ownerCount !== 1)}
+                        onClick={() => {
+                          setDraftGovernanceMode(mode)
+                          setGovernanceSaved(false)
+                        }}
+                        data-testid={`project-governance-${mode}`}
+                        className={`rounded-lg border p-3 text-left transition-colors disabled:cursor-not-allowed disabled:opacity-55 ${selected ? 'border-primary/50 bg-primary/10' : 'border-border bg-background hover:border-primary/30'}`}
+                      >
+                        <span className="block text-[12px] font-semibold text-foreground">
+                          {t(`settings.governance.${mode}.title`)}
+                        </span>
+                        <span className="mt-1 block text-[10px] leading-relaxed text-muted-foreground">
+                          {t(`settings.governance.${mode}.description`)}
+                        </span>
+                      </button>
+                    )
+                  })}
+                </div>
+
+                {hasActiveRun ? (
+                  <p className="mt-2 text-[10px] leading-relaxed text-warning" data-testid="project-governance-active-run-warning">
+                    {t('settings.governance.activeRunBlocked')}
+                  </p>
+                ) : collaboration.project?.role !== 'owner' ? (
+                  <p className="mt-2 text-[10px] leading-relaxed text-faint-foreground">
+                    {t('settings.governance.ownerOnly')}
+                  </p>
+                ) : ownerCount !== 1 ? (
+                  <p className="mt-2 text-[10px] leading-relaxed text-warning" data-testid="project-governance-owner-count-warning">
+                    {t('settings.governance.soloOwnerCount', { count: ownerCount })}
+                  </p>
+                ) : (
+                  <p className="mt-2 text-[10px] leading-relaxed text-faint-foreground">
+                    {t('settings.governance.auditNotice')}
+                  </p>
+                )}
+
+                <div className="mt-3 flex items-center gap-3">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setGovernanceSaved(false)
+                      void collaboration.updateProjectGovernanceMode(draftGovernanceMode)
+                        .then((saved) => setGovernanceSaved(saved))
+                    }}
+                    disabled={
+                      governanceModeDisabled
+                      || (draftGovernanceMode === 'solo' && ownerCount !== 1)
+                      || draftGovernanceMode === collaboration.project?.governanceMode
+                    }
+                    data-testid="save-project-governance"
+                    className="rounded-md bg-primary px-3 py-2 text-[12px] font-semibold text-primary-foreground hover:bg-primary-bright disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    {t('settings.governance.save')}
+                  </button>
+                  {governanceSaved && (
+                    <span role="status" className="text-[10px] text-success">
+                      {t('settings.governance.saved')}
+                    </span>
                   )}
-                  disabled={
-                    collaboration.loading
-                    || collaboration.project?.role !== 'owner'
-                  }
-                  className="mt-1.5 h-9 w-full rounded-md border border-border bg-background px-3 text-sm text-foreground disabled:opacity-50"
-                >
-                  <option value="team">Team — independent review required</option>
-                  <option value="solo">Solo — explicit self-review with audit evidence</option>
-                </select>
-                <span className="mt-1 block text-[10px] text-faint-foreground">
-                  Only the sole owner can enable Solo mode. The mode cannot change while a workflow run is active.
-                </span>
-              </label>
+                </div>
+              </div>
             </div>
 
             <CollaborationCenter />
@@ -130,7 +216,7 @@ export function SettingsCenter() {
                 <IntegrationCard
                   icon={GitBranch}
                   title={t('settings.github')}
-                  description="Connection status is read from the server in the Workbench GitHub panel."
+                  description={t('settings.githubServerDescription')}
                   action={t('settings.openWorkbench')}
                   onClick={() => setSurface('workbench')}
                 />

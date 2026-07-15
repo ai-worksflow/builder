@@ -107,6 +107,7 @@ import {
   type PromptWorkflow,
 } from './prompt-library'
 import { GenerationClientError, streamGeneration } from '@/lib/generation/client'
+import { useI18n } from '@/lib/i18n'
 import { generateLocalWorkspace } from '@/lib/generation/local-generator'
 import { parseGenerationRequest } from '@/lib/generation/schema'
 import type {
@@ -417,6 +418,7 @@ interface WorksflowState {
 const WorksflowContext = createContext<WorksflowState | null>(null)
 
 export function WorksflowProvider({ children }: { children: ReactNode }) {
+  const { locale, t } = useI18n()
   const [surface, setSurface] = useState<Surface>('workbench')
   const [routeReady, setRouteReady] = useState(false)
   const projectCatalogPersistence = usePersistentState({
@@ -454,13 +456,13 @@ export function WorksflowProvider({ children }: { children: ReactNode }) {
           name: project.name,
           teamName: project.teamName,
           phase: latestRun?.status ?? project.lifecycleStatus,
-          updatedAt: new Date(project.updatedAt).toLocaleString(),
+          updatedAt: project.updatedAt,
           starred: project.starred,
           linkedDocs: project.teamReferences.documents.length,
-          latestVersion: latestVersion?.label ?? 'Workspace',
+          latestVersion: latestVersion?.label ?? t('core.store.workspace'),
         }
       }),
-    [projectCatalog.projects],
+    [projectCatalog.projects, t],
   )
   const setProjectName = useCallback(
     (name: string) => {
@@ -648,12 +650,12 @@ export function WorksflowProvider({ children }: { children: ReactNode }) {
     const persistedVersions = activeProductProject.versions.map((version) => ({
       id: version.id,
       title: version.label,
-      subtitle: `${version.description ?? 'Workspace checkpoint'} · ${new Date(version.createdAt).toLocaleString()}`,
+      subtitle: `${version.description ?? t('core.store.workspaceCheckpoint')} · ${new Date(version.createdAt).toLocaleString(locale)}`,
       starred: false,
     }))
     setVersions(persistedVersions.length > 0 ? persistedVersions : VERSIONS.slice(0, 1))
     versionSerial.current = Math.max(2, activeProductProject.versions.length + 2)
-  }, [activeProductProject.id, activeProductProject.versions])
+  }, [activeProductProject.id, activeProductProject.versions, locale, t])
 
   useEffect(() => {
     const latestRun = activeProductProject.generationRuns.at(-1)
@@ -700,7 +702,7 @@ export function WorksflowProvider({ children }: { children: ReactNode }) {
         type,
         blueprintId: blueprint.id,
         summary,
-        createdAt: 'Just now',
+        createdAt: new Date().toISOString(),
       },
       ...prev,
     ].slice(0, 8))
@@ -777,8 +779,16 @@ export function WorksflowProvider({ children }: { children: ReactNode }) {
           updateProjectWorkspace(catalog, runProjectId, (current) =>
             createCheckpoint(current, {
               id: `before-run-${startedAt}`,
-              label: `Before ${mode} run`,
-              message: 'Automatic before snapshot for generated patch review.',
+              label: t('core.store.beforeRunLabel', {
+                mode: t(
+                  mode === 'build'
+                    ? 'core.generationMode.build'
+                    : mode === 'iterate'
+                      ? 'core.generationMode.iterate'
+                      : 'core.generationMode.fix',
+                ),
+              }),
+              message: t('core.store.beforeRunMessage'),
             }),
           ),
         )
@@ -1148,6 +1158,7 @@ export function WorksflowProvider({ children }: { children: ReactNode }) {
       setWorkspace,
       setPromptHistory,
       setProjectCatalog,
+      t,
       workspace.files,
     ],
   )
@@ -1169,7 +1180,7 @@ export function WorksflowProvider({ children }: { children: ReactNode }) {
           id: `f${Date.now()}`,
           text: prompt,
           mode: planMode ? 'plan' : 'build',
-          createdAt: 'Just now',
+          createdAt: new Date().toISOString(),
         },
       ])
       setComposerDraft('')
@@ -1190,17 +1201,17 @@ export function WorksflowProvider({ children }: { children: ReactNode }) {
     setTasks((current) =>
       current.map((task) =>
         task.status === 'active' || task.status === 'pending'
-          ? { ...task, status: 'error', subStatus: 'Stopped' }
+          ? { ...task, status: 'error', subStatus: t('core.store.stopped') }
           : task,
       ),
     )
-    setGenerationError('Generation stopped by the user.')
+    setGenerationError(t('core.store.generationStopped'))
     setGenerationErrorCode('cancelled')
     setGenerationErrorStatus(undefined)
     setGenerationErrorRetryable(true)
     setGenerationErrorCategory('cancelled')
     setGenerationErrorRetryAfterSeconds(undefined)
-    setGenerationErrorAction('Adjust the request or retry when you are ready.')
+    setGenerationErrorAction(t('core.store.adjustOrRetry'))
     if (cancelledRequest) {
       const completedAt = new Date().toISOString()
       setPromptHistory((current) =>
@@ -1223,12 +1234,12 @@ export function WorksflowProvider({ children }: { children: ReactNode }) {
           startedAt: completedAt,
           updatedAt: completedAt,
           completedAt,
-          errorMessage: 'Generation stopped by the user.',
+          errorMessage: t('core.store.generationStopped'),
         }),
       )
     }
     setPhase('error')
-  }, [cancelActiveGeneration, generationModel, setProjectCatalog, setPromptHistory])
+  }, [cancelActiveGeneration, generationModel, setProjectCatalog, setPromptHistory, t])
 
   const resetWorkbench = useCallback(() => {
     cancelActiveGeneration()
@@ -1285,7 +1296,7 @@ export function WorksflowProvider({ children }: { children: ReactNode }) {
   const addTodo = (title: string, priority: TodoTask['priority']) => {
     if (!title.trim()) return
     setTodos((prev) => [
-      { id: `k${Date.now()}`, title: title.trim(), priority, when: 'Just now', done: false },
+      { id: `k${Date.now()}`, title: title.trim(), priority, when: new Date().toISOString(), done: false },
       ...prev,
     ])
   }
@@ -1336,15 +1347,15 @@ export function WorksflowProvider({ children }: { children: ReactNode }) {
       let recoveryCheckpointId: string | undefined
       setWorkspace((current) => {
         const safetyCheckpoint = createCheckpoint(current, {
-          label: `Before restoring ${id}`,
-          message: 'Automatic recovery point created before a restore.',
+          label: t('core.store.beforeRestoreLabel', { id }),
+          message: t('core.store.restoreRecoveryMessage'),
         })
         recoveryCheckpointId = safetyCheckpoint.checkpoints.at(-1)?.id
         return restoreCheckpoint(safetyCheckpoint, id)
       })
       setRestoreRecoveryCheckpointId(recoveryCheckpointId ?? null)
     },
-    [setWorkspace],
+    [setWorkspace, t],
   )
 
   const undoWorkspaceRestore = useCallback(() => {
@@ -1487,12 +1498,12 @@ export function WorksflowProvider({ children }: { children: ReactNode }) {
       )
       return result
     } catch (error) {
-      setQualityError(error instanceof Error ? error.message : 'Quality check failed.')
+      setQualityError(error instanceof Error ? error.message : t('core.store.qualityFailed'))
       return null
     } finally {
       setQualityRunning(false)
     }
-  }, [previewDocument.entryPath, selectedProductProjectId, setWorkspace, workspace.files])
+  }, [previewDocument.entryPath, selectedProductProjectId, setWorkspace, t, workspace.files])
 
   const attachQualityDiagnostics = useCallback(() => {
     if (!qualityRun) return
@@ -1507,31 +1518,34 @@ export function WorksflowProvider({ children }: { children: ReactNode }) {
     setGenerationMode('fix')
     setPlanMode(false)
     setComposerDraft(
-      'Repair every actionable finding in the attached quality report, preserve working behavior, and explain any finding that cannot be fixed safely.',
+      t('core.store.repairQualityPrompt'),
     )
-  }, [addAttachment, qualityRun])
+  }, [addAttachment, qualityRun, t])
 
   const exportWorkspace = useCallback(async () => {
     setDeliveryStatus('exporting')
     setDeliveryError(null)
-    setDeliveryLogs((current) => [...current, 'Preparing a secret-safe source archive…'])
+    setDeliveryLogs((current) => [...current, t('core.store.delivery.preparingArchive')])
     try {
       const result = await exportWorkspaceArchive({ ...workspace, id: selectedProductProjectId, name: projectName })
       downloadBlob(result.blob, result.filename)
       setDeliveryLogs((current) => [
         ...current,
-        `Downloaded ${result.filename} with ${result.fileCount} files.`,
+        t('core.store.delivery.downloaded', {
+          filename: result.filename,
+          count: result.fileCount.toLocaleString(locale),
+        }),
       ])
       setDeliveryStatus('idle')
       return true
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'Export failed.'
+      const message = error instanceof Error ? error.message : t('core.store.delivery.exportFailed')
       setDeliveryError(message)
-      setDeliveryLogs((current) => [...current, `Export failed: ${message}`])
+      setDeliveryLogs((current) => [...current, t('core.store.delivery.exportFailedDetail', { message })])
       setDeliveryStatus('error')
       return false
     }
-  }, [projectName, selectedProductProjectId, workspace])
+  }, [locale, projectName, selectedProductProjectId, t, workspace])
 
   const refreshDeployments = useCallback(async () => {
     try {
@@ -1539,11 +1553,11 @@ export function WorksflowProvider({ children }: { children: ReactNode }) {
       setDeployments(history)
       return history
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'Unable to load deployment history.'
+      const message = error instanceof Error ? error.message : t('core.store.delivery.loadHistoryFailed')
       setDeliveryError(message)
       return []
     }
-  }, [selectedProductProjectId])
+  }, [selectedProductProjectId, t])
 
   const publishCurrentWorkspace = useCallback(
     async (message?: string, environment: 'preview' | 'production' = 'preview') => {
@@ -1551,7 +1565,7 @@ export function WorksflowProvider({ children }: { children: ReactNode }) {
       setDeliveryError(null)
       setDeliveryLogs((current) => [
         ...current,
-        'Validating files and creating an immutable deployment version…',
+        t('core.store.delivery.validating'),
       ])
       try {
         const result = await publishWorkspace(
@@ -1582,19 +1596,22 @@ export function WorksflowProvider({ children }: { children: ReactNode }) {
         )
         setDeliveryLogs((current) => [
           ...current,
-          `Published version ${result.deployment.versions.at(-1)?.number ?? 1} to ${result.absoluteUrl}`,
+          t('core.store.delivery.published', {
+            version: (result.deployment.versions.at(-1)?.number ?? 1).toLocaleString(locale),
+            url: result.absoluteUrl,
+          }),
         ])
         setDeliveryStatus('idle')
         return result.deployment
       } catch (error) {
-        const messageText = error instanceof Error ? error.message : 'Publish failed.'
+        const messageText = error instanceof Error ? error.message : t('core.store.delivery.publishFailed')
         setDeliveryError(messageText)
-        setDeliveryLogs((current) => [...current, `Publish failed: ${messageText}`])
+        setDeliveryLogs((current) => [...current, t('core.store.delivery.publishFailedDetail', { message: messageText })])
         setDeliveryStatus('error')
         return null
       }
     },
-    [previewDocument.entryPath, previewDocument.html, projectName, selectedProductProjectId, setProjectCatalog, workspace],
+    [locale, previewDocument.entryPath, previewDocument.html, projectName, selectedProductProjectId, setProjectCatalog, t, workspace],
   )
 
   const rollbackDeployment = useCallback(
@@ -1603,7 +1620,7 @@ export function WorksflowProvider({ children }: { children: ReactNode }) {
       setDeliveryError(null)
       setDeliveryLogs((current) => [
         ...current,
-        `Creating an audited rollback from ${versionId}…`,
+        t('core.store.delivery.creatingRollback', { version: versionId }),
       ])
       try {
         const deployment = await requestDeploymentRollback(deploymentId, versionId)
@@ -1619,21 +1636,21 @@ export function WorksflowProvider({ children }: { children: ReactNode }) {
             environment: 'preview',
             completedAt: new Date().toISOString(),
             url: publishedUrl ?? deployment.publicPath,
-            summary: `Rollback to ${versionId}`,
+            summary: t('core.store.delivery.rollbackSummary', { version: versionId }),
           }),
         )
-        setDeliveryLogs((current) => [...current, `Rollback completed as ${deployment.activeVersionId}.`])
+        setDeliveryLogs((current) => [...current, t('core.store.delivery.rollbackCompleted', { version: deployment.activeVersionId })])
         setDeliveryStatus('idle')
         return true
       } catch (error) {
-        const message = error instanceof Error ? error.message : 'Rollback failed.'
+        const message = error instanceof Error ? error.message : t('core.store.delivery.rollbackFailed')
         setDeliveryError(message)
-        setDeliveryLogs((current) => [...current, `Rollback failed: ${message}`])
+        setDeliveryLogs((current) => [...current, t('core.store.delivery.rollbackFailedDetail', { message })])
         setDeliveryStatus('error')
         return false
       }
     },
-    [publishedUrl, setProjectCatalog],
+    [publishedUrl, setProjectCatalog, t],
   )
 
   const loadTeamProject = useCallback((project: TeamProject) => {
@@ -1888,7 +1905,7 @@ export function WorksflowProvider({ children }: { children: ReactNode }) {
         setTasks(BUILD_TASKS.map((task, index) => ({
           ...task,
           status: index === 0 ? 'error' : 'pending',
-          subStatus: index === 0 ? 'Stopped' : undefined,
+          subStatus: index === 0 ? t('core.store.stopped') : undefined,
         })))
         setPhase('error')
       } else {
@@ -1908,7 +1925,7 @@ export function WorksflowProvider({ children }: { children: ReactNode }) {
     }
 
     setRouteReady(true)
-  }, [routeReady, teamProjects])
+  }, [routeReady, t, teamProjects])
 
   const toggleProjectStar = (id: string) => {
     setProjectCatalog((catalog) => toggleCatalogProjectStar(catalog, id))
@@ -1974,7 +1991,7 @@ export function WorksflowProvider({ children }: { children: ReactNode }) {
             isStrictVirtualWorkspace((value as { workspace?: unknown }).workspace)
           ? (value as { workspace: VirtualWorkspace }).workspace
           : null
-    if (!candidate) throw new Error('The selected JSON file is not a valid Worksflow workspace.')
+    if (!candidate) throw new Error(t('runtime.store.invalidWorkspace'))
     let projectId = ''
     setProjectCatalog((catalog) => {
       const active = catalog.projects.find((project) => project.id === catalog.selectedProjectId)!
@@ -2199,7 +2216,7 @@ export function WorksflowProvider({ children }: { children: ReactNode }) {
         ...binding,
         id: `nb${Date.now()}`,
         sourceKind: binding.sourceKind ?? 'document',
-        createdAt: 'Just now',
+        createdAt: new Date().toISOString(),
       },
     ])
     if (binding.targetKind === 'document') {
@@ -2549,7 +2566,7 @@ export function WorksflowProvider({ children }: { children: ReactNode }) {
               isBlocking: false,
               requiredForReview: true,
               notifyOnChange: true,
-              createdAt: 'Just now',
+              createdAt: new Date().toISOString(),
             })
           }
         })
@@ -2808,7 +2825,7 @@ export function WorksflowProvider({ children }: { children: ReactNode }) {
       workspaceIsSaving: projectCatalogPersistence.isSaving,
       workspaceLastSavedAt: projectCatalogPersistence.lastSavedAt,
       resetWorkspacePersistence: () => {
-        if (window.confirm('Reset locally stored projects and recover the built-in workspace? This cannot be undone.')) {
+        if (window.confirm(t('core.store.confirmReset'))) {
           projectCatalogPersistence.remove()
         }
       },
@@ -3031,6 +3048,7 @@ export function WorksflowProvider({ children }: { children: ReactNode }) {
       publishCurrentWorkspace,
       refreshDeployments,
       rollbackDeployment,
+      t,
     ],
   )
 

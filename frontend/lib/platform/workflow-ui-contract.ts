@@ -13,6 +13,7 @@ import type {
   CreateWorkflowDefinitionInputDto,
   ExactArtifactRefDto,
   WorkflowCapabilitiesDto,
+  WorkflowDefinitionDto,
   WorkflowEdgeDto,
   WorkflowInputContractDto,
   WorkflowNodeDefinitionDto,
@@ -68,6 +69,13 @@ export interface WorkflowRevisionCandidateResolution {
   readonly error?: string
 }
 
+export interface WorkflowReviewGateApprovalReadiness {
+  readonly ready: boolean
+  readonly revisions: readonly ExactArtifactRefDto[]
+  readonly pendingRevisions: readonly ExactArtifactRefDto[]
+  readonly error?: string
+}
+
 interface LineageSliceRef {
   readonly id: string
   readonly key: string
@@ -80,7 +88,9 @@ interface LineageSliceRef {
 interface LineageBinding {
   readonly sourceNodeKey: string
   readonly sourceDefinitionNodeId: string
+  readonly outputRevisionId?: string
   readonly artifactRevisions: readonly ExactArtifactRefDto[]
+  readonly materializedArtifactRevisions: readonly ExactArtifactRefDto[]
   readonly deliverySliceRefs: readonly LineageSliceRef[]
   readonly proposalPins: readonly WorkflowProposalLineagePinDto[]
   readonly legacyOutputProposal?: { readonly id: string; readonly payloadHash: string }
@@ -893,6 +903,81 @@ export function revisionCandidates(
       : { candidates, error: `No immutable ${kind ?? type} revision matches the current node ${lineageSource.replaceAll('_', ' ')}.` }
 }
 
+export function reviewGateApprovalReadiness(
+  definition: WorkflowDefinitionDto | null | undefined,
+  nodeRun: WorkflowNodeRunDto,
+  run: WorkflowRunDto | null,
+  artifacts: WorkflowArtifactSnapshot,
+): WorkflowReviewGateApprovalReadiness {
+  const unavailable = (error: string): WorkflowReviewGateApprovalReadiness => ({
+    ready: false,
+    revisions: [],
+    pendingRevisions: [],
+    error,
+  })
+  if (!definition) return unavailable('The immutable workflow definition for this run is unavailable.')
+  if (nodeRun.type !== 'review_gate') return unavailable('This node is not a Review Gate node.')
+  const definitionNode = definition.nodes.find((item) => item.id === nodeRun.definitionNodeId)
+  if (definitionNode?.type !== 'review_gate') {
+    return unavailable('The immutable workflow definition does not contain this Review Gate node.')
+  }
+  const lineage = nodeInputLineage(run, nodeRun)
+  if (lineage.error) return unavailable(lineage.error)
+
+  const governedApplication = Boolean(
+    definition.inputContract && definition.outputContract?.capability === 'application',
+  )
+  let revisions: readonly ExactArtifactRefDto[]
+  if (governedApplication) {
+    const materialized = uniqueArtifactRefs(
+      lineage.bindings.flatMap((binding) => binding.materializedArtifactRevisions),
+    )
+    revisions = materialized.length > 0
+      ? materialized
+      : uniqueArtifactRefs(lineage.bindings.flatMap((binding) =>
+          binding.outputRevisionId
+            ? binding.artifactRevisions.filter((revision) =>
+                revision.revisionId === binding.outputRevisionId,
+              )
+            : [],
+        ))
+    if (revisions.length !== 1) {
+      return unavailable('A governed Review Gate requires exactly one current Human Edit materialization.')
+    }
+  } else {
+    revisions = uniqueArtifactRefs(
+      lineage.bindings.flatMap((binding) => binding.artifactRevisions),
+    )
+    if (revisions.length === 0) {
+      return unavailable('The Review Gate input contains no exact upstream artifact revisions.')
+    }
+  }
+
+  const resources: readonly VersionedArtifactDto<unknown>[] = [
+    ...artifacts.documents,
+    ...artifacts.blueprints,
+    ...artifacts.pageSpecs,
+    ...artifacts.prototypes,
+  ]
+  const pendingRevisions = revisions.filter((revision) => {
+    const approved = resources.find((resource) =>
+      resource.artifact.id === revision.artifactId,
+    )?.approvedRevision
+    return !approved
+      || approved.artifactId !== revision.artifactId
+      || approved.id !== revision.revisionId
+      || approved.contentHash !== revision.contentHash
+  })
+  return pendingRevisions.length === 0
+    ? { ready: true, revisions, pendingRevisions: [] }
+    : {
+        ready: false,
+        revisions,
+        pendingRevisions,
+        error: 'One or more exact upstream artifact revisions are not canonically approved in the current workspace snapshot.',
+      }
+}
+
 function revisionContainsAppliedProposal(
   candidate: ArtifactRevisionDto<unknown>,
   available: readonly ArtifactRevisionDto<unknown>[],
@@ -997,10 +1082,15 @@ function nodeInputLineage(
     if (!object(rawBinding) || !object(rawBinding.source)) return { bindings: [], error: `Typed input binding ${index} is malformed.` }
     if (!nonEmpty(rawBinding.source.nodeKey) || !nonEmpty(rawBinding.source.definitionNodeId)) return { bindings: [], error: `Typed input binding ${index} has malformed producer identity.` }
     const rawArtifacts = rawBinding.source.artifactRevisions ?? []
+    const rawMaterializedArtifacts = rawBinding.source.materializedArtifactRevisions ?? []
     const rawSlices = rawBinding.source.deliverySliceRefs ?? []
-    if (!Array.isArray(rawArtifacts) || !Array.isArray(rawSlices)) return { bindings: [], error: `Typed input binding ${index} lineage is malformed.` }
+    if (!Array.isArray(rawArtifacts) || !Array.isArray(rawMaterializedArtifacts) || !Array.isArray(rawSlices)) return { bindings: [], error: `Typed input binding ${index} lineage is malformed.` }
     const artifactRevisions = rawArtifacts.filter(exactRef)
     if (artifactRevisions.length !== rawArtifacts.length) return { bindings: [], error: `Typed input binding ${index} contains a malformed artifact reference.` }
+    const materializedArtifactRevisions = rawMaterializedArtifacts.filter(exactRef)
+    if (materializedArtifactRevisions.length !== rawMaterializedArtifacts.length) return { bindings: [], error: `Typed input binding ${index} contains a malformed materialized artifact reference.` }
+    const outputRevisionId = rawBinding.source.outputRevisionId
+    if (outputRevisionId !== undefined && !nonEmpty(outputRevisionId)) return { bindings: [], error: `Typed input binding ${index} has a malformed output revision identity.` }
     const deliverySliceRefs = rawSlices.filter(lineageSlice)
     if (deliverySliceRefs.length !== rawSlices.length) return { bindings: [], error: `Typed input binding ${index} contains a malformed delivery-slice reference.` }
     const outputProposal = rawBinding.source.outputProposal
@@ -1012,13 +1102,22 @@ function nodeInputLineage(
     bindings.push({
       sourceNodeKey: rawBinding.source.nodeKey,
       sourceDefinitionNodeId: rawBinding.source.definitionNodeId,
+      ...(outputRevisionId ? { outputRevisionId } : {}),
       artifactRevisions,
+      materializedArtifactRevisions,
       deliverySliceRefs,
       proposalPins,
       ...(outputProposal ? { legacyOutputProposal: outputProposal as LineageBinding['legacyOutputProposal'] } : {}),
     })
   }
   return bindings.length > 0 ? { bindings } : { bindings, error: 'The typed input envelope has no enabled incoming bindings.' }
+}
+
+function uniqueArtifactRefs(revisions: readonly ExactArtifactRefDto[]) {
+  return uniqueBy(
+    revisions,
+    (revision) => `${revision.artifactId}:${revision.revisionId}:${revision.contentHash}`,
+  )
 }
 
 function exactRevisionRef(revision: { readonly artifactId: string; readonly id: string; readonly revisionNumber?: number; readonly contentHash: string }): ExactArtifactRefDto {

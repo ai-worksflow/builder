@@ -1,7 +1,7 @@
 import type { Metadata, Viewport } from 'next'
 import { Inter, Fira_Code } from 'next/font/google'
 import { Analytics } from '@vercel/analytics/next'
-import { defaultLocale } from '@/lib/i18n'
+import { defaultLocale, messages } from '@/lib/i18n'
 import './globals.css'
 
 const inter = Inter({
@@ -17,9 +17,8 @@ const firaCode = Fira_Code({
 })
 
 export const metadata: Metadata = {
-  title: 'Worksflow — 生成工作台与团队协作',
-  description:
-    'Worksflow 生成阶段工作台与团队协作文档域高保真原型：从 prompt 到 plan、构建、预览，再到团队文档依赖图与蓝图编辑器。',
+  title: messages[defaultLocale]['meta.title'],
+  description: messages[defaultLocale]['meta.description'],
   generator: 'v0.app',
 }
 
@@ -37,7 +36,7 @@ export default function RootLayout({
     <html lang={defaultLocale} className="bg-background">
       <body className={`${inter.variable} ${firaCode.variable} font-sans antialiased`}>
         {children}
-        {process.env.NODE_ENV === 'production' && <Analytics />}
+        {process.env.VERCEL === '1' && <Analytics />}
       </body>
     </html>
   )

@@ -25,7 +25,7 @@ export function LanguageToggle({ className }: { className?: string }) {
       title={t('i18n.switchTo', { locale: localeLabels[next] })}
     >
       <Languages className="h-3.5 w-3.5" />
-      <span>{locale === 'zh-CN' ? '中' : 'EN'}</span>
+      <span>{t(locale === 'zh-CN' ? 'core.language.zhShort' : 'core.language.enShort')}</span>
     </button>
   )
 }

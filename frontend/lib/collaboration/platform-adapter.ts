@@ -27,8 +27,8 @@ import type {
   CommentReply,
   CommentThread,
   ProjectAction,
-  ProjectGovernanceMode,
   ProjectMember,
+  ProjectGovernanceMode,
   ProjectPresence,
   ProjectReview,
   ProjectRole,
@@ -263,12 +263,12 @@ function exactVersionRef(version: VersionRefDto): VersionRefDto {
 
 export function collaborationErrorMessage(error: unknown, fallback: string) {
   if (error instanceof PlatformNetworkError) {
-    return 'The collaboration backend is unavailable. Check the Go service and try again.'
+    return fallback
   }
   if (error instanceof PlatformHttpError) {
-    if (error.status === 401) return 'Your session has expired. Sign in again.'
-    if (error.status === 403) return 'Your project role does not allow this action.'
-    if (error.status === 409) return error.problem.detail ?? 'This item changed on the server. Refresh and retry.'
+    if (error.status === 401 || error.status === 403 || error.status === 409) {
+      return error.problem.detail ?? fallback
+    }
     return error.problem.detail ?? error.problem.title
   }
   return error instanceof Error ? error.message : fallback

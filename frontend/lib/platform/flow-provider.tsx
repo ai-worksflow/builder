@@ -12,12 +12,14 @@ import {
 } from 'react'
 import { useCollaboration } from '../collaboration/provider'
 import { collaborationErrorMessage } from '../collaboration/platform-adapter'
+import { useI18n, type MessageKey, type MessageValues } from '../i18n'
 import { useArtifactWorkspace } from './artifact-provider'
 import { PlatformFlowClient } from './flow-client'
 import {
   projectBriefEntryAction,
   projectBriefWorkflowManifestInput,
 } from './workflow-entry'
+import { reviewGateApprovalReadiness } from './workflow-ui-contract'
 import { PlatformHttpError } from './http'
 import { wireVersionRef } from './wire-version-ref'
 import {
@@ -179,6 +181,7 @@ interface PlatformFlowContextState {
 const PlatformFlowContext = createContext<PlatformFlowContextState | null>(null)
 
 export function PlatformFlowProvider({ children }: { children: ReactNode }) {
+  const { t } = useI18n()
   const { session, project, platformClient, backendStatus, can } = useCollaboration()
   const artifacts = useArtifactWorkspace()
   const client = platformClient.flow
@@ -235,12 +238,17 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
   proposalRef.current = proposal
   workspaceRevisionRef.current = workspaceRevision
 
-  const fail = useCallback((cause: unknown, fallback: string) => {
-    setError(collaborationErrorMessage(cause, fallback))
+  const flowMessage = useCallback(
+    (key: MessageKey, values?: MessageValues) => t(key, values),
+    [t],
+  )
+
+  const fail = useCallback((cause: unknown, fallback: MessageKey, values?: MessageValues) => {
+    setError(collaborationErrorMessage(cause, flowMessage(fallback, values)))
     if (!(cause instanceof PlatformHttpError && [403, 409, 412, 422].includes(cause.status))) {
       setStatus('error')
     }
-  }, [])
+  }, [flowMessage])
 
   const storeWorkbenchQueue = useCallback((queue: readonly WorkbenchQueueItem[]) => {
     workbenchQueueRef.current = queue
@@ -287,7 +295,7 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
       if (
         requestId === definitionRequestCounter.current
         && selectedDefinitionIdRef.current === definitionId
-      ) fail(cause, 'Unable to load workflow versions.')
+      ) fail(cause, 'runtime.flow.loadVersionsFailed')
     }
   }, [client, fail, projectId])
 
@@ -341,7 +349,7 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
       }
       setStatus('ready')
     } catch (cause) {
-      if (requestId === requestCounter.current) fail(cause, 'Workflow service is unavailable.')
+      if (requestId === requestCounter.current) fail(cause, 'runtime.flow.serviceUnavailable')
     }
   }, [client, fail, projectId, session.signedIn])
 
@@ -377,10 +385,10 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
       const result = await client.getWorkbenchBundle(bundleId)
       if (!workbenchHydrationIsCurrent(requestId, expectation)) return null
       if (result.data.projectId !== projectId) {
-        throw new Error('Workbench bundle belongs to another project.')
+        throw new Error(flowMessage('runtime.flow.bundleOtherProject'))
       }
       if (!workbenchBundleMatchesExpectation(result.data, expectation)) {
-        throw new Error('Workbench bundle hydration does not match the expected run, manifest group, root, and delivery slice.')
+        throw new Error(flowMessage('runtime.flow.bundleHydrationMismatch'))
       }
       let nextWorkspace: WorkspaceRevisionDto | null = null
       if (result.data.currentWorkspaceRevision) {
@@ -389,7 +397,7 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
         )
         if (!workbenchHydrationIsCurrent(requestId, expectation)) return null
         if (!workspaceRevisionMatchesRef(workspace.data, result.data.currentWorkspaceRevision)) {
-          throw new Error('Workbench bundle hydration returned a workspace outside its exact lineage reference.')
+          throw new Error(flowMessage('runtime.flow.workspaceOutsideLineage'))
         }
         nextWorkspace = workspace.data
       }
@@ -404,10 +412,10 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
       return result.data
     } catch (cause) {
       if (!workbenchHydrationIsCurrent(requestId, expectation)) return null
-      fail(cause, 'Unable to load the frozen build manifest.')
+      fail(cause, 'runtime.flow.loadManifestFailed')
       return null
     }
-  }, [activateWorkbenchItem, client, fail, projectId, storeWorkbenchQueue, workbenchHydrationIsCurrent])
+  }, [activateWorkbenchItem, client, fail, flowMessage, projectId, storeWorkbenchQueue, workbenchHydrationIsCurrent])
 
   const loadProposal = useCallback(async (
     proposalId: string,
@@ -419,7 +427,7 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
       const result = await client.getImplementationProposal(proposalId)
       if (!workbenchHydrationIsCurrent(requestId, expectation)) return null
       if (result.data.projectId !== projectId) {
-        throw new Error('Implementation proposal belongs to another project.')
+        throw new Error(flowMessage('runtime.flow.proposalOtherProject'))
       }
       if (
         result.data.id !== proposalId
@@ -443,7 +451,7 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
           )
         )
       ) {
-        throw new Error('Implementation proposal hydration does not match the exact reviewed proposal and build manifest receipt.')
+        throw new Error(flowMessage('runtime.flow.proposalHydrationMismatch'))
       }
       let knownBundle = workbenchQueueRef.current.find(
         (item) => item.bundle?.id === result.data.buildManifestId,
@@ -459,7 +467,7 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
         || knownBundle.projectId !== projectId
         || !workbenchBundleMatchesExpectation(knownBundle, expectation)
       ) {
-        throw new Error('Implementation proposal hydration does not match the exact reviewed run, group, root, and delivery slice receipt.')
+        throw new Error(flowMessage('runtime.flow.proposalReceiptMismatch'))
       }
       if (!workbenchHydrationIsCurrent(requestId, expectation)) return null
       const withBundle = upsertWorkbenchBundle(workbenchQueueRef.current, knownBundle)
@@ -470,10 +478,10 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
       return result.data
     } catch (cause) {
       if (!workbenchHydrationIsCurrent(requestId, expectation)) return null
-      fail(cause, 'Unable to load the implementation proposal.')
+      fail(cause, 'runtime.flow.loadProposalFailed')
       return null
     }
-  }, [activateWorkbenchItem, client, fail, projectId, storeWorkbenchQueue, workbenchHydrationIsCurrent])
+  }, [activateWorkbenchItem, client, fail, flowMessage, projectId, storeWorkbenchQueue, workbenchHydrationIsCurrent])
 
   const hydrateWorkbenchGroup = useCallback(async (
     nextRun: WorkflowRunDto,
@@ -514,7 +522,7 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
             && state.currentProposal.buildManifestId !== state.activeBundle.id
           )
         ) {
-          throw new Error(`Workbench lineage state for ${reference.bundleId} does not match its exact run, manifest group, ordinal, or delivery slice.`)
+          throw new Error(flowMessage('runtime.flow.lineageMismatch', { bundle: reference.bundleId }))
         }
       }
       const currentWorkspaceRevision = lineageResults[0]?.data.currentWorkspaceRevision
@@ -522,7 +530,7 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
         result.data.currentWorkspaceRevision,
         currentWorkspaceRevision,
       ))) {
-        throw new Error('Workbench lineage states disagree about the current project workspace revision.')
+        throw new Error(flowMessage('runtime.flow.lineageWorkspaceMismatch'))
       }
       const hydratedReferences = references.map((reference, index) => {
         const currentProposal = lineageResults[index].data.currentProposal
@@ -552,7 +560,7 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
         const workspace = await client.getWorkspaceRevision(currentWorkspaceRevision.revisionId)
         if (!hydrationIsCurrent()) return
         if (!workspaceRevisionMatchesRef(workspace.data, currentWorkspaceRevision)) {
-          throw new Error('The workspace revision response does not match the exact project lineage reference.')
+          throw new Error(flowMessage('runtime.flow.workspaceRevisionMismatch'))
         }
         workspaceRevisionRef.current = workspace.data
         setWorkspaceRevision(workspace.data)
@@ -577,10 +585,10 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
         setWorkspaceRevision(result.data)
         setQueryReference('workspaceRevisionId', result.data.id)
       } catch (cause) {
-        fail(cause, 'Unable to load the applied application workspace.')
+        fail(cause, 'runtime.flow.loadWorkspaceFailed')
       }
     }
-  }, [activateWorkbenchItem, client, fail, storeWorkbenchQueue])
+  }, [activateWorkbenchItem, client, fail, flowMessage, storeWorkbenchQueue])
 
   const hydrateRunOutputs = useCallback(async (nextRun: WorkflowRunDto, requestId: number) => {
     const hydrationIsCurrent = () => (
@@ -632,7 +640,7 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
       if (
         runRef.current?.id === nextRun.id
         && selectedWorkbenchNodeKeyRef.current === group.nodeKey
-      ) fail(cause, `Unable to load Workbench group ${group.nodeKey}.`)
+      ) fail(cause, 'runtime.flow.loadGroupFailed', { group: group.nodeKey })
     }
   }, [activateWorkbenchItem, fail, hydrateWorkbenchGroup, storeWorkbenchQueue])
 
@@ -672,7 +680,7 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
         && item.contentHash === runResult.data.definition.hash,
       )
       if (!exactDefinition) {
-        throw new Error(`Workflow definition version ${runResult.data.definitionVersionId} is unavailable.`)
+        throw new Error(flowMessage('runtime.flow.definitionUnavailable', { version: runResult.data.definitionVersionId }))
       }
       const mergedEvents = mergeWorkflowEvents(existingEvents, newEvents)
       runRef.current = runResult.data
@@ -692,10 +700,10 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
       }
       return runResult.data
     } catch (cause) {
-      if (requestId === runRequestCounter.current) fail(cause, 'Unable to load the workflow run.')
+      if (requestId === runRequestCounter.current) fail(cause, 'runtime.flow.loadRunFailed')
       return null
     }
-  }, [client, fail, hydrateRunOutputs, projectId])
+  }, [client, fail, flowMessage, hydrateRunOutputs, projectId])
 
   const loadRun = useCallback((runId: string): Promise<WorkflowRunDto | null> => {
     const inFlight = runLoadRef.current
@@ -768,8 +776,8 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
               ) return
               if (result.data.id !== workspaceRevisionId) {
                 fail(
-                  new Error('The workspace response does not match the requested immutable revision.'),
-                  'Unable to load the application workspace revision.',
+                  new Error(flowMessage('runtime.flow.workspaceResponseMismatch')),
+                  'runtime.flow.loadWorkspaceRevisionFailed',
                 )
                 return
               }
@@ -784,8 +792,8 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
                 || artifact.data.artifact.kind !== 'workspace'
               ) {
                 fail(
-                  new Error('Workspace revision belongs to another project or a non-workspace artifact.'),
-                  'Unable to load the application workspace revision.',
+                  new Error(flowMessage('runtime.flow.workspaceWrongProject')),
+                  'runtime.flow.loadWorkspaceRevisionFailed',
                 )
                 return
               }
@@ -796,7 +804,7 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
               if (
                 workspaceRequestId === workbenchHydrationRequestCounter.current
                 && projectIdRef.current === expectedProjectId
-              ) fail(cause, 'Unable to load the application workspace revision.')
+              ) fail(cause, 'runtime.flow.loadWorkspaceRevisionFailed')
             })
         }
       }
@@ -805,6 +813,7 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
     activateWorkbenchItem,
     client,
     fail,
+    flowMessage,
     loadBundle,
     loadProposal,
     loadRun,
@@ -848,7 +857,7 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
       ])
       return result.data
     } catch (cause) {
-      fail(cause, 'Unable to create the workflow definition.')
+      fail(cause, 'runtime.flow.createDefinitionFailed')
       return null
     } finally {
       setBusy(false)
@@ -876,7 +885,7 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
       ])
       return result.data
     } catch (cause) {
-      fail(cause, 'Unable to save the workflow version.')
+      fail(cause, 'runtime.flow.saveVersionFailed')
       return null
     } finally {
       setBusy(false)
@@ -897,7 +906,7 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
       ) await loadDefinitionVersions(definitionId)
       return result.data
     } catch (cause) {
-      fail(cause, 'Unable to publish the workflow version.')
+      fail(cause, 'runtime.flow.publishVersionFailed')
       return null
     } finally {
       setBusy(false)
@@ -910,7 +919,7 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
       (item) => String(item.artifact.kind) === 'project_brief',
     )
     if (!projectBrief) {
-      setError('Create a Project Brief before starting a workflow.')
+      setError(flowMessage('runtime.flow.createBrief'))
       return null
     }
     setBusy(true)
@@ -923,7 +932,7 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
           )
         : undefined
       if (effectiveDefinitionVersionId && !requestedDefinition) {
-        setError(`Workflow definition version ${effectiveDefinitionVersionId} is not loaded.`)
+        setError(flowMessage('runtime.flow.definitionNotLoaded', { version: effectiveDefinitionVersionId }))
         return null
       }
       if (!effectiveDefinitionVersionId) {
@@ -938,7 +947,7 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
             .filter((item) => item.published)
             .sort((left, right) => right.version - left.version)[0]
           if (!requestedDefinition) {
-            setError('The minimum product workflow has no published version.')
+            setError(flowMessage('runtime.flow.minimumNotPublished'))
             return null
           }
           effectiveDefinitionVersionId = requestedDefinition.versionId
@@ -962,7 +971,7 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
         draft: projectBrief.draft,
       })
       if (entryAction === 'blocked_unapproved_changes') {
-        setError('The Project Brief has changes newer than its approved revision. Review and approve an immutable checkpoint before starting this workflow.')
+        setError(flowMessage('runtime.flow.briefHasNewerChanges'))
         return null
       }
       if (entryAction === 'checkpoint_draft' && projectBrief.draft) {
@@ -972,9 +981,9 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
         )
       }
       if (!sourceRevision) {
-        setError(requireApproved
-          ? 'Approve an immutable Project Brief revision before starting this workflow.'
-          : 'Create an immutable Project Brief revision before starting this workflow.')
+        setError(flowMessage(requireApproved
+          ? 'runtime.flow.approveBrief'
+          : 'runtime.flow.createBriefRevision'))
         return null
       }
       const source = revisionRef(sourceRevision)
@@ -998,12 +1007,12 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
       await loadRun(runResult.data.id)
       return runResult.data
     } catch (cause) {
-      fail(cause, 'Unable to freeze the Project Brief input and start the workflow.')
+      fail(cause, 'runtime.flow.startBriefFailed')
       return null
     } finally {
       setBusy(false)
     }
-  }, [artifacts, can, client, definitionVersions, definitions, fail, loadRun, projectId])
+  }, [artifacts, can, client, definitionVersions, definitions, fail, flowMessage, loadRun, projectId])
 
   const compileBlueprintSelection = useCallback(async (
     input: BlueprintSelectionCompileInputDto,
@@ -1021,7 +1030,7 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
       setManifest(result.data)
       return result.data
     } catch (cause) {
-      fail(cause, 'Unable to freeze the approved Blueprint selection.')
+      fail(cause, 'runtime.flow.freezeSelectionFailed')
       return null
     } finally {
       setBusy(false)
@@ -1040,12 +1049,12 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
       if (!effectiveDefinitionVersionId) {
         const definitionKey = options.definitionKey ?? 'blueprint-selection-app'
         const definition = definitions.find((item) => item.key === definitionKey)
-        if (!definition) throw new Error(`Workflow ${definitionKey} is not installed for this project.`)
+        if (!definition) throw new Error(flowMessage('runtime.flow.definitionNotInstalled', { definition: definitionKey }))
         const versions = await client.listDefinitionVersions(projectId, definition.id, { limit: 200 })
         const published = [...versions.data.items]
           .filter((item) => item.published)
           .sort((left, right) => right.version - left.version)[0]
-        if (!published) throw new Error(`Workflow ${definitionKey} has no published version.`)
+        if (!published) throw new Error(flowMessage('runtime.flow.workflowNoPublishedVersion', { definition: definitionKey }))
         effectiveDefinitionVersionId = published.versionId
       }
       const result = await client.startRun(projectId, {
@@ -1064,12 +1073,12 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
       await loadRun(result.data.id)
       return result.data
     } catch (cause) {
-      fail(cause, 'Unable to start the workflow from the frozen selection.')
+      fail(cause, 'runtime.flow.startSelectionFailed')
       return null
     } finally {
       setBusy(false)
     }
-  }, [can, client, definitions, fail, loadRun, projectId])
+  }, [can, client, definitions, fail, flowMessage, loadRun, projectId])
 
   const submitNodeRevision = useCallback(async (
     node: WorkflowNodeRunDto,
@@ -1087,7 +1096,7 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
       await loadRun(run.id)
       return true
     } catch (cause) {
-      fail(cause, 'Unable to submit the exact artifact revision to this workflow node.')
+      fail(cause, 'runtime.flow.submitRevisionFailed')
       return false
     } finally {
       setBusy(false)
@@ -1109,7 +1118,7 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
       await loadRun(run.id)
       return true
     } catch (cause) {
-      fail(cause, 'Unable to authorize this privileged workflow operation as the current member.')
+      fail(cause, 'runtime.flow.authorizeOperationFailed')
       return false
     } finally {
       setBusy(false)
@@ -1123,6 +1132,13 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
     soloReviewConfirmed = false,
   ) => {
     if (!projectId || !run) return false
+    if (
+      resolution === 'approve'
+      && !reviewGateApprovalReadiness(runDefinition?.definition, node, run, artifacts).ready
+    ) {
+      setError(flowMessage('runtime.flow.reviewGateFailed'))
+      return false
+    }
     setBusy(true)
     setError(null)
     try {
@@ -1137,48 +1153,57 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
       await loadRun(run.id)
       return true
     } catch (cause) {
-      fail(cause, 'The canonical artifact review gate has not been satisfied.')
+      fail(cause, 'runtime.flow.reviewGateFailed')
       return false
     } finally {
       setBusy(false)
     }
-  }, [client, fail, loadRun, projectId, run])
+  }, [artifacts, client, fail, flowMessage, loadRun, projectId, run, runDefinition?.definition])
 
-  const retryNode = useCallback(async (node: WorkflowNodeRunDto, reason = 'Retry from Workbench') => {
+  const retryNode = useCallback(async (node: WorkflowNodeRunDto, reason?: string) => {
     if (!projectId || !run || !can('edit')) return false
     setBusy(true)
     try {
-      await client.retryNode(projectId, run.id, node.key, reason)
+      await client.retryNode(
+        projectId,
+        run.id,
+        node.key,
+        reason ?? flowMessage('runtime.flow.retryReason'),
+      )
       await loadRun(run.id)
       return true
     } catch (cause) {
-      fail(cause, 'Unable to retry this workflow node.')
+      fail(cause, 'runtime.flow.retryNodeFailed')
       return false
     } finally {
       setBusy(false)
     }
-  }, [can, client, fail, loadRun, projectId, run])
+  }, [can, client, fail, flowMessage, loadRun, projectId, run])
 
-  const cancelRun = useCallback(async (reason = 'Cancelled from Workbench') => {
+  const cancelRun = useCallback(async (reason?: string) => {
     if (!projectId || !run || !can('edit')) return false
     setBusy(true)
     try {
-      await client.cancelRun(projectId, run.id, reason)
+      await client.cancelRun(
+        projectId,
+        run.id,
+        reason ?? flowMessage('runtime.flow.cancelReason'),
+      )
       await loadRun(run.id)
       return true
     } catch (cause) {
-      fail(cause, 'Unable to cancel the workflow run.')
+      fail(cause, 'runtime.flow.cancelRunFailed')
       return false
     } finally {
       setBusy(false)
     }
-  }, [can, client, fail, loadRun, projectId, run])
+  }, [can, client, fail, flowMessage, loadRun, projectId, run])
 
   const createBundle = useCallback(async (prototype: VersionedArtifactDto<PrototypeContentDto>) => {
     if (!projectId || !can('edit')) return null
     const revision = prototype.approvedRevision
     if (!revision) {
-      setError('Approve an immutable prototype revision before compiling a build manifest.')
+      setError(flowMessage('runtime.flow.approvePrototype'))
       return null
     }
     setBusy(true)
@@ -1195,12 +1220,12 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
       setQueryReference('workspaceRevisionId')
       return result.data
     } catch (cause) {
-      fail(cause, 'Unable to compile the frozen build manifest. Check approved upstream traces.')
+      fail(cause, 'runtime.flow.compileManifestFailed')
       return null
     } finally {
       setBusy(false)
     }
-  }, [activateWorkbenchItem, can, client, fail, projectId, storeWorkbenchQueue])
+  }, [activateWorkbenchItem, can, client, fail, flowMessage, projectId, storeWorkbenchQueue])
 
   const rebaseWorkbenchBundle = useCallback(async () => {
     const workspace = workspaceRevisionRef.current
@@ -1211,7 +1236,7 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
     if (!workspace || !activeBundle || !activeItem || !can('edit')) return null
     if (!workbenchBundleNeedsRebase(activeBundle, workspace)) return activeBundle
     if (proposalIsApplied(activeItem.proposal)) {
-      setError('An applied page proposal cannot be moved to a different Workbench input manifest.')
+      setError(flowMessage('runtime.flow.appliedCannotRebase'))
       return null
     }
     setBusy(true)
@@ -1226,7 +1251,7 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
         || workbenchRootBundleId(result.data) !== activeItem.bundleId
         || workbenchBundleNeedsRebase(result.data, workspace)
       ) {
-        setError('The server did not return a derived bundle pinned to the exact current workspace revision.')
+        setError(flowMessage('runtime.flow.rebaseResponseMismatch'))
         return null
       }
       const nextQueue = upsertWorkbenchBundle(queue, result.data)
@@ -1234,12 +1259,12 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
       activateWorkbenchItem(nextQueue.find((item) => item.bundleId === activeItem.bundleId) ?? null)
       return result.data
     } catch (cause) {
-      fail(cause, 'Unable to rebase the active page bundle onto the exact current workspace revision.')
+      fail(cause, 'runtime.flow.rebaseBundleFailed')
       return null
     } finally {
       setBusy(false)
     }
-  }, [activateWorkbenchItem, can, client, fail, storeWorkbenchQueue])
+  }, [activateWorkbenchItem, can, client, fail, flowMessage, storeWorkbenchQueue])
 
   const generateImplementation = useCallback(async (
     instruction: string,
@@ -1252,7 +1277,7 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
     const activeItem = queue.find((item) => item.bundleId === selectedBundleIdRef.current)
       ?? queue.find((item) => item.bundle?.id === activeBundle.id)
     if (!activeItem) {
-      setError('The active Workbench manifest is not attached to the frozen root bundle order.')
+      setError(flowMessage('runtime.flow.manifestNotAttached'))
       return null
     }
     const activeItemIndex = queue.findIndex((item) => item.bundleId === activeItem.bundleId)
@@ -1261,8 +1286,11 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
         (item) => !proposalIsApplied(item.proposal),
       )
       setError(predecessor
-        ? `Apply ${predecessor.sliceId ?? predecessor.bundleId} before generating ${activeItem.sliceId ?? activeItem.bundleId}. Workbench follows frozen manifest order.`
-        : 'Select a valid Workbench queue item before generating a proposal.')
+        ? flowMessage('runtime.flow.applyBeforeGenerate', {
+            before: predecessor.sliceId ?? predecessor.bundleId,
+            target: activeItem.sliceId ?? activeItem.bundleId,
+          })
+        : flowMessage('runtime.flow.selectQueueBeforeGenerate'))
       return null
     }
     if (
@@ -1270,16 +1298,16 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
       && activeItem.bundleId !== expectedBundleId
       && activeBundle.id !== expectedBundleId
     ) {
-      setError('The exact frozen Workbench bundle is not active.')
+      setError(flowMessage('runtime.flow.exactBundleInactive'))
       return null
     }
     const workspace = workspaceRevisionRef.current
     if (activeBundle.currentWorkspaceRevision && !workspace) {
-      setError('Load the exact workspace revision pinned by this Workbench bundle before generating.')
+      setError(flowMessage('runtime.flow.loadWorkspaceBeforeGenerate'))
       return null
     }
     if (workbenchBundleNeedsRebase(activeBundle, workspace)) {
-      setError('Rebase the active page bundle onto the exact current workspace revision before generating a new proposal.')
+      setError(flowMessage('runtime.flow.rebaseBeforeGenerate'))
       return null
     }
     const replaceProposal = activeItem.proposal
@@ -1291,7 +1319,7 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
         || replaceProposal.executionSource === 'conversation_command'
       )
     ) {
-      setError('This proposal already has review state or belongs to an accepted conversation command. Finish or reject it instead of regenerating.')
+      setError(flowMessage('runtime.flow.proposalAlreadyReviewed'))
       return null
     }
     setBusy(true)
@@ -1313,12 +1341,12 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
       activateWorkbenchItem(itemIndex >= 0 ? nextQueue[itemIndex] : null)
       return result.data.proposal
     } catch (cause) {
-      fail(cause, 'AI could not produce a proposal from the frozen build manifest.')
+      fail(cause, 'runtime.flow.generateProposalFailed')
       return null
     } finally {
       setBusy(false)
     }
-  }, [activateWorkbenchItem, can, client, fail, storeWorkbenchQueue])
+  }, [activateWorkbenchItem, can, client, fail, flowMessage, storeWorkbenchQueue])
 
   const decideOperation = useCallback(async (
     operation: FileOperationDto,
@@ -1327,7 +1355,7 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
   ) => {
     if (!proposal || !can('edit') || operation.decision !== 'pending') return null
     if (workbenchBundleNeedsRebase(bundle, workspaceRevisionRef.current)) {
-      setError('Rebase and generate a new exact-workspace proposal before recording decisions.')
+      setError(flowMessage('runtime.flow.rebaseBeforeDecisions'))
       return null
     }
     setBusy(true)
@@ -1337,7 +1365,7 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
         proposal,
         operation.id,
         decision,
-        reason || (decision === 'rejected' ? 'Rejected in Workbench review' : ''),
+        reason || (decision === 'rejected' ? flowMessage('runtime.flow.rejectedReason') : ''),
       )
       const nextQueue = replaceWorkbenchQueueProposal(workbenchQueueRef.current, result.data, bundle)
       storeWorkbenchQueue(nextQueue)
@@ -1345,12 +1373,12 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
       activateWorkbenchItem(itemIndex >= 0 ? nextQueue[itemIndex] : null)
       return result.data
     } catch (cause) {
-      fail(cause, 'Unable to record the file operation decision.')
+      fail(cause, 'runtime.flow.recordDecisionFailed')
       return null
     } finally {
       setBusy(false)
     }
-  }, [activateWorkbenchItem, bundle, can, client, fail, proposal, storeWorkbenchQueue])
+  }, [activateWorkbenchItem, bundle, can, client, fail, flowMessage, proposal, storeWorkbenchQueue])
 
   const decideAllPending = useCallback(async (
     decision: 'accepted' | 'rejected',
@@ -1358,7 +1386,7 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
   ) => {
     if (!proposal || !can('edit')) return false
     if (workbenchBundleNeedsRebase(bundle, workspaceRevisionRef.current)) {
-      setError('Rebase and generate a new exact-workspace proposal before recording decisions.')
+      setError(flowMessage('runtime.flow.rebaseBeforeDecisions'))
       return false
     }
     setBusy(true)
@@ -1371,7 +1399,7 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
           current,
           operation.id,
           decision,
-          reason || (decision === 'rejected' ? 'Rejected in Workbench review' : ''),
+          reason || (decision === 'rejected' ? flowMessage('runtime.flow.rejectedReason') : ''),
         )
         current = result.data
       }
@@ -1381,17 +1409,17 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
       activateWorkbenchItem(itemIndex >= 0 ? nextQueue[itemIndex] : null)
       return true
     } catch (cause) {
-      fail(cause, 'Unable to record all file operation decisions.')
+      fail(cause, 'runtime.flow.recordAllDecisionsFailed')
       return false
     } finally {
       setBusy(false)
     }
-  }, [activateWorkbenchItem, bundle, can, client, fail, proposal, storeWorkbenchQueue])
+  }, [activateWorkbenchItem, bundle, can, client, fail, flowMessage, proposal, storeWorkbenchQueue])
 
   const applyProposal = useCallback(async () => {
     if (!proposal || !can('edit')) return null
     if (!proposalIsApplied(proposal) && workbenchBundleNeedsRebase(bundle, workspaceRevisionRef.current)) {
-      setError('This proposal is bound to an older Workbench manifest. Rebase the active page bundle and generate a new proposal; prior decisions will not be migrated.')
+      setError(flowMessage('runtime.flow.olderManifest'))
       return null
     }
     const queue = workbenchQueueRef.current.length > 0
@@ -1423,7 +1451,7 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
         await loadRun(run.id)
         return workspaceRevision
       } catch (cause) {
-        fail(cause, 'All page proposals are applied, but Workbench completion could not be recorded.')
+        fail(cause, 'runtime.flow.recordCompletionFailed')
         return null
       } finally {
         setBusy(false)
@@ -1436,8 +1464,8 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
         (item) => !proposalIsApplied(item.proposal),
       )
       setError(previous
-        ? `Apply ${previous.sliceId ?? previous.bundleId} first. Workbench proposals are rebased in frozen manifest order.`
-        : 'This proposal is not ready to apply in the frozen manifest order.')
+        ? flowMessage('runtime.flow.applyFirst', { item: previous.sliceId ?? previous.bundleId })
+        : flowMessage('runtime.flow.notReadyApply'))
       return null
     }
     setBusy(true)
@@ -1471,12 +1499,12 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
       }
       return result.data
     } catch (cause) {
-      fail(cause, 'Unable to apply the reviewed implementation proposal.')
+      fail(cause, 'runtime.flow.applyProposalFailed')
       return null
     } finally {
       setBusy(false)
     }
-  }, [activateWorkbenchItem, bundle, can, client, fail, loadRun, projectId, proposal, run, storeWorkbenchQueue, workspaceRevision])
+  }, [activateWorkbenchItem, bundle, can, client, fail, flowMessage, loadRun, projectId, proposal, run, storeWorkbenchQueue, workspaceRevision])
 
   const proposeFileChange = useCallback(async (
     path: string,
@@ -1495,16 +1523,19 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
         (item) => !proposalIsApplied(item.proposal),
       )
       setError(predecessor
-        ? `Apply ${predecessor.sliceId ?? predecessor.bundleId} before proposing a file change for ${current?.sliceId ?? current?.bundleId ?? bundle.id}. Workbench follows frozen manifest order.`
-        : 'Select a valid Workbench queue item before proposing a file change.')
+        ? flowMessage('runtime.flow.applyBeforeFile', {
+            before: predecessor.sliceId ?? predecessor.bundleId,
+            target: current?.sliceId ?? current?.bundleId ?? bundle.id,
+          })
+        : flowMessage('runtime.flow.selectQueueBeforeFile'))
       return null
     }
     if (bundle.currentWorkspaceRevision && !workspaceRevisionRef.current) {
-      setError('Load the exact workspace revision pinned by this Workbench bundle before proposing a file change.')
+      setError(flowMessage('runtime.flow.loadWorkspaceBeforeFile'))
       return null
     }
     if (workbenchBundleNeedsRebase(bundle, workspaceRevisionRef.current)) {
-      setError('Rebase the active page bundle onto the exact current workspace revision before proposing a file change.')
+      setError(flowMessage('runtime.flow.rebaseBeforeFile'))
       return null
     }
     const operation: CreateImplementationProposalInputDto['operations'][number] = {
@@ -1514,7 +1545,7 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
       content,
       language,
       expectedHash,
-      rationale: 'Manual Workbench edit',
+      rationale: flowMessage('runtime.flow.manualEdit'),
       dependsOn: [],
       traceSource: [bundle.prototypeRevision.revisionId],
     }
@@ -1524,7 +1555,7 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
       const result = await client.createImplementationProposal(projectId, {
         buildManifestId: bundle.id,
         operations: [operation],
-        assumptions: ['Manual edit proposed from the reviewed Workbench file editor.'],
+        assumptions: [flowMessage('runtime.flow.manualEditAssumption')],
       })
       const nextQueue = replaceWorkbenchQueueProposal(workbenchQueueRef.current, result.data, bundle)
       storeWorkbenchQueue(nextQueue)
@@ -1532,12 +1563,12 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
       activateWorkbenchItem(itemIndex >= 0 ? nextQueue[itemIndex] : null)
       return result.data
     } catch (cause) {
-      fail(cause, 'Unable to create a reviewable file change proposal.')
+      fail(cause, 'runtime.flow.proposeFileFailed')
       return null
     } finally {
       setBusy(false)
     }
-  }, [activateWorkbenchItem, bundle, can, client, fail, projectId, storeWorkbenchQueue])
+  }, [activateWorkbenchItem, bundle, can, client, fail, flowMessage, projectId, storeWorkbenchQueue])
 
   const selectedDefinition = definitions.find((item) => item.id === selectedDefinitionId)
     ?? definitionVersions[0]

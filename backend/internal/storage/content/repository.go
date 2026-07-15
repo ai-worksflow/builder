@@ -96,8 +96,7 @@ func (s *MongoStore) EnsureIndexes(ctx context.Context) error {
 	// earlier unique indexes and use a lookup index instead.
 	for _, name := range []string{"project_content_hash_unique", "aggregate_content_hash_unique"} {
 		if _, err := s.collection.Indexes().DropOne(ctx, name); err != nil {
-			var commandError mongo.CommandError
-			if !errors.As(err, &commandError) || commandError.Code != 27 {
+			if !isMissingIndexDropTarget(err) {
 				return fmt.Errorf("drop legacy content index %s: %w", name, err)
 			}
 		}
@@ -120,6 +119,16 @@ func (s *MongoStore) EnsureIndexes(ctx context.Context) error {
 		},
 	})
 	return err
+}
+
+func isMissingIndexDropTarget(err error) bool {
+	var commandError mongo.CommandError
+	if !errors.As(err, &commandError) {
+		return false
+	}
+	// A fresh database has no collection (26); an upgraded one may have no
+	// matching legacy index (27). Both already satisfy the desired state.
+	return commandError.Code == 26 || commandError.Code == 27
 }
 
 func (s *MongoStore) PutPending(

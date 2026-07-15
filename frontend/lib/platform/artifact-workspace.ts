@@ -3,13 +3,16 @@ import type {
   ArtifactDependencyDto,
   ArtifactReviewGateDto,
   ArtifactRevisionDto,
+  AcceptanceCriterionDto,
   BlueprintContentDto,
+  DocumentBlockDto,
   DocumentContentDto,
   ImpactReportDto,
   JsonObject,
   PageSpecContentDto,
   ProposalDto,
   PrototypeContentDto,
+  RequirementItemDto,
   TraceLinkDto,
   VersionRefDto,
   VersionedArtifactDto,
@@ -18,6 +21,15 @@ import { PlatformHttpError } from './http'
 
 const PLATFORM_PAGE_LIMIT = 200
 const WORKSPACE_TRACE_LIMIT = 500
+
+export interface ArtifactWorkspaceSnapshot {
+  readonly documents: readonly VersionedArtifactDto<DocumentContentDto>[]
+  readonly blueprints: readonly VersionedArtifactDto<BlueprintContentDto>[]
+  readonly pageSpecs: readonly VersionedArtifactDto<PageSpecContentDto>[]
+  readonly prototypes: readonly VersionedArtifactDto<PrototypeContentDto>[]
+  readonly proposals: readonly ProposalDto[]
+  readonly traces: readonly TraceLinkDto[]
+}
 
 const ARTIFACT_WORKSPACE_REFRESH_EVENTS = new Set([
   'artifact.updated',
@@ -46,15 +58,6 @@ const ARTIFACT_WORKSPACE_REFRESH_EVENTS = new Set([
 
 export function artifactWorkspaceEventRequiresRefresh(type: string) {
   return ARTIFACT_WORKSPACE_REFRESH_EVENTS.has(type)
-}
-
-export interface ArtifactWorkspaceSnapshot {
-  readonly documents: readonly VersionedArtifactDto<DocumentContentDto>[]
-  readonly blueprints: readonly VersionedArtifactDto<BlueprintContentDto>[]
-  readonly pageSpecs: readonly VersionedArtifactDto<PageSpecContentDto>[]
-  readonly prototypes: readonly VersionedArtifactDto<PrototypeContentDto>[]
-  readonly proposals: readonly ProposalDto[]
-  readonly traces: readonly TraceLinkDto[]
 }
 
 export type ArtifactWorkspaceResourceCollection =
@@ -88,28 +91,123 @@ export function reviewGateReadyForRequest(gate?: ArtifactReviewGateDto) {
     check.severity !== 'error' || check.code === 'canonical_review_approved')
 }
 
+/**
+ * Builds a complete editor/validation view over document content returned by
+ * older or partially materialized payloads. The input remains the canonical
+ * raw value; callers must not persist this derived compatibility view merely
+ * because it was rendered.
+ */
+export function normalizeDocumentContent(content: DocumentContentDto): DocumentContentDto {
+  const raw = objectValue(content)
+  return {
+    ...raw,
+    kind: nonEmptyString(raw.kind) ? raw.kind as DocumentContentDto['kind'] : 'requirement',
+    summary: stringValue(raw.summary),
+    blocks: arrayValue(raw.blocks).map(normalizeDocumentBlock),
+    requirements: arrayValue(raw.requirements).map(normalizeRequirement),
+    acceptanceCriteria: arrayValue(raw.acceptanceCriteria).map(normalizeAcceptanceCriterion),
+    openQuestions: stringArray(raw.openQuestions),
+    assumptions: stringArray(raw.assumptions),
+  } as DocumentContentDto
+}
+
+function normalizeDocumentBlock(value: unknown): DocumentBlockDto {
+  const raw = objectValue(value)
+  return {
+    ...raw,
+    id: stringValue(raw.id),
+    // Preserve forward-compatible server block types such as sourceContext in
+    // the display model; the editor includes the current value as an option.
+    type: (nonEmptyString(raw.type) ? raw.type : 'paragraph') as DocumentBlockDto['type'],
+    ...(raw.text === undefined ? {} : { text: stringValue(raw.text) }),
+    ...(raw.children === undefined
+      ? {}
+      : { children: arrayValue(raw.children).map(normalizeDocumentBlock) }),
+    ...(raw.requirementIds === undefined
+      ? {}
+      : { requirementIds: stringArray(raw.requirementIds) }),
+  } as DocumentBlockDto
+}
+
+function normalizeRequirement(value: unknown): RequirementItemDto {
+  const raw = objectValue(value)
+  return {
+    ...raw,
+    id: stringValue(raw.id),
+    title: stringValue(raw.title),
+    statement: stringValue(raw.statement),
+    priority: priorityValue(raw.priority),
+    acceptanceCriterionIds: stringArray(raw.acceptanceCriterionIds),
+    sourceBlockIds: stringArray(raw.sourceBlockIds),
+  } as RequirementItemDto
+}
+
+function normalizeAcceptanceCriterion(value: unknown): AcceptanceCriterionDto {
+  const raw = objectValue(value)
+  return {
+    ...raw,
+    id: stringValue(raw.id),
+    statement: stringValue(raw.statement),
+    priority: priorityValue(raw.priority),
+    status: criterionStatusValue(raw.status),
+  } as AcceptanceCriterionDto
+}
+
+function priorityValue(value: unknown): RequirementItemDto['priority'] {
+  const normalized = stringValue(value).trim().toLowerCase()
+  return normalized === 'should' || normalized === 'could' ? normalized : 'must'
+}
+
+function criterionStatusValue(value: unknown): AcceptanceCriterionDto['status'] {
+  const normalized = stringValue(value).trim().toLowerCase()
+  return normalized === 'accepted' || normalized === 'rejected' ? normalized : 'open'
+}
+
+function objectValue(value: unknown): Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {}
+}
+
+function arrayValue(value: unknown): readonly unknown[] {
+  return Array.isArray(value) ? value : []
+}
+
+function stringArray(value: unknown): string[] {
+  return arrayValue(value).filter((item): item is string => typeof item === 'string')
+}
+
+function stringValue(value: unknown): string {
+  return typeof value === 'string' ? value : ''
+}
+
+function nonEmptyString(value: unknown): value is string {
+  return typeof value === 'string' && value.trim().length > 0
+}
+
 export function documentReviewIssues(content: DocumentContentDto) {
+  const normalized = normalizeDocumentContent(content)
   const issues: string[] = []
-  if (!content.summary.trim()) issues.push('Summary is required.')
-  if (content.blocks.length === 0) issues.push('At least one structured block is required.')
-  if (content.kind === 'projectBrief' && !content.blocks.some((item) =>
+  if (!normalized.summary.trim()) issues.push('Summary is required.')
+  if (normalized.blocks.length === 0) issues.push('At least one structured block is required.')
+  if (normalized.kind === 'projectBrief' && !normalized.blocks.some((item) =>
     item.type === 'goal' && item.text?.trim(),
   )) {
     issues.push('Project Brief requires at least one non-empty goal block.')
   }
-  if (content.blocks.some((item) =>
+  if (normalized.blocks.some((item) =>
     item.type === 'openQuestion'
       && item.blocking
       && !['answered', 'resolved', 'waived'].includes(item.status ?? 'open'),
   )) {
     issues.push('Resolve or waive every blocking open question before review.')
   }
-  if (content.kind !== 'projectBrief') {
-    const requirements = content.requirements ?? []
-    const criteria = content.acceptanceCriteria ?? []
+  if (normalized.kind !== 'projectBrief') {
+    const requirements = normalized.requirements ?? []
+    const criteria = normalized.acceptanceCriteria
     const requirementIds = requirements.map((item) => item.id)
     const criterionIds = criteria.map((item) => item.id)
-    const blockIds = new Set(content.blocks.map((item) => item.id))
+    const blockIds = new Set(normalized.blocks.map((item) => item.id))
     const criterionSet = new Set(criterionIds)
     if (requirements.length === 0) issues.push('At least one requirement is required.')
     if (requirements.some((item) => !item.id || !item.statement.trim())) {
@@ -152,6 +250,7 @@ const REQUIREMENT_BASELINE_DOCUMENT_KINDS = new Set([
 
 export function approvedRequirementBaselineSources(
   documents: readonly VersionedArtifactDto<DocumentContentDto>[],
+  missingRequirementsMessage = 'Approve Product Requirements with stable requirement and acceptance IDs before creating a Blueprint.',
 ) {
   const eligible = documents.filter((document) =>
     REQUIREMENT_BASELINE_DOCUMENT_KINDS.has(document.artifact.kind),
@@ -159,7 +258,7 @@ export function approvedRequirementBaselineSources(
   if (!eligible.some((document) =>
     document.artifact.kind === 'product_requirements' && document.approvedRevision,
   )) {
-    throw new Error('Approve Product Requirements with stable requirement and acceptance IDs before creating a Blueprint.')
+    throw new Error(missingRequirementsMessage)
   }
   return eligible.flatMap((document) => {
     const revision = document.approvedRevision
@@ -659,7 +758,14 @@ export class ArtifactWorkspaceGateway {
     return { ...generated, data: generated.data.proposal }
   }
 
-  async applyProposal(proposalId: string, acceptedOperationIds: readonly string[]) {
+  async applyProposal(
+    proposalId: string,
+    acceptedOperationIds: readonly string[],
+    messages: {
+      rejectedReason?: string
+      invalidSelection?: string
+    } = {},
+  ) {
     const accepted = new Set(acceptedOperationIds)
     let current = (await this.client.proposals.get(proposalId)).data
     for (const operation of current.operations) {
@@ -668,7 +774,9 @@ export class ArtifactWorkspaceGateway {
       const result = await this.client.proposals.decide(proposalId, {
         operationId: operation.id,
         decision,
-        reason: decision === 'rejected' ? 'Not selected during proposal review.' : undefined,
+        reason: decision === 'rejected'
+          ? messages.rejectedReason ?? 'Not selected during proposal review.'
+          : undefined,
         version: current.version,
       }, {
         ifMatch: proposalEtag(current),
@@ -677,7 +785,10 @@ export class ArtifactWorkspaceGateway {
       current = result.data
     }
     if (current.status !== 'ready') {
-      throw new Error('At least one operation must be accepted and every operation must be decided before apply.')
+      throw new Error(
+        messages.invalidSelection
+          ?? 'At least one operation must be accepted and every operation must be decided before apply.',
+      )
     }
     return this.client.proposals.apply(proposalId, { version: current.version }, {
       ifMatch: proposalEtag(current),

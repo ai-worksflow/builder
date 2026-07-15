@@ -1,8 +1,11 @@
 import assert from 'node:assert/strict'
-import { PlatformCollaborationGateway } from '../lib/collaboration/platform-adapter'
+import {
+  collaborationErrorMessage,
+  PlatformCollaborationGateway,
+} from '../lib/collaboration/platform-adapter'
 import type { CollaborationVersionRef } from '../lib/collaboration/types'
 import { PlatformClient } from '../lib/platform/client'
-import { PlatformNetworkError, type FetchLike } from '../lib/platform/http'
+import { PlatformHttpError, PlatformNetworkError, type FetchLike } from '../lib/platform/http'
 import type { WebSocketFactory, WebSocketLike } from '../lib/platform/websocket'
 
 type TestCase = {
@@ -28,6 +31,18 @@ function user() {
     createdAt: '2026-07-10T00:00:00Z',
   }
 }
+
+test('forbidden origin errors are not mislabeled as project-role failures', () => {
+  const error = new PlatformHttpError({
+    type: 'about:blank',
+    title: 'Origin forbidden',
+    status: 403,
+    detail: 'Origin is not allowed.',
+    code: 'origin_forbidden',
+  })
+
+  assert.equal(collaborationErrorMessage(error, 'Request failed.'), 'Origin is not allowed.')
+})
 
 function project(role: 'owner' | 'admin' | 'editor' | 'commenter' | 'viewer' = 'owner') {
   return {

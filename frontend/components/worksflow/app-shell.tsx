@@ -9,6 +9,7 @@ import { TeamCollaboration } from './team/team-collaboration'
 import { RecentProjects } from './recent-projects'
 import { SettingsCenter } from './settings-center'
 import { LanguageToggle } from './language-toggle'
+import { OnboardingGuide } from './onboarding-guide'
 import { Boxes, Clock, PanelsTopLeft, Settings, Zap } from 'lucide-react'
 import { useCollaboration } from '@/lib/collaboration/provider'
 
@@ -45,7 +46,7 @@ export function AppShell() {
     teamView,
     activeTeamProjectId,
   } = useWorksflow()
-  const { t } = useI18n()
+  const { locale, t } = useI18n()
   const { unreadCount } = useCollaboration()
 
   useEffect(() => {
@@ -116,13 +117,14 @@ export function AppShell() {
               </span>
               {badge > 0 ? (
                 <span className="absolute right-1.5 top-1.5 flex h-3.5 min-w-3.5 items-center justify-center rounded-full bg-primary px-1 text-[9px] font-semibold text-primary-foreground">
-                  {badge}
+                  {badge.toLocaleString(locale)}
                 </span>
               ) : null}
             </button>
           )
         })}
-        <LanguageToggle className="mt-auto w-12 px-0 max-md:mt-0" />
+        <OnboardingGuide className="mt-auto max-md:mt-0" />
+        <LanguageToggle className="w-12 px-0" />
       </nav>
 
       {/* Main surface */}

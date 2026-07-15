@@ -4,6 +4,8 @@ import { useMemo, useState } from 'react'
 import { cn } from '@/lib/utils'
 import { useI18n } from '@/lib/i18n'
 import {
+  localizePromptTemplates,
+  localizePromptWorkflows,
   searchPromptHistory,
   searchPromptTemplates,
   searchPromptWorkflows,
@@ -38,7 +40,7 @@ export function PromptLibraryMenu({
   onSaveWorkflow: (workflow: PromptWorkflow) => void
   onDeleteWorkflow: (id: string) => void
 }) {
-  const { t } = useI18n()
+  const { formatDate, t } = useI18n()
   const dropdown = useDropdown()
   const [tab, setTab] = useState<LibraryTab>('templates')
   const [query, setQuery] = useState('')
@@ -47,17 +49,25 @@ export function PromptLibraryMenu({
   const [stepPrompt, setStepPrompt] = useState('')
   const [stepMode, setStepMode] = useState<PromptWorkflow['steps'][number]['mode']>('build')
   const [workflowSteps, setWorkflowSteps] = useState<PromptWorkflow['steps']>([])
+  const localizedTemplates = useMemo(
+    () => localizePromptTemplates(templates, t),
+    [t, templates],
+  )
+  const localizedWorkflows = useMemo(
+    () => localizePromptWorkflows(workflows, t),
+    [t, workflows],
+  )
   const filteredTemplates = useMemo(
-    () => searchPromptTemplates(templates, query),
-    [query, templates],
+    () => searchPromptTemplates(localizedTemplates, query),
+    [localizedTemplates, query],
   )
   const filteredHistory = useMemo(
     () => searchPromptHistory(history, query),
     [history, query],
   )
   const filteredWorkflows = useMemo(
-    () => searchPromptWorkflows(workflows, query),
-    [query, workflows],
+    () => searchPromptWorkflows(localizedWorkflows, query),
+    [localizedWorkflows, query],
   )
 
   function addWorkflowStep() {
@@ -68,7 +78,7 @@ export function PromptLibraryMenu({
       ...current,
       {
         id: `step-${Date.now()}-${index}`,
-        title: stepTitle.trim() || `Step ${index}`,
+        title: stepTitle.trim() || t('composer.library.defaultStepTitle', { number: index }),
         prompt,
         mode: stepMode,
       },
@@ -83,7 +93,7 @@ export function PromptLibraryMenu({
     onSaveWorkflow({
       id: `workflow-${Date.now()}`,
       title,
-      description: `${workflowSteps.length}-step custom workflow`,
+      description: t('composer.library.customWorkflowDescription', { count: workflowSteps.length }),
       tags: ['custom', 'workflow'],
       steps: workflowSteps,
     })
@@ -157,7 +167,7 @@ export function PromptLibraryMenu({
             </TabButton>
             <TabButton active={tab === 'workflows'} onClick={() => setTab('workflows')}>
               <Workflow className="h-3 w-3" />
-              Workflows
+              {t('composer.library.workflows')}
             </TabButton>
           </div>
 
@@ -191,7 +201,7 @@ export function PromptLibraryMenu({
                     key={template.id}
                     title={template.title}
                     description={template.description}
-                    badge={template.mode}
+                    badge={modeLabel(template.mode, t)}
                     onClick={() => {
                       onSelect(template.prompt, template.mode)
                       dropdown.setOpen(false)
@@ -218,18 +228,18 @@ export function PromptLibraryMenu({
             ) : tab === 'workflows' ? (
               <>
                 <div className="mb-2 space-y-2 rounded-md border border-border bg-card p-2">
-                  <div className="text-[10px] font-semibold uppercase tracking-wide text-faint-foreground">Workflow builder</div>
+                  <div className="text-[10px] font-semibold uppercase tracking-wide text-faint-foreground">{t('composer.library.workflowBuilder')}</div>
                   <input
                     value={workflowTitle}
                     onChange={(event) => setWorkflowTitle(event.target.value)}
-                    placeholder="Workflow title"
+                    placeholder={t('composer.library.workflowTitle')}
                     className="h-8 w-full rounded-md border border-border bg-background px-2 text-[11px] text-foreground outline-none"
                   />
                   <div className="grid grid-cols-[1fr_88px] gap-1.5">
                     <input
                       value={stepTitle}
                       onChange={(event) => setStepTitle(event.target.value)}
-                      placeholder={`Step ${workflowSteps.length + 1} title`}
+                      placeholder={t('composer.library.stepTitle', { number: workflowSteps.length + 1 })}
                       className="h-8 rounded-md border border-border bg-background px-2 text-[11px] text-foreground outline-none"
                     />
                     <select
@@ -237,46 +247,46 @@ export function PromptLibraryMenu({
                       onChange={(event) => setStepMode(event.target.value as typeof stepMode)}
                       className="h-8 rounded-md border border-border bg-background px-2 text-[10px] text-foreground"
                     >
-                      <option value="plan">plan</option><option value="build">build</option><option value="iterate">iterate</option><option value="fix">fix</option>
+                      <option value="plan">{t('composer.mode.plan')}</option><option value="build">{t('composer.mode.buildAction')}</option><option value="iterate">{t('composer.mode.iterate')}</option><option value="fix">{t('composer.mode.fix')}</option>
                     </select>
                   </div>
                   <textarea
                     value={stepPrompt}
                     onChange={(event) => setStepPrompt(event.target.value)}
-                    placeholder={value.trim() ? 'Leave blank to use the current composer prompt' : 'Step instructions'}
+                    placeholder={value.trim() ? t('composer.library.useCurrentPrompt') : t('composer.library.stepInstructions')}
                     rows={2}
                     className="w-full resize-y rounded-md border border-border bg-background p-2 text-[10px] text-foreground outline-none"
                   />
                   {workflowSteps.length > 0 && (
                     <div className="flex flex-wrap gap-1">
                       {workflowSteps.map((step, index) => (
-                        <button key={step.id} type="button" onClick={() => setWorkflowSteps((current) => current.filter((_, itemIndex) => itemIndex !== index))} className="rounded bg-white/5 px-1.5 py-1 text-[9px] text-muted-foreground hover:text-destructive" title="Remove step">
-                          {index + 1}. {step.title} · {step.mode} ×
+                        <button key={step.id} type="button" onClick={() => setWorkflowSteps((current) => current.filter((_, itemIndex) => itemIndex !== index))} className="rounded bg-white/5 px-1.5 py-1 text-[9px] text-muted-foreground hover:text-destructive" title={t('composer.library.removeStep')}>
+                          {index + 1}. {step.title} · {modeLabel(step.mode, t)} ×
                         </button>
                       ))}
                     </div>
                   )}
                   <div className="flex gap-1.5">
-                    <button type="button" onClick={addWorkflowStep} disabled={!stepPrompt.trim() && !value.trim()} className="inline-flex flex-1 items-center justify-center gap-1 rounded-md border border-border px-2 py-1.5 text-[10px] text-muted-foreground disabled:opacity-40"><Plus className="h-3 w-3" />Add step</button>
-                    <button type="button" onClick={saveWorkflow} disabled={!workflowTitle.trim() || workflowSteps.length === 0} className="flex-1 rounded-md bg-primary px-2 py-1.5 text-[10px] font-semibold text-primary-foreground disabled:opacity-40">Save workflow</button>
+                    <button type="button" onClick={addWorkflowStep} disabled={!stepPrompt.trim() && !value.trim()} className="inline-flex flex-1 items-center justify-center gap-1 rounded-md border border-border px-2 py-1.5 text-[10px] text-muted-foreground disabled:opacity-40"><Plus className="h-3 w-3" />{t('composer.library.addStep')}</button>
+                    <button type="button" onClick={saveWorkflow} disabled={!workflowTitle.trim() || workflowSteps.length === 0} className="flex-1 rounded-md bg-primary px-2 py-1.5 text-[10px] font-semibold text-primary-foreground disabled:opacity-40">{t('composer.library.saveWorkflow')}</button>
                   </div>
                 </div>
                 {filteredWorkflows.map((workflow) => (
                   <LibraryRow
                     key={workflow.id}
                     title={workflow.title}
-                    description={`${workflow.description} · ${workflow.steps.length} steps`}
-                    badge="workflow"
+                    description={`${workflow.description} · ${t('composer.library.stepsCount', { count: workflow.steps.length })}`}
+                    badge={t('composer.library.workflows')}
                     onClick={() => {
-                      onSelect(workflowPrompt(workflow), workflow.steps.at(-1)?.mode ?? 'build')
+                      onSelect(workflowPrompt(workflow, t), workflow.steps.at(-1)?.mode ?? 'build')
                       dropdown.setOpen(false)
                     }}
                     action={workflow.builtIn ? null : (
-                      <button type="button" onClick={(event) => { event.stopPropagation(); onDeleteWorkflow(workflow.id) }} className="rounded p-1 text-faint-foreground hover:bg-destructive/10 hover:text-destructive" aria-label={`Delete ${workflow.title}`}><Trash2 className="h-3.5 w-3.5" /></button>
+                      <button type="button" onClick={(event) => { event.stopPropagation(); onDeleteWorkflow(workflow.id) }} className="rounded p-1 text-faint-foreground hover:bg-destructive/10 hover:text-destructive" aria-label={t('composer.library.deleteWorkflow', { name: workflow.title })}><Trash2 className="h-3.5 w-3.5" /></button>
                     )}
                   />
                 ))}
-                {filteredWorkflows.length === 0 && <Empty>No workflows match this search.</Empty>}
+                {filteredWorkflows.length === 0 && <Empty>{t('composer.library.noWorkflows')}</Empty>}
               </>
             ) : (
               <>
@@ -284,8 +294,8 @@ export function PromptLibraryMenu({
                   <LibraryRow
                     key={entry.id}
                     title={entry.prompt}
-                    description={`${entry.model} · ${new Date(entry.createdAt).toLocaleString()}`}
-                    badge={entry.status}
+                    description={`${entry.model} · ${formatDate(entry.createdAt, { dateStyle: 'medium', timeStyle: 'short' })}`}
+                    badge={t(`composer.status.${entry.status}`)}
                     onClick={() => {
                       onSelect(entry.prompt, entry.mode)
                       dropdown.setOpen(false)
@@ -300,6 +310,11 @@ export function PromptLibraryMenu({
       )}
     </div>
   )
+}
+
+function modeLabel(mode: PromptTemplate['mode'], t: ReturnType<typeof useI18n>['t']) {
+  if (mode === 'build') return t('composer.mode.buildAction')
+  return t(`composer.mode.${mode}`)
 }
 
 function TabButton({

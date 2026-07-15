@@ -12,6 +12,7 @@ import {
 } from 'react'
 import { useCollaboration } from '../collaboration/provider'
 import { collaborationErrorMessage } from '../collaboration/platform-adapter'
+import { useI18n } from '../i18n'
 import { useWorksflow } from '../worksflow/store'
 import type {
   Blueprint,
@@ -133,6 +134,7 @@ const EMPTY_SNAPSHOT: ArtifactWorkspaceSnapshot = {
 const ArtifactWorkspaceContext = createContext<ArtifactWorkspaceContextState | null>(null)
 
 export function ArtifactWorkspaceProvider({ children }: { children: ReactNode }) {
+  const { t } = useI18n()
   const { session, project, platformClient } = useCollaboration()
   const {
     beginPlatformTeamFacts,
@@ -163,7 +165,7 @@ export function ArtifactWorkspaceProvider({ children }: { children: ReactNode })
       setStatus('ready')
     } catch (cause) {
       if (currentRequest !== requestId.current) return
-      const message = collaborationErrorMessage(cause, 'Unable to load platform artifacts.')
+      const message = collaborationErrorMessage(cause, t('runtime.artifact.loadFailed'))
       setSnapshot(EMPTY_SNAPSHOT)
       setStatus('error')
       setError(message)
@@ -175,6 +177,7 @@ export function ArtifactWorkspaceProvider({ children }: { children: ReactNode })
     gateway,
     project,
     session.signedIn,
+    t,
   ])
   refreshRef.current = refresh
 
@@ -226,7 +229,10 @@ export function ArtifactWorkspaceProvider({ children }: { children: ReactNode })
     },
     createBlueprint: async (title) => {
       if (!project) return null
-      const approvedSources = approvedRequirementBaselineSources(snapshot.documents)
+      const approvedSources = approvedRequirementBaselineSources(
+        snapshot.documents,
+        t('runtime.artifact.approveRequirements'),
+      )
       const baselineResult = await gateway.compileRequirementBaseline(project.id, approvedSources)
       const baseline = baselineResult.data
       const requirementVersions = [{
@@ -249,7 +255,7 @@ export function ArtifactWorkspaceProvider({ children }: { children: ReactNode })
       const blueprint = snapshot.blueprints.find((item) => item.artifact.id === blueprintArtifactId)
       const revision = blueprint?.approvedRevision
       if (!revision) {
-        throw new Error('Approve an immutable Blueprint revision before creating a formal PageSpec.')
+        throw new Error(t('runtime.artifact.approveBlueprint'))
       }
       const result = await gateway.createPageSpec(
         project.id,
@@ -276,8 +282,8 @@ export function ArtifactWorkspaceProvider({ children }: { children: ReactNode })
       if (!revision) {
         throw new Error(
           exploratory
-            ? 'Create an immutable PageSpec revision before creating a prototype.'
-            : 'Approve an immutable PageSpec revision before creating a formal prototype.',
+            ? t('runtime.artifact.createPageSpecRevision')
+            : t('runtime.artifact.approvePageSpec'),
         )
       }
       const reference = {
@@ -322,14 +328,14 @@ export function ArtifactWorkspaceProvider({ children }: { children: ReactNode })
     createDocumentRevision: async (artifactId, content) => {
       const resource = snapshot.documents.find((item) => item.artifact.id === artifactId)
       const draftEtag = resource?.draft?.etag ?? resource?.artifact.etag
-      if (!draftEtag) throw new Error('Refresh the document draft before creating a revision.')
+      if (!draftEtag) throw new Error(t('runtime.artifact.refreshDocumentDraft'))
       const saved = await gateway.saveDocumentDraft(
         artifactId,
         content,
         draftEtag,
       )
       const revisionEtag = saved.data.draft?.etag ?? saved.etag
-      if (!revisionEtag) throw new Error('The server did not return the saved draft ETag.')
+      if (!revisionEtag) throw new Error(t('runtime.artifact.missingSavedDraftEtag'))
       const result = await gateway.createDocumentRevision(artifactId, revisionEtag)
       await refreshRef.current()
       return result.data
@@ -337,14 +343,14 @@ export function ArtifactWorkspaceProvider({ children }: { children: ReactNode })
     createBlueprintRevision: async (artifactId, content) => {
       const resource = snapshot.blueprints.find((item) => item.artifact.id === artifactId)
       const draftEtag = resource?.draft?.etag ?? resource?.artifact.etag
-      if (!draftEtag) throw new Error('Refresh the blueprint draft before creating a revision.')
+      if (!draftEtag) throw new Error(t('runtime.artifact.refreshBlueprintDraft'))
       const saved = await gateway.saveBlueprintDraft(
         artifactId,
         content,
         draftEtag,
       )
       const revisionEtag = saved.data.draft?.etag ?? saved.etag
-      if (!revisionEtag) throw new Error('The server did not return the saved draft ETag.')
+      if (!revisionEtag) throw new Error(t('runtime.artifact.missingSavedDraftEtag'))
       const result = await gateway.createBlueprintRevision(artifactId, revisionEtag)
       await refreshRef.current()
       return result.data
@@ -352,14 +358,14 @@ export function ArtifactWorkspaceProvider({ children }: { children: ReactNode })
     createPageSpecRevision: async (artifactId, content) => {
       const resource = snapshot.pageSpecs.find((item) => item.artifact.id === artifactId)
       const draftEtag = resource?.draft?.etag ?? resource?.artifact.etag
-      if (!draftEtag) throw new Error('Refresh the PageSpec draft before creating a revision.')
+      if (!draftEtag) throw new Error(t('runtime.artifact.refreshPageSpecDraft'))
       const saved = await gateway.savePageSpecDraft(
         artifactId,
         content,
         draftEtag,
       )
       const revisionEtag = saved.data.draft?.etag ?? saved.etag
-      if (!revisionEtag) throw new Error('The server did not return the saved draft ETag.')
+      if (!revisionEtag) throw new Error(t('runtime.artifact.missingSavedDraftEtag'))
       const result = await gateway.createPageSpecRevision(artifactId, revisionEtag)
       await refreshRef.current()
       return result.data
@@ -367,27 +373,30 @@ export function ArtifactWorkspaceProvider({ children }: { children: ReactNode })
     createPrototypeRevision: async (artifactId, content) => {
       const resource = snapshot.prototypes.find((item) => item.artifact.id === artifactId)
       const draftEtag = resource?.draft?.etag ?? resource?.artifact.etag
-      if (!draftEtag) throw new Error('Refresh the prototype draft before creating a revision.')
+      if (!draftEtag) throw new Error(t('runtime.artifact.refreshPrototypeDraft'))
       const saved = await gateway.savePrototypeDraft(
         artifactId,
         content,
         draftEtag,
       )
       const revisionEtag = saved.data.draft?.etag ?? saved.etag
-      if (!revisionEtag) throw new Error('The server did not return the saved draft ETag.')
+      if (!revisionEtag) throw new Error(t('runtime.artifact.missingSavedDraftEtag'))
       const result = await gateway.createPrototypeRevision(artifactId, revisionEtag)
       await refreshRef.current()
       return result.data
     },
     loadDetails: <TContent,>(artifactId: string) => gateway.details<TContent>(artifactId),
     createProposal: async (input) => {
-      if (!project) throw new Error('Select a project before creating a proposal.')
+      if (!project) throw new Error(t('runtime.artifact.selectProjectBeforeProposal'))
       const result = await gateway.createProposal(project.id, input)
       await refreshRef.current()
       return result.data
     },
     applyProposal: async (proposalId, acceptedOperationIds) => {
-      const result = await gateway.applyProposal(proposalId, acceptedOperationIds)
+      const result = await gateway.applyProposal(proposalId, acceptedOperationIds, {
+        rejectedReason: t('runtime.artifact.proposalNotSelected'),
+        invalidSelection: t('runtime.artifact.proposalSelectionInvalid'),
+      })
       await refreshRef.current()
       return result.data
     },
@@ -409,6 +418,7 @@ export function ArtifactWorkspaceProvider({ children }: { children: ReactNode })
     refresh,
     snapshot,
     status,
+    t,
     updateSnapshotResource,
   ])
 

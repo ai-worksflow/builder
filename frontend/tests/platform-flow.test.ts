@@ -3,6 +3,7 @@ import {
   deliverySliceContext,
   estimateWorkflowSemanticStates,
   parseEditableDefinition,
+  reviewGateApprovalReadiness,
   revisionCandidates,
   starterWorkflowDefinition as starterDefinition,
   workflowRoleSatisfies,
@@ -688,6 +689,185 @@ test('PageSpec branch Human Edit selects the exact applied PageSpec revision', (
   assert.deepEqual(resolution.candidates.map((candidate) => candidate.ref), [revisionRefFixture(pageSpec.latestRevision)])
 })
 
+test('Review Gate readiness requires canonical approval of the exact materialized revision', () => {
+  const target = versionedResource('brief-review', 'brief-review-r4', 'Project brief', { kind: 'projectBrief' })
+  const revision = revisionRefFixture(target.latestRevision)
+  const priorApproved = {
+    ...target.latestRevision,
+    id: 'brief-review-r3',
+    revisionNumber: 3,
+    contentHash: 'sha256:brief-review-r3',
+  }
+  Object.assign(target, { approvedRevision: priorApproved })
+  const node = reviewGateNode()
+  const run = workflowRun(node, [lineageBinding(
+    [revision],
+    undefined,
+    [],
+    [],
+    { materializedArtifactRevisions: [revision], outputRevisionId: revision.revisionId },
+  )])
+  const artifacts = artifactSnapshot({ documents: [target] })
+
+  const pending = reviewGateApprovalReadiness(
+    reviewGateDefinition(true) as never,
+    node as never,
+    run as never,
+    artifacts as never,
+  )
+  assert.equal(pending.ready, false)
+  assert.deepEqual(pending.revisions, [revision])
+  assert.deepEqual(pending.pendingRevisions, [revision])
+  assert.match(pending.error ?? '', /not canonically approved/i)
+
+  Object.assign(target, {
+    approvedRevision: { ...target.latestRevision, contentHash: 'sha256:different-content' },
+  })
+  const hashMismatch = reviewGateApprovalReadiness(
+    reviewGateDefinition(true) as never,
+    node as never,
+    run as never,
+    artifacts as never,
+  )
+  assert.equal(hashMismatch.ready, false)
+  assert.deepEqual(hashMismatch.pendingRevisions, [revision])
+
+  Object.assign(target, { approvedRevision: { ...target.latestRevision } })
+  const approved = reviewGateApprovalReadiness(
+    reviewGateDefinition(true) as never,
+    node as never,
+    run as never,
+    artifacts as never,
+  )
+  assert.equal(approved.ready, true)
+  assert.deepEqual(approved.revisions, [revision])
+  assert.deepEqual(approved.pendingRevisions, [])
+  assert.equal(approved.error, undefined)
+})
+
+test('governed Review Gate readiness supports the legacy output revision fallback', () => {
+  const upstream = versionedResource('brief-upstream', 'brief-upstream-r1', 'Upstream brief', { kind: 'projectBrief' })
+  const target = versionedResource('brief-edited', 'brief-edited-r2', 'Edited brief', { kind: 'projectBrief' })
+  const upstreamRevision = revisionRefFixture(upstream.latestRevision)
+  const targetRevision = revisionRefFixture(target.latestRevision)
+  Object.assign(target, { approvedRevision: { ...target.latestRevision } })
+  const node = reviewGateNode()
+  const legacyBinding = lineageBinding(
+    [upstreamRevision, targetRevision],
+    undefined,
+    [],
+    [],
+    { outputRevisionId: targetRevision.revisionId },
+  )
+  const run = workflowRun(node, [legacyBinding])
+  const approved = reviewGateApprovalReadiness(
+    reviewGateDefinition(true) as never,
+    node as never,
+    run as never,
+    artifactSnapshot({ documents: [target] }) as never,
+  )
+  assert.equal(approved.ready, true)
+  assert.deepEqual(approved.revisions, [targetRevision])
+
+  const missingOutput = workflowRun(node, [lineageBinding(
+    [upstreamRevision, targetRevision],
+    undefined,
+    [],
+    [],
+    { outputRevisionId: 'missing-revision' },
+  )])
+  const unavailable = reviewGateApprovalReadiness(
+    reviewGateDefinition(true) as never,
+    node as never,
+    missingOutput as never,
+    artifactSnapshot({ documents: [target] }) as never,
+  )
+  assert.equal(unavailable.ready, false)
+  assert.deepEqual(unavailable.revisions, [])
+  assert.match(unavailable.error ?? '', /exactly one current Human Edit materialization/i)
+})
+
+test('non-governed Review Gate readiness requires every exact upstream revision', () => {
+  const first = versionedResource('document-a', 'document-a-r1', 'Document A', { kind: 'requirement' })
+  const second = versionedResource('document-b', 'document-b-r1', 'Document B', { kind: 'requirement' })
+  const firstRevision = revisionRefFixture(first.latestRevision)
+  const secondRevision = revisionRefFixture(second.latestRevision)
+  Object.assign(first, { approvedRevision: { ...first.latestRevision } })
+  const node = reviewGateNode()
+  const run = workflowRun(node, [lineageBinding(
+    [firstRevision, secondRevision, firstRevision],
+    undefined,
+    [],
+    [],
+    { outputRevisionId: firstRevision.revisionId },
+  )])
+  const artifacts = artifactSnapshot({ documents: [first, second] })
+
+  const pending = reviewGateApprovalReadiness(
+    reviewGateDefinition(false) as never,
+    node as never,
+    run as never,
+    artifacts as never,
+  )
+  assert.equal(pending.ready, false)
+  assert.deepEqual(pending.revisions, [firstRevision, secondRevision])
+  assert.deepEqual(pending.pendingRevisions, [secondRevision])
+
+  Object.assign(second, { approvedRevision: { ...second.latestRevision } })
+  const approved = reviewGateApprovalReadiness(
+    reviewGateDefinition(false) as never,
+    node as never,
+    run as never,
+    artifacts as never,
+  )
+  assert.equal(approved.ready, true)
+})
+
+test('Review Gate readiness fails closed for unavailable definitions and malformed lineage', () => {
+  const target = versionedResource('brief-malformed', 'brief-malformed-r1', 'Project brief', { kind: 'projectBrief' })
+  const revision = revisionRefFixture(target.latestRevision)
+  Object.assign(target, { approvedRevision: { ...target.latestRevision } })
+  const node = reviewGateNode()
+  const artifacts = artifactSnapshot({ documents: [target] })
+  const validRun = workflowRun(node, [lineageBinding(
+    [revision],
+    undefined,
+    [],
+    [],
+    { materializedArtifactRevisions: [revision] },
+  )])
+
+  assert.equal(reviewGateApprovalReadiness(
+    undefined,
+    node as never,
+    validRun as never,
+    artifacts as never,
+  ).ready, false)
+  assert.equal(reviewGateApprovalReadiness(
+    reviewGateDefinition(true) as never,
+    node as never,
+    workflowRun(node, []) as never,
+    artifacts as never,
+  ).ready, false)
+
+  const malformed = workflowRun(node, [lineageBinding(
+    [revision],
+    undefined,
+    [],
+    [],
+    { materializedArtifactRevisions: {} },
+  )])
+  const malformedResult = reviewGateApprovalReadiness(
+    reviewGateDefinition(true) as never,
+    node as never,
+    malformed as never,
+    artifacts as never,
+  )
+  assert.equal(malformedResult.ready, false)
+  assert.deepEqual(malformedResult.revisions, [])
+  assert.match(malformedResult.error ?? '', /lineage is malformed/i)
+})
+
 test('Blueprint delivery slices include only PageSpecs pinned to the selected Blueprint revision', () => {
   const pageA = versionedResource('page-a', 'page-a-r1', 'Page A', {
     blueprintPageNodeId: 'page-node-a',
@@ -833,6 +1013,7 @@ function lineageBinding(
   outputProposal?: { readonly id: string; readonly payloadHash: string },
   deliverySliceRefs: readonly unknown[] = [],
   proposalPins: readonly unknown[] = [],
+  sourceOverrides: Readonly<Record<string, unknown>> = {},
 ) {
   return {
     edgeId: `edge-${outputProposal?.id ?? 'lineage'}`,
@@ -846,11 +1027,52 @@ function lineageBinding(
       deliverySliceRefs,
       proposalPins,
       ...(outputProposal ? { outputProposal } : {}),
+      ...sourceOverrides,
     },
     output: {},
     outputHash: 'output-hash',
     value: {},
     valueHash: 'value-hash',
+  }
+}
+
+function reviewGateNode() {
+  return {
+    id: 'review-node-run',
+    runId: 'run-1',
+    key: 'project-brief-review',
+    definitionNodeId: 'project-brief-review',
+    type: 'review_gate',
+    status: 'waiting_review',
+    attempt: 1,
+  }
+}
+
+function reviewGateDefinition(governed: boolean) {
+  return {
+    id: 'definition-1',
+    version: 1,
+    name: 'Review test',
+    schemaVersion: 'workflow/v2',
+    nodes: [{
+      id: 'project-brief-review',
+      name: 'Review Project Brief',
+      type: 'review_gate',
+      reviewGate: {
+        requiredRole: 'owner',
+        minimumApprovals: 1,
+        prohibitSelfReview: true,
+        allowWaiver: false,
+      },
+    }],
+    edges: [],
+    ...(governed ? {
+      inputContract: { capability: 'project_brief' },
+      outputContract: { capability: 'application' },
+    } : {}),
+    hash: 'sha256:definition-1',
+    createdBy: 'user-1',
+    createdAt: '2026-07-10T00:00:00Z',
   }
 }
 

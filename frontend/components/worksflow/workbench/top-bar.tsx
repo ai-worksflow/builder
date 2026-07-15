@@ -65,8 +65,8 @@ export function TopBar() {
     rollbackDeployment,
   } = useWorksflow()
   const artifactWorkspace = useArtifactWorkspace()
-  const projectName = collaborationProject?.name ?? 'Select a server project'
-  const { t } = useI18n()
+  const { formatDate, t } = useI18n()
+  const projectName = collaborationProject?.name ?? t('workbench.selectServerProject')
   const projectMenu = useDropdown()
   const moreMenu = useDropdown()
   const [notice, setNotice] = useState<string | null>(null)
@@ -84,7 +84,7 @@ export function TopBar() {
     | 'stripe'
   >(null)
   const [renameDraft, setRenameDraft] = useState(projectName)
-  const [publishMessage, setPublishMessage] = useState('Publish from Worksflow')
+  const [publishMessage, setPublishMessage] = useState('')
   const [publishEnvironment, setPublishEnvironment] = useState<'preview' | 'production'>('preview')
   const [rollbackCandidate, setRollbackCandidate] = useState<{
     deploymentId: string
@@ -114,7 +114,7 @@ export function TopBar() {
       {/* Workspace / project path */}
       <div className="flex min-w-0 flex-1 items-center gap-1.5 text-sm md:flex-none">
         <span className="shrink-0 rounded-md bg-white/5 px-2 py-1 text-xs font-medium text-muted-foreground">
-          Projects
+          {t('workbench.projects')}
         </span>
         <span className="shrink-0 text-faint-foreground">/</span>
 
@@ -214,7 +214,7 @@ export function TopBar() {
                 {t('workbench.menu.integrations')}
               </div>
               <MenuItem icon={Plug} onClick={() => setPanel('stripe')}>{t('workbench.menu.stripe')}</MenuItem>
-              <MenuItem icon={Database} onClick={() => setView('database')}>Worksflow Database</MenuItem>
+              <MenuItem icon={Database} onClick={() => setView('database')}>{t('settings.database')}</MenuItem>
             </Menu>
           )}
         </div>
@@ -233,7 +233,7 @@ export function TopBar() {
           className="hidden items-center gap-1 rounded-md border border-primary/30 bg-primary/10 px-2 py-1 text-[11px] font-medium text-primary-bright hover:bg-primary/15 md:inline-flex"
         >
           <Link2 className="h-3 w-3" />
-          Server artifacts · {artifactWorkspace.documents.length + artifactWorkspace.blueprints.length + artifactWorkspace.pageSpecs.length + artifactWorkspace.prototypes.length}
+          {t('workbench.serverArtifacts', { count: artifactWorkspace.documents.length + artifactWorkspace.blueprints.length + artifactWorkspace.pageSpecs.length + artifactWorkspace.prototypes.length })}
         </button>
         <button
           type="button"
@@ -344,7 +344,7 @@ export function TopBar() {
                   type="button"
                   onClick={async () => {
                     if (await authorizeCollaboration('publish')) {
-                      await publishCurrentWorkspace(publishMessage, publishEnvironment)
+                      await publishCurrentWorkspace(publishMessage.trim() || t('workbench.release.defaultMessage'), publishEnvironment)
                     }
                   }}
                   disabled={deliveryStatus === 'publishing' || !canCollaborate('publish')}
@@ -370,12 +370,12 @@ export function TopBar() {
             <div className="space-y-2">
               {deployments.flatMap((deployment) => deployment.versions.map((version) => (
                 <div key={`${deployment.deploymentId}:${version.id}`} className="rounded-md border border-border bg-card px-3 py-2">
-                  <div className="text-sm font-medium text-foreground">v{version.number} · {version.action}</div>
-                  <div className="mt-0.5 text-[11px] text-faint-foreground">{new Date(version.createdAt).toLocaleString()} · {version.environment ?? 'preview'} · {version.checksum.slice(0, 12)}</div>
+                  <div className="text-sm font-medium text-foreground">v{version.number} · {t(version.action === 'rollback' ? 'workbench.release.action.rollback' : 'workbench.release.action.publish')}</div>
+                  <div className="mt-0.5 text-[11px] text-faint-foreground">{formatDate(version.createdAt, { dateStyle: 'medium', timeStyle: 'short' })} · {t(version.environment === 'production' ? 'workbench.release.environment.production' : 'workbench.release.environment.preview')} · {version.checksum.slice(0, 12)}</div>
                 </div>
               )))}
               {deployments.every((deployment) => deployment.versions.length === 0) && (
-                <p className="rounded-md border border-dashed border-border px-3 py-4 text-[11px] text-faint-foreground">No server release versions yet.</p>
+                <p className="rounded-md border border-dashed border-border px-3 py-4 text-[11px] text-faint-foreground">{t('workbench.release.noVersions')}</p>
               )}
             </div>
           )}
@@ -434,21 +434,22 @@ export function TopBar() {
                   value={publishMessage}
                   onChange={(event) => setPublishMessage(event.target.value)}
                   maxLength={500}
+                  placeholder={t('workbench.release.defaultMessage')}
                   className="mt-1.5 h-9 w-full rounded-md border border-border bg-background px-2.5 text-[12px] text-foreground outline-none focus:border-primary/60"
                 />
               </label>
               <label className="block text-[11px] text-muted-foreground">
-                Environment
+                {t('workbench.release.environment')}
                 <select
                   value={publishEnvironment}
                   onChange={(event) => setPublishEnvironment(event.target.value as 'preview' | 'production')}
                   className="mt-1.5 h-9 w-full rounded-md border border-border bg-background px-2.5 text-[12px] text-foreground outline-none focus:border-primary/60"
                 >
-                  <option value="preview">Preview</option>
-                  <option value="production">Production</option>
+                  <option value="preview">{t('workbench.release.environment.preview')}</option>
+                  <option value="production">{t('workbench.release.environment.production')}</option>
                 </select>
                 <span className="mt-1 block text-[10px] text-faint-foreground">
-                  Plain variables in this scope are embedded as window.__WORKSFLOW_ENV__. Secrets remain server-only.
+                  {t('workbench.release.variablesHint')}
                 </span>
               </label>
               {publishedUrl && (
@@ -474,10 +475,10 @@ export function TopBar() {
                     <div key={version.id} className="flex items-center gap-2 rounded-md border border-border bg-card px-3 py-2">
                       <span className="min-w-0 flex-1">
                         <span className="block text-[11px] font-medium text-foreground">
-                          v{version.number} · {version.action}
+                          v{version.number} · {t(version.action === 'rollback' ? 'workbench.release.action.rollback' : 'workbench.release.action.publish')}
                         </span>
                         <span className="block truncate text-[10px] text-faint-foreground">
-                          {new Date(version.createdAt).toLocaleString()} · {version.environment ?? 'preview'} · {version.environmentVariableNames?.length ?? 0} public vars · {version.checksum.slice(0, 12)}
+                          {formatDate(version.createdAt, { dateStyle: 'medium', timeStyle: 'short' })} · {t(version.environment === 'production' ? 'workbench.release.environment.production' : 'workbench.release.environment.preview')} · {t('workbench.release.publicVariables', { count: version.environmentVariableNames?.length ?? 0 })} · {version.checksum.slice(0, 12)}
                         </span>
                       </span>
                       {version.id !== deployment.activeVersionId && (
@@ -504,9 +505,9 @@ export function TopBar() {
           {panel === 'analytics' && (
             <div className="grid grid-cols-3 gap-2">
               {[
-                ['Deployments', String(deployments.length)],
-                ['Release log entries', String(deliveryLogs.length)],
-                ['Server artifacts', String(artifactWorkspace.documents.length + artifactWorkspace.blueprints.length + artifactWorkspace.pageSpecs.length + artifactWorkspace.prototypes.length)],
+                [t('workbench.analytics.deployments'), String(deployments.length)],
+                [t('workbench.analytics.releaseLogs'), String(deliveryLogs.length)],
+                [t('workbench.analytics.serverArtifacts'), String(artifactWorkspace.documents.length + artifactWorkspace.blueprints.length + artifactWorkspace.pageSpecs.length + artifactWorkspace.prototypes.length)],
               ].map(([label, value]) => (
                 <div key={label} className="rounded-md border border-border bg-card p-3">
                   <div className="text-lg font-semibold text-foreground">{value}</div>
@@ -518,10 +519,10 @@ export function TopBar() {
           {panel === 'knowledge' && (
             <div className="space-y-2 text-[12px] leading-relaxed text-muted-foreground">
               <p className="rounded-md border border-border bg-card px-3 py-2">
-                Build knowledge is frozen by the server InputManifest and BuildManifest. Context selection is reviewed in the workflow; this panel does not mutate it locally.
+                {t('workbench.knowledge.manifests')}
               </p>
               <p className="rounded-md border border-border bg-card px-3 py-2">
-                {artifactWorkspace.documents.length} server document artifact{artifactWorkspace.documents.length === 1 ? '' : 's'} are visible. Only exact approved revisions included by the workflow reach AI generation.
+                {t('workbench.knowledge.documents', { count: artifactWorkspace.documents.length })}
               </p>
             </div>
           )}
@@ -533,7 +534,7 @@ export function TopBar() {
                   className="flex items-center justify-between rounded-md border border-border bg-card px-3 py-2 text-[12px]"
                 >
                   <span className="text-muted-foreground">{item}</span>
-                  <span className="text-faint-foreground">Not configured</span>
+                  <span className="text-faint-foreground">{t('workbench.connector.notConfigured')}</span>
                 </div>
               ))}
             </div>
@@ -546,9 +547,7 @@ export function TopBar() {
               <button
                 type="button"
                 onClick={() => {
-                  setComposerDraft(
-                    'Add Stripe billing with subscription plans, webhook handling, customer portal access, and billing state in the dashboard.',
-                  )
+                  setComposerDraft(t('workbench.stripe.prompt'))
                   showNotice(t('workbench.notice.stripeContextAdded'))
                 }}
                 className="rounded-md bg-primary px-3 py-1.5 text-[12px] font-semibold text-primary-foreground hover:bg-primary-bright"

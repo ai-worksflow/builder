@@ -4,6 +4,13 @@ const now = '2026-07-10T08:00:00Z'
 const hash = (character: string) => character.repeat(64)
 const workflowExecutionProfile = { version: 'workflow-engine/v2', hash: 'dd247a77ce3cfa1095a575a238b93c4bd41dd991eac07e8b62ec170864470da1' }
 
+async function openConversationPanel(page: Page) {
+  await page.getByRole('button', { name: 'Conversation', exact: true }).click()
+  const panel = page.getByRole('complementary', { name: 'Conversation control plane' })
+  await expect(panel).toBeVisible()
+  return panel
+}
+
 const user = {
   id: '11111111-1111-4111-8111-111111111111',
   displayName: 'Flow Owner',
@@ -22,6 +29,7 @@ const project = {
   id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
   name: 'Server Application',
   lifecycle: 'active',
+  governanceMode: 'team',
   currentUserRole: 'owner',
   createdBy: user.id,
   createdAt: now,
@@ -274,6 +282,11 @@ const workflowDefinition = {
       name: 'Pinned Project Brief',
       type: 'artifact_input',
       artifactInput: { allowedTypes: ['document'], allowedKinds: ['project_brief'], requireApproved: true, minimumArtifacts: 1, maximumArtifacts: 1 },
+    }, {
+      id: 'solo-review',
+      name: 'Owner review',
+      type: 'review_gate',
+      reviewGate: { requiredRole: 'owner', prohibitSelfReview: true },
     }],
     edges: [],
     hash: hash('f'),
@@ -355,6 +368,7 @@ const workflowCapabilities = {
 
 interface MockPlatformOptions {
   readonly authenticated?: boolean
+  readonly showOnboarding?: boolean
   readonly prototypes?: 'approved' | 'none'
   readonly historicalRun?: boolean
   readonly role?: 'owner' | 'commenter'
@@ -369,6 +383,8 @@ interface MockPlatformOptions {
   readonly conversationSelectedWorkbenchTarget?: boolean
   readonly conversationSummaryConflict?: boolean
   readonly conversationCheckpointSourcePageSize?: number
+  readonly soloReviewRun?: boolean
+  readonly soloProject?: boolean
 }
 
 type DesignImportRecord = ReturnType<typeof designImportRecord>
@@ -386,6 +402,7 @@ interface MockPlatformState {
     body: unknown
     headers: Record<string, string>
   }>
+  governanceMode: 'solo' | 'team'
   prototypes: unknown[]
   brief: ReturnType<typeof staleProjectBrief>
   pageSpec: typeof pageSpec
@@ -409,13 +426,28 @@ interface MockPlatformState {
 }
 
 async function installPlatformMock(page: Page, options: MockPlatformOptions = {}) {
+  if (!options.showOnboarding) {
+    await page.addInitScript(({ userId }) => {
+      const preference = JSON.stringify({
+        schema: 'worksflow.persistence',
+        version: 1,
+        savedAt: Date.now(),
+        data: { dismissedVersion: 2, completedVersion: 0 },
+      })
+      window.localStorage.setItem('worksflow.onboarding.guest', preference)
+      window.localStorage.setItem(`worksflow.onboarding.${userId}`, preference)
+    }, { userId: user.id })
+  }
   const state: MockPlatformState = {
     requests: [],
+    governanceMode: options.soloReviewRun || options.soloProject ? 'solo' : 'team',
     prototypes: options.prototypes === 'none' ? [] : [approvedPrototype],
     brief: staleProjectBrief(options.staleBriefDraft ?? false),
     pageSpec: structuredClone(pageSpec),
-    run: options.multiWorkbenchGroups
-      ? multiGroupWorkflowRun()
+    run: options.soloReviewRun
+      ? workflowRun('run-solo-review', 'waiting_review', 'solo')
+      : options.multiWorkbenchGroups
+        ? multiGroupWorkflowRun()
       : options.multiBundleWorkbench ? multiBundleWorkflowRun()
       : options.conversationSelectedWorkbenchTarget ? selectionWorkflowRun('run-selection-active', 'build-root-1')
       : options.conversationSelectionTarget ? workflowRun('run-current-other', 'waiting_input')
@@ -534,12 +566,29 @@ async function handlePlatformRoute(
   if (path === '/v1/projects') {
     await respond({ items: options.authenticated === false ? [] : [{
       ...project,
+      governanceMode: state.governanceMode,
       currentUserRole: options.role ?? 'owner',
     }] })
     return
   }
+  if (path === `/v1/projects/${project.id}` && method === 'PATCH') {
+    const input = body as { governanceMode?: 'solo' | 'team' }
+    if (input.governanceMode) state.governanceMode = input.governanceMode
+    await respond({
+      ...project,
+      governanceMode: state.governanceMode,
+      currentUserRole: options.role ?? 'owner',
+      etag: '"project:2"',
+    })
+    return
+  }
   if (path === `/v1/projects/${project.id}`) {
-    await respond({ ...project, currentUserRole: options.role ?? 'owner' })
+    await respond({
+      ...project,
+      governanceMode: state.governanceMode,
+      currentUserRole: options.role ?? 'owner',
+      etag: state.governanceMode === 'solo' ? '"project:2"' : project.etag,
+    })
     return
   }
   if (path.endsWith('/authorization')) {
@@ -942,13 +991,28 @@ async function handlePlatformRoute(
     `^${conversationBase}/([^/]+)/summary-checkpoints/([^/]+)/decision$`,
   ))
   if (summaryCheckpointDecisionPath && method === 'POST') {
-    const input = body as { decision: 'approve' | 'reject'; reason?: string }
+    const input = body as {
+      decision: 'approve' | 'reject'
+      reason?: string
+      soloReviewConfirmed?: boolean
+    }
     const current = state.conversationSummaryCheckpoints.find((item) => (
       item.conversationId === summaryCheckpointDecisionPath[1]
       && item.id === summaryCheckpointDecisionPath[2]
     ))
     if (!current) {
       await respond({ title: 'Not found', status: 404 }, 404)
+      return
+    }
+    if (current.createdBy === user.id && state.governanceMode !== 'solo') {
+      await respond({ title: 'Self approval is forbidden', status: 403 }, 403)
+      return
+    }
+    if (
+      current.createdBy === user.id
+      && (!input.soloReviewConfirmed || !input.reason?.trim())
+    ) {
+      await respond({ title: 'Solo self-review confirmation is required', status: 422 }, 422)
       return
     }
     const updated = {
@@ -1471,6 +1535,10 @@ async function handlePlatformRoute(
     await respond(state.run, 201)
     return
   }
+  if (/\/workflow-runs\/[^/]+\/approve$/.test(path) && method === 'POST') {
+    await route.fulfill({ status: 204, headers: corsHeaders() })
+    return
+  }
   if (/\/workflow-runs\/[^/]+\/events$/.test(path)) {
     await respond({ items: state.run ? [{ id: 'event-1', runId: state.run.id, sequence: 1, type: 'run.created', payload: {}, createdAt: now }] : [] })
     return
@@ -1642,7 +1710,7 @@ async function handlePlatformRoute(
       nodes: current.nodes.map((node) => node.key === input.nodeKey
         ? { ...node, status: 'completed' as const }
         : node),
-    }
+    } as unknown as MockPlatformState['run']
     await respond(undefined, 204)
     return
   }
@@ -1694,6 +1762,110 @@ test('anonymous Workbench fails closed without browser generation fallback', asy
   await expect(page.getByText('Sign in to use the application Workbench')).toBeVisible()
   await expect(page.getByText('Workbench does not generate from browser mock data.')).toBeVisible()
   await expect(page.getByRole('button', { name: 'Freeze build input' })).toBeDisabled()
+})
+
+test('first-time users receive a server-state getting started guide', async ({ page }) => {
+  await installPlatformMock(page, {
+    authenticated: false,
+    prototypes: 'none',
+    showOnboarding: true,
+  })
+  await page.goto('/workbench/planning?view=code')
+
+  await expect(page.getByRole('dialog', { name: 'Start here' })).toBeVisible()
+  await expect(page.getByText('Sign in to the platform')).toBeVisible()
+  await page.getByRole('button', { name: 'Open sign in or registration' }).click()
+  await expect(page).toHaveURL(/\/settings$/)
+})
+
+test('project Owner switches to Solo mode and completes onboarding governance', async ({ page }) => {
+  const state = await installPlatformMock(page, { authenticated: true })
+  await page.goto('/settings')
+
+  await expect(page.getByTestId('project-governance-solo')).toBeEnabled()
+  await page.getByTestId('project-governance-solo').click()
+  await page.getByTestId('save-project-governance').click()
+
+  await expect(page.getByText('Review mode saved.')).toBeVisible()
+  const update = state.requests.find((request) =>
+    request.method === 'PATCH' && request.path === `/v1/projects/${project.id}`,
+  )
+  expect(update?.body).toEqual({ governanceMode: 'solo' })
+  expect(update?.headers['if-match']).toBe(project.etag)
+
+  await page.getByRole('button', { name: 'Open getting started guide' }).click()
+  const governanceStep = page
+    .getByRole('heading', { name: 'Choose a review mode' })
+    .locator('xpath=ancestor::section')
+  await expect(governanceStep).toContainText('Completed')
+  await expect(governanceStep).toContainText('Solo mode is enabled')
+})
+
+test('Solo workflow approval requires confirmation and a non-empty reason', async ({ page }) => {
+  const state = await installPlatformMock(page, {
+    authenticated: true,
+    soloReviewRun: true,
+  })
+  await page.goto('/workbench/planning?view=preview')
+
+  await page.getByRole('button', { name: /run-solo-review/ }).click()
+  await expect(page.getByTestId('solo-review-warning-solo-review')).toBeVisible()
+  const approve = page.getByTestId('workflow-review-approve-solo-review')
+  await expect(approve).toBeDisabled()
+
+  await page.getByTestId('solo-review-confirm-solo-review').check()
+  await expect(approve).toBeDisabled()
+  await page.getByPlaceholder('Review reason / requested change').fill('Reviewed the exact result locally.')
+  await expect(approve).toBeEnabled()
+  await approve.click()
+
+  await expect.poll(() => state.requests.find((request) =>
+    request.method === 'POST' && request.path.endsWith('/workflow-runs/run-solo-review/approve'),
+  )?.body).toEqual({
+    nodeKey: 'solo-review',
+    resolution: 'approve',
+    reason: 'Reviewed the exact result locally.',
+    soloReviewConfirmed: true,
+  })
+})
+
+test('Workflow approval remains blocked until the exact upstream revision has canonical approval', async ({ page }) => {
+  const state = await installPlatformMock(page, {
+    authenticated: true,
+    soloReviewRun: true,
+  })
+  const unapprovedRevision = {
+    ...briefRevision,
+    id: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb4',
+    revisionNumber: 4,
+    contentHash: hash('4'),
+    status: 'draft',
+  }
+  state.brief = {
+    ...state.brief,
+    artifact: {
+      ...state.brief.artifact,
+      latestRevisionId: unapprovedRevision.id,
+      approvedRevisionId: briefRevision.id,
+    },
+    latestRevision: unapprovedRevision,
+    approvedRevision: briefRevision,
+  }
+  state.run = workflowRun('run-solo-review', 'waiting_review', 'solo', unapprovedRevision)
+
+  await page.goto('/workbench/planning?view=preview')
+  await page.getByRole('button', { name: /run-solo-review/ }).click()
+
+  const approve = page.getByTestId('workflow-review-approve-solo-review')
+  await page.getByTestId('solo-review-confirm-solo-review').check()
+  await page.getByPlaceholder('Review reason / requested change').fill('Reviewed the exact result locally.')
+  await expect(page.getByTestId('workflow-review-canonical-blocker-solo-review')).toContainText(
+    'Approve the exact upstream revision in Review Center',
+  )
+  await expect(approve).toBeDisabled()
+  expect(state.requests.some((request) =>
+    request.method === 'POST' && request.path.endsWith('/workflow-runs/run-solo-review/approve'),
+  )).toBe(false)
 })
 
 test('Workbench deep links reject bundles and proposals from another selected project', async ({ page }) => {
@@ -2151,18 +2323,19 @@ test('direct workflow start fails closed when a required approved Brief has newe
 test('conversation turns an approved brief into an accepted command and opens its exact run', async ({ page }) => {
   const state = await installPlatformMock(page, { authenticated: true })
   await page.goto('/workbench/planning?view=code')
+  const panel = await openConversationPanel(page)
 
-  const composer = page.getByPlaceholder('Describe requirements or a controlled next action…')
+  const composer = panel.getByPlaceholder('Describe requirements or a controlled next action…')
   await expect(composer).toBeVisible()
   await composer.fill('Build an order operations application from the approved brief.')
-  await page.getByRole('button', { name: 'Send immutable message' }).click()
-  await expect(page.getByText('Build an order operations application from the approved brief.')).toBeVisible()
+  await panel.getByRole('button', { name: 'Send immutable message' }).click()
+  await expect(panel.getByText('Build an order operations application from the approved brief.')).toBeVisible()
 
-  await page.getByRole('button', { name: 'Generate governed intent' }).click()
-  await expect(page.getByText('Start workflow', { exact: true })).toBeVisible()
-  await page.getByRole('button', { name: 'Accept', exact: true }).click()
-  await expect(page.getByRole('button', { name: 'Execute and open run' })).toBeVisible()
-  await page.getByRole('button', { name: 'Execute and open run' }).click()
+  await panel.getByRole('button', { name: 'Generate governed intent' }).click()
+  await expect(panel.getByText('Start workflow', { exact: true })).toBeVisible()
+  await panel.getByRole('button', { name: 'Accept', exact: true }).click()
+  await expect(panel.getByRole('button', { name: 'Execute and open run' })).toBeVisible()
+  await panel.getByRole('button', { name: 'Execute and open run' }).click()
 
   const commandId = '77777777-7777-4777-8777-777777777777'
   await expect(page).toHaveURL(new RegExp(`runId=${commandId}`))
@@ -2252,13 +2425,13 @@ test('Project Brief conversation switches from the open run to its authoritative
     conversationSelectionTarget: true,
   })
   await page.goto('/workbench/planning?view=code')
+  const panel = await openConversationPanel(page)
 
-  const composer = page.getByPlaceholder('Describe requirements or a controlled next action…')
+  const composer = panel.getByPlaceholder('Describe requirements or a controlled next action…')
   await composer.fill('Continue the active Blueprint selection application.')
-  await page.getByRole('button', { name: 'Send immutable message' }).click()
-  await page.getByRole('button', { name: 'Generate governed intent' }).click()
+  await panel.getByRole('button', { name: 'Send immutable message' }).click()
+  await panel.getByRole('button', { name: 'Generate governed intent' }).click()
 
-  const panel = page.getByRole('complementary', { name: 'Conversation control plane' })
   await expect(panel.getByText('Workbench instruction', { exact: true })).toBeVisible()
   await expect(panel.getByText(selectionWorkflowDefinition.versionId, { exact: false })).toBeVisible()
 
@@ -2315,16 +2488,16 @@ test('conversation sends the selected Workbench root as a hint and renders serve
     conversationSelectedWorkbenchTarget: true,
   })
   await page.goto('/workbench/planning?view=code&runId=run-selection-active')
+  const panel = await openConversationPanel(page)
   await expect.poll(() => state.requests.some((item) =>
     item.method === 'GET' && item.path === '/v1/build-manifests/build-root-1/lineage-state'),
   ).toBe(true)
 
-  await page.getByPlaceholder('Describe requirements or a controlled next action…')
+  await panel.getByPlaceholder('Describe requirements or a controlled next action…')
     .fill('Continue the Orders page from the selected Workbench target.')
-  await page.getByRole('button', { name: 'Send immutable message' }).click()
-  await page.getByRole('button', { name: 'Generate governed intent' }).click()
+  await panel.getByRole('button', { name: 'Send immutable message' }).click()
+  await panel.getByRole('button', { name: 'Generate governed intent' }).click()
 
-  const panel = page.getByRole('complementary', { name: 'Conversation control plane' })
   await expect(panel.getByText('Page: Orders', { exact: true })).toBeVisible()
   await expect(panel.getByText('ORDERS', { exact: true })).toBeVisible()
   const generateRequest = state.requests.find((item) =>
@@ -2343,12 +2516,12 @@ test('conversation displays the RFC summary-checkpoint conflict without hiding i
     conversationSummaryConflict: true,
   })
   await page.goto('/workbench/planning?view=code')
-  await page.getByPlaceholder('Describe requirements or a controlled next action…')
+  const panel = await openConversationPanel(page)
+  await panel.getByPlaceholder('Describe requirements or a controlled next action…')
     .fill('Generate the next governed intent.')
-  await page.getByRole('button', { name: 'Send immutable message' }).click()
-  await page.getByRole('button', { name: 'Generate governed intent' }).click()
+  await panel.getByRole('button', { name: 'Send immutable message' }).click()
+  await panel.getByRole('button', { name: 'Generate governed intent' }).click()
 
-  const panel = page.getByRole('complementary', { name: 'Conversation control plane' })
   await expect(panel.getByRole('alert')).toContainText(
     'Create and review a controlled summary checkpoint; no messages were silently omitted.',
   )
@@ -2360,7 +2533,7 @@ test('conversation creates an immutable summary checkpoint at the server-recomme
     conversationSummaryConflict: true,
   })
   await page.goto('/workbench/planning?view=code')
-  const panel = page.getByRole('complementary', { name: 'Conversation control plane' })
+  const panel = await openConversationPanel(page)
   const composer = panel.getByPlaceholder('Describe requirements or a controlled next action…')
 
   await composer.fill('Preserve the approved product requirements and constraints.')
@@ -2378,12 +2551,13 @@ test('conversation creates an immutable summary checkpoint at the server-recomme
     'The immutable prefix requires preserving all approved product constraints.',
   )
   await panel.getByRole('button', {
-    name: 'Submit immutable summary for independent review',
+    name: 'Submit immutable summary for governed review',
   }).click()
 
-  await expect(panel.getByRole('region', { name: 'Summary checkpoint 1' })).toContainText(
-    'pending review',
-  )
+  const checkpointCard = panel.getByRole('region', { name: 'Summary checkpoint 1' })
+  await expect(checkpointCard).toContainText(/pending review/i)
+  await checkpointCard.getByRole('button', { name: 'Inspect exact bound source delta' }).click()
+  await expect(checkpointCard).toContainText('Team mode requires another member to review')
   await expect(panel.getByRole('button', { name: 'Approve summary checkpoint 1' })).toBeDisabled()
   expect(state.conversationSummaryCheckpoints).toHaveLength(1)
   const createRequest = state.requests.find((item) => (
@@ -2436,7 +2610,7 @@ test('independent checkpoint review unlocks an exact governed-intent retry', asy
   )]
 
   await page.goto('/workbench/planning?view=code')
-  const panel = page.getByRole('complementary', { name: 'Conversation control plane' })
+  const panel = await openConversationPanel(page)
   await panel.getByRole('button', { name: 'Generate governed intent' }).last().click()
   await expect(panel.getByRole('region', {
     name: 'Conversation summary checkpoint required',
@@ -2470,6 +2644,63 @@ test('independent checkpoint review unlocks an exact governed-intent retry', asy
     && item.path.endsWith(`/summary-checkpoints/${state.conversationSummaryCheckpoints[0].id}/decision`)
   ))
   expect(decisionRequest?.headers['if-match']).toBe('"conversation-summary-checkpoint:93939393-9393-4393-8393-939393939393:1"')
+  expect(decisionRequest?.headers['idempotency-key']).toBeTruthy()
+})
+
+test('sole Owner explicitly confirms a Solo conversation checkpoint self-review', async ({ page }) => {
+  const state = await installPlatformMock(page, {
+    authenticated: true,
+    soloProject: true,
+  })
+  const conversationId = state.conversations[0].id
+  const through = conversationMessage(
+    'a3939393-9393-4393-8393-939393939393',
+    conversationId,
+    1,
+    'user',
+    'Preserve the complete product decision and its accessibility constraint.',
+  )
+  const checkpoint = conversationSummaryCheckpoint(
+    'a4949494-9494-4494-8494-949494949494',
+    conversationId,
+    through,
+    'The product decision and accessibility constraint remain required.',
+    { createdBy: user.id },
+  )
+  state.conversationMessages = [through]
+  state.conversationSummaryCheckpoints = [checkpoint]
+
+  await page.goto('/workbench/planning?view=code')
+  const panel = await openConversationPanel(page)
+  const checkpointCard = panel.getByRole('region', { name: 'Summary checkpoint 1' })
+  await expect(checkpointCard).toContainText('Solo mode permits this only for the sole Owner')
+
+  const approve = checkpointCard.getByRole('button', { name: 'Approve summary checkpoint 1' })
+  await expect(approve).toBeDisabled()
+  await checkpointCard.getByRole('button', { name: 'Inspect exact bound source delta' }).click()
+  await expect(approve).toBeDisabled()
+
+  await checkpointCard.getByRole('textbox', {
+    name: 'Solo summary checkpoint review reason',
+  }).fill('Verified the exact source, decisions, constraints, and open questions.')
+  await expect(approve).toBeDisabled()
+  await checkpointCard.getByRole('checkbox', {
+    name: 'I inspected the exact complete source and accept responsibility for this self-review as the sole Owner.',
+  }).check()
+  await expect(approve).toBeEnabled()
+  await approve.click()
+
+  await expect(checkpointCard).toContainText(/approved/i)
+  const decisionRequest = state.requests.find((item) => (
+    item.method === 'POST'
+    && item.path.endsWith(`/summary-checkpoints/${checkpoint.id}/decision`)
+  ))
+  expect(decisionRequest?.body).toEqual({
+    decision: 'approve',
+    reason: 'Verified the exact source, decisions, constraints, and open questions.',
+    soloReviewConfirmed: true,
+  })
+  expect(decisionRequest?.headers['if-match']).toBe(checkpoint.etag)
   expect(decisionRequest?.headers['idempotency-key']).toBeTruthy()
 })
 
@@ -2512,7 +2743,7 @@ test('checkpoint review rejects a paginated source whose final message identity 
   )
 
   await page.goto('/workbench/planning?view=code')
-  const panel = page.getByRole('complementary', { name: 'Conversation control plane' })
+  const panel = await openConversationPanel(page)
   await panel.getByRole('button', { name: 'Inspect exact bound source delta' }).click()
 
   await expect(panel.getByRole('alert')).toContainText(
@@ -2528,15 +2759,15 @@ test('checkpoint review rejects a paginated source whose final message identity 
 test('conversation checkpoints the current Project Brief draft before generating intent', async ({ page }) => {
   const state = await installPlatformMock(page, { authenticated: true, staleBriefDraft: true })
   await page.goto('/workbench/planning?view=code')
+  const panel = await openConversationPanel(page)
 
   await expect.poll(() => state.requests.some((item) =>
     item.path === `/v1/projects/${project.id}/documents`,
   )).toBe(true)
-  await page.getByPlaceholder('Describe requirements or a controlled next action…').fill('Generate from this brief.')
-  await page.getByRole('button', { name: 'Send immutable message' }).click()
-  await page.getByRole('button', { name: 'Checkpoint Brief & generate intent' }).click()
+  await panel.getByPlaceholder('Describe requirements or a controlled next action…').fill('Generate from this brief.')
+  await panel.getByRole('button', { name: 'Send immutable message' }).click()
+  await panel.getByRole('button', { name: 'Checkpoint Brief and generate intent' }).click()
 
-  const panel = page.getByRole('complementary', { name: 'Conversation control plane' })
   await expect(panel.getByRole('status')).toContainText('Created immutable Project Brief checkpoint r4')
   await expect.poll(() => state.requests.some((item) =>
     item.method === 'POST' && item.path.endsWith('/intent-proposals/generate'),
@@ -2605,7 +2836,8 @@ test('conversation hydration ignores a delayed response from the previously sele
 
   await page.goto(`/workbench/planning?view=code&conversationId=${conversationA.id}`)
   await delayedStarted
-  const conversationSelect = page.getByRole('complementary', { name: 'Conversation control plane' }).getByRole('combobox')
+  const panel = await openConversationPanel(page)
+  const conversationSelect = panel.getByRole('combobox')
   await conversationSelect.selectOption(conversationB.id)
   await expect(page.getByText(messageB.content, { exact: true })).toBeVisible()
   releaseDelayed()
@@ -2665,7 +2897,7 @@ test('conversation polling does not cancel an in-flight controlled Workbench exe
   })
 
   await page.goto('/workbench/planning?view=code')
-  const panel = page.getByRole('complementary', { name: 'Conversation control plane' })
+  const panel = await openConversationPanel(page)
   await panel.getByRole('button', { name: 'Generate Workbench proposal' }).click()
   await executeStarted
   await pollDuringExecute
@@ -2718,7 +2950,7 @@ test('same-run polling coalesces with delayed receipt lineage hydration', async 
   })
 
   await page.goto('/workbench/planning?view=code')
-  const panel = page.getByRole('complementary', { name: 'Conversation control plane' })
+  const panel = await openConversationPanel(page)
   await panel.getByRole('button', { name: 'Generate Workbench proposal' }).click()
   await lineageStarted
   await page.waitForTimeout(3_600)
@@ -2775,7 +3007,7 @@ test('conversation receipt hydration rejects a bundle from the wrong reviewed sl
   }))
 
   await page.goto('/workbench/planning?view=code')
-  const panel = page.getByRole('complementary', { name: 'Conversation control plane' })
+  const panel = await openConversationPanel(page)
   await panel.getByRole('button', { name: 'Generate Workbench proposal' }).click()
 
   await expect(panel.getByRole('alert')).toContainText(
@@ -2837,7 +3069,7 @@ test('conversation receipt rejects a proposal manifest mismatch before hydrating
   }))
 
   await page.goto('/workbench/planning?view=code')
-  const panel = page.getByRole('complementary', { name: 'Conversation control plane' })
+  const panel = await openConversationPanel(page)
   await panel.getByRole('button', { name: 'Generate Workbench proposal' }).click()
 
   await expect(panel.getByRole('alert')).toContainText(
@@ -2895,7 +3127,7 @@ test('conversation receipt rejects a proposal not bound to the executed command'
   )
 
   await page.goto('/workbench/planning?view=code')
-  const panel = page.getByRole('complementary', { name: 'Conversation control plane' })
+  const panel = await openConversationPanel(page)
   await panel.getByRole('button', { name: 'Generate Workbench proposal' }).click()
 
   await expect(panel.getByRole('alert')).toContainText(
@@ -2932,7 +3164,7 @@ test('Workbench conversation commands decouple governance and run manifests whil
   }
 
   await page.goto('/workbench/planning?view=code')
-  const panel = page.getByRole('complementary', { name: 'Conversation control plane' })
+  const panel = await openConversationPanel(page)
   const execute = panel.getByRole('button', { name: 'Generate Workbench proposal' })
   await expect(execute).toBeVisible()
   await execute.click()
@@ -2990,7 +3222,7 @@ test('Workbench conversation commands select their exact DAG group before genera
   state.multiWorkbench.currentProposalIds['bundle-group-b'] = undefined
 
   await page.goto('/workbench/complete?view=code&runId=run-groups')
-  const panel = page.getByRole('complementary', { name: 'Conversation control plane' })
+  const panel = await openConversationPanel(page)
   await panel.getByRole('button', { name: 'Generate Workbench proposal' }).click()
 
   expect(state.requests.some((item) =>
@@ -3013,15 +3245,16 @@ test('Workbench conversation commands select their exact DAG group before genera
 test('commenters can append immutable conversation messages but cannot generate intents', async ({ page }) => {
   const state = await installPlatformMock(page, { authenticated: true, role: 'commenter' })
   await page.goto('/workbench/planning?view=code')
+  const panel = await openConversationPanel(page)
 
-  const composer = page.getByPlaceholder('Describe requirements or a controlled next action…')
+  const composer = panel.getByPlaceholder('Describe requirements or a controlled next action…')
   await composer.fill('A commenter can add requirement context.')
-  const send = page.getByRole('button', { name: 'Send immutable message' })
+  const send = panel.getByRole('button', { name: 'Send immutable message' })
   await expect(send).toBeEnabled()
   await send.click()
-  await expect(page.getByText('A commenter can add requirement context.')).toBeVisible()
-  await expect(page.getByRole('button', { name: 'Generate governed intent' })).toBeDisabled()
-  await expect(page.getByRole('button', { name: 'New conversation' })).toBeDisabled()
+  await expect(panel.getByText('A commenter can add requirement context.')).toBeVisible()
+  await expect(panel.getByRole('button', { name: 'Generate governed intent' })).toBeDisabled()
+  await expect(panel.getByRole('button', { name: 'New conversation' })).toBeDisabled()
 
   const messageRequest = state.requests.find((item) =>
     item.method === 'POST' && item.path.endsWith('/messages'))
@@ -3034,13 +3267,14 @@ test('commenters can append immutable conversation messages but cannot generate 
 test('an existing project conversation exposes an explicit new-conversation path', async ({ page }) => {
   const state = await installPlatformMock(page, { authenticated: true })
   await page.goto('/workbench/planning?view=code')
+  const panel = await openConversationPanel(page)
 
-  await expect(page.getByRole('option', { name: 'Project discovery · active' })).toHaveCount(1)
-  await page.getByRole('button', { name: 'New conversation' }).click()
-  await page.getByPlaceholder('Conversation title').fill('Second planning thread')
-  await page.getByRole('button', { name: 'Create', exact: true }).click()
+  await expect(panel.getByRole('option', { name: 'Project discovery · active' })).toHaveCount(1)
+  await panel.getByRole('button', { name: 'New conversation' }).click()
+  await panel.getByPlaceholder('Conversation title').fill('Second planning thread')
+  await panel.getByRole('button', { name: 'Create', exact: true }).click()
 
-  await expect(page.getByRole('option', { name: 'Second planning thread · active' })).toHaveCount(1)
+  await expect(panel.getByRole('option', { name: 'Second planning thread · active' })).toHaveCount(1)
   await expect(page).toHaveURL(/conversationId=44444444-4444-4444-8444-444444444444/)
   const createRequest = state.requests.find((item) =>
     item.method === 'POST' && item.path === `/v1/projects/${project.id}/conversations`)
@@ -3057,7 +3291,9 @@ test('frozen build input produces a reviewed proposal and applied preview', asyn
   await page.getByRole('button', { name: 'Generate proposal' }).click()
   await expect(page.getByText('src/index.html', { exact: true })).toBeVisible()
   await page.getByRole('button', { name: 'Accept pending' }).click()
-  await expect(page.getByText('ready', { exact: true }).last()).toBeVisible()
+  await expect(page.getByRole('button', {
+    name: 'src/index.html Create or update file · Accepted',
+  })).toBeVisible()
   await page.getByRole('button', { name: 'Apply accepted operations' }).click()
 
   const closeConversation = page.getByRole('button', { name: 'Close conversation panel' })
@@ -3116,12 +3352,15 @@ test('multi-bundle Workbench rebases exact shared-file inputs and survives both 
   await page.getByRole('button', { name: 'Generate proposal' }).click()
   await expect(page.getByText('src/shared.ts', { exact: true }).first()).toBeVisible()
   await page.getByRole('button', { name: 'Accept pending' }).click()
-  await expect(page.getByText('ready', { exact: true }).last()).toBeVisible()
+  await expect(page.getByRole('button', {
+    name: 'src/shared.ts Create or update file · Accepted',
+  })).toBeVisible()
 
   await page.reload()
   await expect(page.getByText(/bundle-checkout → bundle-checkout-w1/)).toBeVisible()
-  await expect(page.getByText('ready', { exact: true }).last()).toBeVisible()
-  await expect(page.getByRole('button', { name: 'src/shared.ts file.upsert · accepted' })).toBeVisible()
+  await expect(page.getByRole('button', {
+    name: 'src/shared.ts Create or update file · Accepted',
+  })).toBeVisible()
   await page.getByRole('button', { name: 'Apply and complete Workbench' }).click()
 
   const rebaseRequest = state.requests.find((item) =>
@@ -3211,7 +3450,7 @@ test('node-scoped Workbench groups hydrate independently and complete only the s
   if (await closeConversation.isVisible()) await closeConversation.click()
 
   await expect(page.getByRole('button', {
-    name: 'Workbench group workbench-a waiting input',
+    name: 'Workbench group workbench-a, status waiting input',
   })).toBeVisible()
   await expect(page.getByText(/bundle-group-a ·/)).toBeVisible()
   expect(state.requests.some((item) =>
@@ -3222,7 +3461,7 @@ test('node-scoped Workbench groups hydrate independently and complete only the s
   )).toBe(false)
 
   await page.getByRole('button', {
-    name: 'Workbench group workbench-b waiting input',
+    name: 'Workbench group workbench-b, status waiting input',
   }).click()
   await expect(page).toHaveURL(/workbenchNodeKey=workbench-b/)
   await expect(page.getByText(/bundle-group-b ·/)).toBeVisible()
@@ -3246,7 +3485,7 @@ test('node-scoped Workbench groups hydrate independently and complete only the s
   )).toBe(false)
 
   await page.getByRole('button', {
-    name: 'Workbench group workbench-a waiting input',
+    name: 'Workbench group workbench-a, status waiting input',
   }).click()
   await expect(page.getByText(/bundle-group-a ·/)).toBeVisible()
   await page.getByRole('button', { name: 'Complete Workbench' }).click()
@@ -3295,7 +3534,7 @@ test('Design Import Center freezes an upload, requires an independent reviewer, 
   await page.getByTestId('design-import-submit').click()
 
   await expect(page.getByTestId('design-import-list')).toContainText('dashboard')
-  await expect(page.getByText('open', { exact: true })).toBeVisible()
+  await expect(page.getByTestId('design-import-list').getByText('Open', { exact: true })).toBeVisible()
   const createRequest = state.requests.find((item) =>
     item.method === 'POST' && item.path === `/v1/projects/${project.id}/design-imports`)
   expect(createRequest?.headers['idempotency-key']).toBeTruthy()
@@ -3322,7 +3561,7 @@ test('Design Import Center freezes an upload, requires an independent reviewer, 
   await page.reload()
   await expect(page.getByTestId(`design-import-approve-${state.designImports[0].id}`)).toBeEnabled()
   await page.getByTestId(`design-import-approve-${state.designImports[0].id}`).click()
-  await expect(page.getByText('applied', { exact: true })).toBeVisible()
+  await expect(page.getByTestId('design-import-list').getByText('Applied', { exact: true })).toBeVisible()
   await expect(page.getByTestId('design-import-list')).toContainText('99999999…999992')
   const decisionRequest = state.requests.find((item) =>
     item.method === 'POST' && item.path === `/v1/design-imports/${state.designImports[0].id}/decision`)
@@ -3346,7 +3585,7 @@ test('Design Import Center keeps server-open state when approval CAS fails', asy
   await page.goto(`/team/acme/project/${project.id}/imports`)
   await page.getByTestId(`design-import-approve-${state.designImports[0].id}`).click()
   await expect(page.getByTestId('design-import-center').getByRole('alert')).toContainText('changed since it was loaded')
-  await expect(page.getByText('open', { exact: true })).toBeVisible()
+  await expect(page.getByTestId('design-import-list').getByText('Open', { exact: true })).toBeVisible()
   expect(state.designImports[0].status).toBe('open')
 })
 
@@ -3374,20 +3613,20 @@ test('document dependency graph opens the exact document, PageSpec, and prototyp
   const graphUrl = `/team/acme/project/${project.id}/graph`
 
   await page.goto(graphUrl)
-  await page.getByRole('button', { name: 'Open artifact workspace' }).click()
+  await page.getByRole('button', { name: 'Open in workspace' }).click()
   await expect(page).toHaveURL(new RegExp(`/editor\\?artifactId=${projectBrief.artifact.id}`))
   await expect(page.getByText('Project Brief', { exact: true }).first()).toBeVisible()
 
   await page.goto(graphUrl)
   await page.locator('button').filter({ hasText: 'Dashboard PageSpec' }).first().click()
-  await page.getByRole('button', { name: 'Open artifact workspace' }).click()
+  await page.getByRole('button', { name: 'Open in workspace' }).click()
   await expect(page).toHaveURL(new RegExp(`/blueprint\\?artifactId=${pageSpec.artifact.id}`))
   await expect(page.getByText('Dashboard PageSpec', { exact: true })).toBeVisible()
-  await expect(page.getByRole('button', { name: 'States 4' })).toBeVisible()
+  await expect(page.getByRole('button', { name: 'States (4)' })).toBeVisible()
 
   await page.goto(graphUrl)
   await page.locator('button').filter({ hasText: 'Dashboard Prototype' }).first().click()
-  await page.getByRole('button', { name: 'Open artifact workspace' }).click()
+  await page.getByRole('button', { name: 'Open in workspace' }).click()
   await expect(page).toHaveURL(new RegExp(`/prototype\\?artifactId=${approvedPrototype.artifact.id}`))
   await expect(page.getByText('Dashboard Prototype', { exact: true }).first()).toBeVisible()
 })
@@ -3431,7 +3670,7 @@ test('document bindings preserve local edits when a remote replacement event arr
 
   await expect(page.getByTestId('document-bindings-conflict')).toBeVisible()
   await expect(reviewerRole).toHaveValue('watcher')
-  await page.getByRole('button', { name: 'Reload server bindings' }).click()
+  await page.getByRole('button', { name: 'Reload bindings' }).click()
   await expect(page.getByTestId('document-bindings-conflict')).toBeHidden()
   await expect(panel.locator('select').nth(1)).toHaveValue('assignee')
 })
@@ -3470,12 +3709,12 @@ test('Prototype Studio decides and applies an AI proposal before freezing its at
   })
   await page.goto(`/team/acme/project/${project.id}/prototype`)
 
-  await page.getByRole('button', { name: 'trace', exact: true }).click()
+  await page.getByRole('button', { name: 'Trace', exact: true }).click()
   await expect(page.getByText('prototype-proposal-1', { exact: true })).toBeVisible()
   await page.getByRole('button', {
     name: 'Accept proposal operation prototype-operation-name',
   }).click()
-  await expect(page.getByText('accepted', { exact: true })).toBeVisible()
+  await expect(page.getByText('Accepted', { exact: true })).toBeVisible()
   await page.getByRole('button', { name: 'Accept all pending proposal operations' }).click()
   const apply = page.getByRole('button', { name: 'Apply reviewed prototype proposal' })
   await expect(apply).toBeEnabled()
@@ -3523,10 +3762,10 @@ test('Blueprint PageSpec editor autosaves, versions, and requests exact revision
   await page.goto(`/team/acme/project/${project.id}/blueprint`)
 
   await expect(page.getByText('Product Blueprint', { exact: true }).first()).toBeVisible()
-  await page.getByRole('button', { name: 'PageSpecs 1' }).click()
+  await page.getByRole('button', { name: 'PageSpecs (1)' }).click()
   await page.getByRole('button', { name: 'Open editor' }).click()
   await expect(page.getByText('Dashboard PageSpec', { exact: true })).toBeVisible()
-  await expect(page.getByRole('button', { name: 'States 4' })).toBeVisible()
+  await expect(page.getByRole('button', { name: 'States (4)' })).toBeVisible()
 
   await page.getByLabel('User goal').fill('Inspect order health and resolve exceptions.')
   await expect.poll(() => state.requests.some((item) =>
@@ -3545,14 +3784,16 @@ test('Blueprint PageSpec editor autosaves, versions, and requests exact revision
   expect((draftRequest?.body as { sourceVersions?: unknown })?.sourceVersions).toBeUndefined()
 
   await page.getByRole('button', { name: 'Versions 1' }).last().click()
-  await page.getByRole('button', { name: 'Create immutable PageSpec revision' }).click()
+  const createPageSpecRevision = page.getByRole('button', { name: 'Create immutable revision' })
+  await createPageSpecRevision.click()
   await expect.poll(() => state.requests.some((item) =>
     item.method === 'POST' && item.path === `/v1/page-specs/${pageSpec.artifact.id}/revisions`,
   )).toBe(true)
+  await expect(createPageSpecRevision).toBeHidden()
 
   await page.getByRole('button', { name: 'Review 0' }).last().click()
-  await page.getByLabel('PageSpec reviewer').selectOption(reviewer.id)
-  await page.getByRole('button', { name: 'Request review' }).click()
+  await page.getByLabel('PageSpec reviewer', { exact: true }).selectOption(reviewer.id)
+  await page.getByRole('button', { name: 'Request Review' }).click()
   await expect.poll(() => state.requests.some((item) =>
     item.method === 'POST' && item.path === `/v1/projects/${project.id}/reviews`
       && (item.body as { target?: { revisionId?: string } })?.target?.revisionId === 'dddddddd-dddd-4ddd-8ddd-ddddddddddd4',
@@ -3565,7 +3806,7 @@ test('Blueprint Composer inserts module packs, multi-selects them, and persists 
 
   await page.getByRole('button', { name: /feature\s+Order management/i }).click()
   await page.getByRole('button', { name: /page\s+Dashboard/i }).click({ modifiers: ['Meta'] })
-  await page.getByRole('button', { name: /Group as capability \(2\)/ }).click()
+  await page.getByRole('button', { name: 'Group 2 nodes' }).click()
   await expect(page.getByText('Capability 1', { exact: true })).toBeVisible()
   await page.getByRole('button', { name: 'UI', exact: true }).click()
   await expect.poll(() => state.requests.some((item) =>
@@ -3577,10 +3818,10 @@ test('Blueprint Composer inserts module packs, multi-selects them, and persists 
     item.method === 'PATCH' && item.path === `/v1/blueprints/${blueprint.artifact.id}/draft`)
   const groupedNodeIds = (groupedDraft?.body as { content?: { layout?: { groups?: Array<{ nodeIds: string[] }> } } })?.content?.layout?.groups?.[0]?.nodeIds ?? []
   expect(groupedNodeIds).toEqual(['feature-orders', 'page-dashboard'])
-  await page.getByLabel('Capability name Capability 1').fill('Checkout capability')
-  await page.getByRole('button', { name: 'Select capability Checkout capability', exact: true }).click()
-  await page.getByRole('button', { name: 'Generate docs from selection' }).click()
-  await expect(page.getByText(/Documentation proposal created from 2 frozen nodes/)).toBeVisible()
+  await page.getByLabel('Name for capability “Capability 1”').fill('Checkout capability')
+  await page.getByRole('button', { name: 'Select capability “Checkout capability”', exact: true }).click()
+  await page.getByRole('button', { name: 'Generate documents for selection' }).click()
+  await expect(page.getByText(/Created a document proposal for 2 selected nodes/)).toBeVisible()
   const compile = state.requests.findLast((item) => item.path.endsWith('/blueprint-selections/compile'))
   expect((compile?.body as { nodeIds?: string[] })?.nodeIds).toEqual([...groupedNodeIds].sort())
 })
@@ -3589,8 +3830,8 @@ test('Generate docs from selection creates an AI proposal without prototype or w
   const state = await installPlatformMock(page, { authenticated: true })
   await page.goto(`/team/acme/project/${project.id}/blueprint`)
 
-  await page.getByRole('button', { name: 'Generate docs from selection' }).click()
-  await expect(page.getByText(/Documentation proposal created from 1 frozen nodes/)).toBeVisible()
+  await page.getByRole('button', { name: 'Generate documents for selection' }).click()
+  await expect(page.getByText(/Created a document proposal for 1 selected nodes/)).toBeVisible()
   const selection = state.requests.find((item) => item.path.endsWith('/blueprint-selections/compile'))
   expect(selection?.body).toMatchObject({ nodeIds: ['feature-orders'] })
   expect(selection?.headers['if-match']).toBe(blueprint.artifact.etag)
@@ -3617,8 +3858,8 @@ test('Create prototypes from selection uses the exact approved PageSpec without 
   await page.goto(`/team/acme/project/${project.id}/blueprint`)
 
   await page.getByRole('button', { name: /page\s+Dashboard/i }).click()
-  await page.getByRole('button', { name: 'Create prototypes from selection' }).click()
-  await expect(page.getByText(/1 formal Prototype draft created from exact PageSpec revisions/)).toBeVisible()
+  await page.getByRole('button', { name: 'Create prototypes for selection' }).click()
+  await expect(page.getByText(/Created 1 prototypes/)).toBeVisible()
   const prototypeRequest = state.requests.find((item) =>
     item.method === 'POST' && item.path === `/v1/projects/${project.id}/prototypes`)
   expect(prototypeRequest?.body).toMatchObject({
@@ -3636,7 +3877,7 @@ test('Use selection in workflow starts the selection DAG and does not create doc
   await page.goto(`/team/acme/project/${project.id}/blueprint`)
 
   await page.getByRole('button', { name: /page\s+Dashboard/i }).click()
-  await page.getByRole('button', { name: 'Use selection in workflow / Workbench' }).click()
+  await page.getByRole('button', { name: 'Use selection in Workbench' }).click()
   await expect.poll(() => state.requests.some((item) =>
     item.method === 'POST'
       && item.path === `/v1/projects/${project.id}/workflow-runs`
@@ -3916,13 +4157,15 @@ function workflowDefinitionFor(options: MockPlatformOptions) {
         ...workflowDefinition.definition.inputContract,
         requireApproved: options.workflowRequireApproved ?? workflowDefinition.definition.inputContract.requireApproved,
       },
-      nodes: workflowDefinition.definition.nodes.map((node) => ({
-        ...node,
-        artifactInput: {
-          ...node.artifactInput,
-          requireApproved: options.workflowRequireApproved ?? node.artifactInput.requireApproved,
-        },
-      })),
+      nodes: workflowDefinition.definition.nodes.map((node) => node.type !== 'artifact_input'
+        ? node
+        : {
+            ...node,
+            artifactInput: {
+              ...node.artifactInput,
+              requireApproved: options.workflowRequireApproved ?? node.artifactInput?.requireApproved ?? true,
+            },
+          }),
     },
   }
 }
@@ -4144,28 +4387,70 @@ function draftPrototype(id: string) {
   }
 }
 
-function workflowRun(id: string, status: 'waiting_input' | 'running') {
+function workflowRun(
+  id: string,
+  status: 'waiting_input' | 'waiting_review' | 'running',
+  governanceMode: 'solo' | 'team' = 'team',
+  reviewRevision: {
+    readonly id: string
+    readonly artifactId: string
+    readonly revisionNumber: number
+    readonly contentHash: string
+  } = briefRevision,
+) {
+  const waitingReview = status === 'waiting_review'
+  const reviewRef = exactRevision(
+    reviewRevision.artifactId,
+    reviewRevision.id,
+    reviewRevision.revisionNumber,
+    reviewRevision.contentHash,
+  )
   return {
     id,
     projectId: project.id,
     definitionVersionId: workflowDefinition.versionId,
     definition: { id: workflowDefinition.id, version: 2, hash: workflowDefinition.contentHash },
     inputManifest: { id: 'manifest-1', hash: hash('1') },
+    governanceMode,
     status,
     scope: {},
-    context: { values: {}, nodes: {}, slices: {} },
+    context: {
+      values: {},
+      nodes: waitingReview
+        ? {
+            'solo-review': {
+              definitionNodeId: 'solo-review',
+              maxAttempts: 1,
+              timeoutNanos: 60_000_000_000,
+              input: {
+                hash: hash('9'),
+                bindings: [{
+                  source: {
+                    nodeKey: 'brief-input',
+                    definitionNodeId: 'brief-input',
+                    outputRevisionId: reviewRef.revisionId,
+                    artifactRevisions: [reviewRef],
+                    materializedArtifactRevisions: [reviewRef],
+                  },
+                }],
+              },
+            },
+          }
+        : {},
+      slices: {},
+    },
     eventCursor: 1,
     startedBy: user.id,
     createdAt: now,
     updatedAt: now,
     nodes: [{
-      id: `${id}-input`,
+      id: waitingReview ? `${id}-review` : `${id}-input`,
       runId: id,
-      key: 'brief-input',
-      definitionNodeId: 'brief-input',
-      type: 'artifact_input',
-      status: 'waiting_input',
-      attempt: 0,
+      key: waitingReview ? 'solo-review' : 'brief-input',
+      definitionNodeId: waitingReview ? 'solo-review' : 'brief-input',
+      type: waitingReview ? 'review_gate' : 'artifact_input',
+      status: waitingReview ? 'waiting_review' : 'waiting_input',
+      attempt: waitingReview ? 1 : 0,
       availableAt: now,
       createdAt: now,
       updatedAt: now,

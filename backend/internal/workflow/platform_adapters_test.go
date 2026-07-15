@@ -372,6 +372,33 @@ func TestTargetArtifactTemplatesAreStableAndSliceScoped(t *testing.T) {
 	}
 }
 
+func TestRequirementsTargetTemplateHasCompleteEditorShape(t *testing.T) {
+	t.Parallel()
+	execution, _ := adapterExecution(t)
+	kind, key, title, content, ok := targetArtifactTemplate(execution, "derive_requirements")
+	if !ok || kind != "product_requirements" || key != "DOC-REQUIREMENTS" || title != "Product Requirements" {
+		t.Fatalf("requirements target = %q %q %q %s %v", kind, key, title, content, ok)
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal(content, &payload); err != nil {
+		t.Fatalf("decode requirements target: %v", err)
+	}
+	if payload["kind"] != "productRequirements" {
+		t.Fatalf("requirements target kind = %#v", payload["kind"])
+	}
+	if summary, exists := payload["summary"]; !exists || summary != "" {
+		t.Fatalf("requirements target summary = %#v, exists = %v", summary, exists)
+	}
+	for _, field := range []string{"blocks", "requirements", "acceptanceCriteria", "openQuestions", "assumptions"} {
+		value, exists := payload[field]
+		items, array := value.([]any)
+		if !exists || !array || len(items) != 0 {
+			t.Fatalf("requirements target %s = %#v, exists = %v", field, value, exists)
+		}
+	}
+}
+
 type fakeCoreTargetArtifacts struct {
 	projectID     string
 	artifacts     map[string]core.VersionedArtifact

@@ -29,7 +29,7 @@ import {
 type ConsoleTab = 'worksflow' | 'publish' | 'terminal' | 'quality' | 'versions'
 
 export function CodePanel() {
-  const { t } = useI18n()
+  const { formatDate, t } = useI18n()
   const { session, can } = useCollaboration()
   const readOnly = !session.signedIn || !can('edit')
   const {
@@ -79,7 +79,7 @@ export function CodePanel() {
   function save() {
     if (!file || !dirty || readOnly) return
     updateWorkspaceFile(file.path, draft)
-    setTerminalOutput((current) => [...current, `saved ${file.path}`])
+    setTerminalOutput((current) => [...current, t('code.savedFile', { file: file.path })])
   }
 
   function submitFileAction() {
@@ -93,7 +93,7 @@ export function CodePanel() {
     } catch (error) {
       setTerminalOutput((current) => [
         ...current,
-        `error: ${error instanceof Error ? error.message : 'file operation failed'}`,
+        `error: ${error instanceof Error ? error.message : t('code.fileOperationFailed')}`,
       ])
       setTab('terminal')
       setConsoleOpen(true)
@@ -111,35 +111,35 @@ export function CodePanel() {
 
     let output: string[]
     if (command === 'help') {
-      output = ['Supported commands: help, files, check, checkpoint, preview, clear']
+      output = [t('code.terminal.help')]
     } else if (command === 'files') {
       output = workspace.files.map((item) => `${item.dirty ? '*' : ' '} ${item.path}`)
     } else if (command === 'check') {
-      setTerminalOutput((current) => [...current, `➜ ${command}`, '… running 12 static quality gates'])
+      setTerminalOutput((current) => [...current, `➜ ${command}`, t('code.terminal.runningChecks')])
       const result = await runWorkspaceQuality()
       output = result
         ? [
-            `${result.passed ? '✓' : '✗'} quality score ${result.score.percentage}/100`,
+            `${result.passed ? '✓' : '✗'} ${t('code.terminal.qualityScore', { score: result.score.percentage })}`,
             ...result.checks.map((check) =>
               `${check.status === 'passed' ? '✓' : check.status === 'failed' ? '✗' : '!'} ${check.title}: ${check.status}`,
             ),
-            `${result.diagnostics.length} diagnostic${result.diagnostics.length === 1 ? '' : 's'} · run ${result.metadata.runId}`,
+            t('code.terminal.diagnostics', { count: result.diagnostics.length, run: result.metadata.runId }),
           ]
-        : ['✗ quality service failed; open the Quality tab for recovery details']
+        : [t('code.terminal.qualityFailed')]
       setTerminalOutput((current) => [...current, ...output])
       return
     } else if (command === 'checkpoint') {
       if (readOnly) {
-        output = ['✗ your project role does not allow workspace checkpoints']
+        output = [t('code.terminal.checkpointDenied')]
         setTerminalOutput((current) => [...current, `➜ ${command}`, ...output])
         return
       }
-      createWorkspaceCheckpoint(`Manual checkpoint ${workspace.checkpoints.length + 1}`)
-      output = ['✓ checkpoint created']
+      createWorkspaceCheckpoint(t('code.terminal.manualCheckpoint', { number: workspace.checkpoints.length + 1 }))
+      output = [t('code.terminal.checkpointCreated')]
     } else if (command === 'preview') {
-      output = ['✓ preview document rebuilt from the current workspace']
+      output = [t('code.terminal.previewRebuilt')]
     } else {
-      output = [`command not found: ${command}`, 'Run "help" for supported safe workspace commands.']
+      output = [t('code.terminal.commandNotFound', { command }), t('code.terminal.helpHint')]
     }
     setTerminalOutput((current) => [...current, `➜ ${command}`, ...output])
   }
@@ -148,17 +148,17 @@ export function CodePanel() {
     tab === 'worksflow'
       ? generationLogs.length > 0
         ? generationLogs
-        : ['No generation logs yet.']
+        : [t('code.noGenerationLogs')]
       : tab === 'publish'
         ? deliveryLogs.length > 0
           ? [
-              `Delivery status: ${deliveryStatus}`,
+              t('code.deliveryStatus', { status: t(`status.${deliveryStatus}`) }),
               ...deliveryLogs,
               ...(deliveryError ? [`error: ${deliveryError}`] : []),
             ]
           : [
-              `Workspace persistence: ${workspaceHydrationStatus}`,
-              workspacePersistenceError ?? 'No deployment has been created yet.',
+              t('code.workspacePersistence', { status: t(`status.${workspaceHydrationStatus}`) }),
+              workspacePersistenceError ?? t('code.noDeployment'),
             ]
         : terminalOutput
 
@@ -298,21 +298,21 @@ export function CodePanel() {
               {workspaceHasExternalConflict && (
                 <div role="alert" className="flex flex-wrap items-center gap-2 border-b border-warning/30 bg-warning/10 px-3 py-2 text-[10px] text-warning">
                   <span className="min-w-48 flex-1">
-                    Another tab saved a different project version. Local edits are paused until you choose a version.
+                    {t('code.externalConflict')}
                   </span>
                   <button
                     type="button"
                     onClick={() => resolveWorkspaceExternalConflict('use-external')}
                     className="rounded border border-warning/40 px-2 py-1 hover:bg-warning/10"
                   >
-                    Use other tab
+                    {t('code.useOtherTab')}
                   </button>
                   <button
                     type="button"
                     onClick={() => resolveWorkspaceExternalConflict('keep-local')}
                     className="rounded bg-warning px-2 py-1 font-semibold text-background hover:opacity-90"
                   >
-                    Keep local
+                    {t('code.keepLocal')}
                   </button>
                 </div>
               )}
@@ -324,13 +324,13 @@ export function CodePanel() {
                     onClick={resetWorkspacePersistence}
                     className="rounded border border-destructive/40 px-2 py-1 hover:bg-destructive/10"
                   >
-                    Reset local data
+                    {t('code.resetLocalData')}
                   </button>
                 </div>
               )}
               {readOnly && (
                 <div className="border-b border-warning/30 bg-warning/10 px-3 py-1.5 text-[10px] text-warning">
-                  Your collaboration role is read-only. Server authorization still applies to shared edits.
+                  {t('code.readOnly')}
                 </div>
               )}
               <textarea
@@ -353,10 +353,10 @@ export function CodePanel() {
               />
               <div className="pointer-events-none absolute bottom-2 right-3 rounded bg-background/85 px-2 py-1 text-[9px] text-faint-foreground shadow-sm">
                 {workspaceIsSaving
-                  ? 'Saving…'
+                  ? t('common.saving')
                   : workspaceLastSavedAt
-                    ? `Saved ${new Date(workspaceLastSavedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}`
-                    : `Storage ${workspaceHydrationStatus}`}
+                    ? t('code.savedAt', { time: formatDate(workspaceLastSavedAt, { timeStyle: 'medium' }) })
+                    : t('code.storageStatus', { status: t(`status.${workspaceHydrationStatus}`) })}
               </div>
             </div>
           ) : (

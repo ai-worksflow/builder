@@ -1,7 +1,8 @@
 'use client'
 
 import { useCallback, useEffect, useMemo, useRef, useState, type ChangeEvent, type ReactNode } from 'react'
-import { useCollaboration } from '@/lib/collaboration/provider'
+import { useCollaboration, type CollaborationBackendStatus } from '@/lib/collaboration/provider'
+import type { ProjectRole } from '@/lib/collaboration/types'
 import { useI18n } from '@/lib/i18n'
 import type {
   DesignImportCapabilitiesDto,
@@ -68,7 +69,13 @@ const COPY = {
     mapping: '提案映射', layers: '图层', components: '组件', states: '状态', interactions: '交互',
     createMode: '新建', updateMode: '更新', failure: '导入失败', trust: '外部来源不是事实源；只有批准后形成的内部 Prototype revision 才能进入下游。',
     independentReview: '创建者不能评审自己的设计导入。请由另一位具有评审权限的项目成员批准或拒绝。',
+    soloLimitation: '单人模式允许唯一 Owner 自审核心文档、工作流关卡和长对话摘要检查点。设计导入仍要求另一位成员独立评审。',
     navigationTitle: '继续工作流', graph: '文档依赖图', blueprint: '蓝图编辑器', prototypeStudio: '原型工作室', workbench: '应用工作台',
+    rawSha256: '原始 SHA-256', revision: '修订版本', baseRevision: '基础版本 {id}', operations: '{count} 个操作 · {status}',
+    requestFailed: '设计导入请求失败。', readFailed: '无法读取所选文件。', encodeFailed: '无法编码所选文件。',
+    statusCreating: '创建中', statusOpen: '待审核', statusReviewing: '审核中', statusReady: '可应用', statusApplying: '应用中', statusApplied: '已应用', statusFailed: '失败', statusRejected: '已拒绝', statusSuperseded: '已被取代',
+    roleOwner: '负责人', roleAdmin: '管理员', roleEditor: '编辑者', roleCommenter: '评论者', roleViewer: '查看者',
+    backendConnecting: '连接中', backendOnline: '在线', backendOffline: '离线', backendError: '异常',
   },
   'en-US': {
     description: 'Freeze an external design export, review its conversion proposal, then create or update an internal Prototype.',
@@ -89,9 +96,17 @@ const COPY = {
     mapping: 'Proposal mapping', layers: 'Layers', components: 'Components', states: 'States', interactions: 'Interactions',
     createMode: 'Create', updateMode: 'Update', failure: 'Import failed', trust: 'External sources are not facts. Only the internal Prototype revision created after approval can flow downstream.',
     independentReview: 'Creators cannot review their own design imports. Another project member with review permission must approve or reject it.',
+    soloLimitation: 'Solo mode lets the sole Owner self-review core documents, workflow gates, and long-conversation summary checkpoints. Design imports still require another independent reviewer.',
     navigationTitle: 'Continue the workflow', graph: 'Document Graph', blueprint: 'Blueprint Editor', prototypeStudio: 'Prototype Studio', workbench: 'Application Workbench',
+    rawSha256: 'Raw SHA-256', revision: 'Revision', baseRevision: 'Base {id}', operations: '{count} operations · {status}',
+    requestFailed: 'Design import request failed.', readFailed: 'Unable to read the selected file.', encodeFailed: 'Unable to encode the selected file.',
+    statusCreating: 'Creating', statusOpen: 'Open', statusReviewing: 'Reviewing', statusReady: 'Ready to apply', statusApplying: 'Applying', statusApplied: 'Applied', statusFailed: 'Failed', statusRejected: 'Rejected', statusSuperseded: 'Superseded',
+    roleOwner: 'Owner', roleAdmin: 'Admin', roleEditor: 'Editor', roleCommenter: 'Commenter', roleViewer: 'Viewer',
+    backendConnecting: 'Connecting', backendOnline: 'Online', backendOffline: 'Offline', backendError: 'Error',
   },
 } as const
+
+type ImportCopy = (typeof COPY)[keyof typeof COPY]
 
 type LoadState = 'idle' | 'loading' | 'ready' | 'error'
 
@@ -171,10 +186,10 @@ export function ImportCenter() {
       setLoadState('ready')
     } catch (cause) {
       if (signal?.aborted) return
-      setError(describeError(cause))
+      setError(describeError(cause, copy.requestFailed))
       setLoadState('error')
     }
-  }, [client, collaboration.session.signedIn, projectId])
+  }, [client, collaboration.session.signedIn, copy.requestFailed, projectId])
 
   useEffect(() => {
     const controller = new AbortController()
@@ -197,7 +212,7 @@ export function ImportCenter() {
     setError(null)
     if (next && selectedCapability && next.size > selectedCapability.maxUploadBytes) {
       setFile(null)
-      setError(`${copy.maxFile}: ${formatBytes(selectedCapability.maxUploadBytes)}`)
+      setError(`${copy.maxFile}: ${formatBytes(selectedCapability.maxUploadBytes, locale)}`)
       event.target.value = ''
       return
     }
@@ -214,7 +229,7 @@ export function ImportCenter() {
     setError(null)
     try {
       const mediaType = normalizedMediaType(file)
-      const contentBase64 = await fileBase64(file)
+      const contentBase64 = await fileBase64(file, copy)
       const selectedFrameIds = selectedFrameText.split(',').map((item) => item.trim()).filter(Boolean)
       const createInput = {
         sourceKind: selectedSource,
@@ -244,7 +259,7 @@ export function ImportCenter() {
       if (fileInputRef.current) fileInputRef.current.value = ''
       await workspace.refresh()
     } catch (cause) {
-      setError(describeError(cause))
+      setError(describeError(cause, copy.requestFailed))
     } finally {
       setSubmitting(false)
     }
@@ -265,7 +280,7 @@ export function ImportCenter() {
       setImports((current) => current.map((entry) => entry.id === item.id ? result.data : entry))
       await Promise.allSettled([workspace.refresh(), collaboration.refresh()])
     } catch (cause) {
-      const message = describeError(cause)
+      const message = describeError(cause, copy.requestFailed)
       await load()
       setError(message)
     } finally {
@@ -292,6 +307,13 @@ export function ImportCenter() {
           </button>
         </header>
 
+        {collaboration.project?.governanceMode === 'solo' && (
+          <div role="note" className="mt-4 flex items-start gap-2 rounded-lg border border-warning/35 bg-warning/10 p-3 text-[11px] leading-relaxed text-warning" data-testid="design-import-solo-limitation">
+            <AlertTriangle className="mt-0.5 size-4 shrink-0" />
+            <span>{copy.soloLimitation}</span>
+          </div>
+        )}
+
         {!collaboration.session.signedIn || !projectId ? (
           <div className="mt-6 rounded-xl border border-border bg-surface p-5 text-sm text-muted-foreground">
             {collaboration.session.signedIn ? copy.noProject : copy.signedOut}
@@ -305,11 +327,11 @@ export function ImportCenter() {
               </div>
               <div className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-6">
                 <Metric label={copy.project} value={collaboration.project?.name ?? '—'} wide />
-                <Metric label={copy.role} value={collaboration.project?.role ?? '—'} />
-                <Metric label={copy.backend} value={collaboration.backendStatus} tone={collaboration.backendStatus === 'online' ? 'success' : 'warning'} />
-                <Metric label={copy.pageSpecs} value={pageSpecs.length} />
-                <Metric label={copy.prototypes} value={workspace.prototypes.length} />
-                <Metric label={copy.imports} value={imports.length} />
+                <Metric label={copy.role} value={roleLabel(collaboration.project?.role, copy)} />
+                <Metric label={copy.backend} value={backendStatusLabel(collaboration.backendStatus, copy)} tone={collaboration.backendStatus === 'online' ? 'success' : 'warning'} />
+                <Metric label={copy.pageSpecs} value={pageSpecs.length.toLocaleString(locale)} />
+                <Metric label={copy.prototypes} value={workspace.prototypes.length.toLocaleString(locale)} />
+                <Metric label={copy.imports} value={imports.length.toLocaleString(locale)} />
               </div>
             </section>
 
@@ -374,18 +396,18 @@ export function ImportCenter() {
                       accept={selectedCapability?.acceptedFileExtensions.join(',')}
                       className="block w-full rounded-lg border border-border bg-background px-2 py-2 text-[11px] text-muted-foreground file:mr-2 file:rounded file:border-0 file:bg-primary/15 file:px-2 file:py-1 file:text-[10px] file:font-semibold file:text-primary-bright"
                     />
-                    {selectedCapability && <p className="mt-1 text-[9px] leading-relaxed text-faint-foreground">{selectedCapability.uploadEnabled ? `${copy.maxFile}: ${formatBytes(selectedCapability.maxUploadBytes)} · ${copy.accepted}: ${selectedCapability.acceptedFileExtensions.join(', ')}` : selectedCapability.uploadReason}</p>}
+                    {selectedCapability && <p className="mt-1 text-[9px] leading-relaxed text-faint-foreground">{selectedCapability.uploadEnabled ? `${copy.maxFile}: ${formatBytes(selectedCapability.maxUploadBytes, locale)} · ${copy.accepted}: ${selectedCapability.acceptedFileExtensions.join(', ')}` : selectedCapability.uploadReason}</p>}
                   </Field>
                   <Field label={copy.pageSpec}>
                     <select data-testid="design-import-page-spec" value={pageSpecId} onChange={(event) => setPageSpecId(event.target.value)} className="w-full rounded-lg border border-border bg-background px-3 py-2 text-xs text-foreground outline-none focus:border-primary focus:ring-2 focus:ring-primary/20">
-                      {pageSpecs.map((resource) => <option key={resource.artifact.id} value={resource.artifact.id}>{resource.artifact.title} · r{resource.approvedRevision?.revisionNumber}</option>)}
+                      {pageSpecs.map((resource) => <option key={resource.artifact.id} value={resource.artifact.id}>{resource.artifact.title} · r{resource.approvedRevision?.revisionNumber.toLocaleString(locale)}</option>)}
                     </select>
                     {pageSpecs.length === 0 && <p className="mt-1 text-[10px] leading-relaxed text-warning">{copy.noPageSpec}</p>}
                   </Field>
                   <Field label={copy.target}>
                     <select value={targetPrototypeId} onChange={(event) => setTargetPrototypeId(event.target.value)} className="w-full rounded-lg border border-border bg-background px-3 py-2 text-xs text-foreground outline-none focus:border-primary focus:ring-2 focus:ring-primary/20">
                       <option value="">{copy.createNew}</option>
-                      {targetPrototypes.map((resource) => <option key={resource.artifact.id} value={resource.artifact.id}>{resource.artifact.title} · r{resource.latestRevision?.revisionNumber}</option>)}
+                      {targetPrototypes.map((resource) => <option key={resource.artifact.id} value={resource.artifact.id}>{resource.artifact.title} · r{resource.latestRevision?.revisionNumber.toLocaleString(locale)}</option>)}
                     </select>
                   </Field>
                   <Field label={copy.frames}>
@@ -462,7 +484,7 @@ function ImportRecord({ item, locale, busy, canReview, currentUserId, copy, onAp
   busy: boolean
   canReview: boolean
   currentUserId: string
-  copy: typeof COPY['zh-CN'] | typeof COPY['en-US']
+  copy: ImportCopy
   onApprove: () => void
   onReject: () => void
   onOpenPrototype: () => void
@@ -482,10 +504,10 @@ function ImportRecord({ item, locale, busy, canReview, currentUserId, copy, onAp
           <div className="min-w-0">
             <div className="flex flex-wrap items-center gap-2">
               <h3 className="truncate text-sm font-semibold text-foreground">{item.snapshot.sourceName}</h3>
-              <StatusBadge status={item.status} tone={statusTone} />
+              <StatusBadge status={item.status} tone={statusTone} copy={copy} />
               <span className="rounded border border-border px-1.5 py-0.5 text-[9px] text-muted-foreground">{item.createsPrototype ? copy.createMode : copy.updateMode}</span>
             </div>
-            <p className="mt-1 text-[10px] text-faint-foreground">{item.snapshot.fileName} · {formatBytes(item.snapshot.byteSize)} · {new Date(item.snapshot.capturedAt).toLocaleString(locale)}</p>
+            <p className="mt-1 text-[10px] text-faint-foreground">{item.snapshot.fileName} · {formatBytes(item.snapshot.byteSize, locale)} · {new Date(item.snapshot.capturedAt).toLocaleString(locale)}</p>
           </div>
         </div>
         {busy && <LoaderCircle className="size-4 animate-spin text-primary-bright" />}
@@ -495,11 +517,11 @@ function ImportRecord({ item, locale, busy, canReview, currentUserId, copy, onAp
         <Info label={copy.snapshot} value={shortHash(item.snapshot.contentHash)} mono />
         <Info label={copy.pageSpecPin} value={shortId(item.pageSpecRevision.revisionId)} mono />
         <Info label={copy.manifest} value={item.manifest ? shortHash(item.manifest.hash) : '—'} mono />
-        <Info label={copy.proposal} value={item.proposal ? `${item.proposal.operations.length} op · ${item.proposal.status}` : '—'} />
+        <Info label={copy.proposal} value={item.proposal ? formatCopy(copy.operations, { count: item.proposal.operations.length.toLocaleString(locale), status: importStatusLabel(item.proposal.status, copy) }) : '—'} />
         <Info label={copy.prototype} value={item.prototypeArtifactId ? shortId(item.prototypeArtifactId) : '—'} mono />
         <Info label={copy.selected} value={item.snapshot.selectedFrameIds.length ? item.snapshot.selectedFrameIds.join(', ') : copy.allFrames} />
-        <Info label="Raw SHA-256" value={shortHash(item.snapshot.rawContentHash)} mono />
-        <Info label="Revision" value={item.appliedRevisionId ? shortId(item.appliedRevisionId) : item.baseRevisionId ? `base ${shortId(item.baseRevisionId)}` : '—'} mono />
+        <Info label={copy.rawSha256} value={shortHash(item.snapshot.rawContentHash)} mono />
+        <Info label={copy.revision} value={item.appliedRevisionId ? shortId(item.appliedRevisionId) : item.baseRevisionId ? formatCopy(copy.baseRevision, { id: shortId(item.baseRevisionId) }) : '—'} mono />
       </div>
 
       {item.failureDetail && (
@@ -518,10 +540,10 @@ function ImportRecord({ item, locale, busy, canReview, currentUserId, copy, onAp
         <div className="mt-3 rounded-lg border border-primary/20 bg-primary/[0.04] p-3">
           <div className="flex flex-wrap items-center gap-2 text-[9px] font-semibold uppercase tracking-wide text-primary-bright">
             <span>{copy.mapping}</span>
-            <span>{copy.layers} {mapping.layers}</span>
-            <span>{copy.components} {mapping.components}</span>
-            <span>{copy.states} {mapping.states}</span>
-            <span>{copy.interactions} {mapping.interactions}</span>
+            <span>{copy.layers} {mapping.layers.toLocaleString(locale)}</span>
+            <span>{copy.components} {mapping.components.toLocaleString(locale)}</span>
+            <span>{copy.states} {mapping.states.toLocaleString(locale)}</span>
+            <span>{copy.interactions} {mapping.interactions.toLocaleString(locale)}</span>
           </div>
           {mapping.names.length > 0 && <p className="mt-1.5 line-clamp-2 text-[10px] leading-relaxed text-muted-foreground">{mapping.names.join(' · ')}</p>}
           {item.proposal?.operations[0]?.rationale && <p className="mt-1 text-[9px] leading-relaxed text-faint-foreground">{item.proposal.operations[0].rationale}</p>}
@@ -557,27 +579,70 @@ function Info({ label, value, mono = false }: { label: string; value: string; mo
   return <div className="min-w-0 rounded-lg border border-border/70 bg-background px-2.5 py-2"><div className="text-[8px] uppercase tracking-wide text-faint-foreground">{label}</div><div className={cn('mt-1 truncate text-[10px] text-muted-foreground', mono && 'font-mono')}>{value}</div></div>
 }
 
-function StatusBadge({ status, tone }: { status: string; tone: 'success' | 'danger' | 'warning' | 'primary' }) {
+function StatusBadge({ status, tone, copy }: { status: string; tone: 'success' | 'danger' | 'warning' | 'primary'; copy: ImportCopy }) {
   const Icon = tone === 'success' ? CheckCircle2 : tone === 'danger' ? AlertTriangle : tone === 'warning' ? LoaderCircle : Sparkles
-  return <span className={cn('inline-flex items-center gap-1 rounded border px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wide', tone === 'success' && 'border-success/30 bg-success/10 text-success', tone === 'danger' && 'border-destructive/30 bg-destructive/10 text-destructive', tone === 'warning' && 'border-warning/30 bg-warning/10 text-warning', tone === 'primary' && 'border-primary/30 bg-primary/10 text-primary-bright')}><Icon className={cn('size-2.5', status === 'applying' && 'animate-spin')} />{status}</span>
+  return <span className={cn('inline-flex items-center gap-1 rounded border px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wide', tone === 'success' && 'border-success/30 bg-success/10 text-success', tone === 'danger' && 'border-destructive/30 bg-destructive/10 text-destructive', tone === 'warning' && 'border-warning/30 bg-warning/10 text-warning', tone === 'primary' && 'border-primary/30 bg-primary/10 text-primary-bright')}><Icon className={cn('size-2.5', status === 'applying' && 'animate-spin')} />{importStatusLabel(status, copy)}</span>
 }
 
 function NavigationButton({ icon: Icon, label, onClick }: { icon: typeof Boxes; label: string; onClick: () => void }) {
   return <button type="button" onClick={onClick} className="flex items-center gap-2 rounded-lg border border-border bg-background px-3 py-2 text-left text-xs text-muted-foreground hover:bg-white/5 hover:text-foreground"><Icon className="size-4 text-primary-bright" />{label}</button>
 }
 
-function describeError(cause: unknown) {
+function roleLabel(role: ProjectRole | undefined, copy: ImportCopy) {
+  const labels: Record<ProjectRole, string> = {
+    owner: copy.roleOwner,
+    admin: copy.roleAdmin,
+    editor: copy.roleEditor,
+    commenter: copy.roleCommenter,
+    viewer: copy.roleViewer,
+  }
+  return role ? labels[role] : '—'
+}
+
+function backendStatusLabel(status: CollaborationBackendStatus, copy: ImportCopy) {
+  const labels: Record<CollaborationBackendStatus, string> = {
+    connecting: copy.backendConnecting,
+    online: copy.backendOnline,
+    error: copy.backendError,
+  }
+  return labels[status]
+}
+
+function formatCopy(template: string, values: Readonly<Record<string, string | number>>) {
+  return Object.entries(values).reduce(
+    (result, [key, value]) => result.split(`{${key}}`).join(String(value)),
+    template,
+  )
+}
+
+function importStatusLabel(status: string, copy: ImportCopy) {
+  const labels: Record<string, string> = {
+    creating: copy.statusCreating,
+    open: copy.statusOpen,
+    reviewing: copy.statusReviewing,
+    ready: copy.statusReady,
+    applying: copy.statusApplying,
+    applied: copy.statusApplied,
+    failed: copy.statusFailed,
+    rejected: copy.statusRejected,
+    superseded: copy.statusSuperseded,
+  }
+  return labels[status] ?? status
+}
+
+function describeError(cause: unknown, fallback: string) {
   if (cause instanceof PlatformHttpError) {
     const fields = cause.problem.errors ? Object.values(cause.problem.errors).flat().join(' ') : ''
     return [cause.problem.detail ?? cause.message, fields].filter(Boolean).join(' ')
   }
-  return cause instanceof Error ? cause.message : 'Design import request failed.'
+  return cause instanceof Error ? cause.message : fallback
 }
 
-function formatBytes(value: number) {
-  if (value < 1024) return `${value} B`
-  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KiB`
-  return `${(value / (1024 * 1024)).toFixed(1)} MiB`
+function formatBytes(value: number, locale: string) {
+  if (value < 1024) return `${value.toLocaleString(locale)} B`
+  const formatter = new Intl.NumberFormat(locale, { maximumFractionDigits: 1, minimumFractionDigits: 1 })
+  if (value < 1024 * 1024) return `${formatter.format(value / 1024)} KiB`
+  return `${formatter.format(value / (1024 * 1024))} MiB`
 }
 
 function shortHash(value: string) {
@@ -599,15 +664,15 @@ function normalizedMediaType(file: File) {
   return 'application/json'
 }
 
-async function fileBase64(file: File) {
+async function fileBase64(file: File, copy: ImportCopy) {
   const url = await new Promise<string>((resolve, reject) => {
     const reader = new FileReader()
-    reader.onerror = () => reject(reader.error ?? new Error('Unable to read the selected file.'))
+    reader.onerror = () => reject(reader.error ?? new Error(copy.readFailed))
     reader.onload = () => resolve(String(reader.result ?? ''))
     reader.readAsDataURL(file)
   })
   const comma = url.indexOf(',')
-  if (comma < 0) throw new Error('Unable to encode the selected file.')
+  if (comma < 0) throw new Error(copy.encodeFailed)
   return url.slice(comma + 1)
 }
 

@@ -11,6 +11,7 @@ import {
   type ReactNode,
 } from 'react'
 import { PlatformClient } from '@/lib/platform/client'
+import { useI18n } from '@/lib/i18n'
 import { useWorksflow } from '@/lib/worksflow/store'
 import { allowsSoloSelfApprovalRequest } from '@/lib/worksflow/project-governance'
 import {
@@ -129,6 +130,7 @@ export function CollaborationProvider({
   children: ReactNode
   client?: CollaborationPlatformClient
 }) {
+  const { t } = useI18n()
   const {
     selectedProductProjectId,
     selectPlatformProject,
@@ -209,7 +211,7 @@ export function CollaborationProvider({
       await applyProjectSnapshot(selected.id)
     } catch (cause) {
       setBackendStatus(collaborationBackendUnavailable(cause) ? 'error' : 'online')
-      setError(collaborationErrorMessage(cause, 'Unable to refresh collaboration state.'))
+      setError(collaborationErrorMessage(cause, t('runtime.collab.refreshFailed')))
     } finally {
       setLoading(false)
     }
@@ -220,6 +222,7 @@ export function CollaborationProvider({
     project?.id,
     selectedProductProjectId,
     session.signedIn,
+    t,
   ])
   refreshRef.current = refresh
 
@@ -238,11 +241,11 @@ export function CollaborationProvider({
     } catch (cause) {
       setSession({ signedIn: false })
       setBackendStatus(collaborationBackendUnavailable(cause) ? 'error' : 'online')
-      setError(collaborationErrorMessage(cause, 'Unable to restore your session.'))
+      setError(collaborationErrorMessage(cause, t('runtime.collab.restoreSessionFailed')))
     } finally {
       setLoading(false)
     }
-  }, [clearProjectState, gateway])
+  }, [clearProjectState, gateway, t])
 
   useEffect(() => {
     void restoreSession()
@@ -287,7 +290,7 @@ export function CollaborationProvider({
         .catch((cause) => {
           if (!active) return
           if (collaborationBackendUnavailable(cause)) setBackendStatus('error')
-          setError(collaborationErrorMessage(cause, 'Presence update failed.'))
+          setError(collaborationErrorMessage(cause, t('runtime.collab.presenceFailed')))
         })
     }
     heartbeat()
@@ -299,7 +302,7 @@ export function CollaborationProvider({
       window.clearInterval(heartbeatTimer)
       window.clearTimeout(invalidationTimer)
     }
-  }, [gateway, realtimeProjectId, session.signedIn])
+  }, [gateway, realtimeProjectId, session.signedIn, t])
 
   const can = useCallback(
     (action: ProjectAction) => Boolean(project && ROLE_ACTIONS[project.role].has(action)),
@@ -308,19 +311,19 @@ export function CollaborationProvider({
 
   const authorize = useCallback(async (action: ProjectAction) => {
     if (!session.signedIn || !project) {
-      setError('Sign in and select a project before performing this action.')
+      setError(t('runtime.collab.signInSelectProject'))
       return false
     }
     try {
       const allowed = await gateway.authorize(project.id, action)
-      if (!allowed) setError('Your project role does not allow this action.')
+      if (!allowed) setError(t('runtime.collab.roleActionDenied'))
       return allowed
     } catch (cause) {
       if (collaborationBackendUnavailable(cause)) setBackendStatus('error')
-      setError(collaborationErrorMessage(cause, 'This action is not permitted.'))
+      setError(collaborationErrorMessage(cause, t('runtime.collab.actionNotPermitted')))
       return false
     }
-  }, [gateway, project, session.signedIn])
+  }, [gateway, project, session.signedIn, t])
 
   const signUp = useCallback(async (name: string, email: string, password: string) => {
     setLoading(true)
@@ -332,12 +335,12 @@ export function CollaborationProvider({
       return next.signedIn
     } catch (cause) {
       setBackendStatus(collaborationBackendUnavailable(cause) ? 'error' : 'online')
-      setError(collaborationErrorMessage(cause, 'Registration failed.'))
+      setError(collaborationErrorMessage(cause, t('runtime.collab.registrationFailed')))
       return false
     } finally {
       setLoading(false)
     }
-  }, [gateway])
+  }, [gateway, t])
 
   const signIn = useCallback(async (email: string, password: string) => {
     setLoading(true)
@@ -349,12 +352,12 @@ export function CollaborationProvider({
       return next.signedIn
     } catch (cause) {
       setBackendStatus(collaborationBackendUnavailable(cause) ? 'error' : 'online')
-      setError(collaborationErrorMessage(cause, 'Sign-in failed.'))
+      setError(collaborationErrorMessage(cause, t('runtime.collab.signInFailed')))
       return false
     } finally {
       setLoading(false)
     }
-  }, [gateway])
+  }, [gateway, t])
 
   const signOut = useCallback(async () => {
     setLoading(true)
@@ -367,15 +370,15 @@ export function CollaborationProvider({
       setBackendStatus('online')
     } catch (cause) {
       setBackendStatus(collaborationBackendUnavailable(cause) ? 'error' : 'online')
-      setError(collaborationErrorMessage(cause, 'Sign-out failed.'))
+      setError(collaborationErrorMessage(cause, t('runtime.collab.signOutFailed')))
     } finally {
       setLoading(false)
     }
-  }, [clearProjectState, gateway])
+  }, [clearProjectState, gateway, t])
 
   const createProject = useCallback(async (name: string, description?: string) => {
     if (!session.signedIn) {
-      setError('Sign in before creating a project.')
+      setError(t('runtime.collab.signInBeforeProject'))
       return null
     }
     setLoading(true)
@@ -388,17 +391,17 @@ export function CollaborationProvider({
       return created.id
     } catch (cause) {
       setBackendStatus(collaborationBackendUnavailable(cause) ? 'error' : 'online')
-      setError(collaborationErrorMessage(cause, 'Unable to create the project.'))
+      setError(collaborationErrorMessage(cause, t('runtime.collab.createProjectFailed')))
       return null
     } finally {
       setLoading(false)
     }
-  }, [applyProjectSnapshot, gateway, session.signedIn])
+  }, [applyProjectSnapshot, gateway, session.signedIn, t])
 
   const selectProject = useCallback(async (projectId: string) => {
     const selected = projects.find((item) => item.id === projectId)
     if (!selected) {
-      setError('The selected project is no longer available on the server.')
+      setError(t('runtime.collab.projectUnavailable'))
       return false
     }
     setLoading(true)
@@ -409,12 +412,12 @@ export function CollaborationProvider({
       return true
     } catch (cause) {
       setBackendStatus(collaborationBackendUnavailable(cause) ? 'error' : 'online')
-      setError(collaborationErrorMessage(cause, 'Unable to open the selected project.'))
+      setError(collaborationErrorMessage(cause, t('runtime.collab.openProjectFailed')))
       return false
     } finally {
       setLoading(false)
     }
-  }, [applyProjectSnapshot, projects])
+  }, [applyProjectSnapshot, projects, t])
 
   const renameProject = useCallback(async (projectId: string, name: string) => {
     const target = projects.find((item) => item.id === projectId)
@@ -423,7 +426,7 @@ export function CollaborationProvider({
     setError(null)
     try {
       if (!(await gateway.authorize(projectId, 'admin'))) {
-        setError('Your project role does not allow renaming this project.')
+        setError(t('runtime.collab.renameDenied'))
         return false
       }
       const updated = await gateway.renameProject(target, name.trim())
@@ -435,19 +438,19 @@ export function CollaborationProvider({
       return true
     } catch (cause) {
       setBackendStatus(collaborationBackendUnavailable(cause) ? 'error' : 'online')
-      setError(collaborationErrorMessage(cause, 'Unable to rename the project.'))
+      setError(collaborationErrorMessage(cause, t('runtime.collab.renameProjectFailed')))
       return false
     } finally {
       setLoading(false)
     }
-  }, [applyProjectSnapshot, gateway, project?.id, projects])
+  }, [applyProjectSnapshot, gateway, project?.id, projects, t])
 
   const updateProjectGovernanceMode = useCallback(async (
     governanceMode: ProjectGovernanceMode,
   ) => {
     if (!project || project.governanceMode === governanceMode) return Boolean(project)
     if (project.role !== 'owner') {
-      setError('Only the project owner can change the governance mode.')
+      setError(t('runtime.collab.governanceOwnerRequired'))
       return false
     }
     setLoading(true)
@@ -459,12 +462,12 @@ export function CollaborationProvider({
       return true
     } catch (cause) {
       setBackendStatus(collaborationBackendUnavailable(cause) ? 'error' : 'online')
-      setError(collaborationErrorMessage(cause, 'Unable to change the project governance mode.'))
+      setError(collaborationErrorMessage(cause, t('runtime.collab.governanceUpdateFailed')))
       return false
     } finally {
       setLoading(false)
     }
-  }, [applyProjectSnapshot, gateway, project])
+  }, [applyProjectSnapshot, gateway, project, t])
 
   const archiveProject = useCallback(async (projectId: string) => {
     const target = projects.find((item) => item.id === projectId)
@@ -473,7 +476,7 @@ export function CollaborationProvider({
     setError(null)
     try {
       if (!(await gateway.authorize(projectId, 'admin'))) {
-        setError('Your project role does not allow archiving this project.')
+        setError(t('runtime.collab.archiveDenied'))
         return false
       }
       await gateway.archiveProject(target)
@@ -491,12 +494,12 @@ export function CollaborationProvider({
       return true
     } catch (cause) {
       setBackendStatus(collaborationBackendUnavailable(cause) ? 'error' : 'online')
-      setError(collaborationErrorMessage(cause, 'Unable to archive the project.'))
+      setError(collaborationErrorMessage(cause, t('runtime.collab.archiveProjectFailed')))
       return false
     } finally {
       setLoading(false)
     }
-  }, [applyProjectSnapshot, clearProjectState, gateway, project?.id, projects])
+  }, [applyProjectSnapshot, clearProjectState, gateway, project?.id, projects, t])
 
   const mutate = useCallback(async (
     action: ProjectAction,
@@ -510,15 +513,15 @@ export function CollaborationProvider({
       return true
     } catch (cause) {
       if (collaborationBackendUnavailable(cause)) setBackendStatus('error')
-      setError(collaborationErrorMessage(cause, 'Collaboration action failed.'))
+      setError(collaborationErrorMessage(cause, t('runtime.collab.actionFailed')))
       return false
     }
-  }, [applyProjectSnapshot, authorize, project])
+  }, [applyProjectSnapshot, authorize, project, t])
 
   const unavailableDocumentOperation = useCallback(async () => {
-    setError('Document content migration is not enabled yet. Use the document workspace without server editing for now.')
+    setError(t('runtime.collab.documentMigrationUnavailable'))
     return null
-  }, [])
+  }, [t])
 
   const value = useMemo<CollaborationContextState>(() => ({
     platformClient: activeClient,
@@ -554,7 +557,7 @@ export function CollaborationProvider({
     selectProject,
     addComment: (body, parentId, target = reviewTargets[0]) => {
       if (!target) {
-        setError('Create a versioned artifact before adding a formal comment.')
+        setError(t('runtime.collab.versionedArtifactBeforeComment'))
         return Promise.resolve(false)
       }
       return mutate('comment', (projectId) => gateway.addComment(projectId, body, target, parentId))
@@ -562,7 +565,7 @@ export function CollaborationProvider({
     resolveComment: (commentId, resolved) => {
       const thread = comments.find((item) => item.id === commentId)
       if (!thread?.etag) {
-        setError('Refresh comments before changing the thread state.')
+        setError(t('runtime.collab.refreshComments'))
         return Promise.resolve(false)
       }
       return mutate('edit', () => gateway.resolveComment(commentId, resolved, thread.etag))
@@ -570,7 +573,7 @@ export function CollaborationProvider({
     addReview: (decision, summary, target = reviewTargets[0]) => {
       void decision
       if (!target) {
-        setError('Create a versioned artifact before requesting a review.')
+        setError(t('runtime.collab.versionedArtifactBeforeReview'))
         return Promise.resolve(false)
       }
       const reviewer = project?.governanceMode === 'solo'
@@ -580,17 +583,19 @@ export function CollaborationProvider({
             ['owner', 'admin', 'editor'].includes(member.role),
           )
       if (!reviewer) {
-        setError('Assign another owner, admin, or editor before requesting a review.')
+        setError(t('runtime.collab.assignReviewer'))
         return Promise.resolve(false)
       }
       const reviewerIds = [reviewer.user.id]
-      return mutate('edit', (projectId) => gateway.requestReview(
-        projectId,
-        target,
-        summary,
-        reviewerIds,
-        allowsSoloSelfApprovalRequest(project?.governanceMode ?? 'team', members, reviewerIds),
-      ))
+      return mutate('edit', (projectId) =>
+        gateway.requestReview(
+          projectId,
+          target,
+          summary,
+          reviewerIds,
+          allowsSoloSelfApprovalRequest(project?.governanceMode ?? 'team', members, reviewerIds),
+        ),
+      )
     },
     requestReview: (summary, target, requiredReviewerIds) => {
       const allowSelfApproval = allowsSoloSelfApprovalRequest(
@@ -609,7 +614,7 @@ export function CollaborationProvider({
     decideReview: (reviewId, decision, summary, soloReviewConfirmed = false) => {
       const review = reviews.find((item) => item.id === reviewId)
       if (!review?.etag) {
-        setError('Refresh reviews before recording a decision.')
+        setError(t('runtime.collab.refreshReviews'))
         return Promise.resolve(false)
       }
       return mutate('edit', () => gateway.decideReview(
@@ -625,7 +630,7 @@ export function CollaborationProvider({
       const member = members.find((item) => item.user.id === userId)
       const etag = member?.etag
       if (!etag) {
-        setError('Refresh members before changing this role.')
+        setError(t('runtime.collab.refreshMembersRole'))
         return Promise.resolve(false)
       }
       return mutate('admin', (projectId) =>
@@ -636,7 +641,7 @@ export function CollaborationProvider({
       const member = members.find((item) => item.user.id === userId)
       const etag = member?.etag
       if (!etag) {
-        setError('Refresh members before removing this member.')
+        setError(t('runtime.collab.refreshMembersRemove'))
         return Promise.resolve(false)
       }
       return mutate('admin', (projectId) => gateway.removeMember(projectId, userId, etag))
@@ -648,7 +653,7 @@ export function CollaborationProvider({
         return true
       } catch (cause) {
         if (collaborationBackendUnavailable(cause)) setBackendStatus('error')
-        setError(collaborationErrorMessage(cause, 'Unable to update the notification.'))
+        setError(collaborationErrorMessage(cause, t('runtime.collab.notificationFailed')))
         return false
       }
     },
@@ -686,6 +691,7 @@ export function CollaborationProvider({
     signIn,
     signOut,
     signUp,
+    t,
     unavailableDocumentOperation,
   ])
 

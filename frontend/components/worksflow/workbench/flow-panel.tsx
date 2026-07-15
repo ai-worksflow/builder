@@ -23,6 +23,7 @@ import {
   X,
 } from 'lucide-react'
 import { useCollaboration } from '@/lib/collaboration/provider'
+import { useI18n } from '@/lib/i18n'
 import { useArtifactWorkspace } from '@/lib/platform/artifact-provider'
 import { usePlatformFlow } from '@/lib/platform/flow-provider'
 import type {
@@ -34,6 +35,7 @@ import type {
 import {
   exactArtifactRefsEqual,
   parseEditableDefinition as parseWorkflowContract,
+  reviewGateApprovalReadiness,
   resolveCandidateSelection as resolveLineageSelection,
   revisionCandidates as resolveLineageCandidates,
   starterWorkflowDefinition,
@@ -48,11 +50,12 @@ type EditorMode = 'closed' | 'create' | 'version'
 export function FlowPanel() {
   const flow = usePlatformFlow()
   const { can, session, project } = useCollaboration()
+  const { locale, t } = useI18n()
   const [expanded, setExpanded] = useState(true)
   const [editorMode, setEditorMode] = useState<EditorMode>('closed')
   const [draftKey, setDraftKey] = useState('custom-application-flow')
-  const [draftTitle, setDraftTitle] = useState('Custom application flow')
-  const [draftDescription, setDraftDescription] = useState('A composable typed workflow for this project.')
+  const [draftTitle, setDraftTitle] = useState('')
+  const [draftDescription, setDraftDescription] = useState('')
   const [definitionJSON, setDefinitionJSON] = useState('{}')
   const [editorError, setEditorError] = useState<string | null>(null)
   const [selectedVersionId, setSelectedVersionId] = useState('')
@@ -77,13 +80,15 @@ export function FlowPanel() {
       }, null, 2))
       return
     }
+    setDraftTitle(t('flow.defaultTitle'))
+    setDraftDescription(t('flow.defaultDescription'))
     setDefinitionJSON(JSON.stringify(starterWorkflowDefinition(), null, 2))
   }
 
   async function saveDefinition() {
     setEditorError(null)
     try {
-      const parsed = parseDefinitionJSON(definitionJSON, flow.capabilities)
+      const parsed = parseDefinitionJSON(definitionJSON, flow.capabilities, t)
       if (editorMode === 'create') {
         const input: CreateWorkflowDefinitionInputDto = {
           key: draftKey.trim(),
@@ -106,7 +111,7 @@ export function FlowPanel() {
         }
       }
     } catch (cause) {
-      setEditorError(cause instanceof Error ? cause.message : 'Definition JSON is invalid.')
+      setEditorError(cause instanceof Error ? cause.message : t('flow.error.invalidDefinition'))
     }
   }
 
@@ -122,15 +127,15 @@ export function FlowPanel() {
         {expanded && (
           <>
             <div className="min-w-0 flex-1">
-              <div className="truncate text-xs font-semibold text-foreground">Application workflow</div>
-              <div className="truncate text-[9px] text-faint-foreground">conversation → artifacts → build manifest → app</div>
+              <div className="truncate text-xs font-semibold text-foreground">{t('flow.title')}</div>
+              <div className="truncate text-[9px] text-faint-foreground">{t('flow.subtitle')}</div>
             </div>
             <button
               type="button"
               onClick={() => void flow.refresh()}
               disabled={flow.busy}
               className="rounded p-1.5 text-faint-foreground hover:bg-white/5 hover:text-foreground disabled:opacity-30"
-              aria-label="Refresh workflows"
+              aria-label={t('flow.refresh')}
             >
               <RefreshCw className={cn('size-3.5', flow.busy && 'animate-spin')} />
             </button>
@@ -140,7 +145,7 @@ export function FlowPanel() {
           type="button"
           onClick={() => setExpanded((value) => !value)}
           className="rounded p-1 text-faint-foreground hover:bg-white/5 hover:text-foreground"
-          aria-label={expanded ? 'Collapse workflow panel' : 'Expand workflow panel'}
+          aria-label={expanded ? t('flow.collapse') : t('flow.expand')}
         >
           {expanded ? <ChevronDown className="size-3.5" /> : <ChevronRight className="size-3.5" />}
         </button>
@@ -153,30 +158,30 @@ export function FlowPanel() {
               <div className="flex gap-2">
                 <CircleAlert className="mt-0.5 size-3.5 shrink-0" />
                 <span className="min-w-0 flex-1">{flow.error}</span>
-                <button type="button" onClick={flow.clearError} aria-label="Dismiss error"><X className="size-3" /></button>
+                <button type="button" onClick={flow.clearError} aria-label={t('flow.dismissError')}><X className="size-3" /></button>
               </div>
             </div>
           )}
 
           {!session.signedIn || !project ? (
-            <EmptyState text="Sign in and select a server project before using workflows." />
+            <EmptyState text={t('flow.empty.signIn')} />
           ) : flow.status === 'loading' ? (
-            <EmptyState text="Loading workflow definitions from Go…" loading />
+            <EmptyState text={t('flow.empty.loading')} loading />
           ) : flow.status === 'error' ? (
-            <EmptyState text="Workflow service is unavailable. Generation and shared edits are disabled." />
+            <EmptyState text={t('flow.empty.unavailable')} />
           ) : (
             <>
-              <Section title="Definition" icon={GitBranch}>
+              <Section title={t('flow.section.definition')} icon={GitBranch}>
                 <select
                   value={flow.selectedDefinition?.id ?? ''}
                   onChange={(event) => void flow.selectDefinition(event.target.value)}
                   className="h-8 w-full rounded-md border border-border bg-background px-2 text-[11px] text-foreground outline-none"
-                  aria-label="Workflow definition"
+                  aria-label={t('flow.definition')}
                 >
-                  {flow.definitions.length === 0 && <option value="">No server definition</option>}
+                  {flow.definitions.length === 0 && <option value="">{t('flow.noDefinition')}</option>}
                   {flow.definitions.map((definition) => (
                     <option key={definition.id} value={definition.id}>
-                      {definition.title} · v{definition.version}{definition.published ? ' · published' : ''}
+                      {definition.title} · v{definition.version.toLocaleString(locale)}{definition.published ? ` · ${t('flow.status.published')}` : ''}
                     </option>
                   ))}
                 </select>
@@ -186,11 +191,11 @@ export function FlowPanel() {
                     value={selectedVersion?.versionId ?? ''}
                     onChange={(event) => setSelectedVersionId(event.target.value)}
                     className="h-8 min-w-0 flex-1 rounded-md border border-border bg-background px-2 text-[10px] text-foreground outline-none"
-                    aria-label="Workflow version"
+                    aria-label={t('flow.version')}
                   >
                     {flow.definitionVersions.map((version) => (
                       <option key={version.versionId} value={version.versionId}>
-                        v{version.version} · {version.contentHash.slice(0, 12)}{version.executionProfile?.version ? ` · ${version.executionProfile.version}` : ' · legacy profile'}{version.published ? ' · published' : ''}
+                        v{version.version.toLocaleString(locale)} · {version.contentHash.slice(0, 12)}{version.executionProfile?.version ? ` · ${version.executionProfile.version}` : ` · ${t('flow.legacyProfile')}`}{version.published ? ` · ${t('flow.status.published')}` : ''}
                       </option>
                     ))}
                   </select>
@@ -199,17 +204,17 @@ export function FlowPanel() {
                     onClick={() => selectedVersion && void flow.publishDefinitionVersion(selectedVersion.id, selectedVersion.versionId)}
                     disabled={!selectedVersion || selectedVersion.published || !can('publish') || flow.busy}
                     className="inline-flex h-8 items-center gap-1 rounded-md border border-border px-2 text-[10px] text-muted-foreground hover:border-primary/40 hover:text-foreground disabled:opacity-35"
-                    title="Publish immutable version"
+                    title={t('flow.publishTitle')}
                   >
-                    <UploadCloud className="size-3" /> Publish
+                    <UploadCloud className="size-3" /> {t('flow.publish')}
                   </button>
                 </div>
 
                 {selectedVersion?.executionProfile && (
                   <p className="mt-1 truncate font-mono text-[8px] text-faint-foreground" title={selectedVersion.executionProfile.hash}>
-                    execution {selectedVersion.executionProfile.version} · {selectedVersion.executionProfile.hash.slice(0, 12)}
+                    {t('flow.execution')} {selectedVersion.executionProfile.version} · {selectedVersion.executionProfile.hash.slice(0, 12)}
                     {flow.capabilities?.analysisLimits
-                      ? ` · registry v${flow.capabilities.version} · semantic max ${flow.capabilities.analysisLimits.maxSemanticPathStates}`
+                      ? ` · ${t('flow.registry')} v${flow.capabilities.version.toLocaleString(locale)} · ${t('flow.semanticMax')} ${flow.capabilities.analysisLimits.maxSemanticPathStates.toLocaleString(locale)}`
                       : ''}
                   </p>
                 )}
@@ -217,10 +222,10 @@ export function FlowPanel() {
                 {can('admin') && (
                   <div className="mt-2 grid grid-cols-2 gap-1.5">
                     <button type="button" onClick={() => openEditor('create')} className="inline-flex h-8 items-center justify-center gap-1 rounded-md border border-border text-[10px] text-muted-foreground hover:border-primary/40 hover:text-foreground">
-                      <PencilLine className="size-3" /> New definition
+                      <PencilLine className="size-3" /> {t('flow.newDefinition')}
                     </button>
                     <button type="button" onClick={() => openEditor('version')} disabled={!selectedVersion} className="inline-flex h-8 items-center justify-center gap-1 rounded-md border border-border text-[10px] text-muted-foreground hover:border-primary/40 hover:text-foreground disabled:opacity-35">
-                      <GitBranch className="size-3" /> New version
+                      <GitBranch className="size-3" /> {t('flow.newVersion')}
                     </button>
                   </div>
                 )}
@@ -232,26 +237,26 @@ export function FlowPanel() {
                   })}
                   disabled={!canStart || flow.busy || (selectedVersion ? !selectedVersion.published : false)}
                   className="mt-2 inline-flex h-9 w-full items-center justify-center gap-1.5 rounded-md bg-primary px-3 text-[11px] font-semibold text-primary-foreground hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-40"
-                  title="Freeze the exact Project Brief revision required by this published workflow version"
+                  title={t('flow.startTitle')}
                 >
                   <Play className="size-3.5" />
-                  Start from exact Project Brief
+                  {t('flow.start')}
                 </button>
                 <p className="mt-1.5 text-[9px] leading-relaxed text-faint-foreground">
-                  The published definition decides whether approval is required; the server always freezes artifactId + revisionId + contentHash.
+                  {t('flow.startCopy')}
                 </p>
               </Section>
 
               {flow.manifest && (
-                <Section title="Frozen input" icon={ShieldCheck}>
-                  <Fact label="Manifest" value={flow.manifest.id} mono />
-                  <Fact label="Hash" value={flow.manifest.hash} mono />
-                  <Fact label="Sources" value={String(flow.manifest.sources.length)} />
+                <Section title={t('flow.section.frozenInput')} icon={ShieldCheck}>
+                  <Fact label={t('flow.manifest')} value={flow.manifest.id} mono />
+                  <Fact label={t('flow.hash')} value={flow.manifest.hash} mono />
+                  <Fact label={t('flow.sources')} value={flow.manifest.sources.length.toLocaleString(locale)} />
                 </Section>
               )}
 
               {flow.runs.length > 0 && (
-                <Section title="Server run history" icon={HistoryIcon}>
+                <Section title={t('flow.section.runHistory')} icon={HistoryIcon}>
                   <div className="max-h-36 space-y-1 overflow-y-auto pr-1 scrollbar-thin">
                     {flow.runs.map((item) => (
                       <button
@@ -268,7 +273,7 @@ export function FlowPanel() {
                         <RunStatusIcon status={item.status} />
                         <span className="min-w-0 flex-1">
                           <span className="block truncate font-mono text-[9px] text-foreground">{item.id}</span>
-                          <span className="block text-[8px] text-faint-foreground">{item.status.replaceAll('_', ' ')} · {new Date(item.updatedAt).toLocaleString()}</span>
+                          <span className="block text-[8px] text-faint-foreground">{workflowStatusLabel(item.status, t)} · {new Date(item.updatedAt).toLocaleString(locale)}</span>
                         </span>
                       </button>
                     ))}
@@ -277,17 +282,17 @@ export function FlowPanel() {
               )}
 
               {flow.run && (
-                <Section title="Run" icon={Workflow}>
+                <Section title={t('flow.section.run')} icon={Workflow}>
                   <div className="mb-2 flex items-center gap-2 rounded-md border border-border bg-background p-2">
                     <RunStatusIcon status={flow.run.status} />
                     <div className="min-w-0 flex-1">
                       <div className="truncate font-mono text-[10px] text-foreground">{flow.run.id}</div>
                       <div className="mt-0.5 text-[9px] text-faint-foreground">
-                        {flow.run.status.replaceAll('_', ' ')} · event {flow.run.eventCursor}
+                        {workflowStatusLabel(flow.run.status, t)} · {t('flow.eventNumber', { number: flow.run.eventCursor.toLocaleString(locale) })}
                       </div>
                     </div>
                     {!['completed', 'failed', 'cancelled', 'stale'].includes(flow.run.status) && (
-                      <button type="button" onClick={() => void flow.cancelRun()} disabled={!can('edit') || flow.busy} className="rounded p-1 text-faint-foreground hover:text-destructive" aria-label="Cancel run">
+                      <button type="button" onClick={() => void flow.cancelRun()} disabled={!can('edit') || flow.busy} className="rounded p-1 text-faint-foreground hover:text-destructive" aria-label={t('flow.cancelRun')}>
                         <Square className="size-3" />
                       </button>
                     )}
@@ -304,12 +309,12 @@ export function FlowPanel() {
               )}
 
               {flow.events.length > 0 && (
-                <Section title="Durable events" icon={RefreshCw}>
+                <Section title={t('flow.section.events')} icon={RefreshCw}>
                   <div className="max-h-36 space-y-1 overflow-y-auto pr-1 scrollbar-thin">
                     {flow.events.slice(-20).toReversed().map((event) => (
                       <div key={event.id} className="rounded border border-border bg-background px-2 py-1.5">
                         <div className="flex gap-2 text-[9px]">
-                          <span className="font-mono text-primary-bright">#{event.sequence}</span>
+                          <span className="font-mono text-primary-bright">#{event.sequence.toLocaleString(locale)}</span>
                           <span className="min-w-0 flex-1 truncate text-muted-foreground">{event.type}</span>
                           <span className="text-faint-foreground">{event.nodeKey}</span>
                         </div>
@@ -350,6 +355,7 @@ function RunNodeCard({ node }: { node: WorkflowNodeRunDto }) {
   const flow = usePlatformFlow()
   const artifacts = useArtifactWorkspace()
   const { can, project } = useCollaboration()
+  const { t } = useI18n()
   const [revisionKey, setRevisionKey] = useState('')
   const [reason, setReason] = useState('')
   const [soloReviewConfirmed, setSoloReviewConfirmed] = useState(false)
@@ -366,39 +372,46 @@ function RunNodeCard({ node }: { node: WorkflowNodeRunDto }) {
   const staleSelection = Boolean(revisionKey && !selected)
   const selectionRequired = candidates.length > 1 && !selected
   const submitError = candidateResolution.error
-    ?? (staleSelection ? 'The previously selected revision is no longer part of this node lineage.' : undefined)
-    ?? (selectionRequired ? 'Multiple lineage revisions match. Select one exact revision.' : undefined)
+    ?? (staleSelection ? t('flow.error.staleRevision') : undefined)
+    ?? (selectionRequired ? t('flow.error.multipleRevisions') : undefined)
   const active = ['waiting_input', 'waiting_review', 'failed'].includes(node.status)
   const reviewRequiredRole = definitionNode?.reviewGate?.requiredRole ?? 'editor'
   const canApproveReview = Boolean(project && workflowRoleSatisfies(project.role, reviewRequiredRole))
+  const canonicalReview = useMemo(
+    () => reviewGateApprovalReadiness(
+      flow.runDefinition?.definition,
+      node,
+      flow.run,
+      artifacts,
+    ),
+    [artifacts, flow.run, flow.runDefinition?.definition, node],
+  )
   const soloApprovalRequiresConfirmation = project
     ? requiresSoloReviewConfirmation(flow.run?.governanceMode ?? project.governanceMode, 'approve')
     : false
 
   async function approveReview() {
+    if (!canonicalReview.ready) return
     const approved = await flow.resolveReview(
       node,
       'approve',
-      reason.trim(),
+      reason,
       soloReviewConfirmed,
     )
-    if (approved) {
-      setReason('')
-      setSoloReviewConfirmed(false)
-    }
+    if (approved) setSoloReviewConfirmed(false)
   }
 
   function submitSelectedRevision() {
     setSelectionError(null)
     if (!selected) {
-      setSelectionError(submitError ?? 'Select an exact lineage revision.')
+      setSelectionError(submitError ?? t('flow.error.selectRevision'))
       return
     }
     const stillAllowed = candidateResolution.candidates.find((candidate) =>
       candidate.key === selected.key && exactArtifactRefsEqual(candidate.ref, selected.ref),
     )
     if (!stillAllowed) {
-      setSelectionError('The selected revision is no longer part of this node input lineage.')
+      setSelectionError(t('flow.error.revisionRemoved'))
       return
     }
     void flow.submitNodeRevision(node, stillAllowed.ref)
@@ -416,13 +429,13 @@ function RunNodeCard({ node }: { node: WorkflowNodeRunDto }) {
             {definitionNode?.name ?? node.definitionNodeId}
           </div>
           <div className="mt-0.5 flex flex-wrap gap-x-2 text-[9px] text-faint-foreground">
-            <span>{node.type}</span>
-            <span>{node.status.replaceAll('_', ' ')}</span>
-            {node.sliceId && <span>slice {node.sliceId.slice(0, 8)}</span>}
+            <span>{workflowNodeTypeLabel(node.type, t)}</span>
+            <span>{workflowStatusLabel(node.status, t)}</span>
+            {node.sliceId && <span>{t('flow.slice')} {node.sliceId.slice(0, 8)}</span>}
           </div>
         </div>
         {node.status === 'failed' && (
-          <button type="button" onClick={() => void flow.retryNode(node, reason)} disabled={!can('edit') || flow.busy} className="rounded p-1 text-warning hover:bg-warning/10" aria-label="Retry node">
+          <button type="button" onClick={() => void flow.retryNode(node, reason)} disabled={!can('edit') || flow.busy} className="rounded p-1 text-warning hover:bg-warning/10" aria-label={t('flow.retryNode')}>
             <RotateCcw className="size-3" />
           </button>
         )}
@@ -439,9 +452,9 @@ function RunNodeCard({ node }: { node: WorkflowNodeRunDto }) {
                   setSelectionError(null)
                 }}
                 className="h-7 w-full rounded border border-border bg-panel px-1.5 text-[9px] text-foreground outline-none"
-                aria-label="Exact artifact revision"
+                aria-label={t('flow.exactRevision')}
               >
-                {candidates.length > 1 && <option value="">Select a revision from this node lineage…</option>}
+                {candidates.length > 1 && <option value="">{t('flow.selectLineageRevision')}</option>}
                 {candidates.map((candidate) => (
                   <option key={candidate.key} value={candidate.key}>{candidate.label}</option>
                 ))}
@@ -452,7 +465,7 @@ function RunNodeCard({ node }: { node: WorkflowNodeRunDto }) {
                 disabled={!selected || Boolean(submitError) || !can('edit') || flow.busy}
                 className="mt-1.5 inline-flex h-7 w-full items-center justify-center gap-1 rounded bg-primary text-[9px] font-semibold text-primary-foreground disabled:opacity-40"
               >
-                <Send className="size-3" /> Submit pinned revision
+                <Send className="size-3" /> {t('flow.submitPinnedRevision')}
               </button>
               {(submitError || selectionError) && (
                 <p className="mt-1 text-[9px] leading-relaxed text-warning">
@@ -462,7 +475,7 @@ function RunNodeCard({ node }: { node: WorkflowNodeRunDto }) {
             </>
           ) : (
             <p className="text-[9px] leading-relaxed text-warning">
-              {candidateResolution.error ?? 'No immutable revision belongs to this node input lineage. Create the required revision, then refresh the run.'}
+              {candidateResolution.error ?? t('flow.error.noRevision')}
             </p>
           )}
         </div>
@@ -478,27 +491,39 @@ function RunNodeCard({ node }: { node: WorkflowNodeRunDto }) {
             className="inline-flex h-7 w-full items-center justify-center gap-1 rounded bg-primary text-[9px] font-semibold text-primary-foreground disabled:opacity-40"
           >
             <ShieldCheck className="size-3" />
-            {node.type === 'publish' ? 'Authorize and publish' : 'Authorize and run quality gate'}
+            {node.type === 'publish' ? t('flow.authorizePublish') : t('flow.authorizeQuality')}
           </button>
           <p className="mt-1 text-[8px] leading-relaxed text-faint-foreground">
-            The server records your current project role and rechecks permission immediately before the privileged operation runs.
+            {t('flow.authorizationCopy')}
           </p>
         </div>
       )}
 
       {node.status === 'waiting_input' && node.type === 'workbench_build' && (
         <p className="mt-2 border-t border-border pt-2 text-[9px] leading-relaxed text-primary-bright">
-          Review every generated file operation, then apply the proposal. The applied workspace revision will complete this node.
+          {t('flow.reviewBuildCopy')}
         </p>
       )}
 
       {node.status === 'waiting_review' && (
         <div className="mt-2 border-t border-border pt-2">
-          {soloApprovalRequiresConfirmation && (
-            <div role="alert" className="mb-2 rounded border border-warning/35 bg-warning/10 p-2 text-[9px] leading-relaxed text-warning">
+          {!canonicalReview.ready && (
+            <div
+              role="alert"
+              className="mb-2 rounded border border-warning/35 bg-warning/10 p-2 text-[9px] leading-relaxed text-warning"
+              data-testid={`workflow-review-canonical-blocker-${node.key}`}
+            >
               <div className="flex items-start gap-1.5">
                 <CircleAlert className="mt-0.5 size-3 shrink-0" />
-                <span>This approval is a Solo self-review. The platform records your identity, reason, and decision in the audit log.</span>
+                <span>{t('flow.canonicalReviewRequired')}</span>
+              </div>
+            </div>
+          )}
+          {soloApprovalRequiresConfirmation && (
+            <div role="alert" className="mb-2 rounded border border-warning/35 bg-warning/10 p-2 text-[9px] leading-relaxed text-warning" data-testid={`solo-review-warning-${node.key}`}>
+              <div className="flex items-start gap-1.5">
+                <CircleAlert className="mt-0.5 size-3 shrink-0" />
+                <span>{t('flow.soloReview.warning')}</span>
               </div>
               <label className="mt-2 flex cursor-pointer items-start gap-1.5 text-foreground">
                 <input
@@ -506,27 +531,28 @@ function RunNodeCard({ node }: { node: WorkflowNodeRunDto }) {
                   checked={soloReviewConfirmed}
                   onChange={(event) => setSoloReviewConfirmed(event.target.checked)}
                   className="mt-0.5"
+                  data-testid={`solo-review-confirm-${node.key}`}
                 />
-                <span>I confirm this Solo self-review.</span>
+                <span>{t('flow.soloReview.confirm')}</span>
               </label>
             </div>
           )}
           <input
             value={reason}
             onChange={(event) => setReason(event.target.value)}
-            placeholder="Review reason / requested change"
+            placeholder={t('flow.reviewReason')}
             className="h-7 w-full rounded border border-border bg-panel px-2 text-[9px] text-foreground outline-none placeholder:text-faint-foreground"
           />
           <div className="mt-1.5 grid grid-cols-2 gap-1">
-            <button type="button" onClick={() => void approveReview()} disabled={!canApproveReview || flow.busy || !reason.trim() || (soloApprovalRequiresConfirmation && !soloReviewConfirmed)} className="inline-flex h-7 items-center justify-center gap-1 rounded bg-success/15 text-[9px] font-medium text-success disabled:opacity-35">
-              <Check className="size-3" /> Approve
+            <button type="button" data-testid={`workflow-review-approve-${node.key}`} onClick={() => void approveReview()} disabled={!canApproveReview || !canonicalReview.ready || flow.busy || (soloApprovalRequiresConfirmation && (!soloReviewConfirmed || !reason.trim()))} className="inline-flex h-7 items-center justify-center gap-1 rounded bg-success/15 text-[9px] font-medium text-success disabled:opacity-35">
+              <Check className="size-3" /> {t('flow.approve')}
             </button>
-            <button type="button" onClick={() => void flow.resolveReview(node, 'changes_requested', reason || 'Changes requested in Workbench')} disabled={!can('edit') || flow.busy} className="inline-flex h-7 items-center justify-center gap-1 rounded bg-warning/15 text-[9px] font-medium text-warning disabled:opacity-35">
-              <PencilLine className="size-3" /> Changes
+            <button type="button" onClick={() => void flow.resolveReview(node, 'changes_requested', reason || t('flow.defaultChangeRequest'))} disabled={!can('edit') || flow.busy} className="inline-flex h-7 items-center justify-center gap-1 rounded bg-warning/15 text-[9px] font-medium text-warning disabled:opacity-35">
+              <PencilLine className="size-3" /> {t('flow.requestChanges')}
             </button>
           </div>
           <p className="mt-1 text-[8px] leading-relaxed text-faint-foreground">
-            Required reviewer role: {reviewRequiredRole} or higher. Approval succeeds only after the canonical artifact review is approved and blocking comments are resolved.
+            {t('flow.reviewerCopy', { role: workflowRoleLabel(reviewRequiredRole, t) })}
           </p>
         </div>
       )}
@@ -567,29 +593,32 @@ function DefinitionEditor({
   onClose: () => void
   onSave: () => void
 }) {
+  const { locale, t } = useI18n()
   return (
-    <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/70 p-4" role="dialog" aria-modal="true" aria-label="Workflow definition editor">
+    <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/70 p-4" role="dialog" aria-modal="true" aria-label={t('flow.editor.label')}>
       <div className="flex max-h-[92vh] w-full max-w-4xl flex-col overflow-hidden rounded-xl border border-border bg-panel shadow-2xl">
         <header className="flex items-center gap-3 border-b border-border px-4 py-3">
           <GitBranch className="size-4 text-primary-bright" />
           <div className="min-w-0 flex-1">
             <h2 className="text-sm font-semibold text-foreground">
-              {mode === 'create' ? 'Create workflow definition' : `Create v${(definition?.version ?? 0) + 1}`}
+              {mode === 'create'
+                ? t('flow.editor.create')
+                : t('flow.editor.createVersion', { version: ((definition?.version ?? 0) + 1).toLocaleString(locale) })}
             </h2>
-            <p className="text-[10px] text-faint-foreground">Typed DAG validation and publication happen on the Go service.</p>
+            <p className="text-[10px] text-faint-foreground">{t('flow.editor.copy')}</p>
           </div>
-          <button type="button" onClick={onClose} className="rounded p-1.5 text-faint-foreground hover:bg-white/5 hover:text-foreground" aria-label="Close"><X className="size-4" /></button>
+          <button type="button" onClick={onClose} className="rounded p-1.5 text-faint-foreground hover:bg-white/5 hover:text-foreground" aria-label={t('flow.editor.close')}><X className="size-4" /></button>
         </header>
         <div className="min-h-0 flex-1 overflow-y-auto p-4 scrollbar-thin">
           {mode === 'create' && (
             <div className="mb-3 grid grid-cols-2 gap-2 max-md:grid-cols-1">
-              <label className="text-[10px] font-semibold uppercase tracking-wider text-faint-foreground [&_input]:mt-1 [&_input]:h-9 [&_input]:w-full [&_input]:rounded-md [&_input]:border [&_input]:border-border [&_input]:bg-background [&_input]:px-2 [&_input]:text-xs [&_input]:font-normal [&_input]:normal-case [&_input]:text-foreground [&_input]:outline-none">Key<input value={draftKey} onChange={(event) => onKeyChange(event.target.value)} pattern="[a-z][a-z0-9-]{2,63}" /></label>
-              <label className="text-[10px] font-semibold uppercase tracking-wider text-faint-foreground [&_input]:mt-1 [&_input]:h-9 [&_input]:w-full [&_input]:rounded-md [&_input]:border [&_input]:border-border [&_input]:bg-background [&_input]:px-2 [&_input]:text-xs [&_input]:font-normal [&_input]:normal-case [&_input]:text-foreground [&_input]:outline-none">Title<input value={draftTitle} onChange={(event) => onTitleChange(event.target.value)} /></label>
-              <label className="col-span-2 text-[10px] font-semibold uppercase tracking-wider text-faint-foreground max-md:col-span-1 [&_input]:mt-1 [&_input]:h-9 [&_input]:w-full [&_input]:rounded-md [&_input]:border [&_input]:border-border [&_input]:bg-background [&_input]:px-2 [&_input]:text-xs [&_input]:font-normal [&_input]:normal-case [&_input]:text-foreground [&_input]:outline-none">Description<input value={draftDescription} onChange={(event) => onDescriptionChange(event.target.value)} /></label>
+              <label className="text-[10px] font-semibold uppercase tracking-wider text-faint-foreground [&_input]:mt-1 [&_input]:h-9 [&_input]:w-full [&_input]:rounded-md [&_input]:border [&_input]:border-border [&_input]:bg-background [&_input]:px-2 [&_input]:text-xs [&_input]:font-normal [&_input]:normal-case [&_input]:text-foreground [&_input]:outline-none">{t('flow.editor.key')}<input value={draftKey} onChange={(event) => onKeyChange(event.target.value)} pattern="[a-z][a-z0-9-]{2,63}" /></label>
+              <label className="text-[10px] font-semibold uppercase tracking-wider text-faint-foreground [&_input]:mt-1 [&_input]:h-9 [&_input]:w-full [&_input]:rounded-md [&_input]:border [&_input]:border-border [&_input]:bg-background [&_input]:px-2 [&_input]:text-xs [&_input]:font-normal [&_input]:normal-case [&_input]:text-foreground [&_input]:outline-none">{t('flow.editor.title')}<input value={draftTitle} onChange={(event) => onTitleChange(event.target.value)} /></label>
+              <label className="col-span-2 text-[10px] font-semibold uppercase tracking-wider text-faint-foreground max-md:col-span-1 [&_input]:mt-1 [&_input]:h-9 [&_input]:w-full [&_input]:rounded-md [&_input]:border [&_input]:border-border [&_input]:bg-background [&_input]:px-2 [&_input]:text-xs [&_input]:font-normal [&_input]:normal-case [&_input]:text-foreground [&_input]:outline-none">{t('flow.editor.description')}<input value={draftDescription} onChange={(event) => onDescriptionChange(event.target.value)} /></label>
             </div>
           )}
           <div className="text-[10px] font-semibold uppercase tracking-wider text-faint-foreground">
-            Definition graph and contracts
+            {t('flow.editor.graphAndContracts')}
             <div className="mt-2 normal-case tracking-normal">
               <WorkflowGraphEditor value={definitionJSON} onChange={onJSONChange} capabilities={capabilities} />
             </div>
@@ -597,17 +626,23 @@ function DefinitionEditor({
           {error && <p role="alert" className="mt-2 text-[10px] text-destructive">{error}</p>}
         </div>
         <footer className="flex items-center justify-end gap-2 border-t border-border px-4 py-3">
-          <button type="button" onClick={onClose} className="rounded-md border border-border px-3 py-2 text-[11px] text-muted-foreground hover:text-foreground">Cancel</button>
-          <button type="button" onClick={onSave} disabled={busy} className="inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-2 text-[11px] font-semibold text-primary-foreground disabled:opacity-40"><Save className="size-3.5" /> Save immutable draft version</button>
+          <button type="button" onClick={onClose} className="rounded-md border border-border px-3 py-2 text-[11px] text-muted-foreground hover:text-foreground">{t('flow.editor.cancel')}</button>
+          <button type="button" onClick={onSave} disabled={busy} className="inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-2 text-[11px] font-semibold text-primary-foreground disabled:opacity-40"><Save className="size-3.5" /> {t('flow.editor.save')}</button>
         </footer>
       </div>
     </div>
   )
 }
 
-export function parseDefinitionJSON(value: string, capabilities?: WorkflowCapabilitiesDto | null) {
+type Translate = ReturnType<typeof useI18n>['t']
+
+export function parseDefinitionJSON(
+  value: string,
+  capabilities?: WorkflowCapabilitiesDto | null,
+  t?: Translate,
+) {
   const parsed = parseWorkflowContract(value, true, capabilities)
-  if (!parsed.definition) throw new Error(parsed.error ?? 'Definition JSON is invalid.')
+  if (!parsed.definition) throw new Error(parsed.error ?? t?.('flow.error.invalidDefinition') ?? 'Definition JSON is invalid.')
   return parsed.definition
 }
 
@@ -626,6 +661,53 @@ function Fact({ label, value, mono }: { label: string; value: string; mono?: boo
 
 function EmptyState({ text, loading }: { text: string; loading?: boolean }) {
   return <div className="rounded-lg border border-dashed border-border bg-background p-4 text-center text-[10px] leading-relaxed text-faint-foreground">{loading && <CircleDashed className="mx-auto mb-2 size-4 animate-spin text-primary-bright" />}{text}</div>
+}
+
+function workflowStatusLabel(status: string, t: Translate) {
+  switch (status) {
+    case 'ready': return t('flow.status.ready')
+    case 'queued': return t('flow.status.queued')
+    case 'pending': return t('flow.status.pending')
+    case 'running': return t('flow.status.running')
+    case 'waiting_input': return t('flow.status.waitingInput')
+    case 'waiting_review': return t('flow.status.waitingReview')
+    case 'completed': return t('flow.status.completed')
+    case 'failed': return t('flow.status.failed')
+    case 'cancelled': return t('flow.status.cancelled')
+    case 'stale': return t('flow.status.stale')
+    case 'blocked': return t('flow.status.blocked')
+    case 'published': return t('flow.status.published')
+    default: return status.replaceAll('_', ' ')
+  }
+}
+
+function workflowNodeTypeLabel(type: string, t: Translate) {
+  switch (type) {
+    case 'artifact_input': return t('flow.nodeType.artifactInput')
+    case 'ai_transform': return t('flow.nodeType.aiTransform')
+    case 'human_edit': return t('flow.nodeType.humanEdit')
+    case 'review_gate': return t('flow.nodeType.reviewGate')
+    case 'condition': return t('flow.nodeType.condition')
+    case 'fan_out': return t('flow.nodeType.fanOut')
+    case 'merge': return t('flow.nodeType.merge')
+    case 'manifest_compiler': return t('flow.nodeType.manifestCompiler')
+    case 'workbench_build': return t('flow.nodeType.workbenchBuild')
+    case 'quality_gate': return t('flow.nodeType.qualityGate')
+    case 'publish': return t('flow.nodeType.publish')
+    case 'transform': return t('flow.nodeType.transform')
+    default: return type.replaceAll('_', ' ')
+  }
+}
+
+function workflowRoleLabel(role: string, t: Translate) {
+  switch (role) {
+    case 'viewer': return t('flow.role.viewer')
+    case 'commenter': return t('flow.role.commenter')
+    case 'editor': return t('flow.role.editor')
+    case 'admin': return t('flow.role.admin')
+    case 'owner': return t('flow.role.owner')
+    default: return role
+  }
 }
 
 function RunStatusIcon({ status }: { status: string }) {

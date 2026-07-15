@@ -318,7 +318,7 @@ export function PreviewPanel() {
               event.preventDefault()
               navigatePreview()
             }}
-            aria-label="Preview route"
+            aria-label={t('preview.route')}
             title={runtimeLocation}
           >
             <span className="hidden max-w-40 shrink-0 truncate text-faint-foreground md:inline">
@@ -329,7 +329,7 @@ export function PreviewPanel() {
               onChange={(event) => setRouteInput(event.target.value)}
               onBlur={() => setRouteInput(normalizePreviewRoute(routeInput, route))}
               className="min-h-6 min-w-16 flex-1 bg-transparent px-1.5 py-1 text-foreground outline-none"
-              aria-label="Virtual preview route"
+              aria-label={t('preview.virtualRoute')}
               autoCapitalize="off"
               autoComplete="off"
               spellCheck={false}
@@ -337,8 +337,8 @@ export function PreviewPanel() {
             <button
               type="submit"
               className="min-h-6 min-w-6 rounded p-1 text-faint-foreground hover:bg-white/5 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary"
-              aria-label="Navigate to preview route"
-              title="Navigate"
+              aria-label={t('preview.navigateRoute')}
+              title={t('preview.navigate')}
             >
               <ArrowRight className="h-3 w-3" />
             </button>
@@ -354,7 +354,7 @@ export function PreviewPanel() {
           </ToolbarButton>
         </div>
         <div className="flex min-h-9 flex-wrap items-center gap-1 border-t border-white/[0.04] px-2 py-1 sm:gap-1.5 sm:px-2.5">
-          <div className="flex items-center" role="group" aria-label="Preview device presets">
+          <div className="flex items-center" role="group" aria-label={t('preview.devicePresets')}>
             <ToolbarButton label={t('preview.mobileView')} active={device === 'mobile'} onClick={() => selectDevice('mobile')}>
               <Smartphone className="h-3.5 w-3.5" />
             </ToolbarButton>
@@ -391,22 +391,22 @@ export function PreviewPanel() {
             value={zoom}
             onChange={(event) => setZoom(event.target.value === 'fit' ? 'fit' : Number(event.target.value) as PreviewZoom)}
             className="h-7 rounded-md border border-border bg-background px-1.5 text-[10px] text-muted-foreground outline-none focus-visible:ring-2 focus-visible:ring-primary"
-            aria-label="Preview zoom"
+            aria-label={t('preview.zoom')}
           >
             {ZOOM_OPTIONS.map((option) => (
-              <option key={option} value={option}>{option === 'fit' ? 'Fit' : `${option}%`}</option>
+              <option key={option} value={option}>{option === 'fit' ? t('preview.fit') : `${option}%`}</option>
             ))}
           </select>
           <div
             className="ml-auto flex items-center gap-1 whitespace-nowrap font-mono text-[9px] text-faint-foreground"
             role="status"
             aria-live="polite"
-            aria-label={`Preview ${loading ? 'loading' : 'ready'}, revision ${workspace.revision}, reload ${refreshKey}`}
+            aria-label={t('preview.status', { status: loading ? t('common.loading') : t('workbench.panel.ready'), revision: workspace.revision, reload: refreshKey })}
           >
             <span className={cn('h-1.5 w-1.5 rounded-full', loading ? 'animate-pulse bg-warning' : 'bg-success')} />
-            {loading ? 'Loading' : 'Ready'} · r{workspace.revision}.{refreshKey}
+            {loading ? t('common.loading') : t('workbench.panel.ready')} · r{workspace.revision}.{refreshKey}
           </div>
-          <div className="flex items-center" role="group" aria-label="Preview inspection tools">
+          <div className="flex items-center" role="group" aria-label={t('preview.inspectionTools')}>
             <ToolbarButton
               label={t('preview.inspect')}
               active={inspectionMode === 'element'}
@@ -415,7 +415,7 @@ export function PreviewPanel() {
               <MousePointer2 className="h-3.5 w-3.5" />
             </ToolbarButton>
             <ToolbarButton
-              label="Select preview region"
+              label={t('preview.selectRegion')}
               active={inspectionMode === 'region'}
               onClick={() => setInspectionMode((current) => current === 'region' ? null : 'region')}
             >
@@ -438,15 +438,15 @@ export function PreviewPanel() {
           >
             <span>
               {inspectionMode === 'region'
-                ? 'Region selection active — drag across the preview.'
-                : 'Element inspection active — select an element in the preview.'}
+                ? t('preview.regionSelectionHint')
+                : t('preview.elementSelectionHint')}
             </span>
             <button
               type="button"
               onClick={() => setInspectionMode(null)}
               className="pointer-events-auto rounded border border-border px-1.5 py-0.5 text-faint-foreground hover:bg-white/5 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary"
             >
-              Cancel (Esc)
+              {t('preview.cancelEsc')}
             </button>
           </div>
         )}
@@ -484,7 +484,7 @@ export function PreviewPanel() {
                   title={t('preview.generatedTitle')}
                 />
                 <span className="sr-only">Taskflow</span>
-                <footer className="sr-only">Made in Worksflow</footer>
+                <footer className="sr-only">{t('preview.madeIn')}</footer>
                 {loading && (
                   <div className="absolute inset-0 grid place-items-center bg-background/70 backdrop-blur-sm" role="status" aria-label={t('preview.loading')}>
                     <Loader2 className="h-6 w-6 animate-spin text-primary-bright" />
@@ -541,12 +541,12 @@ export function PreviewPanel() {
                       onClick={() => {
                         sendContextToComposer(buildPreviewErrorComposerContext(log, route), 'fix')
                         setConsoleOpen(false)
-                        showNotice('Runtime error added to the composer.')
+                        showNotice(t('preview.runtimeErrorAdded'))
                       }}
                       className="shrink-0 rounded border border-destructive/40 px-1.5 py-0.5 text-[9px] font-sans font-medium text-destructive hover:bg-destructive/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary"
-                      aria-label={`Send error to composer: ${log.message.slice(0, 120)}`}
+                      aria-label={t('preview.sendErrorAria', { message: log.message.slice(0, 120) })}
                     >
-                      Send to composer
+                      {t('preview.sendToComposer')}
                     </button>
                   )}
                 </div>
@@ -665,6 +665,7 @@ function DimensionInput({
   onChange: (value: string) => void
   onCommit: () => void
 }) {
+  const { t } = useI18n()
   const limits = PREVIEW_DIMENSION_LIMITS[axis]
   const hintId = `preview-${axis}-range`
 
@@ -673,7 +674,7 @@ function DimensionInput({
       className="flex h-7 items-center rounded-md border border-border bg-background px-1.5 text-[9px] text-faint-foreground focus-within:ring-2 focus-within:ring-primary"
       title={`${limits.min}–${limits.max}px`}
     >
-      <span aria-hidden="true">{axis === 'width' ? 'W' : 'H'}</span>
+      <span aria-hidden="true">{t(axis === 'width' ? 'preview.widthShort' : 'preview.heightShort')}</span>
       <input
         value={value}
         onChange={(event) => onChange(event.target.value)}
@@ -690,13 +691,13 @@ function DimensionInput({
         )}
         inputMode="numeric"
         maxLength={6}
-        aria-label={`Preview ${axis} in pixels`}
+        aria-label={t(axis === 'width' ? 'preview.widthPixels' : 'preview.heightPixels')}
         aria-describedby={hintId}
         aria-invalid={invalid}
       />
       <span aria-hidden="true">px</span>
       <span id={hintId} className="sr-only">
-        Allowed range {limits.min} to {limits.max} pixels
+        {t('preview.allowedRange', { min: limits.min, max: limits.max })}
       </span>
     </label>
   )

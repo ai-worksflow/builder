@@ -6,11 +6,13 @@ import {
   PlatformHttpError,
   PlatformNetworkError,
   PlatformProtocolError,
+  resolvePlatformBaseUrl,
   type FetchLike,
   type CsrfTokenStore,
 } from '../lib/platform/http'
 import {
   PlatformWebSocketClient,
+  resolveWebSocketUrl,
   type PlatformDomainEvent,
   type WebSocketFactory,
   type WebSocketLike,
@@ -32,6 +34,17 @@ function test(name: string, run: TestCase['run']) {
 function json(data: unknown, status = 200, headers?: HeadersInit) {
   return Response.json(data, { status, headers })
 }
+
+test('HTTP resolves configured, local-development, proxied and server platform base URLs', () => {
+  assert.equal(
+    resolvePlatformBaseUrl('  https://platform.example.test/api  ', { hostname: 'builder.example.test' }),
+    'https://platform.example.test/api',
+  )
+  assert.equal(resolvePlatformBaseUrl(undefined, { hostname: 'localhost' }), 'http://localhost:8080')
+  assert.equal(resolvePlatformBaseUrl(undefined, { hostname: '127.0.0.1' }), 'http://127.0.0.1:8080')
+  assert.equal(resolvePlatformBaseUrl(undefined, { hostname: 'builder.example.test' }), '/api/platform')
+  assert.equal(resolvePlatformBaseUrl(), 'http://127.0.0.1:8080')
+})
 
 test('HTTP requests include platform headers, credentials, query values and expose response metadata', async () => {
   let capturedUrl = ''
@@ -416,6 +429,18 @@ function fakeSocketFactory() {
   }
   return { factory, sockets, urls }
 }
+
+test('WebSocket resolves same-origin Nginx paths', () => {
+  const location = { protocol: 'https:', host: 'builder.example.test' }
+  assert.equal(
+    resolveWebSocketUrl('/api/platform/v1/ws', location),
+    'wss://builder.example.test/api/platform/v1/ws',
+  )
+  assert.equal(
+    resolveWebSocketUrl('wss://platform.example.test/v1/ws', location),
+    'wss://platform.example.test/v1/ws',
+  )
+})
 
 test('WebSocket authenticates after opening and never exposes the bearer token in its URL', async () => {
   const fake = fakeSocketFactory()

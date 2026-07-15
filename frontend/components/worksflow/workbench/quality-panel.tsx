@@ -14,7 +14,7 @@ import {
 } from 'lucide-react'
 
 export function QualityPanel() {
-  const { t } = useI18n()
+  const { locale, t } = useI18n()
   const {
     qualityRun,
     qualityRunning,
@@ -35,8 +35,8 @@ export function QualityPanel() {
           <div className="text-faint-foreground">
             {qualityRun
               ? t('quality.summary', {
-                  score: qualityRun.score.percentage,
-                  count: qualityRun.diagnostics.length,
+                  score: qualityRun.score.percentage.toLocaleString(locale),
+                  count: qualityRun.diagnostics.length.toLocaleString(locale),
                 })
               : t('quality.description')}
           </div>
@@ -81,11 +81,13 @@ export function QualityPanel() {
                   ) : (
                     <AlertTriangle className="h-3.5 w-3.5 text-warning" />
                   )}
-                  <span className="truncate font-medium text-foreground">{check.title}</span>
+                  <span className="truncate font-medium text-foreground">
+                    {qualityCheckTitle(check.id, t)}
+                  </span>
                 </div>
                 <div className="mt-1 flex items-center justify-between text-[10px] text-faint-foreground">
-                  <span>{check.status}</span>
-                  <span>{check.score.percentage}%</span>
+                  <span>{qualityCheckStatus(check.status, t)}</span>
+                  <span>{new Intl.NumberFormat(locale, { style: 'percent' }).format(check.score.percentage / 100)}</span>
                 </div>
               </div>
             ))}
@@ -114,7 +116,7 @@ export function QualityPanel() {
                           : 'bg-primary/10 text-primary-bright',
                     )}
                   >
-                    {diagnostic.severity}
+                    {qualitySeverity(diagnostic.severity, t)}
                   </span>
                   <span className="min-w-0 flex-1">
                     <span className="block text-foreground">{diagnostic.message}</span>
@@ -135,4 +137,38 @@ export function QualityPanel() {
       )}
     </div>
   )
+}
+
+type Translate = ReturnType<typeof useI18n>['t']
+
+function qualityCheckTitle(checkId: string, t: Translate) {
+  switch (checkId) {
+    case 'build': return t('quality.check.build')
+    case 'type': return t('quality.check.type')
+    case 'lint': return t('quality.check.lint')
+    case 'test': return t('quality.check.test')
+    case 'accessibility': return t('quality.check.accessibility')
+    case 'dependency': return t('quality.check.dependency')
+    case 'secret': return t('quality.check.secret')
+    default: return checkId
+  }
+}
+
+function qualityCheckStatus(status: string, t: Translate) {
+  switch (status) {
+    case 'passed': return t('quality.status.passed')
+    case 'warning': return t('quality.status.warning')
+    case 'failed': return t('quality.status.failed')
+    case 'skipped': return t('quality.status.skipped')
+    default: return status
+  }
+}
+
+function qualitySeverity(severity: string, t: Translate) {
+  switch (severity) {
+    case 'error': return t('quality.severity.error')
+    case 'warning': return t('quality.severity.warning')
+    case 'info': return t('quality.severity.info')
+    default: return severity
+  }
 }

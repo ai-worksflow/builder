@@ -9,6 +9,7 @@ import { DOC_STATUS_CLASS } from '@/lib/worksflow/labels'
 import { useWorksflow } from '@/lib/worksflow/store'
 import { useLocalizedLabels } from '../use-localized-labels'
 import { useCollaboration } from '@/lib/collaboration/provider'
+import { BUILD_SUBSTATUS, BUILD_TASKS } from '@/lib/worksflow/mock-data'
 import {
   Check,
   ChevronRight,
@@ -33,6 +34,14 @@ export function TaskChecklist({ tasks }: { tasks: BuildTask[] }) {
       {tasks.map((task) => {
         const isExpandable = Boolean(task.subStatus)
         const open = expanded === task.id
+        const demoIndex = BUILD_TASKS.findIndex(
+          (candidate) => candidate.id === task.id && candidate.title === task.title,
+        )
+        const title = demoIndex >= 0 ? localizedDemoTaskTitle(demoIndex, t) : task.title
+        const subStatus =
+          demoIndex >= 0 && task.subStatus === BUILD_SUBSTATUS[task.id]
+            ? localizedDemoTaskSubStatus(demoIndex, t)
+            : task.subStatus
         return (
           <li key={task.id}>
             <button
@@ -52,11 +61,11 @@ export function TaskChecklist({ tasks }: { tasks: BuildTask[] }) {
                         : 'text-foreground',
                   )}
                 >
-                  {task.title}
+                  {title}
                 </span>
-                {task.subStatus && (
+                {subStatus && (
                   <span className="mt-0.5 flex items-center gap-1.5 font-mono text-[11px] text-primary-bright">
-                    {task.subStatus}
+                    {subStatus}
                   </span>
                 )}
               </span>
@@ -71,10 +80,10 @@ export function TaskChecklist({ tasks }: { tasks: BuildTask[] }) {
             </button>
             {open && (
               <div className="ml-8 mb-1 rounded-md border border-border bg-black/30 p-2 font-mono text-[11px] text-muted-foreground">
-                {task.subStatus}
+                {subStatus}
                 {'\n'}
                 <span className="text-faint-foreground">
-                  - {t('chat.runningStep', { task: task.title })}
+                  - {t('chat.runningStep', { task: title })}
                 </span>
               </div>
             )}
@@ -204,7 +213,7 @@ export function BlueprintContextCard() {
           </div>
         </div>
         <span className="shrink-0 rounded-md border border-primary/30 bg-background/60 px-1.5 py-0.5 text-[10px] font-medium text-primary-bright">
-          {activeBlueprintContext.status}
+          {t(`blueprint.context.status.${activeBlueprintContext.status}`)}
         </span>
       </div>
 
@@ -256,6 +265,40 @@ export function BlueprintContextCard() {
       </button>
     </div>
   )
+}
+
+function localizedDemoTaskTitle(
+  index: number,
+  t: ReturnType<typeof useI18n>['t'],
+) {
+  const keys = [
+    'chat.demo.task.t1',
+    'chat.demo.task.t2',
+    'chat.demo.task.t3',
+    'chat.demo.task.t4',
+    'chat.demo.task.t5',
+    'chat.demo.task.t6',
+    'chat.demo.task.t7',
+    'chat.demo.task.t8',
+  ] as const
+  return t(keys[index] ?? keys[0])
+}
+
+function localizedDemoTaskSubStatus(
+  index: number,
+  t: ReturnType<typeof useI18n>['t'],
+) {
+  const keys = [
+    'chat.demo.substatus.t1',
+    'chat.demo.substatus.t2',
+    'chat.demo.substatus.t3',
+    'chat.demo.substatus.t4',
+    'chat.demo.substatus.t5',
+    'chat.demo.substatus.t6',
+    'chat.demo.substatus.t7',
+    'chat.demo.substatus.t8',
+  ] as const
+  return t(keys[index] ?? keys[0])
 }
 
 function Metric({ value, label }: { value: string; label: string }) {

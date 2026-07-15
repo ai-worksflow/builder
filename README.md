@@ -62,6 +62,42 @@ pnpm build
 
 `pnpm test` runs both mock model tests and Playwright interaction tests.
 
+## Complete local deployment
+
+The production frontend, Go API, PostgreSQL, Redis, MongoDB, NATS JetStream,
+and isolated delivery sandbox are defined in the root Compose file. Start the
+complete stack from the repository root:
+
+```sh
+make deploy
+```
+
+`make deploy` validates the Compose configuration, rebuilds the frontend and
+API images, starts the stack in the background, waits for its health checks,
+and prints the resulting service status. Use `make deploy-fresh` when a
+no-cache rebuild is required. `make status`, `make logs`, and `make down`
+provide the common operational commands; `make down` preserves persisted data.
+
+Open `http://localhost:10000`. Nginx is the only public entry point: `/` maps to
+the Next.js frontend, `/api/platform/*` maps to the Go API with that prefix
+removed, and `/health/*` plus `/published/*` map directly to the Go API.
+Stop the stack without deleting persisted data with `make down`.
+
+For a deployment reached through a hostname other than `localhost`, provide
+the browser-visible endpoints before building the frontend:
+
+```sh
+NGINX_PORT=10000 \
+PLATFORM_ALLOWED_ORIGINS=https://app.example.com \
+DELIVERY_PUBLISH_BASE_URL=https://app.example.com/published \
+make deploy
+```
+
+Set `OPENAI_API_KEY` to enable AI-backed routes. Custom gateways may set
+`OPENAI_BASE_URL` and `OPENAI_DEFAULT_MODEL`; the base URL is expanded to
+`/v1/responses`, while `OPENAI_RESPONSES_URL` remains an explicit override.
+When the key is unset, AI requests fail closed as not configured.
+
 ## Manual Demo Path
 
 1. Open the Workbench.

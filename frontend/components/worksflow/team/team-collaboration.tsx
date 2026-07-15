@@ -67,7 +67,7 @@ export function TeamCollaboration() {
   } = useCollaboration()
   const canEdit = session.signedIn && can('edit')
   const canUseActiveTeamView = teamView === 'members' || teamView === 'reviews' || canEdit
-  const { t } = useI18n()
+  const { locale, t } = useI18n()
   const [navCollapsed, setNavCollapsed] = useState(false)
   const [searchQuery, setSearchQuery] = useState('')
   const searchResults = searchQuery.trim()
@@ -88,7 +88,7 @@ export function TeamCollaboration() {
             <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded bg-primary text-[10px] font-bold text-primary-foreground">
               {(project?.name ?? activeTeamProject.name).slice(0, 1)}
             </span>
-            <span className="shrink-0">Projects</span>
+            <span className="shrink-0">{t('team.projects')}</span>
             <span className="shrink-0 text-faint-foreground">/</span>
             <select
               value={project?.id ?? ''}
@@ -97,10 +97,10 @@ export function TeamCollaboration() {
               className="max-w-[220px] truncate rounded border border-transparent bg-transparent text-sm font-medium text-foreground outline-none hover:border-border hover:bg-white/5"
               aria-label={t('recent.project')}
             >
-              {projects.length === 0 && <option value="">No server projects</option>}
+              {projects.length === 0 && <option value="">{t('team.noServerProjects')}</option>}
               {projects.map((item) => (
                 <option key={item.id} value={item.id}>
-                  {item.name} · {item.role}
+                  {item.name} · {projectRoleLabel(item.role, t)}
                 </option>
               ))}
             </select>
@@ -108,7 +108,7 @@ export function TeamCollaboration() {
           <button
             type="button"
             onClick={() => {
-              const name = window.prompt('New project name')?.trim()
+              const name = window.prompt(t('team.project.namePrompt'))?.trim()
               if (name) void createProject(name)
             }}
             disabled={!session.signedIn || backendStatus !== 'online'}
@@ -144,7 +144,7 @@ export function TeamCollaboration() {
                   className="block w-full rounded-md px-2.5 py-2 text-left hover:bg-white/5"
                 >
                   <span className="block truncate text-[11px] font-medium text-foreground">{document.title}</span>
-                  <span className="block truncate text-[9px] text-faint-foreground">{document.type} · {document.status}</span>
+                  <span className="block truncate text-[9px] text-faint-foreground">{documentTypeLabel(document.type, t)} · {documentStatusLabel(document.status, t)}</span>
                 </button>
               ))}
             </div>
@@ -160,13 +160,14 @@ export function TeamCollaboration() {
             aria-label={t('team.notifications')}
           >
             <Bell className="h-4 w-4" />
-            {unreadCount > 0 && <span className="absolute right-0.5 top-0.5 flex h-4 min-w-4 items-center justify-center rounded-full bg-primary px-1 text-[8px] font-semibold text-primary-foreground">{unreadCount}</span>}
+            {unreadCount > 0 && <span className="absolute right-0.5 top-0.5 flex h-4 min-w-4 items-center justify-center rounded-full bg-primary px-1 text-[8px] font-semibold text-primary-foreground">{unreadCount.toLocaleString(locale)}</span>}
           </button>
           <button
             type="button"
             onClick={() => setSurface('settings')}
             className="relative flex h-7 w-7 items-center justify-center rounded-full bg-primary text-[10px] font-semibold text-primary-foreground"
-            title={session.signedIn ? `${session.user.name} · ${presence.filter((item) => item.status !== 'offline').length} online` : 'Sign in'}
+            aria-label={session.signedIn ? t('team.presence.onlineTitle', { name: session.user.name, count: presence.filter((item) => item.status !== 'offline').length.toLocaleString(locale) }) : t('team.signIn')}
+            title={session.signedIn ? t('team.presence.onlineTitle', { name: session.user.name, count: presence.filter((item) => item.status !== 'offline').length.toLocaleString(locale) }) : t('team.signIn')}
           >
             {session.signedIn
               ? session.user.name.split(/\s+/).slice(0, 2).map((part) => part[0]).join('').toUpperCase()
@@ -233,7 +234,7 @@ export function TeamCollaboration() {
                       navCollapsed && 'absolute right-1 top-1',
                     )}
                   >
-                    {badge}
+                    {badge.toLocaleString(locale)}
                   </span>
                 ) : null}
               </button>
@@ -255,14 +256,14 @@ export function TeamCollaboration() {
         >
           {!canUseActiveTeamView && (
             <div className="absolute inset-x-3 top-3 z-40 rounded-md border border-warning/30 bg-popover/95 px-3 py-2 text-[10px] text-warning shadow-lg">
-              This project role is read-only. Shared edits require editor access.
+              {t('team.readOnlyRole')}
             </div>
           )}
-          {teamView === 'dashboard' && platformTeamFactsStatus === 'loading' && <PlatformFactsState loading message="Loading server documents and blueprint…" />}
-          {teamView === 'dashboard' && platformTeamFactsStatus === 'error' && <PlatformFactsState message={platformTeamFactsError ?? 'Server artifacts are unavailable.'} onRetry={artifactWorkspace.refresh} />}
+          {teamView === 'dashboard' && platformTeamFactsStatus === 'loading' && <PlatformFactsState loading message={t('team.loadingDocumentsBlueprint')} />}
+          {teamView === 'dashboard' && platformTeamFactsStatus === 'error' && <PlatformFactsState message={platformTeamFactsError ?? t('team.serverArtifactsUnavailable')} onRetry={artifactWorkspace.refresh} />}
           {teamView === 'dashboard' && !['loading', 'error'].includes(platformTeamFactsStatus) && <TeamDashboard />}
-          {teamView === 'graph' && platformTeamFactsStatus === 'loading' && <PlatformFactsState loading message="Loading the server dependency graph…" />}
-          {teamView === 'graph' && platformTeamFactsStatus === 'error' && <PlatformFactsState message={platformTeamFactsError ?? 'Server artifacts are unavailable.'} onRetry={artifactWorkspace.refresh} />}
+          {teamView === 'graph' && platformTeamFactsStatus === 'loading' && <PlatformFactsState loading message={t('team.loadingDependencyGraph')} />}
+          {teamView === 'graph' && platformTeamFactsStatus === 'error' && <PlatformFactsState message={platformTeamFactsError ?? t('team.serverArtifactsUnavailable')} onRetry={artifactWorkspace.refresh} />}
           {teamView === 'graph' && !['loading', 'error'].includes(platformTeamFactsStatus) && <DocumentGraph />}
           {teamView === 'editor' && <DocumentEditor />}
           {teamView === 'blueprint' && <BlueprintEditor />}
@@ -277,5 +278,42 @@ export function TeamCollaboration() {
 }
 
 function PlatformFactsState({ message, loading, onRetry }: { message: string; loading?: boolean; onRetry?: () => Promise<void> }) {
-  return <div className="flex h-full items-center justify-center bg-canvas p-6"><div className="max-w-md rounded-lg border border-dashed border-border bg-panel p-6 text-center"><p className="text-sm text-muted-foreground">{message}</p>{loading && <p className="mt-2 text-[10px] text-primary-bright">Platform artifact request in progress</p>}{onRetry && <button type="button" onClick={() => void onRetry()} className="mt-4 rounded-md bg-primary px-3 py-2 text-[10px] font-semibold text-primary-foreground">Retry platform artifacts</button>}</div></div>
+  const { t } = useI18n()
+  return <div className="flex h-full items-center justify-center bg-canvas p-6"><div className="max-w-md rounded-lg border border-dashed border-border bg-panel p-6 text-center"><p className="text-sm text-muted-foreground">{message}</p>{loading && <p className="mt-2 text-[10px] text-primary-bright">{t('team.platformRequestInProgress')}</p>}{onRetry && <button type="button" onClick={() => void onRetry()} className="mt-4 rounded-md bg-primary px-3 py-2 text-[10px] font-semibold text-primary-foreground">{t('team.retryPlatformArtifacts')}</button>}</div></div>
+}
+
+type Translate = ReturnType<typeof useI18n>['t']
+
+function projectRoleLabel(role: string, t: Translate) {
+  if (role === 'owner') return t('common.owner')
+  if (role === 'admin') return t('team.role.admin')
+  if (role === 'editor') return t('common.editor')
+  if (role === 'commenter') return t('common.commenter')
+  if (role === 'viewer') return t('common.viewer')
+  return role
+}
+
+function documentTypeLabel(type: string, t: Translate) {
+  const labels: Record<string, string> = {
+    requirement: t('doc.type.requirement'),
+    pageSplit: t('doc.type.pageSplit'),
+    featureList: t('doc.type.featureList'),
+    apiContract: t('doc.type.apiContract'),
+    backendDev: t('doc.type.backendDev'),
+    uiPrototype: t('doc.type.uiPrototype'),
+    frontendDev: t('doc.type.frontendDev'),
+  }
+  return labels[type] ?? type
+}
+
+function documentStatusLabel(status: string, t: Translate) {
+  const labels: Record<string, string> = {
+    draft: t('doc.status.draft'),
+    readyForReview: t('doc.status.readyForReview'),
+    changesRequested: t('doc.status.changesRequested'),
+    approved: t('doc.status.approved'),
+    needsSync: t('doc.status.needsSync'),
+    archived: t('doc.status.archived'),
+  }
+  return labels[status] ?? status
 }

@@ -1,4 +1,7 @@
 import type { GenerationMode } from '@/lib/generation/types'
+import type { MessageKey, MessageValues } from '@/lib/i18n'
+
+type PromptTranslator = (key: MessageKey, values?: MessageValues) => string
 
 export type PromptRunStatus = 'completed' | 'failed' | 'cancelled'
 
@@ -160,6 +163,88 @@ export const SLASH_COMMANDS: SlashCommand[] = [
   },
 ]
 
+export function localizePromptTemplates(
+  templates: PromptTemplate[],
+  t: PromptTranslator,
+): PromptTemplate[] {
+  return templates.map((template) => {
+    if (!template.builtIn) return template
+
+    const prefix =
+      template.id === 'template-landing-page'
+        ? 'composer.template.landing'
+        : template.id === 'template-dashboard'
+          ? 'composer.template.dashboard'
+          : template.id === 'template-accessibility'
+            ? 'composer.template.accessibility'
+            : template.id === 'template-test-repair'
+              ? 'composer.template.quality'
+              : null
+    if (!prefix) return template
+
+    return {
+      ...template,
+      title: t(`${prefix}.title` as MessageKey),
+      description: t(`${prefix}.description` as MessageKey),
+      prompt: t(`${prefix}.prompt` as MessageKey),
+    }
+  })
+}
+
+export function localizePromptWorkflows(
+  workflows: PromptWorkflow[],
+  t: PromptTranslator,
+): PromptWorkflow[] {
+  return workflows.map((workflow) => {
+    if (!workflow.builtIn) return workflow
+    if (workflow.id === 'workflow-production-feature') {
+      const stepKeys = ['plan', 'build', 'verify'] as const
+      return {
+        ...workflow,
+        title: t('composer.workflow.production.title'),
+        description: t('composer.workflow.production.description'),
+        steps: workflow.steps.map((step, index) => ({
+          ...step,
+          title: t(`composer.workflow.production.${stepKeys[index]}.title` as MessageKey),
+          prompt: t(`composer.workflow.production.${stepKeys[index]}.prompt` as MessageKey),
+        })),
+      }
+    }
+    if (workflow.id === 'workflow-accessible-release') {
+      const stepKeys = ['build', 'a11y', 'release'] as const
+      return {
+        ...workflow,
+        title: t('composer.workflow.accessible.title'),
+        description: t('composer.workflow.accessible.description'),
+        steps: workflow.steps.map((step, index) => ({
+          ...step,
+          title: t(`composer.workflow.accessible.${stepKeys[index]}.title` as MessageKey),
+          prompt: t(`composer.workflow.accessible.${stepKeys[index]}.prompt` as MessageKey),
+        })),
+      }
+    }
+    return workflow
+  })
+}
+
+export function localizeSlashCommands(t: PromptTranslator): SlashCommand[] {
+  return SLASH_COMMANDS.map((item) => {
+    const command = item.command.slice(1)
+    const promptKey =
+      command === 'a11y'
+        ? 'composer.template.accessibility.prompt'
+        : command === 'quality'
+          ? 'composer.template.quality.prompt'
+          : `composer.command.${command}.prompt`
+    return {
+      ...item,
+      title: t(`composer.command.${command}.title` as MessageKey),
+      description: t(`composer.command.${command}.description` as MessageKey),
+      prompt: `${t(promptKey as MessageKey)} `,
+    }
+  })
+}
+
 export function redactSensitivePrompt(value: string) {
   return value
     .replace(/\b(?:sk-[a-z0-9_-]{12,}|gh[opusr]_[a-z0-9]{12,})\b/gi, '[REDACTED]')
@@ -197,14 +282,18 @@ export function searchPromptWorkflows(workflows: PromptWorkflow[], query: string
   )
 }
 
-export function workflowPrompt(workflow: PromptWorkflow) {
+export function workflowPrompt(workflow: PromptWorkflow, t?: PromptTranslator) {
   return [
-    `Execute the reusable workflow "${workflow.title}" in order.`,
+    t
+      ? t('composer.workflow.executeInOrder', { title: workflow.title })
+      : `Execute the reusable workflow "${workflow.title}" in order.`,
     ...workflow.steps.map(
       (step, index) =>
         `${index + 1}. ${step.title} [${step.mode}]: ${redactSensitivePrompt(step.prompt)}`,
     ),
-    'Complete every step in this run and report verification evidence.',
+    t
+      ? t('composer.workflow.completeEveryStep')
+      : 'Complete every step in this run and report verification evidence.',
   ].join('\n')
 }
 
@@ -222,10 +311,13 @@ export function searchPromptHistory(
   )
 }
 
-export function suggestSlashCommands(value: string): SlashCommand[] {
+export function suggestSlashCommands(
+  value: string,
+  commands: SlashCommand[] = SLASH_COMMANDS,
+): SlashCommand[] {
   const trimmed = value.trimStart().toLowerCase()
   if (!trimmed.startsWith('/') || trimmed.includes(' ')) return []
-  return SLASH_COMMANDS.filter((item) => item.command.startsWith(trimmed))
+  return commands.filter((item) => item.command.startsWith(trimmed))
 }
 
 export function applySlashCommand(

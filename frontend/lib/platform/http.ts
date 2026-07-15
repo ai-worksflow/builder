@@ -105,19 +105,25 @@ export class PlatformProtocolError extends PlatformClientError {
   }
 }
 
-function configuredBaseUrl() {
-  if (typeof process !== 'undefined') {
-    const value = process.env.NEXT_PUBLIC_PLATFORM_API_URL?.trim()
-    if (value) return value
+export function resolvePlatformBaseUrl(
+  configuredValue?: string,
+  location?: { readonly hostname: string },
+) {
+  const value = configuredValue?.trim()
+  if (value) return value
+  if (location?.hostname === 'localhost' || location?.hostname === '127.0.0.1') {
+    return `http://${location.hostname}:8080`
   }
-  if (
-    typeof window !== 'undefined' &&
-    (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1')
-  ) {
-    return `http://${window.location.hostname}:8080`
-  }
-  if (typeof window !== 'undefined') return window.location.origin
+  if (location) return '/api/platform'
   return 'http://127.0.0.1:8080'
+}
+
+function configuredBaseUrl() {
+  const value = typeof process !== 'undefined'
+    ? process.env.NEXT_PUBLIC_PLATFORM_API_URL
+    : undefined
+  const location = typeof window !== 'undefined' ? window.location : undefined
+  return resolvePlatformBaseUrl(value, location)
 }
 
 class MemoryCsrfTokenStore implements CsrfTokenStore {

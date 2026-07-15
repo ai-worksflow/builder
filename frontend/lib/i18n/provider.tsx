@@ -24,6 +24,9 @@ type I18nContextValue = {
   localeLabels: Record<Locale, string>
   setLocale: (locale: Locale) => void
   t: (key: MessageKey, values?: MessageValues) => string
+  formatDate: (value: Date | string | number, options?: Intl.DateTimeFormatOptions) => string
+  formatNumber: (value: number, options?: Intl.NumberFormatOptions) => string
+  formatList: (values: string[], options?: Intl.ListFormatOptions) => string
 }
 
 const I18nContext = createContext<I18nContextValue | null>(null)
@@ -74,6 +77,33 @@ export function I18nProvider({ children }: { children: React.ReactNode }) {
     [locale],
   )
 
+  const formatDate = useCallback(
+    (value: Date | string | number, options?: Intl.DateTimeFormatOptions) => {
+      const date = value instanceof Date ? value : new Date(value)
+      if (Number.isNaN(date.getTime())) return String(value)
+      return new Intl.DateTimeFormat(locale, options).format(date)
+    },
+    [locale],
+  )
+
+  const formatNumber = useCallback(
+    (value: number, options?: Intl.NumberFormatOptions) =>
+      new Intl.NumberFormat(locale, options).format(value),
+    [locale],
+  )
+
+  const formatList = useCallback(
+    (values: string[], options?: Intl.ListFormatOptions) =>
+      new Intl.ListFormat(locale, options).format(values),
+    [locale],
+  )
+
+  useEffect(() => {
+    document.title = t('meta.title')
+    const description = document.querySelector<HTMLMetaElement>('meta[name="description"]')
+    if (description) description.content = t('meta.description')
+  }, [t])
+
   const value = useMemo<I18nContextValue>(
     () => ({
       locale,
@@ -81,8 +111,11 @@ export function I18nProvider({ children }: { children: React.ReactNode }) {
       localeLabels,
       setLocale,
       t,
+      formatDate,
+      formatNumber,
+      formatList,
     }),
-    [locale, setLocale, t],
+    [formatDate, formatList, formatNumber, locale, setLocale, t],
   )
 
   return <I18nContext.Provider value={value}>{children}</I18nContext.Provider>

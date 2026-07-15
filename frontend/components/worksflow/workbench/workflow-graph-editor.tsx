@@ -16,6 +16,7 @@ import type {
   WorkflowNodeDefinitionDto,
   WorkflowNodeType,
 } from '@/lib/platform/flow-contract'
+import { useI18n } from '@/lib/i18n'
 import {
   appendPairedFanOutSubgraph,
   estimateWorkflowSemanticStates,
@@ -33,19 +34,19 @@ interface WorkflowGraphEditorProps {
   readonly capabilities?: WorkflowCapabilitiesDto | null
 }
 
-const NODE_TYPES: readonly { readonly value: WorkflowNodeType; readonly label: string }[] = [
-  { value: 'artifact_input', label: 'Artifact input' },
-  { value: 'ai_transform', label: 'AI transform' },
-  { value: 'human_edit', label: 'Human edit' },
-  { value: 'review_gate', label: 'Review gate' },
-  { value: 'condition', label: 'Condition' },
-  { value: 'fan_out', label: 'Fan out' },
-  { value: 'merge', label: 'Merge' },
-  { value: 'manifest_compiler', label: 'Manifest compiler' },
-  { value: 'workbench_build', label: 'Workbench build' },
-  { value: 'quality_gate', label: 'Quality gate' },
-  { value: 'publish', label: 'Publish' },
-  { value: 'transform', label: 'Passthrough transform' },
+const NODE_TYPES: readonly WorkflowNodeType[] = [
+  'artifact_input',
+  'ai_transform',
+  'human_edit',
+  'review_gate',
+  'condition',
+  'fan_out',
+  'merge',
+  'manifest_compiler',
+  'workbench_build',
+  'quality_gate',
+  'publish',
+  'transform',
 ]
 
 const NODE_WIDTH = 176
@@ -55,6 +56,7 @@ const ROW_GAP = 34
 const PADDING = 30
 
 export function WorkflowGraphEditor({ value, onChange, capabilities }: WorkflowGraphEditorProps) {
+  const { locale, t } = useI18n()
   const [mode, setMode] = useState<'graph' | 'json'>('graph')
   const [selectedNodeId, setSelectedNodeId] = useState('')
   const [newNodeType, setNewNodeType] = useState<WorkflowNodeType>('ai_transform')
@@ -123,7 +125,7 @@ export function WorkflowGraphEditor({ value, onChange, capabilities }: WorkflowG
       return
     }
     const id = uniqueNodeId(newNodeType.replaceAll('_', '-'), definition.nodes)
-    const node = createNode(id, newNodeType, capabilities)
+    const node = createNode(id, newNodeType, capabilities, t)
     commit({ ...definition, nodes: [...definition.nodes, node] })
     setSelectedNodeId(id)
   }
@@ -144,12 +146,12 @@ export function WorkflowGraphEditor({ value, onChange, capabilities }: WorkflowG
     if (!definition || !selectedNode) return
     try {
       const candidate = JSON.parse(nodeDraft) as unknown
-      const validationError = validateNodeContract(candidate, 'Node')
+      const validationError = validateNodeContract(candidate, t('workflowGraph.node'))
       if (validationError) throw new Error(validationError)
       const nextNode = candidate as WorkflowNodeDefinitionDto
       const nextId = nextNode.id.trim()
       if (definition.nodes.some((node) => node.id === nextId && node.id !== selectedNode.id)) {
-        throw new Error(`Node id ${nextId} already exists.`)
+        throw new Error(t('workflowGraph.error.duplicateNode', { id: nextId }))
       }
       const renamedNodes = definition.nodes.map((node) => {
         if (node.id === selectedNode.id) return nextNode
@@ -172,21 +174,21 @@ export function WorkflowGraphEditor({ value, onChange, capabilities }: WorkflowG
       })
       setSelectedNodeId(nextId)
     } catch (cause) {
-      setLocalError(cause instanceof Error ? cause.message : 'Node JSON is invalid.')
+      setLocalError(cause instanceof Error ? cause.message : t('workflowGraph.error.invalidNode'))
     }
   }
 
   function addEdge() {
     if (!definition || !edgeFrom || !edgeTo) return
     if (edgeFrom === edgeTo) {
-      setLocalError('A node cannot connect to itself.')
+      setLocalError(t('workflowGraph.error.selfConnection'))
       return
     }
     const duplicate = definition.edges.some((edge) =>
       edge.from === edgeFrom && edge.to === edgeTo &&
       (edge.fromPort || 'default') === fromPort && (edge.toPort || 'default') === toPort)
     if (duplicate) {
-      setLocalError('That typed connection already exists.')
+      setLocalError(t('workflowGraph.error.duplicateConnection'))
       return
     }
     const baseId = `${edgeFrom}-${fromPort}-${edgeTo}-${toPort}`
@@ -209,7 +211,7 @@ export function WorkflowGraphEditor({ value, onChange, capabilities }: WorkflowG
           onChange={(event) => onChange(event.target.value)}
           spellCheck={false}
           className="mt-2 h-[52vh] w-full resize-none rounded-lg border border-border bg-background p-3 font-mono text-[11px] leading-relaxed text-muted-foreground outline-none focus:border-primary/60"
-          aria-label="Workflow definition JSON"
+          aria-label={t('workflowGraph.definitionJson')}
         />
         {parsed.error && <p className="mt-2 text-[10px] text-destructive">{parsed.error}</p>}
       </div>
@@ -221,7 +223,7 @@ export function WorkflowGraphEditor({ value, onChange, capabilities }: WorkflowG
       <div>
         <EditorTabs mode={mode} onModeChange={setMode} graphDisabled />
         <div className="mt-2 rounded-lg border border-destructive/30 bg-destructive/10 p-4 text-[11px] text-destructive">
-          {parsed.error}. Open JSON to repair the definition.
+          {parsed.error}. {t('workflowGraph.repairJson')}
         </div>
       </div>
     )
@@ -236,10 +238,17 @@ export function WorkflowGraphEditor({ value, onChange, capabilities }: WorkflowG
         <div className="flex min-h-0 flex-col bg-background">
           <div className="flex flex-wrap items-center gap-1.5 border-b border-border p-2">
             <select value={newNodeType} onChange={(event) => setNewNodeType(event.target.value as WorkflowNodeType)} className="h-8 min-w-40 rounded border border-border bg-panel px-2 text-[10px] text-foreground">
-              {NODE_TYPES.filter((item) => !capabilities || capabilities.nodeTypes.includes(item.value)).map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}
+              {NODE_TYPES.filter((item) => !capabilities || capabilities.nodeTypes.includes(item)).map((item) => (
+                <option key={item} value={item}>{workflowGraphNodeTypeLabel(item, t)}</option>
+              ))}
             </select>
-            <button type="button" onClick={addNode} className="inline-flex h-8 items-center gap-1 rounded bg-primary px-2.5 text-[10px] font-semibold text-primary-foreground"><CirclePlus className="size-3" /> Add node</button>
-            <span className="ml-auto text-[9px] text-faint-foreground">{definition.nodes.length} nodes · {definition.edges.length} edges</span>
+            <button type="button" onClick={addNode} className="inline-flex h-8 items-center gap-1 rounded bg-primary px-2.5 text-[10px] font-semibold text-primary-foreground"><CirclePlus className="size-3" /> {t('workflowGraph.addNode')}</button>
+            <span className="ml-auto text-[9px] text-faint-foreground">
+              {t('workflowGraph.counts', {
+                nodes: definition.nodes.length.toLocaleString(locale),
+                edges: definition.edges.length.toLocaleString(locale),
+              })}
+            </span>
             {semanticStateEstimate && (
               <span
                 className={cn(
@@ -249,19 +258,19 @@ export function WorkflowGraphEditor({ value, onChange, capabilities }: WorkflowG
                     : 'border-border bg-panel text-faint-foreground',
                 )}
                 title={semanticStateEstimate.exceeded
-                  ? 'Reduce independent Condition combinations or merge branches earlier.'
-                  : 'Peak deterministic semantic states estimated before server validation.'}
+                  ? t('workflowGraph.semantic.reduceTitle')
+                  : t('workflowGraph.semantic.estimateTitle')}
               >
-                semantic states {semanticStateEstimate.exceeded ? '>' : ''}{semanticStateEstimate.exceeded
+                {t('workflowGraph.semantic.states')} {semanticStateEstimate.exceeded ? '>' : ''}{(semanticStateEstimate.exceeded
                   ? semanticStateEstimate.maximumStates
-                  : semanticStateEstimate.peakStates}/{semanticStateEstimate.maximumStates}
+                  : semanticStateEstimate.peakStates).toLocaleString(locale)}/{semanticStateEstimate.maximumStates.toLocaleString(locale)}
               </span>
             )}
           </div>
 
           <div className="min-h-[300px] flex-1 overflow-auto scrollbar-thin">
             <div className="relative" style={{ width: layout.width, height: layout.height }}>
-              <svg className="absolute inset-0" width={layout.width} height={layout.height} aria-label="Workflow graph connections">
+              <svg className="absolute inset-0" width={layout.width} height={layout.height} aria-label={t('workflowGraph.connections')}>
                 <defs>
                   <marker id="workflow-arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse">
                     <path d="M 0 0 L 10 5 L 0 10 z" className="fill-primary/70" />
@@ -297,8 +306,12 @@ export function WorkflowGraphEditor({ value, onChange, capabilities }: WorkflowG
                     style={{ left: position.x, top: position.y, width: NODE_WIDTH, height: NODE_HEIGHT }}
                   >
                     <span className="block truncate text-[10px] font-semibold text-foreground">{node.name}</span>
-                    <span className="mt-1 block truncate font-mono text-[8px] text-primary-bright">{node.type}</span>
-                    <span className="mt-1 flex justify-between text-[8px] text-faint-foreground"><span>{incoming} in</span><span>{node.id}</span><span>{outgoing} out</span></span>
+                    <span className="mt-1 block truncate font-mono text-[8px] text-primary-bright">{workflowGraphNodeTypeLabel(node.type, t)}</span>
+                    <span className="mt-1 flex justify-between text-[8px] text-faint-foreground">
+                      <span>{t('workflowGraph.incoming', { count: incoming.toLocaleString(locale) })}</span>
+                      <span>{node.id}</span>
+                      <span>{t('workflowGraph.outgoing', { count: outgoing.toLocaleString(locale) })}</span>
+                    </span>
                   </button>
                 )
               })}
@@ -307,16 +320,16 @@ export function WorkflowGraphEditor({ value, onChange, capabilities }: WorkflowG
 
           <div className="border-t border-border p-2">
             <div className="flex flex-wrap items-end gap-1.5">
-              <NodePortSelect label="From" nodeId={edgeFrom} port={fromPort} nodes={definition.nodes} direction="output" onNodeChange={setEdgeFrom} onPortChange={setFromPort} />
+              <NodePortSelect label={t('workflowGraph.from')} nodeId={edgeFrom} port={fromPort} nodes={definition.nodes} direction="output" onNodeChange={setEdgeFrom} onPortChange={setFromPort} />
               <ArrowRight className="mb-2 size-3.5 text-faint-foreground" />
-              <NodePortSelect label="To" nodeId={edgeTo} port={toPort} nodes={definition.nodes} direction="input" onNodeChange={setEdgeTo} onPortChange={setToPort} />
-              <button type="button" onClick={addEdge} disabled={definition.nodes.length < 2} className="mb-0 inline-flex h-8 items-center gap-1 rounded border border-primary/40 bg-primary/10 px-2 text-[9px] font-medium text-primary-bright disabled:opacity-35"><GitBranch className="size-3" /> Connect</button>
+              <NodePortSelect label={t('workflowGraph.to')} nodeId={edgeTo} port={toPort} nodes={definition.nodes} direction="input" onNodeChange={setEdgeTo} onPortChange={setToPort} />
+              <button type="button" onClick={addEdge} disabled={definition.nodes.length < 2} className="mb-0 inline-flex h-8 items-center gap-1 rounded border border-primary/40 bg-primary/10 px-2 text-[9px] font-medium text-primary-bright disabled:opacity-35"><GitBranch className="size-3" /> {t('workflowGraph.connect')}</button>
             </div>
             <div className="mt-2 flex max-h-20 flex-wrap gap-1 overflow-y-auto scrollbar-thin">
               {definition.edges.map((edge) => (
                 <span key={edge.id} className="inline-flex items-center gap-1 rounded border border-border bg-panel px-1.5 py-1 font-mono text-[8px] text-muted-foreground">
                   {edge.from}:{edge.fromPort || 'default'} → {edge.to}:{edge.toPort || 'default'}
-                  <button type="button" onClick={() => commit({ ...definition, edges: definition.edges.filter((item) => item.id !== edge.id) })} className="text-faint-foreground hover:text-destructive" aria-label={`Delete edge ${edge.id}`}><Trash2 className="size-2.5" /></button>
+                  <button type="button" onClick={() => commit({ ...definition, edges: definition.edges.filter((item) => item.id !== edge.id) })} className="text-faint-foreground hover:text-destructive" aria-label={t('workflowGraph.deleteEdge', { id: edge.id })}><Trash2 className="size-2.5" /></button>
                 </span>
               ))}
             </div>
@@ -328,19 +341,19 @@ export function WorkflowGraphEditor({ value, onChange, capabilities }: WorkflowG
             <>
               <div className="flex items-center gap-2">
                 <Network className="size-3.5 text-primary-bright" />
-                <div className="min-w-0 flex-1"><div className="truncate text-[10px] font-semibold text-foreground">Node contract</div><div className="truncate font-mono text-[8px] text-faint-foreground">{selectedNode.id}</div></div>
-                <button type="button" onClick={() => deleteNode(selectedNode.id)} className="rounded p-1.5 text-faint-foreground hover:bg-destructive/10 hover:text-destructive" aria-label="Delete selected node"><Trash2 className="size-3.5" /></button>
+                <div className="min-w-0 flex-1"><div className="truncate text-[10px] font-semibold text-foreground">{t('workflowGraph.nodeContract')}</div><div className="truncate font-mono text-[8px] text-faint-foreground">{selectedNode.id}</div></div>
+                <button type="button" onClick={() => deleteNode(selectedNode.id)} className="rounded p-1.5 text-faint-foreground hover:bg-destructive/10 hover:text-destructive" aria-label={t('workflowGraph.deleteSelectedNode')}><Trash2 className="size-3.5" /></button>
               </div>
-              <p className="mt-2 text-[9px] leading-relaxed text-faint-foreground">Edit the typed config, schemas, and named ports. Renaming an id updates connected edges.</p>
-              <textarea value={nodeDraft} onChange={(event) => setNodeDraft(event.target.value)} spellCheck={false} className="mt-2 h-[34vh] min-h-56 w-full resize-none rounded border border-border bg-background p-2 font-mono text-[9px] leading-relaxed text-muted-foreground outline-none focus:border-primary/60" aria-label="Selected workflow node JSON" />
-              <button type="button" onClick={applyNodeDraft} className="mt-2 inline-flex h-8 w-full items-center justify-center gap-1 rounded bg-primary px-2 text-[9px] font-semibold text-primary-foreground"><Save className="size-3" /> Apply node contract</button>
+              <p className="mt-2 text-[9px] leading-relaxed text-faint-foreground">{t('workflowGraph.nodeContractCopy')}</p>
+              <textarea value={nodeDraft} onChange={(event) => setNodeDraft(event.target.value)} spellCheck={false} className="mt-2 h-[34vh] min-h-56 w-full resize-none rounded border border-border bg-background p-2 font-mono text-[9px] leading-relaxed text-muted-foreground outline-none focus:border-primary/60" aria-label={t('workflowGraph.selectedNodeJson')} />
+              <button type="button" onClick={applyNodeDraft} className="mt-2 inline-flex h-8 w-full items-center justify-center gap-1 rounded bg-primary px-2 text-[9px] font-semibold text-primary-foreground"><Save className="size-3" /> {t('workflowGraph.applyNodeContract')}</button>
             </>
           ) : (
-            <p className="text-[10px] text-faint-foreground">Add or select a node to edit its typed contract.</p>
+            <p className="text-[10px] text-faint-foreground">{t('workflowGraph.selectNode')}</p>
           )}
           {semanticStateEstimate?.exceeded && (
             <p role="alert" className="mt-2 text-[9px] leading-relaxed text-destructive">
-              This graph exceeds the server&apos;s semantic analysis budget. Reduce independent Condition combinations or merge branches earlier before saving.
+              {t('workflowGraph.semantic.exceeded')}
             </p>
           )}
           {localError && <p role="alert" className="mt-2 text-[9px] leading-relaxed text-destructive">{localError}</p>}
@@ -351,9 +364,10 @@ export function WorkflowGraphEditor({ value, onChange, capabilities }: WorkflowG
 }
 
 function EditorTabs({ mode, graphDisabled, onModeChange }: { readonly mode: 'graph' | 'json'; readonly graphDisabled: boolean; readonly onModeChange: (mode: 'graph' | 'json') => void }) {
+  const { t } = useI18n()
   return (
     <div className="inline-flex rounded-md border border-border bg-background p-0.5">
-      <button type="button" onClick={() => onModeChange('graph')} disabled={graphDisabled} className={cn('inline-flex h-7 items-center gap-1 rounded px-2 text-[9px]', mode === 'graph' ? 'bg-primary/15 text-primary-bright' : 'text-faint-foreground', 'disabled:opacity-35')}><Network className="size-3" /> Graph</button>
+      <button type="button" onClick={() => onModeChange('graph')} disabled={graphDisabled} className={cn('inline-flex h-7 items-center gap-1 rounded px-2 text-[9px]', mode === 'graph' ? 'bg-primary/15 text-primary-bright' : 'text-faint-foreground', 'disabled:opacity-35')}><Network className="size-3" /> {t('workflowGraph.graph')}</button>
       <button type="button" onClick={() => onModeChange('json')} className={cn('inline-flex h-7 items-center gap-1 rounded px-2 text-[9px]', mode === 'json' ? 'bg-primary/15 text-primary-bright' : 'text-faint-foreground')}><Braces className="size-3" /> JSON</button>
     </div>
   )
@@ -377,17 +391,18 @@ function createNode(
   id: string,
   type: WorkflowNodeType,
   capabilities?: WorkflowCapabilitiesDto | null,
+  t?: Translate,
   reciprocalId?: string,
 ): WorkflowNodeDefinitionDto {
   const schema = { type: 'object', additionalProperties: true } as const
-  const base = { id, name: NODE_TYPES.find((item) => item.value === type)?.label ?? type, type, inputSchema: schema, outputSchema: schema }
+  const base = { id, name: t ? workflowGraphNodeTypeLabel(type, t) : type, type, inputSchema: schema, outputSchema: schema }
   switch (type) {
     case 'artifact_input': return { ...base, artifactInput: { allowedTypes: ['document'], allowedKinds: ['project_brief'], requireApproved: true, minimumArtifacts: 1, maximumArtifacts: 1 } }
     case 'ai_transform': {
       const registered = capabilities?.aiTransforms.at(0) ?? { jobType: 'derive_requirements', outputSchemaVersion: 'requirements-proposal/v1', modelPolicies: ['project-default'] }
       return { ...base, aiTransform: { jobType: registered.jobType, outputSchemaVersion: registered.outputSchemaVersion, modelPolicy: registered.modelPolicies.at(0) ?? 'project-default', maxAttempts: 2, timeout: 120_000_000_000 } }
     }
-    case 'human_edit': return { ...base, humanEdit: { artifactType: 'document', artifactKind: 'product_requirements', requiredRole: 'editor', instructions: 'Submit an exact immutable revision.' } }
+    case 'human_edit': return { ...base, humanEdit: { artifactType: 'document', artifactKind: 'product_requirements', requiredRole: 'editor', instructions: t?.('workflowGraph.defaultHumanEditInstructions') ?? 'Submit an exact immutable revision.' } }
     case 'review_gate': return { ...base, reviewGate: { requiredRole: 'admin', minimumApprovals: 1, prohibitSelfReview: true, allowWaiver: false } }
     case 'condition': return { ...base, outputPorts: { yes: { schema }, otherwise: { schema } }, condition: { branches: [{ name: 'yes', expression: 'true', default: false }, { name: 'otherwise', default: true }] } }
     case 'fan_out': {
@@ -401,6 +416,25 @@ function createNode(
     case 'quality_gate': return { ...base, qualityGate: { gateName: capabilities?.qualityGates.at(0) ?? 'release', blocking: true } }
     case 'publish': return { ...base, publish: { environment: capabilities?.publishEnvironments.at(0) ?? 'preview', requiredRole: 'admin', allowRollback: true } }
     case 'transform': return { ...base, transform: { transform: capabilities?.transforms.at(0) ?? 'selection_passthrough' } }
+  }
+}
+
+type Translate = ReturnType<typeof useI18n>['t']
+
+function workflowGraphNodeTypeLabel(type: WorkflowNodeType, t: Translate) {
+  switch (type) {
+    case 'artifact_input': return t('flow.nodeType.artifactInput')
+    case 'ai_transform': return t('flow.nodeType.aiTransform')
+    case 'human_edit': return t('flow.nodeType.humanEdit')
+    case 'review_gate': return t('flow.nodeType.reviewGate')
+    case 'condition': return t('flow.nodeType.condition')
+    case 'fan_out': return t('flow.nodeType.fanOut')
+    case 'merge': return t('flow.nodeType.merge')
+    case 'manifest_compiler': return t('flow.nodeType.manifestCompiler')
+    case 'workbench_build': return t('flow.nodeType.workbenchBuild')
+    case 'quality_gate': return t('flow.nodeType.qualityGate')
+    case 'publish': return t('flow.nodeType.publish')
+    case 'transform': return t('flow.nodeType.transform')
   }
 }
 

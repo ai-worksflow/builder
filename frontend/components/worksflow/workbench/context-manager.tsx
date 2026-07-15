@@ -9,6 +9,9 @@ import {
   attachmentSetIssue,
   attachmentSummary,
   isSafeContextUrl,
+  MAX_COMPOSER_ATTACHMENT_COUNT,
+  MAX_TEXT_ATTACHMENT_BYTES,
+  MAX_TOTAL_TEXT_ATTACHMENT_BYTES,
   type ComposerAttachment,
   type ComposerContextSource,
 } from '@/lib/worksflow/composer-context'
@@ -62,7 +65,7 @@ export function ContextManager({
         const attachment = await attachmentFromFile(file)
         const issue = attachmentSetIssue(nextAttachments, attachment)
         if (issue) {
-          setError(issue)
+          setError(localizeAttachmentIssue(issue, t))
           break
         }
         onAdd(attachment)
@@ -92,7 +95,7 @@ export function ContextManager({
     }
     const issue = attachmentSetIssue(attachments, attachment)
     if (issue) {
-      setError(issue)
+      setError(localizeAttachmentIssue(issue, t))
       return
     }
     onAdd(attachment)
@@ -112,7 +115,7 @@ export function ContextManager({
     }
     const issue = attachmentSetIssue(attachments, attachment)
     if (issue) {
-      setError(issue)
+      setError(localizeAttachmentIssue(issue, t))
       return
     }
     onAdd(attachment)
@@ -255,7 +258,7 @@ export function ContextManager({
         <span
           key={attachment.id}
           className={cn('flex max-w-[170px] items-center gap-1 rounded-md border border-primary/25 bg-primary/10 px-2 py-1 text-[10px] text-primary-bright', attachment.included === false && 'opacity-55')}
-          title={`${attachment.name} · ${attachmentSummary(attachment)} · ${attachment.included === false ? 'excluded' : 'included'}`}
+          title={`${attachment.name} · ${localizedAttachmentSummary(attachment, t)} · ${t(attachment.included === false ? 'composer.context.excluded' : 'composer.context.included')}`}
         >
           {attachment.kind === 'image' ? <ImageIcon className="h-3 w-3 shrink-0" /> : attachment.kind === 'url' ? <Globe2 className="h-3 w-3 shrink-0" /> : attachment.kind === 'document' ? <Link2 className="h-3 w-3 shrink-0" /> : <FileText className="h-3 w-3 shrink-0" />}
           <span className={cn('truncate', attachment.included === false && 'line-through')}>{attachment.name}</span>
@@ -263,7 +266,7 @@ export function ContextManager({
             type="button"
             onClick={() => onToggle(attachment.id)}
             className="shrink-0 rounded hover:bg-white/10"
-            aria-label={`${attachment.included === false ? 'Include' : 'Exclude'} ${attachment.name}`}
+            aria-label={t(attachment.included === false ? 'composer.context.include' : 'composer.context.exclude', { name: attachment.name })}
             aria-pressed={attachment.included !== false}
           >
             {attachment.included === false ? <EyeOff className="h-3 w-3" /> : <Eye className="h-3 w-3" />}
@@ -280,6 +283,28 @@ export function ContextManager({
       ))}
     </div>
   )
+}
+
+function localizeAttachmentIssue(issue: string, t: ReturnType<typeof useI18n>['t']) {
+  if (issue.startsWith('You can include at most')) {
+    return t('composer.context.tooMany', { count: MAX_COMPOSER_ATTACHMENT_COUNT })
+  }
+  if (issue.startsWith('Combined text context')) {
+    return t('composer.context.combinedTooLarge', { size: MAX_TOTAL_TEXT_ATTACHMENT_BYTES / 1024 })
+  }
+  if (issue.startsWith('Text context')) {
+    return t('composer.context.textTooLarge', { size: MAX_TEXT_ATTACHMENT_BYTES / 1024 })
+  }
+  return issue
+}
+
+function localizedAttachmentSummary(
+  attachment: ComposerAttachment,
+  t: ReturnType<typeof useI18n>['t'],
+) {
+  const summary = attachmentSummary(attachment)
+  if (attachment.kind === 'url' || typeof attachment.size === 'number') return summary
+  return t(`composer.context.kind.${attachment.kind}`)
 }
 
 function ContextTabButton({

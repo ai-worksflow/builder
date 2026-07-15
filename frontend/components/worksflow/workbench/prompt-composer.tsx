@@ -8,12 +8,14 @@ import { listGenerationModels } from '@/lib/generation/client'
 import { attachmentId, type ComposerAttachment } from '@/lib/worksflow/composer-context'
 import {
   applySlashCommand,
+  localizeSlashCommands,
   suggestSlashCommands,
   type SlashCommand,
 } from '@/lib/worksflow/prompt-library'
 import { ContextManager } from './context-manager'
 import { PromptLibraryMenu } from './prompt-library-menu'
 import { useCollaboration } from '@/lib/collaboration/provider'
+import { useLocalizedLabels } from '../use-localized-labels'
 import { ArrowUp, AtSign, ChevronDown, Command, Sparkles, Square, Workflow } from 'lucide-react'
 
 type ComposerSuggestion =
@@ -61,6 +63,7 @@ export function PromptComposer() {
     deletePromptWorkflow,
   } = useWorksflow()
   const { t } = useI18n()
+  const labels = useLocalizedLabels()
   const [value, setValue] = useState('')
   const [activeSuggestion, setActiveSuggestion] = useState(0)
   const [dismissedValue, setDismissedValue] = useState<string | null>(null)
@@ -84,12 +87,12 @@ export function PromptComposer() {
       })
       .catch((cause) => {
         if (!active) return
-        setModelListError(cause instanceof Error ? cause.message : 'Unable to load approved models.')
+        setModelListError(cause instanceof Error ? cause.message : t('composer.modelsLoadFailed'))
       })
     return () => {
       active = false
     }
-  }, [canViewProject, generationModel, selectedProductProjectId, setGenerationModel])
+  }, [canViewProject, generationModel, selectedProductProjectId, setGenerationModel, t])
 
   const placeholder =
     phase === 'planning'
@@ -97,7 +100,7 @@ export function PromptComposer() {
       : t('composer.placeholder.default')
 
   const suggestions = useMemo<ComposerSuggestion[]>(() => {
-    const commands = suggestSlashCommands(value)
+    const commands = suggestSlashCommands(value, localizeSlashCommands(t))
     if (commands.length > 0) {
       return commands.map((command) => ({ id: command.command, kind: 'command', command }))
     }
@@ -131,7 +134,7 @@ export function PromptComposer() {
           ].join('\n\n'),
           sourceId: document.id,
         },
-        description: document.status,
+        description: labels.docStatus(document.status),
       })),
     ]
     return sources
@@ -145,7 +148,7 @@ export function PromptComposer() {
         ),
       )
       .slice(0, 7)
-  }, [attachments, documents, value, workspace.files])
+  }, [attachments, documents, labels, t, value, workspace.files])
 
   const suggestionsVisible = suggestions.length > 0 && dismissedValue !== value
 

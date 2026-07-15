@@ -7,6 +7,7 @@ import {
   createEmptyPageSpecContent,
   createEmptyPrototypeContent,
   documentReviewIssues,
+  normalizeDocumentContent,
   replaceArtifactWorkspaceSnapshotResource,
   reviewGateReadyForRequest,
   type ArtifactWorkspaceSnapshot,
@@ -246,7 +247,10 @@ test('workspace trace loading paginates within the platform limit', async () => 
   const snapshot = await new ArtifactWorkspaceGateway(client).load('project-1')
   assert.equal(snapshot.traces.length, 500)
   assert.equal(snapshot.traces[499]?.id, 'trace-499')
-  assert.deepEqual(traceUrls.map((url) => url.searchParams.get('limit')), ['200', '200', '100'])
+  assert.deepEqual(
+    traceUrls.map((url) => url.searchParams.get('limit')),
+    ['200', '200', '100'],
+  )
   assert.deepEqual(
     traceUrls.map((url) => url.searchParams.get('cursor')),
     [null, 'trace-page-2', 'trace-page-3'],
@@ -277,7 +281,10 @@ test('workspace proposal loading follows every pagination cursor', async () => {
   const snapshot = await new ArtifactWorkspaceGateway(client).load('project-1')
   assert.equal(snapshot.proposals.length, 201)
   assert.equal(snapshot.proposals[200]?.id, 'proposal-200')
-  assert.deepEqual(proposalUrls.map((url) => url.searchParams.get('limit')), ['200', '200'])
+  assert.deepEqual(
+    proposalUrls.map((url) => url.searchParams.get('limit')),
+    ['200', '200'],
+  )
   assert.deepEqual(
     proposalUrls.map((url) => url.searchParams.get('cursor')),
     [null, 'proposal-page-2'],
@@ -960,6 +967,77 @@ test('requirements review gate enforces Must-to-AC and source-block integrity', 
   }), [
     'Every requirement acceptance reference must resolve to an existing criterion.',
     'Every requirement must trace to at least one existing source block.',
+  ])
+})
+
+test('incomplete Product Requirements are normalized only for rendering and validation', () => {
+  const initialPayload = {
+    blocks: [],
+    kind: 'productRequirements',
+    schemaVersion: 1,
+  }
+  const initialSnapshot = structuredClone(initialPayload)
+  const normalizedInitial = normalizeDocumentContent(initialPayload as unknown as DocumentContentDto)
+
+  assert.deepEqual(initialPayload, initialSnapshot)
+  assert.equal(normalizedInitial.summary, '')
+  assert.deepEqual(normalizedInitial.requirements, [])
+  assert.deepEqual(normalizedInitial.acceptanceCriteria, [])
+  assert.deepEqual(normalizedInitial.openQuestions, [])
+  assert.deepEqual(normalizedInitial.assumptions, [])
+  assert.deepEqual(documentReviewIssues(initialPayload as unknown as DocumentContentDto), [
+    'Summary is required.',
+    'At least one structured block is required.',
+    'At least one requirement is required.',
+  ])
+
+  const appliedPayload = {
+    blocks: [{ id: 'source-brief', type: 'sourceContext', text: 'Reviewed Project Brief.' }],
+    kind: 'productRequirements',
+    schemaVersion: 1,
+    summary: 'Preserve the approved workflow lineage.',
+    requirements: [{
+      id: 'REQ-001',
+      statement: 'Preserve the exact Proposal and Revision lineage.',
+      priority: 'Must',
+      acceptanceCriterionIds: ['AC-001'],
+      sourceBlockIds: ['source-brief'],
+    }],
+    acceptanceCriteria: [{
+      id: 'AC-001',
+      statement: 'Every gate references the exact immutable Revision.',
+    }],
+  }
+  const appliedSnapshot = structuredClone(appliedPayload)
+  const normalizedApplied = normalizeDocumentContent(appliedPayload as unknown as DocumentContentDto)
+
+  assert.deepEqual(appliedPayload, appliedSnapshot)
+  assert.equal(normalizedApplied.blocks[0]?.type, 'sourceContext')
+  assert.equal(normalizedApplied.requirements?.[0]?.title, '')
+  assert.equal(normalizedApplied.requirements?.[0]?.priority, 'must')
+  assert.equal(normalizedApplied.acceptanceCriteria[0]?.priority, 'must')
+  assert.equal(normalizedApplied.acceptanceCriteria[0]?.status, 'open')
+  assert.deepEqual(normalizedApplied.openQuestions, [])
+  assert.deepEqual(normalizedApplied.assumptions, [])
+  assert.deepEqual(documentReviewIssues(appliedPayload as unknown as DocumentContentDto), [])
+})
+
+test('case-insensitive Must priority still enforces acceptance coverage', () => {
+  const content = {
+    blocks: [{ id: 'source-brief', type: 'sourceContext', text: 'Reviewed Project Brief.' }],
+    kind: 'productRequirements',
+    summary: 'Define a stable requirement.',
+    requirements: [{
+      id: 'REQ-001',
+      statement: 'Preserve exact lineage.',
+      priority: 'MUST',
+      sourceBlockIds: ['source-brief'],
+    }],
+    acceptanceCriteria: [],
+  }
+
+  assert.deepEqual(documentReviewIssues(content as unknown as DocumentContentDto), [
+    'Every Must requirement needs at least one acceptance criterion.',
   ])
 })
 

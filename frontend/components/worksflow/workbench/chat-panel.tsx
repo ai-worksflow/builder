@@ -4,14 +4,6 @@ import { useState } from 'react'
 import { cn } from '@/lib/utils'
 import { useI18n } from '@/lib/i18n'
 import { useWorksflow } from '@/lib/worksflow/store'
-import {
-  BUILD_SUMMARY,
-  PLAN_GROUPS,
-  PLAN_SUMMARY,
-  PLAN_TITLE,
-  USER_PROMPT,
-  WHAT_WAS_BUILT,
-} from '@/lib/worksflow/mock-data'
 import { PromptComposer } from './prompt-composer'
 import {
   BlueprintContextCard,
@@ -164,7 +156,7 @@ export function ChatPanel() {
 
 function FollowUpList() {
   const { followUps } = useWorksflow()
-  const { t } = useI18n()
+  const { formatDate, t } = useI18n()
   return (
     <div className="space-y-2 rounded-lg border border-border bg-card p-3">
       <div className="text-[12px] font-medium text-foreground">{t('chat.currentIterationQueue')}</div>
@@ -174,7 +166,7 @@ function FollowUpList() {
             <span className="text-[11px] font-medium text-primary-bright">
               {item.mode === 'plan' ? t('chat.planFirst') : t('chat.buildDirectly')}
             </span>
-            <span className="text-[10px] text-faint-foreground">{item.createdAt}</span>
+            <span className="text-[10px] text-faint-foreground">{formatDate(item.createdAt, { timeStyle: 'short' })}</span>
           </div>
           <p className="mt-1 text-[12px] leading-relaxed text-muted-foreground">{item.text}</p>
         </div>
@@ -184,10 +176,11 @@ function FollowUpList() {
 }
 
 function UserPrompt() {
+  const { t } = useI18n()
   return (
     <div className="flex justify-end">
       <div className="max-w-[85%] rounded-lg rounded-tr-sm bg-secondary px-3.5 py-2.5 text-[13px] leading-relaxed text-foreground">
-        {USER_PROMPT}
+        {t('chat.demo.userPrompt')}
       </div>
     </div>
   )
@@ -211,8 +204,7 @@ function PlanningState() {
   return (
     <div className="space-y-3">
       <p className="text-[13px] leading-relaxed text-muted-foreground">
-        I&apos;ll start by reading the current project files to understand the setup before
-        creating a plan.
+        {t('chat.demo.planningIntro')}
       </p>
       <div className="flex items-center gap-2 rounded-md border border-border bg-card px-3 py-2 text-[12px] text-muted-foreground">
         <FileSearch className="h-4 w-4 text-primary-bright" />
@@ -247,7 +239,7 @@ function PlanBlock() {
       </div>
 
       <h3 className="text-[15px] font-semibold text-foreground text-balance">
-        {generationPlan?.title ?? PLAN_TITLE}
+        {generationPlan?.title ?? t('chat.demo.planTitle')}
       </h3>
 
       <ol className="space-y-3">
@@ -256,7 +248,7 @@ function PlanBlock() {
               title: task.title,
               items: [task.description],
             }))
-          : PLAN_GROUPS
+          : demoPlanGroups(t)
         ).map((group, i) => (
           <li key={group.title}>
             <div className="flex items-center gap-2">
@@ -280,7 +272,7 @@ function PlanBlock() {
       </ol>
 
       <p className="text-[12px] leading-relaxed text-muted-foreground">
-        {generationPlan?.summary ?? PLAN_SUMMARY}
+        {generationPlan?.summary ?? t('chat.demo.planSummary')}
       </p>
       <ResponseActions />
     </div>
@@ -310,18 +302,18 @@ function BuildBlock() {
     generationLimits,
     retryGeneration,
   } = useWorksflow()
-  const { t } = useI18n()
+  const { formatNumber, t } = useI18n()
   return (
     <div className="space-y-3">
       <div className="flex justify-end">
         <div className="max-w-[85%] rounded-lg rounded-tr-sm bg-secondary px-3.5 py-2.5 text-[13px] leading-relaxed text-foreground">
-          Perfect, you can start implementing this plan!
+          {t('chat.demo.startImplementation')}
         </div>
       </div>
 
       <AssistantHeader />
       <p className="text-[13px] leading-relaxed text-muted-foreground">
-        I&apos;ll implement the plan now. Let me set up task tracking and start building.
+        {t('chat.demo.buildIntro')}
       </p>
 
       <div className="rounded-lg border border-border bg-card p-3">
@@ -372,16 +364,16 @@ function BuildBlock() {
         <div className="grid grid-cols-3 gap-1.5 sm:grid-cols-6">
           {[
             [t('chat.runProvider'), generationProvider ?? '—'],
-            [t('chat.runModel'), generationProvider === 'local' ? 'Local' : generationModel],
+            [t('chat.runModel'), generationProvider === 'local' ? t('chat.localProvider') : generationModel],
             [
               t('chat.runTokens'),
               generationUsage
-                ? `${generationUsage.totalTokens.toLocaleString()}${generationUsage.estimated ? '~' : ''}`
+                ? `${formatNumber(generationUsage.totalTokens)}${generationUsage.estimated ? '~' : ''}`
                 : '—',
             ],
             [
               t('chat.runDuration'),
-              generationDurationMs ? `${(generationDurationMs / 1000).toFixed(1)}s` : '—',
+              generationDurationMs ? t('chat.seconds', { count: formatNumber(generationDurationMs / 1000, { maximumFractionDigits: 1 }) }) : '—',
             ],
             [
               t('chat.runCost'),
@@ -392,7 +384,7 @@ function BuildBlock() {
             [
               t('chat.runLimit'),
               generationLimits?.maxTotalTokens
-                ? generationLimits.maxTotalTokens.toLocaleString()
+                ? formatNumber(generationLimits.maxTotalTokens)
                 : t('chat.notConfigured'),
             ],
           ].map(([label, value]) => (
@@ -416,7 +408,7 @@ function BuildBlock() {
           <p className="mt-1 text-[10px] leading-relaxed text-muted-foreground">
             {generationErrorAction ?? generationRecoveryHint(generationErrorCode, generationErrorStatus, t)}
             {generationErrorRetryAfterSeconds !== undefined
-              ? ` Retry after about ${generationErrorRetryAfterSeconds} seconds.`
+              ? ` ${t('chat.retryAfter', { seconds: generationErrorRetryAfterSeconds })}`
               : ''}
           </p>
           {generationErrorRetryable && (
@@ -436,12 +428,12 @@ function BuildBlock() {
       {phase === 'complete' && (
         <div className="space-y-3">
           <p className="text-[13px] leading-relaxed text-foreground">
-            {generationSummary || BUILD_SUMMARY}
+            {generationSummary || t('chat.demo.buildSummary')}
           </p>
           <div>
             <p className="mb-1.5 text-[12px] font-medium text-foreground">{t('chat.whatWasBuilt')}</p>
             <ul className="space-y-1">
-              {(generationPlan?.tasks.map((task) => task.title) ?? WHAT_WAS_BUILT).map((item) => (
+              {(generationPlan?.tasks.map((task) => task.title) ?? demoBuiltItems(t)).map((item) => (
                 <li key={item} className="flex items-center gap-2 text-[12px] text-muted-foreground">
                   <Check className="h-3.5 w-3.5 text-success" />
                   {item}
@@ -457,6 +449,45 @@ function BuildBlock() {
       )}
     </div>
   )
+}
+
+function demoPlanGroups(t: ReturnType<typeof useI18n>['t']) {
+  return [
+    {
+      title: t('chat.demo.plan.1.title'),
+      items: [
+        t('chat.demo.plan.1.item1'),
+        t('chat.demo.plan.1.item2'),
+        t('chat.demo.plan.1.item3'),
+      ],
+    },
+    {
+      title: t('chat.demo.plan.2.title'),
+      items: [t('chat.demo.plan.2.item1'), t('chat.demo.plan.2.item2')],
+    },
+    {
+      title: t('chat.demo.plan.3.title'),
+      items: [t('chat.demo.plan.3.item1'), t('chat.demo.plan.3.item2')],
+    },
+    {
+      title: t('chat.demo.plan.4.title'),
+      items: [t('chat.demo.plan.4.item1'), t('chat.demo.plan.4.item2')],
+    },
+    {
+      title: t('chat.demo.plan.5.title'),
+      items: [t('chat.demo.plan.5.item1'), t('chat.demo.plan.5.item2')],
+    },
+  ]
+}
+
+function demoBuiltItems(t: ReturnType<typeof useI18n>['t']) {
+  return [
+    t('chat.demo.built.topNav'),
+    t('chat.demo.built.taskInput'),
+    t('chat.demo.built.taskList'),
+    t('chat.demo.built.filters'),
+    t('chat.demo.built.emptyStates'),
+  ]
 }
 
 function generationRecoveryHint(

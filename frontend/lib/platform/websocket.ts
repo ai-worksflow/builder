@@ -264,11 +264,23 @@ function configuredUrl() {
       'platform_websocket_url_required',
     )
   }
-  if (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1') {
-    return `ws://${window.location.hostname}:8080/v1/ws`
+  return '/api/platform/v1/ws'
+}
+
+export function resolveWebSocketUrl(
+  value: string,
+  location?: { readonly protocol: string; readonly host: string },
+) {
+  if (!value.startsWith('/')) return value
+  const browserLocation = location ?? (typeof window !== 'undefined' ? window.location : undefined)
+  if (!browserLocation) {
+    throw new PlatformWebSocketError(
+      'A relative WebSocket URL requires a browser location.',
+      'platform_websocket_url_required',
+    )
   }
-  const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-  return `${protocol}//${window.location.host}/v1/ws`
+  const protocol = browserLocation.protocol === 'https:' ? 'wss:' : 'ws:'
+  return protocol + '//' + browserLocation.host + value
 }
 
 function defaultFactory(url: string, protocols?: string | string[]) {
@@ -595,7 +607,7 @@ export class PlatformWebSocketClient {
 
   private openSocket(reconnecting: boolean) {
     this.clearReconnect()
-    const url = this.options.url?.trim() || configuredUrl()
+    const url = resolveWebSocketUrl(this.options.url?.trim() || configuredUrl())
     this.transition(reconnecting ? 'reconnecting' : 'connecting')
 
     let socket: WebSocketLike

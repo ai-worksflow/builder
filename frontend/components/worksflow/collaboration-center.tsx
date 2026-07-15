@@ -1,17 +1,19 @@
 'use client'
 
-import { useMemo, useState, type FormEvent } from 'react'
+import { useEffect, useMemo, useState, type FormEvent } from 'react'
 import { useCollaboration } from '@/lib/collaboration/provider'
 import type {
   CollaborationVersionRef,
   ProjectRole,
   ReviewDecision,
 } from '@/lib/collaboration/types'
-import { reviewCandidatesForGovernance } from '@/lib/worksflow/project-governance'
 import { cn } from '@/lib/utils'
+import { useI18n } from '@/lib/i18n'
+import { reviewCandidatesForGovernance } from '@/lib/worksflow/project-governance'
 import {
   Bell,
   CheckCircle2,
+  CircleAlert,
   Clock3,
   Loader2,
   LogIn,
@@ -36,6 +38,7 @@ export function CollaborationCenter() {
 }
 
 function AuthenticationPanel() {
+  const { t } = useI18n()
   const {
     loading,
     backendStatus,
@@ -57,7 +60,7 @@ function AuthenticationPanel() {
     email,
     password,
     confirmation,
-  }), [confirmation, email, mode, name, password])
+  }, t), [confirmation, email, mode, name, password, t])
 
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
@@ -79,9 +82,9 @@ function AuthenticationPanel() {
           <ShieldCheck className="size-4" />
         </span>
         <span className="min-w-0 flex-1">
-          <span className="block text-sm font-semibold text-foreground">Identity and collaboration</span>
+          <span className="block text-sm font-semibold text-foreground">{t('collab.auth.title')}</span>
           <span className="mt-1 block text-[11px] leading-relaxed text-faint-foreground">
-            Sign in to the shared platform backend. Projects, membership and reviews are never restored from browser storage.
+            {t('collab.auth.description')}
           </span>
         </span>
         <BackendBadge status={backendStatus} />
@@ -89,8 +92,8 @@ function AuthenticationPanel() {
 
       <div className="mt-4 grid grid-cols-2 rounded-md border border-border bg-background p-1">
         {([
-          ['signIn', 'Sign in'],
-          ['signUp', 'Create account'],
+          ['signIn', t('collab.auth.signIn')],
+          ['signUp', t('collab.auth.createAccount')],
         ] as const).map(([id, label]) => (
           <button
             key={id}
@@ -112,7 +115,7 @@ function AuthenticationPanel() {
       <form className="mt-4 space-y-3" onSubmit={submit} noValidate>
         {mode === 'signUp' && (
           <AuthField
-            label="Display name"
+            label={t('collab.auth.displayName')}
             value={name}
             onChange={setName}
             autoComplete="name"
@@ -120,7 +123,7 @@ function AuthenticationPanel() {
           />
         )}
         <AuthField
-          label="Email"
+          label={t('collab.auth.email')}
           value={email}
           onChange={setEmail}
           type="email"
@@ -128,17 +131,17 @@ function AuthenticationPanel() {
           error={submitted ? validation.email : undefined}
         />
         <AuthField
-          label="Password"
+          label={t('collab.auth.password')}
           value={password}
           onChange={setPassword}
           type="password"
           autoComplete={mode === 'signIn' ? 'current-password' : 'new-password'}
-          hint={mode === 'signUp' ? 'Use at least 10 characters.' : undefined}
+          hint={mode === 'signUp' ? t('collab.auth.passwordHint') : undefined}
           error={submitted ? validation.password : undefined}
         />
         {mode === 'signUp' && (
           <AuthField
-            label="Confirm password"
+            label={t('collab.auth.confirmPassword')}
             value={confirmation}
             onChange={setConfirmation}
             type="password"
@@ -153,7 +156,7 @@ function AuthenticationPanel() {
           className="inline-flex w-full items-center justify-center gap-1.5 rounded-md bg-primary px-3 py-2.5 text-[11px] font-semibold text-primary-foreground hover:bg-primary-bright disabled:cursor-wait disabled:opacity-60"
         >
           {loading ? <Loader2 className="size-3.5 animate-spin" /> : mode === 'signIn' ? <LogIn className="size-3.5" /> : <UserPlus className="size-3.5" />}
-          {loading ? 'Contacting platform…' : mode === 'signIn' ? 'Sign in' : 'Create account'}
+          {loading ? t('collab.auth.contacting') : mode === 'signIn' ? t('collab.auth.signIn') : t('collab.auth.createAccount')}
         </button>
       </form>
 
@@ -168,7 +171,7 @@ function AuthenticationPanel() {
               className="mt-2 inline-flex items-center gap-1 rounded border border-border bg-background px-2 py-1 text-[10px] text-foreground disabled:opacity-50"
             >
               <RefreshCw className={cn('size-3', loading && 'animate-spin')} />
-              Retry backend connection
+              {t('collab.auth.retryBackend')}
             </button>
           )}
         </div>
@@ -178,6 +181,7 @@ function AuthenticationPanel() {
 }
 
 function SignedInCollaboration() {
+  const { locale, t } = useI18n()
   const {
     loading,
     backendStatus,
@@ -218,19 +222,23 @@ function SignedInCollaboration() {
   const [reviewSummary, setReviewSummary] = useState('')
   const [reviewTargetId, setReviewTargetId] = useState('')
 
+  useEffect(() => {
+    if (project?.role !== 'owner' && memberRole === 'owner') setMemberRole('viewer')
+  }, [memberRole, project?.role])
+
   if (!session.signedIn) return null
-  const selectedReviewTarget = reviewTargets.find((target) => target.revisionId === reviewTargetId)
-    ?? reviewTargets[0]
-  const selectedCommentTarget = reviewTargets.find((target) => target.revisionId === commentTargetId)
-    ?? reviewTargets[0]
-  const reviewCandidates = reviewCandidatesForGovernance(
+  const reviewerCandidates = reviewCandidatesForGovernance(
     members,
     session.user.id,
     project?.governanceMode ?? 'team',
   )
   const effectiveReviewerId = project?.governanceMode === 'solo'
-    ? reviewCandidates[0]?.user.id ?? ''
+    ? reviewerCandidates[0]?.user.id ?? ''
     : reviewerId
+  const selectedReviewTarget = reviewTargets.find((target) => target.revisionId === reviewTargetId)
+    ?? reviewTargets[0]
+  const selectedCommentTarget = reviewTargets.find((target) => target.revisionId === commentTargetId)
+    ?? reviewTargets[0]
 
   async function submitProject(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
@@ -253,42 +261,42 @@ function SignedInCollaboration() {
         <BackendBadge status={backendStatus} />
         <span className="flex items-center gap-1 text-[10px] text-success">
           <span className="size-2 rounded-full bg-success" />
-          {presence.filter((item) => item.status !== 'offline').length} online
+          {t('collab.onlineCount', { count: formatNumber(presence.filter((item) => item.status !== 'offline').length, locale) })}
         </span>
-        <button type="button" onClick={() => void refresh()} disabled={loading} className="rounded-md border border-border p-1.5 text-muted-foreground hover:bg-white/5 hover:text-foreground disabled:opacity-50" aria-label="Refresh collaboration">
+        <button type="button" onClick={() => void refresh()} disabled={loading} className="rounded-md border border-border p-1.5 text-muted-foreground hover:bg-white/5 hover:text-foreground disabled:opacity-50" aria-label={t('collab.refresh')}>
           <RefreshCw className={cn('size-3.5', loading && 'animate-spin')} />
         </button>
-        <button type="button" onClick={() => void signOut()} disabled={loading} className="rounded-md border border-border p-1.5 text-muted-foreground hover:bg-white/5 hover:text-foreground disabled:opacity-50" aria-label="Sign out">
+        <button type="button" onClick={() => void signOut()} disabled={loading} className="rounded-md border border-border p-1.5 text-muted-foreground hover:bg-white/5 hover:text-foreground disabled:opacity-50" aria-label={t('collab.auth.signOut')}>
           <LogOut className="size-3.5" />
         </button>
       </header>
 
       <div className="grid gap-3 border-b border-border bg-background/40 p-4 md:grid-cols-[minmax(0,1fr)_minmax(260px,0.7fr)]">
         <label className="text-[10px] font-medium text-muted-foreground">
-          Shared project
+          {t('collab.project.shared')}
           <select
             value={project?.id ?? ''}
             onChange={(event) => void selectProject(event.target.value)}
             disabled={loading || projects.length === 0}
             className="mt-1.5 h-9 w-full rounded-md border border-border bg-background px-2 text-[11px] text-foreground outline-none focus:border-primary/60 disabled:opacity-50"
           >
-            {projects.length === 0 && <option value="">No server projects</option>}
-            {projects.map((item) => <option key={item.id} value={item.id}>{item.name} · {item.role}</option>)}
+            {projects.length === 0 && <option value="">{t('collab.project.none')}</option>}
+            {projects.map((item) => <option key={item.id} value={item.id}>{item.name} · {projectRoleLabel(item.role, t)}</option>)}
           </select>
         </label>
         <form onSubmit={submitProject} className="flex items-end gap-2">
           <label className="min-w-0 flex-1 text-[10px] font-medium text-muted-foreground">
-            New project
+            {t('collab.project.new')}
             <input
               value={newProjectName}
               onChange={(event) => setNewProjectName(event.target.value)}
-              placeholder="Project name"
+              placeholder={t('collab.project.namePlaceholder')}
               maxLength={120}
               className="mt-1.5 h-9 w-full rounded-md border border-border bg-background px-2 text-[11px] text-foreground outline-none focus:border-primary/60"
             />
           </label>
           <button type="submit" disabled={loading || !newProjectName.trim()} className="inline-flex h-9 items-center gap-1 rounded-md bg-primary px-3 text-[10px] font-semibold text-primary-foreground disabled:opacity-50">
-            <Plus className="size-3" /> Create
+            <Plus className="size-3" /> {t('collab.project.create')}
           </button>
         </form>
       </div>
@@ -298,18 +306,18 @@ function SignedInCollaboration() {
       {!project ? (
         <div className="p-8 text-center">
           <Users2 className="mx-auto size-7 text-primary-bright" />
-          <p className="mt-2 text-sm font-medium text-foreground">Create your first shared project</p>
-          <p className="mt-1 text-[11px] text-faint-foreground">The creator becomes the project owner on the backend.</p>
+          <p className="mt-2 text-sm font-medium text-foreground">{t('collab.project.firstTitle')}</p>
+          <p className="mt-1 text-[11px] text-faint-foreground">{t('collab.project.firstDescription')}</p>
         </div>
       ) : (
         <>
           <nav className="flex overflow-x-auto border-b border-border p-1 scrollbar-thin">
             {([
-              ['comments', `Comments ${comments.length}`, MessageSquare],
-              ['members', `Members ${members.length}`, Users2],
-              ['reviews', `Reviews ${reviews.length}`, CheckCircle2],
-              ['notifications', `Notifications ${unreadCount}`, Bell],
-              ['audit', `Audit ${auditEvents.length}`, Clock3],
+              ['comments', t('collab.tab.comments', { count: formatNumber(comments.length, locale) }), MessageSquare],
+              ['members', t('collab.tab.members', { count: formatNumber(members.length, locale) }), Users2],
+              ['reviews', t('collab.tab.reviews', { count: formatNumber(reviews.length, locale) }), CheckCircle2],
+              ['notifications', t('collab.tab.notifications', { count: formatNumber(unreadCount, locale) }), Bell],
+              ['audit', t('collab.tab.audit', { count: formatNumber(auditEvents.length, locale) }), Clock3],
             ] as const).map(([id, label, Icon]) => (
               <button key={id} type="button" onClick={() => setTab(id)} className={cn('flex shrink-0 items-center gap-1.5 rounded-md px-2.5 py-1.5 text-[10px] font-medium', tab === id ? 'bg-primary/15 text-primary-bright' : 'text-muted-foreground hover:bg-white/5 hover:text-foreground')}>
                 <Icon className="size-3.5" />{label}
@@ -338,6 +346,8 @@ function SignedInCollaboration() {
               <MembersTab
                 members={members}
                 canAdmin={can('admin')}
+                canAssignOwner={project.role === 'owner' && project.governanceMode === 'team'}
+                ownerRequiresTeamMode={project.role === 'owner' && project.governanceMode === 'solo'}
                 name={memberName}
                 email={memberEmail}
                 role={memberRole}
@@ -361,15 +371,15 @@ function SignedInCollaboration() {
                 selectedTarget={selectedReviewTarget}
                 onTargetChange={setReviewTargetId}
                 canReview={can('edit')}
-                reviewers={reviewCandidates}
+                reviewers={reviewerCandidates}
                 reviewerId={effectiveReviewerId}
+                governanceMode={project.governanceMode}
                 summary={reviewSummary}
                 onReviewerChange={setReviewerId}
                 onSummaryChange={setReviewSummary}
                 onSubmit={async () => {
                   if (
                     selectedReviewTarget &&
-                    effectiveReviewerId &&
                     await requestReview(reviewSummary, selectedReviewTarget, [effectiveReviewerId])
                   ) {
                     setReviewSummary('')
@@ -381,7 +391,7 @@ function SignedInCollaboration() {
             )}
             {tab === 'notifications' && (
               <div className="space-y-2">
-                {notifications.length === 0 && <EmptyState text="No notifications." />}
+                {notifications.length === 0 && <EmptyState text={t('collab.notifications.empty')} />}
                 {notifications.map((notification) => (
                   <button key={notification.id} type="button" onClick={() => void markNotification(notification.id, !notification.readAt)} className={cn('block w-full rounded-md border border-border px-3 py-2 text-left', !notification.readAt && 'bg-primary/5')}>
                     <span className="block text-[10px] font-medium text-foreground">{notification.title}</span>
@@ -392,8 +402,8 @@ function SignedInCollaboration() {
             )}
             {tab === 'audit' && (
               <div className="space-y-2">
-                {!can('admin') && <EmptyState text="Audit history is available to project owners and admins." />}
-                {can('admin') && auditEvents.length === 0 && <EmptyState text="No audit events." />}
+                {!can('admin') && <EmptyState text={t('collab.audit.restricted')} />}
+                {can('admin') && auditEvents.length === 0 && <EmptyState text={t('collab.audit.empty')} />}
                 {auditEvents.map((event) => (
                   <div key={event.id} className="rounded-md border border-border px-3 py-2 text-[10px]">
                     <span className="font-medium text-foreground">{event.action}</span>
@@ -432,27 +442,28 @@ function CommentsTab({
   onAdd: () => Promise<void>
   onResolve: (commentId: string, resolved: boolean) => Promise<boolean>
 }) {
+  const { locale, t } = useI18n()
   return (
     <div className="space-y-2">
       {canComment && (
         <form onSubmit={(event) => { event.preventDefault(); void onAdd() }} className="grid gap-2 sm:grid-cols-[220px_1fr_auto]">
-          <select value={selectedTarget?.revisionId ?? ''} onChange={(event) => onTargetChange(event.target.value)} className="h-9 rounded-md border border-border bg-background px-2 text-[10px] text-foreground"><option value="">Select artifact version</option>{targets.map((target) => <option key={target.revisionId} value={target.revisionId}>{target.title ?? target.artifactId} · {versionDisplay(target)}</option>)}</select>
-          <input value={comment} onChange={(event) => onCommentChange(event.target.value)} placeholder="Comment on this exact revision" className="h-9 min-w-0 rounded-md border border-border bg-background px-2 text-[10px] text-foreground outline-none" />
-          <button type="submit" disabled={!selectedTarget || !comment.trim()} className="rounded-md bg-primary px-3 text-[10px] font-semibold text-primary-foreground disabled:opacity-50">Post</button>
+          <select value={selectedTarget?.revisionId ?? ''} onChange={(event) => onTargetChange(event.target.value)} className="h-9 rounded-md border border-border bg-background px-2 text-[10px] text-foreground"><option value="">{t('collab.comments.selectVersion')}</option>{targets.map((target) => <option key={target.revisionId} value={target.revisionId}>{target.title ?? target.artifactId} · {versionDisplay(target, t)}</option>)}</select>
+          <input value={comment} onChange={(event) => onCommentChange(event.target.value)} placeholder={t('collab.comments.placeholder')} className="h-9 min-w-0 rounded-md border border-border bg-background px-2 text-[10px] text-foreground outline-none" />
+          <button type="submit" disabled={!selectedTarget || !comment.trim()} className="rounded-md bg-primary px-3 text-[10px] font-semibold text-primary-foreground disabled:opacity-50">{t('collab.comments.post')}</button>
         </form>
       )}
-      {targets.length === 0 && <EmptyState text="Create a versioned artifact before adding formal comments." />}
-      {comments.length === 0 && <EmptyState text="No comments yet." />}
+      {targets.length === 0 && <EmptyState text={t('collab.comments.noTargets')} />}
+      {comments.length === 0 && <EmptyState text={t('collab.comments.empty')} />}
       {comments.map((thread) => (
         <div key={thread.id} className="rounded-md border border-border bg-card px-3 py-2">
           <div className="flex items-center gap-2">
             <span className="text-[10px] font-medium text-foreground">{thread.author.name}</span>
-            <span className="ml-auto text-[9px] text-faint-foreground">{new Date(thread.createdAt).toLocaleString()}</span>
+            <span className="ml-auto text-[9px] text-faint-foreground">{formatDateTime(thread.createdAt, locale)}</span>
           </div>
           <p className="mt-1 text-[10px] text-muted-foreground">{thread.body}</p>
-          {thread.target && <p className="mt-1 font-mono text-[8px] text-faint-foreground">{versionDisplay(thread.target)} · {thread.target.contentHash.slice(0, 12)}</p>}
+          {thread.target && <p className="mt-1 font-mono text-[8px] text-faint-foreground">{versionDisplay(thread.target, t)} · {thread.target.contentHash.slice(0, 12)}</p>}
           {thread.replies.map((reply) => <p key={reply.id} className="mt-2 border-l border-border pl-2 text-[9px] text-muted-foreground"><b>{reply.author.name}:</b> {reply.body}</p>)}
-          {canResolve && <button type="button" onClick={() => void onResolve(thread.id, !thread.resolvedAt)} className="mt-2 text-[9px] text-primary-bright">{thread.resolvedAt ? 'Reopen' : 'Resolve'}</button>}
+          {canResolve && <button type="button" onClick={() => void onResolve(thread.id, !thread.resolvedAt)} className="mt-2 text-[9px] text-primary-bright">{thread.resolvedAt ? t('collab.comments.reopen') : t('collab.comments.resolve')}</button>}
         </div>
       ))}
     </div>
@@ -462,6 +473,8 @@ function CommentsTab({
 function MembersTab({
   members,
   canAdmin,
+  canAssignOwner,
+  ownerRequiresTeamMode,
   name,
   email,
   role,
@@ -474,6 +487,8 @@ function MembersTab({
 }: {
   members: ReturnType<typeof useCollaboration>['members']
   canAdmin: boolean
+  canAssignOwner: boolean
+  ownerRequiresTeamMode: boolean
   name: string
   email: string
   role: ProjectRole
@@ -484,23 +499,32 @@ function MembersTab({
   onRole: (userId: string, role: ProjectRole) => Promise<boolean>
   onRemove: (userId: string) => Promise<boolean>
 }) {
+  const { t } = useI18n()
+  const assignableRoles = canAssignOwner
+    ? PROJECT_ROLES
+    : PROJECT_ROLES.filter((item) => item !== 'owner')
   return (
     <div className="space-y-2">
       {canAdmin && (
         <form onSubmit={(event) => { event.preventDefault(); void onAdd() }} className="grid gap-2 rounded-md border border-border bg-card p-3 sm:grid-cols-[1fr_1fr_120px_auto]">
-          <input value={name} onChange={(event) => onNameChange(event.target.value)} placeholder="Display name" className="h-8 rounded border border-border bg-background px-2 text-[10px] text-foreground" />
-          <input value={email} onChange={(event) => onEmailChange(event.target.value)} type="email" placeholder="Email" className="h-8 rounded border border-border bg-background px-2 text-[10px] text-foreground" />
-          <select value={role} onChange={(event) => onRoleChange(event.target.value as ProjectRole)} className="h-8 rounded border border-border bg-background px-2 text-[10px] text-foreground">{PROJECT_ROLES.filter((item) => item !== 'owner').map((item) => <option key={item}>{item}</option>)}</select>
-          <button type="submit" disabled={!name.trim() || !validEmail(email)} className="rounded bg-primary px-2 text-[10px] font-semibold text-primary-foreground disabled:opacity-50">Invite</button>
+          <input value={name} onChange={(event) => onNameChange(event.target.value)} placeholder={t('collab.auth.displayName')} className="h-8 rounded border border-border bg-background px-2 text-[10px] text-foreground" />
+          <input value={email} onChange={(event) => onEmailChange(event.target.value)} type="email" placeholder={t('collab.auth.email')} className="h-8 rounded border border-border bg-background px-2 text-[10px] text-foreground" />
+          <select value={role} onChange={(event) => onRoleChange(event.target.value as ProjectRole)} aria-label={t('collab.members.role')} className="h-8 rounded border border-border bg-background px-2 text-[10px] text-foreground">{assignableRoles.map((item) => <option key={item} value={item}>{projectRoleLabel(item, t)}</option>)}</select>
+          <button type="submit" disabled={!name.trim() || !validEmail(email)} className="rounded bg-primary px-2 text-[10px] font-semibold text-primary-foreground disabled:opacity-50">{t('collab.members.invite')}</button>
         </form>
+      )}
+      {ownerRequiresTeamMode && (
+        <p className="rounded-md border border-warning/30 bg-warning/10 p-2 text-[10px] text-warning">
+          {t('teamPlatform.members.soloOwnerRestriction')}
+        </p>
       )}
       {members.map((member) => (
         <div key={member.user.id} className="flex flex-wrap items-center gap-2 rounded-md border border-border bg-card px-3 py-2">
           <span className="min-w-0 flex-1"><span className="block truncate text-[10px] font-medium text-foreground">{member.user.name}</span><span className="block truncate text-[9px] text-faint-foreground">{member.user.email}</span></span>
           {canAdmin && member.role !== 'owner' ? (
-            <select value={member.role} onChange={(event) => void onRole(member.user.id, event.target.value as ProjectRole)} className="h-7 rounded border border-border bg-background px-1 text-[9px] text-foreground">{PROJECT_ROLES.filter((item) => item !== 'owner').map((item) => <option key={item}>{item}</option>)}</select>
-          ) : <span className="rounded bg-primary/10 px-2 py-1 text-[9px] text-primary-bright">{member.role}</span>}
-          {canAdmin && member.role !== 'owner' && <button type="button" onClick={() => window.confirm(`Remove ${member.user.name} from this project?`) && void onRemove(member.user.id)} className="text-[9px] text-destructive">Remove</button>}
+            <select value={member.role} onChange={(event) => void onRole(member.user.id, event.target.value as ProjectRole)} aria-label={t('collab.members.roleFor', { name: member.user.name })} className="h-7 rounded border border-border bg-background px-1 text-[9px] text-foreground">{assignableRoles.map((item) => <option key={item} value={item}>{projectRoleLabel(item, t)}</option>)}</select>
+          ) : <span className="rounded bg-primary/10 px-2 py-1 text-[9px] text-primary-bright">{projectRoleLabel(member.role, t)}</span>}
+          {canAdmin && member.role !== 'owner' && <button type="button" onClick={() => window.confirm(t('collab.members.removeConfirm', { name: member.user.name })) && void onRemove(member.user.id)} className="text-[9px] text-destructive">{t('common.remove')}</button>}
         </div>
       ))}
     </div>
@@ -515,6 +539,7 @@ function ReviewsTab({
   canReview,
   reviewers,
   reviewerId,
+  governanceMode,
   summary,
   onReviewerChange,
   onSummaryChange,
@@ -529,6 +554,7 @@ function ReviewsTab({
   canReview: boolean
   reviewers: ReturnType<typeof useCollaboration>['members']
   reviewerId: string
+  governanceMode: 'solo' | 'team'
   summary: string
   onReviewerChange: (userId: string) => void
   onSummaryChange: (summary: string) => void
@@ -541,40 +567,50 @@ function ReviewsTab({
   ) => Promise<boolean>
   currentUserId: string
 }) {
+  const { t } = useI18n()
+  const [soloReviewConfirmations, setSoloReviewConfirmations] = useState<ReadonlySet<string>>(
+    () => new Set(),
+  )
   const [approvalSummaries, setApprovalSummaries] = useState<Readonly<Record<string, string>>>({})
-  const [soloConfirmations, setSoloConfirmations] = useState<ReadonlySet<string>>(() => new Set())
   return (
     <div className="space-y-2">
       {canReview && (
         <form onSubmit={(event) => { event.preventDefault(); void onSubmit() }} className="grid gap-2 rounded-md border border-border bg-card p-3 sm:grid-cols-2">
-          <label className="text-[9px] text-faint-foreground">Artifact revision<select value={selectedTarget?.revisionId ?? ''} onChange={(event) => onTargetChange(event.target.value)} className="mt-1 h-8 w-full rounded border border-border bg-background px-2 text-[10px] text-foreground"><option value="">Select a version</option>{targets.map((target) => <option key={target.revisionId} value={target.revisionId}>{target.title ?? target.artifactId} · {versionDisplay(target)}</option>)}</select></label>
-          <label className="text-[9px] text-faint-foreground">Required reviewer<select value={reviewerId} onChange={(event) => onReviewerChange(event.target.value)} className="mt-1 h-8 w-full rounded border border-border bg-background px-2 text-[10px] text-foreground"><option value="">Select reviewer</option>{reviewers.map((member) => <option key={member.user.id} value={member.user.id}>{member.user.name}</option>)}</select></label>
-          <textarea value={summary} onChange={(event) => onSummaryChange(event.target.value)} placeholder="Version-level review summary" rows={3} className="rounded border border-border bg-background p-2 text-[10px] text-foreground sm:col-span-2" />
-          <button type="submit" disabled={!selectedTarget || !reviewerId || !summary.trim()} className="rounded bg-primary px-3 py-2 text-[10px] font-semibold text-primary-foreground disabled:opacity-50 sm:col-span-2">Request version review</button>
+          <label className="text-[9px] text-faint-foreground">{t('collab.reviews.artifactRevision')}<select value={selectedTarget?.revisionId ?? ''} onChange={(event) => onTargetChange(event.target.value)} className="mt-1 h-8 w-full rounded border border-border bg-background px-2 text-[10px] text-foreground"><option value="">{t('collab.reviews.selectVersion')}</option>{targets.map((target) => <option key={target.revisionId} value={target.revisionId}>{target.title ?? target.artifactId} · {versionDisplay(target, t)}</option>)}</select></label>
+          <label className="text-[9px] text-faint-foreground">{t('collab.reviews.requiredReviewer')}<select value={reviewerId} onChange={(event) => onReviewerChange(event.target.value)} disabled={governanceMode === 'solo'} className="mt-1 h-8 w-full rounded border border-border bg-background px-2 text-[10px] text-foreground disabled:opacity-75"><option value="">{t('collab.reviews.selectReviewer')}</option>{reviewers.map((member) => <option key={member.user.id} value={member.user.id}>{member.user.name}</option>)}</select></label>
+          <textarea value={summary} onChange={(event) => onSummaryChange(event.target.value)} placeholder={t('collab.reviews.summaryPlaceholder')} rows={3} className="rounded border border-border bg-background p-2 text-[10px] text-foreground sm:col-span-2" />
+          <button type="submit" disabled={!selectedTarget || !reviewerId || !summary.trim()} className="rounded bg-primary px-3 py-2 text-[10px] font-semibold text-primary-foreground disabled:opacity-50 sm:col-span-2">{t('collab.reviews.request')}</button>
         </form>
       )}
-      {targets.length === 0 && <EmptyState text="Create a versioned artifact before requesting review." />}
+      {targets.length === 0 && <EmptyState text={t('collab.reviews.noTargets')} />}
       {reviews.map((review) => (
         <div key={review.id} className="rounded-md border border-border bg-card px-3 py-2">
-          <div className="flex items-center gap-2"><span className="rounded bg-primary/10 px-1.5 py-0.5 text-[9px] text-primary-bright">{review.state ?? review.decision}</span><span className="text-[10px] font-medium text-foreground">{review.reviewer.name}</span><span className="ml-auto text-[9px] text-faint-foreground">{review.target ? versionDisplay(review.target) : 'revision unavailable'}</span></div>
+          <div className="flex items-center gap-2"><span className="rounded bg-primary/10 px-1.5 py-0.5 text-[9px] text-primary-bright">{reviewStateLabel(review.state ?? review.decision, t)}</span><span className="text-[10px] font-medium text-foreground">{review.reviewer.name}</span><span className="ml-auto text-[9px] text-faint-foreground">{review.target ? versionDisplay(review.target, t) : t('collab.reviews.revisionUnavailable')}</span></div>
           <p className="mt-1 text-[10px] text-muted-foreground">{review.summary}</p>
           {review.state === 'pending' && canReview && review.requiredReviewerIds?.includes(currentUserId) && (
             <div className="mt-2">
               {review.policy.governanceMode === 'solo'
                 && review.policy.soloSelfReviewOwnerId === currentUserId && (
-                <label className="mb-2 flex items-start gap-1.5 rounded border border-warning/35 bg-warning/10 p-2 text-[9px] text-warning">
-                  <input
-                    type="checkbox"
-                    checked={soloConfirmations.has(review.id)}
-                    onChange={(event) => setSoloConfirmations((current) => {
-                      const next = new Set(current)
-                      if (event.target.checked) next.add(review.id)
-                      else next.delete(review.id)
-                      return next
-                    })}
-                  />
-                  <span>I confirm this Solo self-review will be recorded in the audit log.</span>
-                </label>
+                <div role="alert" className="mb-2 rounded border border-warning/35 bg-warning/10 p-2 text-[9px] leading-relaxed text-warning">
+                  <div className="flex items-start gap-1.5">
+                    <CircleAlert className="mt-0.5 size-3 shrink-0" />
+                    <span>{t('teamPlatform.reviews.soloWarning')}</span>
+                  </div>
+                  <label className="mt-1.5 flex cursor-pointer items-start gap-1.5 text-foreground">
+                    <input
+                      type="checkbox"
+                      checked={soloReviewConfirmations.has(review.id)}
+                      onChange={(event) => setSoloReviewConfirmations((current) => {
+                        const next = new Set(current)
+                        if (event.target.checked) next.add(review.id)
+                        else next.delete(review.id)
+                        return next
+                      })}
+                      className="mt-0.5"
+                    />
+                    <span>{t('teamPlatform.reviews.soloConfirm')}</span>
+                  </label>
+                </div>
               )}
               <textarea
                 value={approvalSummaries[review.id] ?? ''}
@@ -584,38 +620,41 @@ function ReviewsTab({
                 }))}
                 rows={2}
                 maxLength={4000}
-                placeholder="Approval reason"
-                aria-label="Approval reason"
+                placeholder={t('teamPlatform.reviews.approvalReason')}
+                aria-label={t('teamPlatform.reviews.approvalReason')}
                 className="mb-2 w-full rounded border border-border bg-background p-2 text-[9px] text-foreground"
               />
               <div className="flex gap-2">
                 <button
                   type="button"
                   onClick={() => {
-                    const summary = (approvalSummaries[review.id] ?? '').trim()
-                    if (!summary) return
+                    const approvalSummary = (approvalSummaries[review.id] ?? '').trim()
+                    if (!approvalSummary) return
                     void onDecide(
                       review.id,
                       'approve',
-                      summary,
+                      approvalSummary,
                       review.policy.governanceMode === 'solo'
                         && review.policy.soloSelfReviewOwnerId === currentUserId
-                        && soloConfirmations.has(review.id),
-                    )
+                        && soloReviewConfirmations.has(review.id),
+                    ).then((approved) => {
+                      if (!approved) return
+                      setApprovalSummaries((current) => ({ ...current, [review.id]: '' }))
+                    })
                   }}
                   disabled={
                     !(approvalSummaries[review.id] ?? '').trim()
                     || (
                       review.policy.governanceMode === 'solo'
                       && review.policy.soloSelfReviewOwnerId === currentUserId
-                      && !soloConfirmations.has(review.id)
+                      && !soloReviewConfirmations.has(review.id)
                     )
                   }
                   className="text-[9px] text-success disabled:opacity-40"
                 >
-                  Approve
+                  {t('common.approve')}
                 </button>
-                <button type="button" onClick={() => { const reason = window.prompt('Describe the required changes')?.trim(); if (reason) void onDecide(review.id, 'request_changes', reason) }} className="text-[9px] text-warning">Request changes</button>
+                <button type="button" onClick={() => { const reason = window.prompt(t('collab.reviews.changesPrompt'))?.trim(); if (reason) void onDecide(review.id, 'request_changes', reason) }} className="text-[9px] text-warning">{t('collab.reviews.requestChanges')}</button>
               </div>
             </div>
           )}
@@ -625,10 +664,10 @@ function ReviewsTab({
   )
 }
 
-function versionDisplay(target: Pick<CollaborationVersionRef, 'revisionId' | 'revisionNumber'>) {
+function versionDisplay(target: Pick<CollaborationVersionRef, 'revisionId' | 'revisionNumber'>, t: ReturnType<typeof useI18n>['t']) {
   return target.revisionNumber
     ? `r${target.revisionNumber}`
-    : `revision ${target.revisionId.slice(0, 12)}`
+    : t('collab.revision', { id: target.revisionId.slice(0, 12) })
 }
 
 function AuthField({
@@ -659,7 +698,8 @@ function AuthField({
 }
 
 function BackendBadge({ status }: { status: ReturnType<typeof useCollaboration>['backendStatus'] }) {
-  return <span className={cn('rounded-full border px-2 py-1 text-[9px] font-medium', status === 'online' ? 'border-success/30 bg-success/10 text-success' : status === 'error' ? 'border-destructive/30 bg-destructive/10 text-destructive' : 'border-border bg-background text-faint-foreground')}>{status === 'online' ? 'Platform online' : status === 'error' ? 'Platform unavailable' : 'Connecting…'}</span>
+  const { t } = useI18n()
+  return <span className={cn('rounded-full border px-2 py-1 text-[9px] font-medium', status === 'online' ? 'border-success/30 bg-success/10 text-success' : status === 'error' ? 'border-destructive/30 bg-destructive/10 text-destructive' : 'border-border bg-background text-faint-foreground')}>{status === 'online' ? t('collab.backend.online') : status === 'error' ? t('collab.backend.unavailable') : t('collab.backend.connecting')}</span>
 }
 
 function EmptyState({ text }: { text: string }) {
@@ -672,14 +712,48 @@ function validateAuthentication(input: {
   email: string
   password: string
   confirmation: string
-}) {
+}, t: ReturnType<typeof useI18n>['t']) {
   const errors: Partial<Record<'name' | 'email' | 'password' | 'confirmation', string>> = {}
-  if (input.mode === 'signUp' && input.name.trim().length < 2) errors.name = 'Enter at least 2 characters.'
-  if (!validEmail(input.email)) errors.email = 'Enter a valid email address.'
-  if (!input.password) errors.password = 'Enter your password.'
-  if (input.mode === 'signUp' && Array.from(input.password).length < 10) errors.password = 'Use at least 10 characters.'
-  if (input.mode === 'signUp' && input.confirmation !== input.password) errors.confirmation = 'Passwords do not match.'
+  if (input.mode === 'signUp' && input.name.trim().length < 2) errors.name = t('collab.validation.nameLength')
+  if (!validEmail(input.email)) errors.email = t('collab.validation.email')
+  if (!input.password) errors.password = t('collab.validation.password')
+  if (input.mode === 'signUp' && Array.from(input.password).length < 10) errors.password = t('collab.validation.passwordLength')
+  if (input.mode === 'signUp' && input.confirmation !== input.password) errors.confirmation = t('collab.validation.passwordMatch')
   return errors
+}
+
+function projectRoleLabel(role: ProjectRole, t: ReturnType<typeof useI18n>['t']) {
+  const labels: Record<ProjectRole, string> = {
+    owner: t('collab.role.owner'),
+    admin: t('collab.role.admin'),
+    editor: t('collab.role.editor'),
+    commenter: t('collab.role.commenter'),
+    viewer: t('collab.role.viewer'),
+  }
+  return labels[role]
+}
+
+function reviewStateLabel(state: ReviewDecision | 'pending' | 'approved' | 'changesRequested' | undefined, t: ReturnType<typeof useI18n>['t']) {
+  if (!state) return t('collab.reviews.unknown')
+  const labels = {
+    approve: t('collab.reviews.approved'),
+    request_changes: t('collab.reviews.changesRequested'),
+    pending: t('collab.reviews.pending'),
+    approved: t('collab.reviews.approved'),
+    changesRequested: t('collab.reviews.changesRequested'),
+  }
+  return labels[state]
+}
+
+function formatDateTime(value: string, locale: string) {
+  return new Intl.DateTimeFormat(locale, {
+    dateStyle: 'medium',
+    timeStyle: 'short',
+  }).format(new Date(value))
+}
+
+function formatNumber(value: number, locale: string) {
+  return new Intl.NumberFormat(locale).format(value)
 }
 
 function validEmail(value: string) {

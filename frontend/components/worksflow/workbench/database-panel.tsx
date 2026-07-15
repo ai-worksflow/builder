@@ -64,22 +64,22 @@ type DataTab =
   | 'connect'
   | 'audit'
 
-const TABS: Array<{ id: DataTab; label: string; icon: typeof Database }> = [
-  { id: 'overview', label: 'Overview', icon: Database },
-  { id: 'tables', label: 'Tables', icon: Table2 },
-  { id: 'records', label: 'Records', icon: Braces },
-  { id: 'public', label: 'Public API', icon: Globe2 },
-  { id: 'auth', label: 'Auth', icon: Users },
-  { id: 'storage', label: 'Storage', icon: HardDrive },
-  { id: 'functions', label: 'Functions', icon: FunctionSquare },
-  { id: 'migrations', label: 'Migrations', icon: Play },
-  { id: 'variables', label: 'Secrets', icon: FileKey2 },
-  { id: 'connect', label: 'Supabase', icon: Cloud },
-  { id: 'audit', label: 'Audit', icon: ScrollText },
+const TABS: Array<{ id: DataTab; icon: typeof Database }> = [
+  { id: 'overview', icon: Database },
+  { id: 'tables', icon: Table2 },
+  { id: 'records', icon: Braces },
+  { id: 'public', icon: Globe2 },
+  { id: 'auth', icon: Users },
+  { id: 'storage', icon: HardDrive },
+  { id: 'functions', icon: FunctionSquare },
+  { id: 'migrations', icon: Play },
+  { id: 'variables', icon: FileKey2 },
+  { id: 'connect', icon: Cloud },
+  { id: 'audit', icon: ScrollText },
 ]
 
 export function DatabasePanel() {
-  const { t } = useI18n()
+  const { locale, t } = useI18n()
   const { session, project, platformClient, can } = useCollaboration()
   const projectId = project?.id ?? ''
   const data = platformClient.data
@@ -106,7 +106,7 @@ export function DatabasePanel() {
   const [tableName, setTableName] = useState('tasks')
   const [columnName, setColumnName] = useState('title')
   const [columnType, setColumnType] = useState<DataColumnType>('text')
-  const [recordJson, setRecordJson] = useState('{\n  "title": "First task"\n}')
+  const [recordJson, setRecordJson] = useState('{\n  "title": ""\n}')
   const [metadataName, setMetadataName] = useState('')
   const [metadataSecondary, setMetadataSecondary] = useState('')
   const [variableName, setVariableName] = useState('API_BASE_URL')
@@ -171,11 +171,11 @@ export function DatabasePanel() {
       setSnapshot(null)
       setRecords([])
       setRecordsTotal(0)
-      setError(dataErrorMessage(cause, 'Unable to load the data project.'))
+      setError(dataErrorMessage(cause, t('database.error.loadProject'), t))
     } finally {
       if (sequence === refreshSequence.current) setLoading(false)
     }
-  }, [canView, data, projectId])
+  }, [canView, data, projectId, t])
 
   const refreshRecords = useCallback(async (offset: number) => {
     if (!selectedTableId) {
@@ -201,11 +201,11 @@ export function DatabasePanel() {
       if (sequence !== recordsSequence.current) return
       setRecords([])
       setRecordsTotal(0)
-      setError(dataErrorMessage(cause, 'Unable to load records.'))
+      setError(dataErrorMessage(cause, t('database.error.loadRecords'), t))
     } finally {
       if (sequence === recordsSequence.current) setRecordsLoading(false)
     }
-  }, [data, projectId, selectedTableId])
+  }, [data, projectId, selectedTableId, t])
 
   const refreshPublicPolicies = useCallback(async () => {
     if (!canView || !snapshot) {
@@ -228,11 +228,11 @@ export function DatabasePanel() {
       ])))
     } catch (cause) {
       if (sequence !== publicPoliciesSequence.current) return
-      setPublicError(dataErrorMessage(cause, 'Unable to load anonymous access policies.'))
+      setPublicError(dataErrorMessage(cause, t('database.error.loadPolicies'), t))
     } finally {
       if (sequence === publicPoliciesSequence.current) setPublicPoliciesLoading(false)
     }
-  }, [canView, projectId, publicData, snapshot])
+  }, [canView, projectId, publicData, snapshot, t])
 
   const refreshDeployments = useCallback(async () => {
     if (!canView) {
@@ -249,7 +249,7 @@ export function DatabasePanel() {
       const next = await delivery.list(projectId)
       if (sequence !== deploymentsSequence.current) return
       if (next.some((deployment) => deployment.projectId !== projectId)) {
-        throw new Error('The delivery service returned a deployment from another project.')
+        throw new Error(t('database.error.foreignDeployment'))
       }
       const sorted = [...next].sort((left, right) =>
         Date.parse(right.updatedAt) - Date.parse(left.updatedAt),
@@ -264,11 +264,11 @@ export function DatabasePanel() {
       )
     } catch (cause) {
       if (sequence !== deploymentsSequence.current) return
-      setDeploymentError(dataErrorMessage(cause, 'Unable to load server deployments.'))
+      setDeploymentError(dataErrorMessage(cause, t('database.error.loadDeployments'), t))
     } finally {
       if (sequence === deploymentsSequence.current) setDeploymentsLoading(false)
     }
-  }, [canView, delivery, projectId])
+  }, [canView, delivery, projectId, t])
 
   useEffect(() => {
     refreshSequence.current += 1
@@ -333,14 +333,14 @@ export function DatabasePanel() {
       .catch((cause: unknown) => {
         if (sequence !== runtimeSequence.current) return
         if (cause instanceof PlatformHttpError && cause.status === 404) return
-        setRuntimeError(dataErrorMessage(cause, 'Unable to load the active public runtime.'))
+        setRuntimeError(dataErrorMessage(cause, t('database.error.loadRuntime'), t))
       })
       .finally(() => {
         if (sequence !== runtimeSequence.current) return
         setRuntimeLoading(false)
         setRuntimeChecked(true)
       })
-  }, [canView, projectId, publicData, runtimeReload, selectedDeploymentId, tab])
+  }, [canView, projectId, publicData, runtimeReload, selectedDeploymentId, t, tab])
 
   async function perform(action: () => Promise<unknown>, success: string) {
     if (mutating) return false
@@ -353,7 +353,7 @@ export function DatabasePanel() {
       await refresh()
       return true
     } catch (cause) {
-      setError(dataErrorMessage(cause, 'The data operation failed.'))
+      setError(dataErrorMessage(cause, t('database.error.operationFailed'), t))
       return false
     } finally {
       setMutating(false)
@@ -369,7 +369,7 @@ export function DatabasePanel() {
           displayName: metadataSecondary || undefined,
           status: 'active',
         }),
-        'Auth user metadata added.',
+        t('database.notice.authAdded'),
       )
     } else if (kind === 'storage-objects') {
       await perform(
@@ -378,7 +378,7 @@ export function DatabasePanel() {
           path: metadataName,
           sizeBytes: 0,
         }),
-        'Storage object metadata added.',
+        t('database.notice.storageAdded'),
       )
     } else {
       await perform(
@@ -388,7 +388,7 @@ export function DatabasePanel() {
           runtime: 'edge',
           status: 'draft',
         }),
-        'Server function metadata added.',
+        t('database.notice.functionAdded'),
       )
     }
     setMetadataName('')
@@ -402,14 +402,14 @@ export function DatabasePanel() {
     } else if (selectedTableId) {
       operations = [{ type: 'drop-table', tableId: selectedTableId }]
     } else {
-      setError('Select a table before previewing a destructive migration.')
+      setError(t('database.error.selectTableForMigration'))
       return
     }
     setError(null)
     try {
       setMigrationPreview((await data.previewMigration(projectId, operations)).data.preview)
     } catch (cause) {
-      setError(dataErrorMessage(cause, 'Migration preview failed.'))
+      setError(dataErrorMessage(cause, t('database.error.migrationPreview'), t))
     }
   }
 
@@ -428,17 +428,17 @@ export function DatabasePanel() {
 
   async function savePublicPolicy(tableId: string) {
     if (!canAdmin || publicPolicyMutating) {
-      if (!canAdmin) setPublicError('An owner or administrator is required to change anonymous access.')
+      if (!canAdmin) setPublicError(t('database.error.adminChangePolicy'))
       return
     }
     const table = snapshot?.tables.find((candidate) => candidate.id === tableId)
     if (!table) {
-      setPublicError('Refresh the data project before saving this table policy.')
+      setPublicError(t('database.error.refreshBeforePolicy'))
       return
     }
     const currentPolicy = publicPolicies.find((policy) => policy.tableId === tableId)
     if (!currentPolicy?.etag) {
-      setPublicError('Refresh public policies before saving so the current ETag can be verified.')
+      setPublicError(t('database.error.refreshPolicyEtag'))
       return
     }
     const draft = publicPolicyDrafts[tableId] ?? publicPolicyInput()
@@ -468,11 +468,15 @@ export function DatabasePanel() {
         ...current,
         [tableId]: publicPolicyInput(policy),
       }))
-      setNotice(`Anonymous policy for ${table.name} saved as version ${policy.version}.`)
+      setNotice(t('database.notice.policySaved', {
+        table: table.name,
+        version: policy.version.toLocaleString(locale),
+      }))
     } catch (cause) {
       setPublicError(dataErrorMessage(
         cause,
-        'Unable to save the anonymous access policy. Refresh if another collaborator changed it.',
+        t('database.error.savePolicy'),
+        t,
       ))
     } finally {
       setPublicPolicyMutating(null)
@@ -481,14 +485,14 @@ export function DatabasePanel() {
 
   async function deletePublicPolicy(tableId: string) {
     if (!canAdmin || publicPolicyMutating) {
-      if (!canAdmin) setPublicError('An owner or administrator is required to remove a policy.')
+      if (!canAdmin) setPublicError(t('database.error.adminRemovePolicy'))
       return
     }
     const table = snapshot?.tables.find((candidate) => candidate.id === tableId)
     if (!table) return
     const currentPolicy = publicPolicies.find((policy) => policy.tableId === tableId)
     if (!currentPolicy?.etag || currentPolicy.version === 0) {
-      setPublicError('There is no saved policy to remove, or its current ETag is unavailable.')
+      setPublicError(t('database.error.noSavedPolicy'))
       return
     }
     publicPoliciesSequence.current += 1
@@ -498,11 +502,12 @@ export function DatabasePanel() {
     try {
       await publicData.deletePolicy(projectId, tableId, { ifMatch: currentPolicy.etag })
       await refreshPublicPolicies()
-      setNotice(`Policy removed from ${table.name}; anonymous access is default-deny again.`)
+      setNotice(t('database.notice.policyRemoved', { table: table.name }))
     } catch (cause) {
       setPublicError(dataErrorMessage(
         cause,
-        'Unable to remove the anonymous access policy. Refresh if another collaborator changed it.',
+        t('database.error.removePolicy'),
+        t,
       ))
     } finally {
       setPublicPolicyMutating(null)
@@ -511,7 +516,7 @@ export function DatabasePanel() {
 
   async function revokePublicRuntime() {
     if (!canPublish || !selectedDeploymentId || runtimeRevoking) {
-      if (!canPublish) setRuntimeError('An owner or administrator with publish access is required to revoke a runtime.')
+      if (!canPublish) setRuntimeError(t('database.error.publishRevokeRuntime'))
       return
     }
     runtimeSequence.current += 1
@@ -522,9 +527,9 @@ export function DatabasePanel() {
       await publicData.revokeDeploymentRuntime(projectId, selectedDeploymentId)
       setPublicDeploymentRuntime(null)
       setRuntimeChecked(true)
-      setNotice('The deployment public data capability was revoked. Publish again to issue a new capability.')
+      setNotice(t('database.notice.runtimeRevoked'))
     } catch (cause) {
-      setRuntimeError(dataErrorMessage(cause, 'Unable to revoke the public data runtime.'))
+      setRuntimeError(dataErrorMessage(cause, t('database.error.revokeRuntime'), t))
     } finally {
       setRuntimeRevoking(false)
     }
@@ -548,7 +553,7 @@ export function DatabasePanel() {
               )}
             >
               <Icon className="h-3.5 w-3.5" />
-              {item.label}
+              {dataTabLabel(item.id, t)}
             </button>
           )
         })}
@@ -563,7 +568,9 @@ export function DatabasePanel() {
             <div className="min-w-0 flex-1">
               <h2 className="text-sm font-semibold text-foreground">{t('database.title')}</h2>
               <p className="text-[11px] text-faint-foreground">
-                Project {projectId || 'not selected'} · Go data runtime · secret values are never returned
+                {t('database.projectSummary', {
+                  project: projectId || t('database.notSelected'),
+                })}
               </p>
             </div>
             <button
@@ -571,7 +578,7 @@ export function DatabasePanel() {
               onClick={() => void refresh()}
               disabled={loading || !canView}
               className="rounded-md border border-border p-2 text-muted-foreground hover:bg-white/5 hover:text-foreground disabled:opacity-50"
-              aria-label="Refresh database"
+              aria-label={t('database.refresh')}
             >
               <RefreshCw className={cn('h-3.5 w-3.5', loading && 'animate-spin')} />
             </button>
@@ -581,27 +588,27 @@ export function DatabasePanel() {
           {notice && <div className="mb-3 rounded-md border border-success/30 bg-success/10 px-3 py-2 text-[11px] text-success">{notice}</div>}
           {!session.signedIn ? (
             <div className="rounded-lg border border-warning/30 bg-warning/10 p-6 text-center text-[12px] text-warning">
-              Sign in from Settings to inspect or change this project&apos;s data.
+              {t('database.signInRequired')}
             </div>
           ) : !canView ? (
             <div className="rounded-lg border border-border bg-card p-6 text-center text-[12px] text-muted-foreground">
-              Waiting for project access, or your account is not a project member.
+              {t('database.waitingForAccess')}
             </div>
           ) : loading && !snapshot ? (
             <div className="flex h-48 items-center justify-center"><Loader2 className="h-5 w-5 animate-spin text-primary-bright" /></div>
           ) : !snapshot ? (
             <div className="rounded-lg border border-destructive/30 bg-card p-6 text-center">
               <Database className="mx-auto h-5 w-5 text-destructive" />
-              <p className="mt-2 text-[12px] font-medium text-foreground">Data runtime unavailable</p>
+              <p className="mt-2 text-[12px] font-medium text-foreground">{t('database.unavailable')}</p>
               <p className="mt-1 text-[10px] text-faint-foreground">
-                No browser fixture or local database has been substituted. Restore the Go service and retry.
+                {t('database.unavailableCopy')}
               </p>
               <button
                 type="button"
                 onClick={() => void refresh()}
                 className="mt-3 rounded-md border border-border px-3 py-2 text-[11px] text-foreground hover:bg-white/5"
               >
-                Retry server connection
+                {t('database.retryConnection')}
               </button>
             </div>
           ) : (
@@ -609,12 +616,12 @@ export function DatabasePanel() {
               {tab !== 'overview' && (
                 <p className="mb-3 text-[10px] text-faint-foreground">
                   {tab === 'audit'
-                    ? 'Read-only audit events are loaded from the Go data runtime.'
+                    ? t('database.permission.audit')
                     : tab === 'public'
-                    ? 'Policies require an administrator. Revoking a deployment capability requires publish access.'
+                    ? t('database.permission.public')
                     : tab === 'tables' || tab === 'records' || tab === 'migrations'
-                    ? 'Editing this area requires an editor role. Applying a migration still requires an administrator.'
-                    : 'Changing this area requires an administrator role.'}
+                    ? t('database.permission.editor')
+                    : t('database.permission.admin')}
                 </p>
               )}
               {tab === 'overview' && <Overview snapshot={snapshot} />}
@@ -633,11 +640,11 @@ export function DatabasePanel() {
                       name: tableName,
                       columns: columnName ? [{ name: columnName, type: columnType }] : [],
                     }),
-                    'Table created.',
+                    t('database.notice.tableCreated'),
                   )}
                   onDelete={(tableId) => void perform(
                     () => data.deleteTable(projectId, tableId),
-                    'Table deleted.',
+                    t('database.notice.tableDeleted'),
                   )}
                 />
               )}
@@ -655,20 +662,23 @@ export function DatabasePanel() {
                   canMutate={canEdit}
                   onCreate={() => void (async () => {
                     try {
-                      const values = jsonObject(JSON.parse(recordJson) as unknown)
+                      const values = jsonObject(
+                        JSON.parse(recordJson) as unknown,
+                        t('database.error.recordJson'),
+                      )
                       const ok = await perform(
                         () => data.createRecord(projectId, selectedTableId, { values }),
-                        'Record created.',
+                        t('database.notice.recordCreated'),
                       )
                       if (ok) await refreshRecords(recordsOffset)
                     } catch {
-                      setError('Record values must be a valid JSON object.')
+                      setError(t('database.error.recordJson'))
                     }
                   })()}
                   onDelete={(recordId) => void (async () => {
                     const ok = await perform(
                       () => data.deleteRecord(projectId, selectedTableId, recordId),
-                      'Record deleted.',
+                      t('database.notice.recordDeleted'),
                     )
                     if (ok) await refreshRecords(recordsOffset)
                   })()}
@@ -711,8 +721,8 @@ export function DatabasePanel() {
                 <MetadataView
                   kind="auth-users"
                   items={snapshot.authUsers}
-                  primaryLabel="Email"
-                  secondaryLabel="Display name"
+                  primaryLabel={t('database.email')}
+                  secondaryLabel={t('database.displayName')}
                   primary={metadataName}
                   secondary={metadataSecondary}
                   onPrimary={setMetadataName}
@@ -721,7 +731,7 @@ export function DatabasePanel() {
                   onAdd={() => void addMetadata('auth-users')}
                   onDelete={(id) => void perform(
                     () => data.deleteMetadata(projectId, 'auth-users', id),
-                    'Auth user metadata deleted.',
+                    t('database.notice.authDeleted'),
                   )}
                 />
               )}
@@ -729,8 +739,8 @@ export function DatabasePanel() {
                 <MetadataView
                   kind="storage-objects"
                   items={snapshot.storageObjects}
-                  primaryLabel="Object path"
-                  secondaryLabel="Bucket"
+                  primaryLabel={t('database.objectPath')}
+                  secondaryLabel={t('database.bucket')}
                   primary={metadataName}
                   secondary={metadataSecondary}
                   onPrimary={setMetadataName}
@@ -739,7 +749,7 @@ export function DatabasePanel() {
                   onAdd={() => void addMetadata('storage-objects')}
                   onDelete={(id) => void perform(
                     () => data.deleteMetadata(projectId, 'storage-objects', id),
-                    'Storage object metadata deleted.',
+                    t('database.notice.storageDeleted'),
                   )}
                 />
               )}
@@ -747,8 +757,8 @@ export function DatabasePanel() {
                 <MetadataView
                   kind="server-functions"
                   items={snapshot.serverFunctions}
-                  primaryLabel="Function name"
-                  secondaryLabel="Entry path"
+                  primaryLabel={t('database.functionName')}
+                  secondaryLabel={t('database.entryPath')}
                   primary={metadataName}
                   secondary={metadataSecondary}
                   onPrimary={setMetadataName}
@@ -757,7 +767,7 @@ export function DatabasePanel() {
                   onAdd={() => void addMetadata('server-functions')}
                   onDelete={(id) => void perform(
                     () => data.deleteMetadata(projectId, 'server-functions', id),
-                    'Function metadata deleted.',
+                    t('database.notice.functionDeleted'),
                   )}
                 />
               )}
@@ -775,7 +785,7 @@ export function DatabasePanel() {
                     if (!migrationPreview) return
                     const ok = await perform(
                       () => data.applyMigration(projectId, migrationPreview.confirmationToken),
-                      'Migration applied.',
+                      t('database.notice.migrationApplied'),
                     )
                     if (ok) setMigrationPreview(null)
                   })()}
@@ -801,11 +811,11 @@ export function DatabasePanel() {
                       scope: variableScope,
                       kind: variableKind,
                     }),
-                    'Environment variable saved with a masked value.',
+                    t('database.notice.variableSaved'),
                   )}
                   onDelete={(id) => void perform(
                     () => data.deleteVariable(projectId, id),
-                    'Environment variable deleted.',
+                    t('database.notice.variableDeleted'),
                   )}
                 />
               )}
@@ -834,10 +844,10 @@ export function DatabasePanel() {
                         return
                       }
                       setSupabaseKey('')
-                      setNotice('Supabase connection verified and stored by the Go data runtime.')
+                      setNotice(t('database.notice.supabaseConnected'))
                       await refresh()
                     } catch (cause) {
-                      setError(dataErrorMessage(cause, 'Supabase connection failed.'))
+                      setError(dataErrorMessage(cause, t('database.error.supabaseConnection'), t))
                     } finally {
                       setMutating(false)
                     }
@@ -854,30 +864,31 @@ export function DatabasePanel() {
 }
 
 function Overview({ snapshot }: { snapshot: DataProjectSnapshot }) {
+  const { locale, t } = useI18n()
   const cards = [
-    ['Tables', snapshot.tables.length, Table2],
-    ['Records', snapshot.tables.reduce((sum, table) => sum + table.recordCount, 0), Braces],
-    ['Auth users', snapshot.authUsers.length, Users],
-    ['Storage objects', snapshot.storageObjects.length, HardDrive],
-    ['Functions', snapshot.serverFunctions.length, FunctionSquare],
-    ['Variables', snapshot.variables.length, FileKey2],
+    [t('database.overview.tables'), snapshot.tables.length, Table2],
+    [t('database.overview.records'), snapshot.tables.reduce((sum, table) => sum + table.recordCount, 0), Braces],
+    [t('database.overview.authUsers'), snapshot.authUsers.length, Users],
+    [t('database.overview.storageObjects'), snapshot.storageObjects.length, HardDrive],
+    [t('database.overview.functions'), snapshot.serverFunctions.length, FunctionSquare],
+    [t('database.overview.variables'), snapshot.variables.length, FileKey2],
   ] as const
   return (
     <div className="grid grid-cols-2 gap-3 md:grid-cols-3">
       {cards.map(([label, value, Icon]) => (
         <div key={label} className="rounded-lg border border-border bg-card p-4">
           <Icon className="h-4 w-4 text-primary-bright" />
-          <div className="mt-3 text-2xl font-semibold text-foreground">{value}</div>
+          <div className="mt-3 text-2xl font-semibold text-foreground">{value.toLocaleString(locale)}</div>
           <div className="text-[11px] text-faint-foreground">{label}</div>
         </div>
       ))}
       <div className="col-span-2 rounded-lg border border-border bg-card p-4 md:col-span-3">
         <div className="flex items-center gap-2 text-[12px] font-medium text-foreground">
           <ShieldCheck className="h-4 w-4 text-success" />
-          Secret-safe by default
+          {t('database.overview.secretSafe')}
         </div>
         <p className="mt-1 text-[11px] leading-relaxed text-faint-foreground">
-          Variable values stay on the server. Browser responses, project snapshots, audit events, logs, and exports contain masked metadata only.
+          {t('database.overview.secretSafeCopy')}
         </p>
       </div>
     </div>
@@ -907,6 +918,7 @@ function TablesView({
   onCreate: () => void
   onDelete: (id: string) => void
 }) {
+  const { locale, t } = useI18n()
   return (
     <div className="grid gap-3 lg:grid-cols-[1fr_300px]">
       <div className="space-y-2">
@@ -915,33 +927,37 @@ function TablesView({
             <div className="flex items-center gap-2">
               <Table2 className="h-4 w-4 text-primary-bright" />
               <span className="font-mono text-[12px] font-medium text-foreground">{table.name}</span>
-              <span className="text-[10px] text-faint-foreground">{table.recordCount} records</span>
-              <button type="button" disabled={!canMutate} onClick={() => window.confirm(`Delete table ${table.name} and all of its records?`) && onDelete(table.id)} className="ml-auto rounded p-1.5 text-faint-foreground hover:bg-destructive/10 hover:text-destructive disabled:cursor-not-allowed disabled:opacity-40" aria-label={`Delete ${table.name}`}>
+              <span className="text-[10px] text-faint-foreground">
+                {t('database.recordCount', { count: table.recordCount.toLocaleString(locale) })}
+              </span>
+              <button type="button" disabled={!canMutate} onClick={() => window.confirm(t('database.confirm.deleteTable', { table: table.name })) && onDelete(table.id)} className="ml-auto rounded p-1.5 text-faint-foreground hover:bg-destructive/10 hover:text-destructive disabled:cursor-not-allowed disabled:opacity-40" aria-label={t('database.deleteNamed', { name: table.name })}>
                 <Trash2 className="h-3.5 w-3.5" />
               </button>
             </div>
             <div className="mt-2 flex flex-wrap gap-1.5">
               {table.columns.map((column) => (
                 <span key={column.id} className="rounded bg-white/5 px-2 py-1 font-mono text-[10px] text-muted-foreground">
-                  {column.name}: {column.type}{column.required ? '!' : ''}
+                  {column.name}: {dataColumnTypeLabel(column.type, t)}{column.required ? '!' : ''}
                 </span>
               ))}
-              {table.columns.length === 0 && <span className="text-[10px] text-faint-foreground">No columns yet</span>}
+              {table.columns.length === 0 && <span className="text-[10px] text-faint-foreground">{t('database.tables.noColumns')}</span>}
             </div>
           </div>
         ))}
-        {snapshot.tables.length === 0 && <EmptyState title="No tables" copy="Create the first typed table using the form." />}
+        {snapshot.tables.length === 0 && <EmptyState title={t('database.tables.empty')} copy={t('database.tables.emptyCopy')} />}
       </div>
-      <FormCard title="Create table">
-        <Field label="Table name" value={tableName} onChange={onTableName} />
-        <Field label="First column" value={columnName} onChange={onColumnName} />
+      <FormCard title={t('database.tables.create')}>
+        <Field label={t('database.tableName')} value={tableName} onChange={onTableName} />
+        <Field label={t('database.tables.firstColumn')} value={columnName} onChange={onColumnName} />
         <label className="block text-[10px] text-faint-foreground">
-          Column type
+          {t('database.tables.columnType')}
           <select value={columnType} onChange={(event) => onColumnType(event.target.value as DataColumnType)} className="mt-1 h-9 w-full rounded-md border border-border bg-background px-2 text-[11px] text-foreground">
-            {(['text', 'number', 'boolean', 'date', 'json'] as const).map((type) => <option key={type}>{type}</option>)}
+            {(['text', 'number', 'boolean', 'date', 'json'] as const).map((type) => (
+              <option key={type} value={type}>{dataColumnTypeLabel(type, t)}</option>
+            ))}
           </select>
         </label>
-        <PrimaryButton onClick={onCreate} disabled={!canMutate}><Plus className="h-3.5 w-3.5" />Create table</PrimaryButton>
+        <PrimaryButton onClick={onCreate} disabled={!canMutate}><Plus className="h-3.5 w-3.5" />{t('database.tables.create')}</PrimaryButton>
       </FormCard>
     </div>
   )
@@ -978,10 +994,11 @@ function RecordsView({
   onPrevious: () => void
   onNext: () => void
 }) {
+  const { locale, t } = useI18n()
   return (
     <div className="space-y-3">
       <select value={selectedTableId} onChange={(event) => onSelectTable(event.target.value)} className="h-9 rounded-md border border-border bg-card px-3 text-[11px] text-foreground">
-        <option value="">Select a table</option>
+        <option value="">{t('database.records.selectTable')}</option>
         {tables.map((table) => <option key={table.id} value={table.id}>{table.name}</option>)}
       </select>
       {selectedTableId && (
@@ -990,14 +1007,18 @@ function RecordsView({
             {loading ? <Loader2 className="h-4 w-4 animate-spin text-primary-bright" /> : records.map((record) => (
               <div key={record.id} className="flex items-start gap-2 rounded-md border border-border bg-card p-3">
                 <pre className="min-w-0 flex-1 overflow-x-auto text-[10px] leading-relaxed text-muted-foreground">{JSON.stringify(record.values, null, 2)}</pre>
-                <button type="button" disabled={!canMutate} onClick={() => window.confirm('Delete this record?') && onDelete(record.id)} className="rounded p-1.5 text-faint-foreground hover:bg-destructive/10 hover:text-destructive disabled:cursor-not-allowed disabled:opacity-40"><Trash2 className="h-3.5 w-3.5" /></button>
+                <button type="button" disabled={!canMutate} onClick={() => window.confirm(t('database.confirm.deleteRecord')) && onDelete(record.id)} className="rounded p-1.5 text-faint-foreground hover:bg-destructive/10 hover:text-destructive disabled:cursor-not-allowed disabled:opacity-40" aria-label={t('database.records.delete')}><Trash2 className="h-3.5 w-3.5" /></button>
               </div>
             ))}
-            {!loading && records.length === 0 && <EmptyState title="No records" copy="Add a JSON record from the form." />}
+            {!loading && records.length === 0 && <EmptyState title={t('database.records.empty')} copy={t('database.records.emptyCopy')} />}
             {!loading && total > 0 && (
               <div className="flex items-center justify-between rounded-md border border-border bg-card px-3 py-2 text-[10px] text-faint-foreground">
                 <span>
-                  {offset + 1}–{Math.min(offset + records.length, total)} of {total}
+                  {t('database.records.range', {
+                    start: (offset + 1).toLocaleString(locale),
+                    end: Math.min(offset + records.length, total).toLocaleString(locale),
+                    total: total.toLocaleString(locale),
+                  })}
                 </span>
                 <span className="flex gap-2">
                   <button
@@ -1006,7 +1027,7 @@ function RecordsView({
                     disabled={offset === 0}
                     className="rounded border border-border px-2 py-1 text-foreground disabled:opacity-40"
                   >
-                    Previous
+                    {t('database.previous')}
                   </button>
                   <button
                     type="button"
@@ -1014,18 +1035,18 @@ function RecordsView({
                     disabled={offset + records.length >= total}
                     className="rounded border border-border px-2 py-1 text-foreground disabled:opacity-40"
                   >
-                    Next
+                    {t('database.next')}
                   </button>
                 </span>
               </div>
             )}
           </div>
-          <FormCard title="Create record">
+          <FormCard title={t('database.records.create')}>
             <label className="block text-[10px] text-faint-foreground">
-              JSON values
+              {t('database.records.jsonValues')}
               <textarea value={recordJson} onChange={(event) => onRecordJson(event.target.value)} rows={8} className="mt-1 w-full resize-y rounded-md border border-border bg-background p-2 font-mono text-[10px] text-foreground outline-none" />
             </label>
-            <PrimaryButton onClick={onCreate} disabled={!canMutate}><Plus className="h-3.5 w-3.5" />Create record</PrimaryButton>
+            <PrimaryButton onClick={onCreate} disabled={!canMutate}><Plus className="h-3.5 w-3.5" />{t('database.records.create')}</PrimaryButton>
           </FormCard>
         </div>
       )}
@@ -1085,6 +1106,7 @@ function PublicRuntimeView({
   onRevoke: () => void
   onRefresh: () => void
 }) {
+  const { locale, t } = useI18n()
   const selectedDeployment = deployments.find(
     (deployment) => deployment.deploymentId === selectedDeploymentId,
   )
@@ -1094,9 +1116,9 @@ function PublicRuntimeView({
       <div className="flex items-start gap-3 rounded-lg border border-primary/25 bg-primary/5 p-3">
         <ShieldCheck className="mt-0.5 h-4 w-4 shrink-0 text-primary-bright" />
         <div className="min-w-0 flex-1">
-          <h3 className="text-[12px] font-medium text-foreground">Deployment-scoped public data</h3>
+          <h3 className="text-[12px] font-medium text-foreground">{t('database.public.title')}</h3>
           <p className="mt-1 text-[10px] leading-relaxed text-faint-foreground">
-            Every table is anonymous-deny until an administrator saves a policy. Published apps receive a short-lived deployment capability directly from the server; its token is never returned to this browser.
+            {t('database.public.copy')}
           </p>
         </div>
         <button
@@ -1104,7 +1126,7 @@ function PublicRuntimeView({
           onClick={onRefresh}
           disabled={policiesLoading || deploymentsLoading || runtimeLoading}
           className="rounded border border-border p-1.5 text-muted-foreground hover:bg-white/5 hover:text-foreground disabled:opacity-40"
-          aria-label="Refresh public data settings"
+          aria-label={t('database.public.refresh')}
         >
           <RefreshCw className={cn(
             'h-3.5 w-3.5',
@@ -1117,9 +1139,9 @@ function PublicRuntimeView({
         <div className="flex flex-wrap items-center gap-2">
           <Globe2 className="h-4 w-4 text-primary-bright" />
           <div className="min-w-0 flex-1">
-            <h3 className="text-[12px] font-medium text-foreground">Active deployment runtime</h3>
+            <h3 className="text-[12px] font-medium text-foreground">{t('database.public.runtimeTitle')}</h3>
             <p className="text-[10px] text-faint-foreground">
-              Capabilities are issued by publish and isolated to one deployment version and its allowed origins.
+              {t('database.public.runtimeCopy')}
             </p>
           </div>
           <select
@@ -1127,12 +1149,12 @@ function PublicRuntimeView({
             onChange={(event) => onSelectDeployment(event.target.value)}
             disabled={deploymentsLoading || deployments.length === 0}
             className="h-8 max-w-full rounded-md border border-border bg-background px-2 text-[10px] text-foreground disabled:opacity-50"
-            aria-label="Selected deployment"
+            aria-label={t('database.public.selectedDeployment')}
           >
-            <option value="">Select deployment</option>
+            <option value="">{t('database.public.selectDeployment')}</option>
             {deployments.map((deployment) => (
               <option key={deployment.deploymentId} value={deployment.deploymentId}>
-                {deployment.environment} · {deployment.status} · {shortId(deployment.deploymentId)}
+                {environmentLabel(deployment.environment, t)} · {deploymentStatusLabel(deployment.status, t)} · {shortId(deployment.deploymentId)}
               </option>
             ))}
           </select>
@@ -1146,10 +1168,10 @@ function PublicRuntimeView({
           </div>
         ) : deployments.length === 0 ? (
           <div className="mt-3 rounded-md border border-dashed border-border p-4 text-center text-[10px] text-faint-foreground">
-            No server deployment is available. Publish a reviewed build before a public capability can exist.
+            {t('database.public.noDeployment')}
           </div>
         ) : !selectedDeployment ? (
-          <p className="mt-3 text-[10px] text-faint-foreground">Select a deployment to inspect its active capability.</p>
+          <p className="mt-3 text-[10px] text-faint-foreground">{t('database.public.selectDeploymentCopy')}</p>
         ) : runtimeLoading ? (
           <div className="flex h-24 items-center justify-center">
             <Loader2 className="h-4 w-4 animate-spin text-primary-bright" />
@@ -1158,27 +1180,27 @@ function PublicRuntimeView({
           <div className="mt-3 grid gap-3 lg:grid-cols-[1fr_auto]">
             <div className="min-w-0 rounded-md border border-success/25 bg-success/5 p-3">
               <div className="flex flex-wrap items-center gap-2 text-[10px]">
-                <span className="rounded-full bg-success/15 px-2 py-0.5 font-medium text-success">active</span>
-                <span className="font-mono text-faint-foreground">capability {shortId(runtime.capabilityId)}</span>
-                <span className="font-mono text-faint-foreground">version {shortId(runtime.deploymentVersionId)}</span>
+                <span className="rounded-full bg-success/15 px-2 py-0.5 font-medium text-success">{t('database.status.active')}</span>
+                <span className="font-mono text-faint-foreground">{t('database.public.capability')} {shortId(runtime.capabilityId)}</span>
+                <span className="font-mono text-faint-foreground">{t('database.public.version')} {shortId(runtime.deploymentVersionId)}</span>
               </div>
               <dl className="mt-3 grid gap-2 text-[10px] sm:grid-cols-2">
                 <RuntimeDetail
-                  label="Public endpoint"
+                  label={t('database.public.endpoint')}
                   value={`${runtime.apiBasePath}/${runtime.deploymentId}`}
                 />
-                <RuntimeDetail label="Expires" value={formatDate(runtime.expiresAt)} />
+                <RuntimeDetail label={t('database.public.expires')} value={formatDate(runtime.expiresAt, locale)} />
                 <RuntimeDetail
-                  label="Activated"
-                  value={runtime.activatedAt ? formatDate(runtime.activatedAt) : 'activation pending'}
+                  label={t('database.public.activated')}
+                  value={runtime.activatedAt ? formatDate(runtime.activatedAt, locale) : t('database.public.activationPending')}
                 />
                 <RuntimeDetail
-                  label="Deployment"
-                  value={`${selectedDeployment.environment} · ${selectedDeployment.status}`}
+                  label={t('database.public.deployment')}
+                  value={`${environmentLabel(selectedDeployment.environment, t)} · ${deploymentStatusLabel(selectedDeployment.status, t)}`}
                 />
               </dl>
               <div className="mt-3">
-                <div className="text-[9px] uppercase tracking-wide text-faint-foreground">Allowed origins</div>
+                <div className="text-[9px] uppercase tracking-wide text-faint-foreground">{t('database.public.allowedOrigins')}</div>
                 <div className="mt-1 flex flex-wrap gap-1">
                   {runtime.allowedOrigins.map((origin) => (
                     <span key={origin} className="rounded bg-background px-2 py-1 font-mono text-[9px] text-muted-foreground">
@@ -1191,7 +1213,7 @@ function PublicRuntimeView({
             <button
               type="button"
               onClick={() => window.confirm(
-                'Revoke anonymous data access for this deployment? The published app will lose public data access until it is published again.',
+                t('database.confirm.revokeCapability'),
               ) && onRevoke()}
               disabled={!canPublish || runtimeRevoking}
               className="inline-flex h-9 items-center justify-center gap-1.5 rounded-md border border-destructive/40 px-3 text-[10px] font-medium text-destructive hover:bg-destructive/10 disabled:cursor-not-allowed disabled:opacity-40"
@@ -1199,17 +1221,17 @@ function PublicRuntimeView({
               {runtimeRevoking
                 ? <Loader2 className="h-3.5 w-3.5 animate-spin" />
                 : <ShieldOff className="h-3.5 w-3.5" />}
-              Revoke capability
+              {t('database.public.revokeCapability')}
             </button>
           </div>
         ) : runtimeChecked && !runtimeError ? (
           <div className="mt-3 rounded-md border border-warning/25 bg-warning/5 p-3 text-[10px] text-warning">
-            This deployment has no active public data capability. Its app cannot call the anonymous data plane until a successful publish issues and activates one.
+            {t('database.public.noRuntime')}
           </div>
         ) : null}
         {!canPublish && selectedDeployment && (
           <p className="mt-2 text-[9px] text-faint-foreground">
-            Your role can inspect the runtime but cannot revoke it. Publish access is required.
+            {t('database.public.cannotRevoke')}
           </p>
         )}
       </section>
@@ -1218,16 +1240,16 @@ function PublicRuntimeView({
         <div className="mb-2 flex items-center gap-2">
           <Table2 className="h-4 w-4 text-primary-bright" />
           <div className="min-w-0 flex-1">
-            <h3 className="text-[12px] font-medium text-foreground">Anonymous table policies</h3>
+            <h3 className="text-[12px] font-medium text-foreground">{t('database.public.policiesTitle')}</h3>
             <p className="text-[10px] text-faint-foreground">
-              Operations and field allowlists are independent for each table. Unsaved changes never affect a published app.
+              {t('database.public.policiesCopy')}
             </p>
           </div>
         </div>
         {policyError && <InlineError message={policyError} />}
         {!canAdmin && (
           <div className="mb-2 rounded-md border border-border bg-card px-3 py-2 text-[10px] text-faint-foreground">
-            Read-only policy view. An owner or administrator is required to save or remove anonymous access.
+            {t('database.public.readOnly')}
           </div>
         )}
         {policiesLoading && tables.length > 0 && policies.length === 0 ? (
@@ -1235,7 +1257,7 @@ function PublicRuntimeView({
             <Loader2 className="h-4 w-4 animate-spin text-primary-bright" />
           </div>
         ) : tables.length === 0 ? (
-          <EmptyState title="No tables" copy="Create a typed table before configuring anonymous access." />
+          <EmptyState title={t('database.tables.empty')} copy={t('database.public.noTablesCopy')} />
         ) : (
           <div className="space-y-3">
             {tables.map((table) => {
@@ -1250,20 +1272,20 @@ function PublicRuntimeView({
                     <span className="font-mono text-[12px] font-medium text-foreground">{table.name}</span>
                     {policy && policy.version > 0 ? (
                       <span className="rounded-full bg-primary/10 px-2 py-0.5 text-[9px] text-primary-bright">
-                        saved v{policy.version}
+                        {t('database.public.savedVersion', { version: policy.version.toLocaleString(locale) })}
                       </span>
                     ) : (
                       <span className="rounded-full bg-warning/10 px-2 py-0.5 text-[9px] text-warning">
-                        default deny · no policy
+                        {t('database.public.defaultDeny')}
                       </span>
                     )}
-                    {dirty && <span className="text-[9px] text-warning">unsaved changes</span>}
+                    {dirty && <span className="text-[9px] text-warning">{t('database.public.unsaved')}</span>}
                     <span className="ml-auto font-mono text-[8px] text-faint-foreground">{shortId(table.id)}</span>
                   </div>
 
                   <div className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-4">
                     <PolicyToggle
-                      label="Read"
+                      label={t('database.public.anonymousRead')}
                       checked={draft.allowRead}
                       disabled={!canAdmin || saving}
                       onChange={(checked) => onChangeDraft(table.id, (current) => ({
@@ -1273,7 +1295,7 @@ function PublicRuntimeView({
                       }))}
                     />
                     <PolicyToggle
-                      label="Create"
+                      label={t('database.public.anonymousCreate')}
                       checked={draft.allowCreate}
                       disabled={!canAdmin || saving}
                       onChange={(checked) => onChangeDraft(table.id, (current) => ({
@@ -1285,7 +1307,7 @@ function PublicRuntimeView({
                       }))}
                     />
                     <PolicyToggle
-                      label="Update"
+                      label={t('database.public.anonymousUpdate')}
                       checked={draft.allowUpdate}
                       disabled={!canAdmin || saving}
                       onChange={(checked) => onChangeDraft(table.id, (current) => ({
@@ -1297,7 +1319,7 @@ function PublicRuntimeView({
                       }))}
                     />
                     <PolicyToggle
-                      label="Delete"
+                      label={t('database.public.anonymousDelete')}
                       checked={draft.allowDelete}
                       disabled={!canAdmin || saving}
                       onChange={(checked) => onChangeDraft(table.id, (current) => ({
@@ -1309,24 +1331,24 @@ function PublicRuntimeView({
 
                   <div className="mt-3 grid gap-3 md:grid-cols-2">
                     <FieldAllowlist
-                      title="Readable fields"
-                      description="Returned inside record values"
+                      title={t('database.public.readableFields')}
+                      description={t('database.public.readableFieldsCopy')}
                       columns={table.columns.map((column) => column.name)}
                       selected={draft.readableFields}
                       disabled={!canAdmin || !draft.allowRead || saving}
-                      disabledReason={!draft.allowRead ? 'Enable anonymous read first.' : undefined}
+                      disabledReason={!draft.allowRead ? t('database.public.enableRead') : undefined}
                       onToggle={(field) => onChangeDraft(table.id, (current) => ({
                         ...current,
                         readableFields: toggleField(current.readableFields, field),
                       }))}
                     />
                     <FieldAllowlist
-                      title="Writable fields"
-                      description="Accepted for create and update"
+                      title={t('database.public.writableFields')}
+                      description={t('database.public.writableFieldsCopy')}
                       columns={table.columns.map((column) => column.name)}
                       selected={draft.writableFields}
                       disabled={!canAdmin || !writeEnabled || saving}
-                      disabledReason={!writeEnabled ? 'Enable anonymous create or update first.' : undefined}
+                      disabledReason={!writeEnabled ? t('database.public.enableWrite') : undefined}
                       onToggle={(field) => onChangeDraft(table.id, (current) => ({
                         ...current,
                         writableFields: toggleField(current.writableFields, field),
@@ -1338,12 +1360,12 @@ function PublicRuntimeView({
                     <button
                       type="button"
                       onClick={() => window.confirm(
-                        `Remove the saved policy for ${table.name}? Anonymous access will return to default-deny.`,
+                        t('database.confirm.removePolicy', { table: table.name }),
                       ) && onDelete(table.id)}
                       disabled={!canAdmin || !policy || policy.version === 0 || saving}
                       className="inline-flex h-8 items-center gap-1.5 rounded-md border border-border px-2.5 text-[10px] text-muted-foreground hover:border-destructive/40 hover:text-destructive disabled:cursor-not-allowed disabled:opacity-40"
                     >
-                      <Trash2 className="h-3.5 w-3.5" />Remove policy
+                      <Trash2 className="h-3.5 w-3.5" />{t('database.public.removePolicy')}
                     </button>
                     <button
                       type="button"
@@ -1354,7 +1376,7 @@ function PublicRuntimeView({
                       {saving
                         ? <Loader2 className="h-3.5 w-3.5 animate-spin" />
                         : <Save className="h-3.5 w-3.5" />}
-                      Save policy
+                      {t('database.public.savePolicy')}
                     </button>
                   </div>
                 </article>
@@ -1391,7 +1413,7 @@ function PolicyToggle({
         onChange={(event) => onChange(event.target.checked)}
         className="accent-primary"
       />
-      Anonymous {label.toLowerCase()}
+      {label}
     </label>
   )
 }
@@ -1413,6 +1435,7 @@ function FieldAllowlist({
   disabledReason?: string
   onToggle: (field: string) => void
 }) {
+  const { t } = useI18n()
   return (
     <fieldset disabled={disabled} className="rounded-md border border-border bg-background p-2.5">
       <legend className="sr-only">{title}</legend>
@@ -1438,7 +1461,7 @@ function FieldAllowlist({
           )
         })}
         {columns.length === 0 && (
-          <span className="text-[9px] text-faint-foreground">This table has no value fields.</span>
+          <span className="text-[9px] text-faint-foreground">{t('database.public.noValueFields')}</span>
         )}
       </div>
     </fieldset>
@@ -1487,21 +1510,22 @@ function MetadataView({
   onAdd: () => void
   onDelete: (id: string) => void
 }) {
+  const { t } = useI18n()
   return (
     <div className="grid gap-3 lg:grid-cols-[1fr_300px]">
       <div className="space-y-2">
         {items.map((item) => (
           <div key={item.id} className="flex items-start gap-2 rounded-md border border-border bg-card p-3">
             <pre className="min-w-0 flex-1 overflow-x-auto text-[10px] leading-relaxed text-muted-foreground">{JSON.stringify(item, null, 2)}</pre>
-            <button type="button" disabled={!canMutate} onClick={() => window.confirm('Delete this metadata item?') && onDelete(item.id)} className="rounded p-1.5 text-faint-foreground hover:bg-destructive/10 hover:text-destructive disabled:cursor-not-allowed disabled:opacity-40"><Trash2 className="h-3.5 w-3.5" /></button>
+            <button type="button" disabled={!canMutate} onClick={() => window.confirm(t('database.confirm.deleteMetadata')) && onDelete(item.id)} className="rounded p-1.5 text-faint-foreground hover:bg-destructive/10 hover:text-destructive disabled:cursor-not-allowed disabled:opacity-40" aria-label={t('database.metadata.delete')}><Trash2 className="h-3.5 w-3.5" /></button>
           </div>
         ))}
-        {items.length === 0 && <EmptyState title={`No ${kind}`} copy="Add metadata using the form. Credentials are not accepted here." />}
+        {items.length === 0 && <EmptyState title={t('database.metadata.empty', { kind: metadataKindLabel(kind, t) })} copy={t('database.metadata.emptyCopy')} />}
       </div>
-      <FormCard title={`Add ${kind}`}>
+      <FormCard title={t('database.metadata.addKind', { kind: metadataKindLabel(kind, t) })}>
         <Field label={primaryLabel} value={primary} onChange={onPrimary} />
         <Field label={secondaryLabel} value={secondary} onChange={onSecondary} />
-        <PrimaryButton onClick={onAdd} disabled={!canMutate}><Plus className="h-3.5 w-3.5" />Add metadata</PrimaryButton>
+        <PrimaryButton onClick={onAdd} disabled={!canMutate}><Plus className="h-3.5 w-3.5" />{t('database.metadata.add')}</PrimaryButton>
       </FormCard>
     </div>
   )
@@ -1534,6 +1558,7 @@ function VariablesView({
   onSave: () => void
   onDelete: (id: string) => void
 }) {
+  const { t } = useI18n()
   return (
     <div className="grid gap-3 lg:grid-cols-[1fr_320px]">
       <div className="space-y-2">
@@ -1542,27 +1567,27 @@ function VariablesView({
             <KeyRound className="h-3.5 w-3.5 text-primary-bright" />
             <span className="min-w-0 flex-1">
               <span className="block font-mono text-[11px] text-foreground">{variable.name}</span>
-              <span className="block text-[10px] text-faint-foreground">{variable.scope} · {variable.kind} · {variable.maskedValue}</span>
+              <span className="block text-[10px] text-faint-foreground">{environmentLabel(variable.scope, t)} · {variableKindLabel(variable.kind, t)} · {variable.maskedValue}</span>
             </span>
-            <button type="button" disabled={!canMutate} onClick={() => window.confirm(`Delete ${variable.name}?`) && onDelete(variable.id)} className="rounded p-1.5 text-faint-foreground hover:bg-destructive/10 hover:text-destructive disabled:cursor-not-allowed disabled:opacity-40"><Trash2 className="h-3.5 w-3.5" /></button>
+            <button type="button" disabled={!canMutate} onClick={() => window.confirm(t('database.confirm.deleteVariable', { name: variable.name })) && onDelete(variable.id)} className="rounded p-1.5 text-faint-foreground hover:bg-destructive/10 hover:text-destructive disabled:cursor-not-allowed disabled:opacity-40" aria-label={t('database.deleteNamed', { name: variable.name })}><Trash2 className="h-3.5 w-3.5" /></button>
           </div>
         ))}
       </div>
-      <FormCard title="Set environment variable">
-        <Field label="Name" value={name} onChange={onName} />
+      <FormCard title={t('database.variables.set')}>
+        <Field label={t('database.variables.name')} value={name} onChange={onName} />
         <label className="block text-[10px] text-faint-foreground">
-          Value (never returned)
+          {t('database.variables.value')}
           <input type={kind === 'secret' ? 'password' : 'text'} value={value} onChange={(event) => onValue(event.target.value)} className="mt-1 h-9 w-full rounded-md border border-border bg-background px-2 text-[11px] text-foreground outline-none" />
         </label>
         <div className="grid grid-cols-2 gap-2">
           <select value={scope} onChange={(event) => onScope(event.target.value as EnvironmentScope)} className="h-9 rounded-md border border-border bg-background px-2 text-[11px] text-foreground">
-            {(['development', 'preview', 'production'] as const).map((item) => <option key={item}>{item}</option>)}
+            {(['development', 'preview', 'production'] as const).map((item) => <option key={item} value={item}>{environmentLabel(item, t)}</option>)}
           </select>
           <select value={kind} onChange={(event) => onKind(event.target.value as EnvironmentVariableKind)} className="h-9 rounded-md border border-border bg-background px-2 text-[11px] text-foreground">
-            <option value="plain">plain</option><option value="secret">secret</option>
+            <option value="plain">{variableKindLabel('plain', t)}</option><option value="secret">{variableKindLabel('secret', t)}</option>
           </select>
         </div>
-        <PrimaryButton onClick={onSave} disabled={!canMutate}><FileKey2 className="h-3.5 w-3.5" />Save masked variable</PrimaryButton>
+        <PrimaryButton onClick={onSave} disabled={!canMutate}><FileKey2 className="h-3.5 w-3.5" />{t('database.variables.save')}</PrimaryButton>
       </FormCard>
     </div>
   )
@@ -1591,29 +1616,30 @@ function MigrationsView({
   onApply: () => void
   canApply: boolean
 }) {
+  const { locale, t } = useI18n()
   return (
     <div className="grid gap-3 lg:grid-cols-[320px_1fr]">
-      <FormCard title="Migration operation">
+      <FormCard title={t('database.migrations.operation')}>
         <select value={kind} onChange={(event) => onKind(event.target.value as typeof kind)} className="h-9 rounded-md border border-border bg-background px-2 text-[11px] text-foreground">
-          <option value="create-table">Create table</option>
-          <option value="drop-table">Drop selected table</option>
+          <option value="create-table">{t('database.migrations.createTable')}</option>
+          <option value="drop-table">{t('database.migrations.dropTable')}</option>
         </select>
-        {kind === 'create-table' ? <Field label="Table name" value={tableName} onChange={onTableName} /> : <p className="rounded-md border border-destructive/30 bg-destructive/10 px-2 py-2 text-[10px] text-destructive">Destructive target: {selectedTable ?? 'none selected'}</p>}
-        <PrimaryButton onClick={onPreview} disabled={!canPreview}><Play className="h-3.5 w-3.5" />Preview migration</PrimaryButton>
+        {kind === 'create-table' ? <Field label={t('database.tableName')} value={tableName} onChange={onTableName} /> : <p className="rounded-md border border-destructive/30 bg-destructive/10 px-2 py-2 text-[10px] text-destructive">{t('database.migrations.destructiveTarget', { table: selectedTable ?? t('database.migrations.noneSelected') })}</p>}
+        <PrimaryButton onClick={onPreview} disabled={!canPreview}><Play className="h-3.5 w-3.5" />{t('database.migrations.preview')}</PrimaryButton>
       </FormCard>
       <div className="rounded-lg border border-border bg-card p-3">
-        <h3 className="text-[12px] font-medium text-foreground">Preview and confirmation</h3>
-        {!preview ? <p className="mt-2 text-[11px] text-faint-foreground">No migration preview yet. Applying is impossible until a server-issued one-time token exists.</p> : (
+        <h3 className="text-[12px] font-medium text-foreground">{t('database.migrations.previewTitle')}</h3>
+        {!preview ? <p className="mt-2 text-[11px] text-faint-foreground">{t('database.migrations.noPreview')}</p> : (
           <div className="mt-3 space-y-2">
             {preview.changes.map((change, index) => (
               <div key={`${change.operation}-${index}`} className={cn('rounded-md border px-3 py-2 text-[11px]', change.destructive ? 'border-destructive/30 bg-destructive/10 text-destructive' : 'border-border bg-background text-muted-foreground')}>
-                <div className="font-medium">{change.operation}{change.destructive ? ' · destructive' : ''}</div>
+                <div className="font-medium">{migrationOperationLabel(change.operation, t)}{change.destructive ? ` · ${t('database.migrations.destructive')}` : ''}</div>
                 <div className="mt-0.5">{change.summary}</div>
               </div>
             ))}
-            <p className="font-mono text-[9px] text-faint-foreground">Expires {new Date(preview.expiresAt).toLocaleString()}</p>
+            <p className="font-mono text-[9px] text-faint-foreground">{t('database.migrations.expires', { date: new Date(preview.expiresAt).toLocaleString(locale) })}</p>
             <button type="button" onClick={onApply} disabled={!canApply} className="inline-flex items-center gap-1.5 rounded-md bg-destructive px-3 py-2 text-[11px] font-semibold text-destructive-foreground hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-40">
-              <CheckCircle2 className="h-3.5 w-3.5" />Confirm and apply migration
+              <CheckCircle2 className="h-3.5 w-3.5" />{t('database.migrations.apply')}
             </button>
           </div>
         )}
@@ -1641,31 +1667,37 @@ function ConnectionView({
   onApiKey: (value: string) => void
   onConnect: () => void
 }) {
+  const { locale, t } = useI18n()
   return (
     <div className="mx-auto max-w-lg rounded-lg border border-border bg-card p-4">
-      <div className="flex items-center gap-2 text-sm font-semibold text-foreground"><Cloud className="h-4 w-4 text-primary-bright" />Test Supabase REST connection</div>
-      <p className="mt-1 text-[11px] leading-relaxed text-faint-foreground">The key is used only by the server for this connection test, is never echoed, and is cleared from this form after success. Private-network and redirect targets are blocked.</p>
+      <div className="flex items-center gap-2 text-sm font-semibold text-foreground"><Cloud className="h-4 w-4 text-primary-bright" />{t('database.connection.title')}</div>
+      <p className="mt-1 text-[11px] leading-relaxed text-faint-foreground">{t('database.connection.copy')}</p>
       {storedConnection && (
         <div className="mt-3 rounded-md border border-success/30 bg-success/10 px-3 py-2 text-[10px] text-success">
-          Stored server-side · {storedConnection.endpoint} · {storedConnection.schemaTables.length} schema tables · updated {new Date(storedConnection.updatedAt).toLocaleString()}
+          {t('database.connection.stored', {
+            endpoint: storedConnection.endpoint,
+            count: storedConnection.schemaTables.length.toLocaleString(locale),
+            date: new Date(storedConnection.updatedAt).toLocaleString(locale),
+          })}
         </div>
       )}
       <div className="mt-4 space-y-3">
-        <Field label="Project endpoint" value={endpoint} onChange={onEndpoint} placeholder="https://project.supabase.co" />
-        <label className="block text-[10px] text-faint-foreground">API key<input type="password" value={apiKey} onChange={(event) => onApiKey(event.target.value)} className="mt-1 h-9 w-full rounded-md border border-border bg-background px-2 text-[11px] text-foreground outline-none" /></label>
-        <PrimaryButton onClick={onConnect} disabled={!canMutate}><Cloud className="h-3.5 w-3.5" />Test connection</PrimaryButton>
+        <Field label={t('database.connection.endpoint')} value={endpoint} onChange={onEndpoint} placeholder="https://project.supabase.co" />
+        <label className="block text-[10px] text-faint-foreground">{t('database.connection.apiKey')}<input type="password" value={apiKey} onChange={(event) => onApiKey(event.target.value)} className="mt-1 h-9 w-full rounded-md border border-border bg-background px-2 text-[11px] text-foreground outline-none" /></label>
+        <PrimaryButton onClick={onConnect} disabled={!canMutate}><Cloud className="h-3.5 w-3.5" />{t('database.connection.test')}</PrimaryButton>
       </div>
-      {result && <div role={result.ok ? 'status' : 'alert'} className={cn('mt-3 rounded-md border px-3 py-2 text-[11px]', result.ok ? 'border-success/30 bg-success/10 text-success' : 'border-destructive/30 bg-destructive/10 text-destructive')}>{result.message} · HTTP {result.status} · {result.latencyMs} ms</div>}
+      {result && <div role={result.ok ? 'status' : 'alert'} className={cn('mt-3 rounded-md border px-3 py-2 text-[11px]', result.ok ? 'border-success/30 bg-success/10 text-success' : 'border-destructive/30 bg-destructive/10 text-destructive')}>{result.message} · HTTP {result.status} · {t('database.connection.latency', { value: result.latencyMs.toLocaleString(locale) })}</div>}
       {result?.schemaTables && result.schemaTables.length > 0 && (
-        <p className="mt-2 text-[10px] text-faint-foreground">Schema: {result.schemaTables.join(', ')}</p>
+        <p className="mt-2 text-[10px] text-faint-foreground">{t('database.connection.schema', { tables: result.schemaTables.join(', ') })}</p>
       )}
     </div>
   )
 }
 
 function AuditView({ events }: { events: DataProjectSnapshot['audit'] }) {
+  const { locale, t } = useI18n()
   if (events.length === 0) {
-    return <EmptyState title="No audit events" copy="Data mutations will appear here after the server commits them." />
+    return <EmptyState title={t('database.audit.empty')} copy={t('database.audit.emptyCopy')} />
   }
   return (
     <div className="space-y-2">
@@ -1678,7 +1710,7 @@ function AuditView({ events }: { events: DataProjectSnapshot['audit'] }) {
               {event.resource}{event.resourceId ? `/${event.resourceId}` : ''}
             </span>
             <time className="ml-auto text-[9px] text-faint-foreground" dateTime={event.createdAt}>
-              {new Date(event.createdAt).toLocaleString()}
+              {new Date(event.createdAt).toLocaleString(locale)}
             </time>
           </div>
           {event.details && Object.keys(event.details).length > 0 && (
@@ -1745,25 +1777,100 @@ function shortId(value: string) {
   return value.length > 12 ? `${value.slice(0, 8)}…${value.slice(-4)}` : value
 }
 
-function formatDate(value: string) {
-  const date = new Date(value)
-  return Number.isFinite(date.getTime()) ? date.toLocaleString() : value
+type Translate = ReturnType<typeof useI18n>['t']
+
+function dataTabLabel(tab: DataTab, t: Translate) {
+  switch (tab) {
+    case 'overview': return t('database.tab.overview')
+    case 'tables': return t('database.tab.tables')
+    case 'records': return t('database.tab.records')
+    case 'public': return t('database.tab.public')
+    case 'auth': return t('database.tab.auth')
+    case 'storage': return t('database.tab.storage')
+    case 'functions': return t('database.tab.functions')
+    case 'migrations': return t('database.tab.migrations')
+    case 'variables': return t('database.tab.variables')
+    case 'connect': return t('database.tab.connect')
+    case 'audit': return t('database.tab.audit')
+  }
 }
 
-function jsonObject(value: unknown): Readonly<Record<string, JsonValue>> {
+function dataColumnTypeLabel(type: DataColumnType, t: Translate) {
+  switch (type) {
+    case 'text': return t('database.columnType.text')
+    case 'number': return t('database.columnType.number')
+    case 'boolean': return t('database.columnType.boolean')
+    case 'date': return t('database.columnType.date')
+    case 'json': return t('database.columnType.json')
+  }
+}
+
+function metadataKindLabel(kind: DataMetadataKind, t: Translate) {
+  switch (kind) {
+    case 'auth-users': return t('database.metadata.authUsers')
+    case 'storage-objects': return t('database.metadata.storageObjects')
+    case 'server-functions': return t('database.metadata.serverFunctions')
+  }
+}
+
+function environmentLabel(environment: string, t: Translate) {
+  switch (environment) {
+    case 'development': return t('database.environment.development')
+    case 'preview': return t('database.environment.preview')
+    case 'production': return t('database.environment.production')
+    default: return environment
+  }
+}
+
+function variableKindLabel(kind: EnvironmentVariableKind, t: Translate) {
+  return kind === 'secret' ? t('database.variableKind.secret') : t('database.variableKind.plain')
+}
+
+function deploymentStatusLabel(status: string, t: Translate) {
+  switch (status) {
+    case 'pending': return t('database.status.pending')
+    case 'building': return t('database.status.building')
+    case 'ready': return t('database.status.ready')
+    case 'active': return t('database.status.active')
+    case 'failed': return t('database.status.failed')
+    case 'cancelled': return t('database.status.cancelled')
+    case 'revoked': return t('database.status.revoked')
+    default: return status.replaceAll('_', ' ')
+  }
+}
+
+function migrationOperationLabel(operation: string, t: Translate) {
+  switch (operation) {
+    case 'create-table': return t('database.migrations.createTable')
+    case 'drop-table': return t('database.migrations.dropTable')
+    case 'add-column': return t('database.migrations.addColumn')
+    case 'drop-column': return t('database.migrations.dropColumn')
+    default: return operation.replaceAll('-', ' ')
+  }
+}
+
+function formatDate(value: string, locale: string) {
+  const date = new Date(value)
+  return Number.isFinite(date.getTime()) ? date.toLocaleString(locale) : value
+}
+
+function jsonObject(
+  value: unknown,
+  errorMessage: string,
+): Readonly<Record<string, JsonValue>> {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) {
-    throw new Error('Record values must be a JSON object.')
+    throw new Error(errorMessage)
   }
   return value as Readonly<Record<string, JsonValue>>
 }
 
-function dataErrorMessage(error: unknown, fallback: string) {
+function dataErrorMessage(error: unknown, fallback: string, t: Translate) {
   if (error instanceof PlatformNetworkError) {
-    return 'The Go data runtime is unavailable. No local or mock data was substituted.'
+    return t('database.error.network')
   }
   if (error instanceof PlatformHttpError) {
-    if (error.status === 401) return 'Your session expired. Sign in again before using project data.'
-    if (error.status === 403) return 'Your project role does not allow this data operation.'
+    if (error.status === 401) return t('database.error.sessionExpired')
+    if (error.status === 403) return t('database.error.forbidden')
     if (error.problem.errors) {
       const details = Object.values(error.problem.errors).flat()
       if (details.length > 0) return details.join(' ')

@@ -11,7 +11,7 @@ import { GitBranch, GitCompareArrows, RotateCcw } from 'lucide-react'
 export function VersionPanel() {
   const { session, can, authorize } = useCollaboration()
   const canEdit = session.signedIn && can('edit')
-  const { t } = useI18n()
+  const { locale, t } = useI18n()
   const {
     workspace,
     restoreWorkspaceCheckpoint,
@@ -56,7 +56,9 @@ export function VersionPanel() {
         <div className="flex items-center gap-2 rounded-md border border-border bg-card px-2.5 py-2 text-[10px] text-muted-foreground">
           <GitBranch className="h-3.5 w-3.5 text-primary-bright" />
           <span className="truncate">{activeBranch?.name ?? workspace.activeBranchId}</span>
-          <span className="ml-auto text-faint-foreground">{workspace.checkpoints.length}</span>
+          <span className="ml-auto text-faint-foreground">
+            {t('version.checkpointCount', { count: workspace.checkpoints.length.toLocaleString(locale) })}
+          </span>
         </div>
 
         <label className="block text-[10px] text-faint-foreground">
@@ -115,9 +117,11 @@ export function VersionPanel() {
           <div className="flex h-full min-h-0 flex-col">
             <div className="flex items-center gap-3 border-b border-border px-2.5 py-1.5 text-[10px]">
               <GitCompareArrows className="h-3.5 w-3.5 text-primary-bright" />
-              <span className="text-success">+{comparison.files.reduce((sum, file) => sum + file.diff.additions, 0)}</span>
-              <span className="text-destructive">-{comparison.files.reduce((sum, file) => sum + file.diff.deletions, 0)}</span>
-              <span className="text-faint-foreground">{changedFiles.length} {t('code.changedFiles')}</span>
+              <span className="text-success">+{comparison.files.reduce((sum, file) => sum + file.diff.additions, 0).toLocaleString(locale)}</span>
+              <span className="text-destructive">-{comparison.files.reduce((sum, file) => sum + file.diff.deletions, 0).toLocaleString(locale)}</span>
+              <span className="text-faint-foreground">
+                {t('version.changedFileCount', { count: changedFiles.length.toLocaleString(locale) })}
+              </span>
             </div>
             <div className="grid min-h-0 flex-1 grid-cols-[180px_1fr] max-md:grid-cols-1">
               <div className="overflow-y-auto border-r border-border p-1 scrollbar-thin max-md:max-h-20 max-md:border-b max-md:border-r-0">
@@ -128,7 +132,12 @@ export function VersionPanel() {
                     onClick={() => setSelectedPath(file.path)}
                     className={cn('flex w-full items-center gap-1 rounded px-1.5 py-1 text-left text-[10px]', selected?.path === file.path ? 'bg-primary/15 text-foreground' : 'text-muted-foreground hover:bg-white/5')}
                   >
-                    <span className={cn('w-4 shrink-0 font-semibold', file.status === 'added' ? 'text-success' : file.status === 'deleted' ? 'text-destructive' : 'text-warning')}>{file.status[0].toUpperCase()}</span>
+                    <span
+                      className={cn('w-4 shrink-0 font-semibold', file.status === 'added' ? 'text-success' : file.status === 'deleted' ? 'text-destructive' : 'text-warning')}
+                      title={fileStatusLabel(file.status, t)}
+                    >
+                      {fileStatusShortLabel(file.status, t)}
+                    </span>
                     <span className="truncate">{file.path}</span>
                   </button>
                 ))}
@@ -146,4 +155,26 @@ export function VersionPanel() {
       </div>
     </div>
   )
+}
+
+type Translate = ReturnType<typeof useI18n>['t']
+
+function fileStatusLabel(status: string, t: Translate) {
+  switch (status) {
+    case 'added': return t('version.fileStatus.added')
+    case 'deleted': return t('version.fileStatus.deleted')
+    case 'modified': return t('version.fileStatus.modified')
+    case 'unchanged': return t('version.fileStatus.unchanged')
+    default: return status
+  }
+}
+
+function fileStatusShortLabel(status: string, t: Translate) {
+  switch (status) {
+    case 'added': return t('version.fileStatus.addedShort')
+    case 'deleted': return t('version.fileStatus.deletedShort')
+    case 'modified': return t('version.fileStatus.modifiedShort')
+    case 'unchanged': return t('version.fileStatus.unchangedShort')
+    default: return status.slice(0, 1).toUpperCase()
+  }
 }

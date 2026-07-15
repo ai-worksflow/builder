@@ -1778,7 +1778,7 @@ func targetExecutionSlice(execution Execution) (SliceContext, bool) {
 func targetArtifactTemplate(execution Execution, jobType string) (kind, key, title string, content json.RawMessage, ok bool) {
 	switch jobType {
 	case "derive_requirements":
-		return "product_requirements", "DOC-REQUIREMENTS", "Product Requirements", json.RawMessage(`{"schemaVersion":1,"kind":"productRequirements","blocks":[]}`), true
+		return "product_requirements", "DOC-REQUIREMENTS", "Product Requirements", json.RawMessage(`{"schemaVersion":1,"kind":"productRequirements","summary":"","blocks":[],"requirements":[],"acceptanceCriteria":[],"openQuestions":[],"assumptions":[]}`), true
 	case "decompose_pages":
 		return "blueprint", "BLUEPRINT-MAIN", "Product Blueprint", json.RawMessage(`{"schemaVersion":1,"nodes":[],"edges":[],"pageSpecs":[]}`), true
 	case "generate_page_spec":
