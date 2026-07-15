@@ -36,6 +36,7 @@ import {
   type ArtifactWorkspaceSnapshot,
   type ArtifactWorkspaceResourceCollection,
 } from './artifact-workspace'
+import { normalizeBlueprintContent } from './blueprint-content'
 import type {
   ArtifactRevisionDto,
   ArtifactDraftDto,
@@ -541,8 +542,9 @@ function documentAsLegacy(resource: VersionedArtifactDto<DocumentContentDto>): T
 }
 
 function blueprintAsLegacy(resource: VersionedArtifactDto<BlueprintContentDto>): Blueprint {
-  const content = resource.draft?.content ?? resource.latestRevision?.content
-    ?? createEmptyBlueprintContent()
+  const content = normalizeBlueprintContent(
+    resource.draft?.content ?? resource.latestRevision?.content ?? createEmptyBlueprintContent(),
+  )
   const semanticNodes = content.semantic?.nodes ?? content.nodes.map(({ position: _, ...node }) => node)
   const semanticEdges = content.semantic?.edges ?? content.edges
   return {
@@ -557,7 +559,7 @@ function blueprintAsLegacy(resource: VersionedArtifactDto<BlueprintContentDto>):
       description: node.description,
       position: content.layout?.nodePositions[node.id] ?? { x: 0, y: 0 },
       boundDocumentIds: [],
-      boundMemberIds: [...node.assignedMemberIds],
+      boundMemberIds: [...(node.assignedMemberIds ?? [])],
       boundPrototypeArtifactIds: [],
       generatedDocIds: [],
       missing: [],

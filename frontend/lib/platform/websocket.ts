@@ -829,7 +829,12 @@ export class PlatformWebSocketClient {
 
   private scheduleHeartbeat() {
     this.clearHeartbeat()
-    const interval = this.serverHeartbeatIntervalMs ?? this.options.heartbeatIntervalMs
+    const advertisedInterval = this.serverHeartbeatIntervalMs ?? this.options.heartbeatIntervalMs
+    const livenessInterval = Math.max(1, Math.floor(this.options.heartbeatTimeoutMs / 2))
+    const interval = Math.max(1, Math.min(
+      advertisedInterval > 0 ? advertisedInterval : this.options.heartbeatIntervalMs,
+      livenessInterval,
+    ))
     this.heartbeatHandle = this.timer.setTimeout(() => {
       this.heartbeatHandle = undefined
       if (this.stateValue !== 'open') return

@@ -540,6 +540,36 @@ test('WebSocket subscriptions dispatch discriminated events and persist cursors'
   client.destroy()
 })
 
+test('WebSocket probes before its timeout when the server advertises a slower heartbeat', async () => {
+  const fake = fakeSocketFactory()
+  const timer = new FakeTimer()
+  const client = new PlatformWebSocketClient({
+    url: 'wss://platform.example.test/v1/ws',
+    webSocketFactory: fake.factory,
+    timer,
+    heartbeatIntervalMs: 15_000,
+    heartbeatTimeoutMs: 45_000,
+  })
+
+  client.connect()
+  fake.sockets[0].open()
+  await Promise.resolve()
+  fake.sockets[0].message({
+    type: 'auth.ack',
+    connectionId: 'connection-1',
+    heartbeatIntervalMs: 50_000,
+  })
+
+  assert.equal(timer.runOnlyTask(), 22_500)
+  assert.equal(client.state, 'open')
+  assert.deepEqual(fake.sockets[0].closes, [])
+  assert.deepEqual(fake.sockets[0].sent.at(-1), {
+    type: 'heartbeat',
+    sentAt: '2026-07-10T00:00:22.500Z',
+  })
+  client.destroy()
+})
+
 test('WebSocket cursor reset clears replay state, notifies the projection, and resubscribes', async () => {
   const fake = fakeSocketFactory()
   const cursors = new FakeCursorStore()

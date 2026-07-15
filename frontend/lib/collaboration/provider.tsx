@@ -123,6 +123,14 @@ export interface CollaborationDocumentConflict {
 
 const CollaborationContext = createContext<CollaborationContextState | null>(null)
 
+let browserPlatformClient: PlatformClient | undefined
+
+function defaultPlatformClient() {
+  if (typeof window === 'undefined') return new PlatformClient()
+  browserPlatformClient ??= new PlatformClient()
+  return browserPlatformClient
+}
+
 export function CollaborationProvider({
   children,
   client,
@@ -136,7 +144,7 @@ export function CollaborationProvider({
     selectPlatformProject,
   } = useWorksflow()
   const defaultClientRef = useRef<PlatformClient | null>(null)
-  if (!client && !defaultClientRef.current) defaultClientRef.current = new PlatformClient()
+  if (!client && !defaultClientRef.current) defaultClientRef.current = defaultPlatformClient()
   const activeClient = client ?? defaultClientRef.current!
   const gateway = useMemo(() => new PlatformCollaborationGateway(activeClient), [activeClient])
   const selectPlatformProjectRef = useRef(selectPlatformProject)
@@ -298,7 +306,6 @@ export function CollaborationProvider({
     return () => {
       active = false
       unsubscribe()
-      gateway.disconnectRealtime()
       window.clearInterval(heartbeatTimer)
       window.clearTimeout(invalidationTimer)
     }

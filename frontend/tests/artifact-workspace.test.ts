@@ -804,6 +804,110 @@ test('blueprints keep semantic facts independent from canvas layout', () => {
   assert.deepEqual(moved.nodes[0].position, { x: 240, y: 120 })
 })
 
+test('Blueprint normalization hydrates canonical AI graphs without editor-only arrays or layout', () => {
+  const generated = {
+    nodes: [
+      {
+        id: 'feature-interview',
+        key: 'FEATURE-INTERVIEW',
+        kind: 'feature',
+        title: 'AI interview',
+      },
+      {
+        id: 'page-interview',
+        key: 'PAGE-INTERVIEW',
+        kind: 'page',
+        title: 'AI interview',
+        route: '/interview',
+        userGoal: 'Complete an interview.',
+        requirementIds: ['req-ai-interview-guidance'],
+      },
+    ],
+    edges: [{
+      id: 'edge-feature-page',
+      sourceNodeId: 'feature-interview',
+      targetNodeId: 'page-interview',
+      kind: 'contains',
+    }],
+  } as unknown as BlueprintContentDto
+
+  const normalized = normalizeBlueprintContent(generated)
+  assert.deepEqual(normalized.semantic?.nodes.map((node) => node.assignedMemberIds), [[], []])
+  assert.deepEqual(normalized.semantic?.nodes.map((node) => node.requirementIds), [[], ['req-ai-interview-guidance']])
+  assert.deepEqual(normalized.semantic?.edges.map((edge) => edge.required), [false])
+  assert.deepEqual(normalized.pageSpecRefs, [])
+  assert.deepEqual(normalized.validation, [])
+  assert.deepEqual(normalized.layout?.nodePositions, {
+    'feature-interview': { x: 48, y: 48 },
+    'page-interview': { x: 258, y: 48 },
+  })
+  assert.deepEqual(blueprintGate(normalized), [])
+})
+
+test('Blueprint normalization canonicalizes backend wire aliases and nested Page fields', () => {
+  const generated = {
+    nodes: [
+      {
+        id: 'feature-interview',
+        businessKey: 'FEATURE-INTERVIEW',
+        type: 'Feature',
+      },
+      {
+        id: 'page-interview',
+        businessKey: 'PAGE-INTERVIEW',
+        type: 'Page',
+        requirementIds: ['req-ai-interview-guidance'],
+        spec: {
+          title: 'AI interview',
+          route: '/interview',
+          userGoal: 'Complete an interview.',
+        },
+      },
+    ],
+    edges: [{
+      id: 'edge-feature-page',
+      from: 'feature-interview',
+      to: 'page-interview',
+      type: 'contains',
+    }],
+  } as unknown as BlueprintContentDto
+
+  const normalized = normalizeBlueprintContent(generated)
+  assert.deepEqual(normalized.semantic?.nodes.map((node) => ({
+    id: node.id,
+    key: node.key,
+    kind: node.kind,
+    title: node.title,
+    route: node.route,
+    userGoal: node.userGoal,
+  })), [
+    {
+      id: 'feature-interview',
+      key: 'FEATURE-INTERVIEW',
+      kind: 'feature',
+      title: 'FEATURE-INTERVIEW',
+      route: undefined,
+      userGoal: undefined,
+    },
+    {
+      id: 'page-interview',
+      key: 'PAGE-INTERVIEW',
+      kind: 'page',
+      title: 'AI interview',
+      route: '/interview',
+      userGoal: 'Complete an interview.',
+    },
+  ])
+  assert.deepEqual(normalized.semantic?.edges, [{
+    id: 'edge-feature-page',
+    sourceNodeId: 'feature-interview',
+    targetNodeId: 'page-interview',
+    kind: 'contains',
+    required: false,
+  }])
+  assert.deepEqual(blueprintGate(normalized), [])
+})
+
 test('Blueprint normalization canonicalizes Permission role aliases', () => {
   const legacy: BlueprintContentDto = {
     nodes: [{
