@@ -3793,6 +3793,31 @@ test('frozen build input produces a reviewed proposal and applied preview', asyn
   expect(state.requests.some((item) => item.path.includes('/api/generate'))).toBe(false)
 })
 
+test('Workbench renders production-shaped nullable build manifest collections', async ({ page }) => {
+  const state = await installPlatformMock(page, { authenticated: true })
+  const rawBundle = state.workbenchBundle as unknown as Record<string, unknown>
+
+  // This intentionally mirrors the persisted production wire shape instead
+  // of hiding Go nil slices behind the stricter WorkbenchBundleDto.
+  Object.assign(rawBundle, {
+    contractRevisions: null,
+    designSystemRevisions: null,
+    assumptions: null,
+  })
+
+  await page.goto('/workbench/complete?view=code')
+  await page.getByRole('button', { name: 'Freeze build input' }).click()
+
+  await expect(page.getByText('Frozen application build manifest')).toBeVisible()
+  for (const label of [
+    'Contracts',
+    'Design system refs',
+  ]) {
+    await expect(page.getByText(label, { exact: true }).locator('..')).toContainText('0')
+  }
+  await expect(page.getByRole('button', { name: 'Generate proposal' })).toBeEnabled()
+})
+
 test('multi-bundle Workbench rebases exact shared-file inputs and survives both reload boundaries', async ({ page }) => {
   const state = await installPlatformMock(page, {
     authenticated: true,

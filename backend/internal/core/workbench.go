@@ -65,6 +65,24 @@ type WorkbenchBundle struct {
 	ManifestHash               string                     `json:"contentHash"`
 }
 
+// MarshalJSON preserves the historical omission of contextRevisions when the
+// field was absent while allowing newly created bundles to freeze an explicit
+// empty collection. This distinction keeps legacy manifest hashes stable:
+// omitted input unmarshals to nil, whereas a newly frozen [] remains non-nil.
+func (bundle WorkbenchBundle) MarshalJSON() ([]byte, error) {
+	type bundleAlias WorkbenchBundle
+	if bundle.ContextRevisions == nil {
+		return json.Marshal(bundleAlias(bundle))
+	}
+	return json.Marshal(struct {
+		bundleAlias
+		ContextRevisions []WorkbenchContextRevision `json:"contextRevisions"`
+	}{
+		bundleAlias:      bundleAlias(bundle),
+		ContextRevisions: bundle.ContextRevisions,
+	})
+}
+
 type WorkbenchContextRevision struct {
 	Kind     string     `json:"kind"`
 	Revision VersionRef `json:"revision"`
@@ -369,12 +387,18 @@ func (s *WorkbenchService) CreateBundle(ctx context.Context, projectID, actorID 
 		ID: bundleID.String(), ProjectID: projectID, RootBuildManifestID: bundleID.String(),
 		WorkflowRunID: input.WorkflowRunID, ManifestGroupKey: input.ManifestGroupKey,
 		DeliverySliceID: input.DeliverySliceID, PageSpecRevision: classified.pageSpecs[0],
-		PrototypeRevision: input.PrototypeRevision, RequirementRevisions: classified.requirements,
-		BlueprintRevision: classified.blueprints[0], ContractRevisions: classified.contracts,
-		DesignSystemRevisions: classified.designSystems, CurrentWorkspaceRevision: workspaceRef,
-		ContextRevisions: classified.contexts, WorkflowContext: cloneApplicationBuildContext(workflowContext),
-		RenderedFrames: renderedFrames, Assumptions: stringSlice(prototype["assumptions"]),
-		Waivers: waivers, CreatedBy: actorID, CreatedAt: now,
+		PrototypeRevision:        input.PrototypeRevision,
+		RequirementRevisions:     append([]VersionRef{}, classified.requirements...),
+		BlueprintRevision:        classified.blueprints[0],
+		ContractRevisions:        append([]VersionRef{}, classified.contracts...),
+		DesignSystemRevisions:    append([]VersionRef{}, classified.designSystems...),
+		CurrentWorkspaceRevision: workspaceRef,
+		ContextRevisions:         append([]WorkbenchContextRevision{}, classified.contexts...),
+		WorkflowContext:          cloneApplicationBuildContext(workflowContext),
+		RenderedFrames:           append([]RenderedFrameRef{}, renderedFrames...),
+		Assumptions:              append([]string{}, stringSlice(prototype["assumptions"])...),
+		Waivers:                  append([]string{}, waivers...),
+		CreatedBy:                actorID, CreatedAt: now,
 	}
 	bundle.SceneGraph = fragmentAsset(prototypeRevision, prototype, "scene", "layers", "scene-graph.json")
 	bundle.InteractionManifest = fragmentAsset(prototypeRevision, prototype, "interactions", "interactions", "interactions.json")

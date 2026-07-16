@@ -399,6 +399,50 @@ test('Workbench lineage hydration and exact workspace rebase use root-scoped rou
   ])
 })
 
+test('Workbench bundle responses normalize nullable collections at the API boundary', async () => {
+  const rawBundle = {
+    id: 'bundle-nullable',
+    requirementRevisions: null,
+    contractRevisions: null,
+    designSystemRevisions: null,
+    contextRevisions: null,
+    renderedFrames: null,
+    assumptions: null,
+    waivers: null,
+    workflowContext: {
+      inputManifest: { sources: null },
+    },
+  }
+  const client = flowClient((path) => path.endsWith('/lineage-state')
+    ? json({ rootBundleId: rawBundle.id, activeBundle: rawBundle, lineage: null })
+    : json(rawBundle))
+  const revision = {
+    artifactId: 'artifact-1',
+    revisionId: 'revision-1',
+    revisionNumber: 1,
+    contentHash: 'a'.repeat(64),
+  }
+
+  const fetched = await client.getWorkbenchBundle(rawBundle.id)
+  const created = await client.createWorkbenchBundle('project-1', {
+    prototypeRevision: revision,
+  })
+  const rebased = await client.rebaseWorkbenchBundle(rawBundle.id, revision)
+  const lineage = await client.getWorkbenchBundleLineageState(rawBundle.id)
+
+  for (const bundle of [fetched.data, created.data, rebased.data, lineage.data.activeBundle]) {
+    assert.deepEqual(bundle.requirementRevisions, [])
+    assert.deepEqual(bundle.contractRevisions, [])
+    assert.deepEqual(bundle.designSystemRevisions, [])
+    assert.deepEqual(bundle.contextRevisions, [])
+    assert.deepEqual(bundle.renderedFrames, [])
+    assert.deepEqual(bundle.assumptions, [])
+    assert.deepEqual(bundle.waivers, [])
+    assert.deepEqual(bundle.workflowContext?.inputManifest.sources, [])
+  }
+  assert.deepEqual(lineage.data.lineage, [])
+})
+
 test('new workflow definitions start as the complete executable product delivery loop', () => {
   const definition = starterDefinition()
   assert.equal(definition.schemaVersion, '4')

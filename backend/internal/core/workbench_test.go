@@ -44,6 +44,35 @@ func TestLegacyWorkbenchBundleWithoutContextRevisionsKeepsHashShape(t *testing.T
 	}
 }
 
+func TestNewWorkbenchBundleEmptyCollectionsMarshalAsArrays(t *testing.T) {
+	t.Parallel()
+	bundle := WorkbenchBundle{
+		RequirementRevisions:  []VersionRef{},
+		ContractRevisions:     []VersionRef{},
+		DesignSystemRevisions: []VersionRef{},
+		ContextRevisions:      []WorkbenchContextRevision{},
+		RenderedFrames:        []RenderedFrameRef{},
+		Assumptions:           []string{},
+		Waivers:               []string{},
+	}
+	payload, err := json.Marshal(bundle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &object); err != nil {
+		t.Fatal(err)
+	}
+	for _, field := range []string{
+		"requirementRevisions", "contractRevisions", "designSystemRevisions", "contextRevisions",
+		"renderedFrames", "assumptions", "waivers",
+	} {
+		if got := string(object[field]); got != "[]" {
+			t.Errorf("new Workbench bundle field %s encoded as %s, want []", field, got)
+		}
+	}
+}
+
 func TestApplicationBuildContextProfileCompatibilityKeepsHistoricalBundleHash(t *testing.T) {
 	t.Parallel()
 	legacy := WorkbenchBundle{ID: "legacy-profile-bundle", ProjectID: "legacy-project", WorkflowContext: &ApplicationBuildContext{

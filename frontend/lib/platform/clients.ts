@@ -70,6 +70,7 @@ import type { CreateInputManifestDto, InputManifestDto } from './flow-contract'
 import type { HttpRequestOptions, HttpResult, QueryValue } from './http'
 import { HttpClient } from './http'
 import { wireVersionRef } from './wire-version-ref'
+import { normalizeWorkbenchBundle } from './workbench-normalization'
 
 export interface ClientRequestOptions {
   readonly signal?: AbortSignal
@@ -919,23 +920,25 @@ export class RunsClient extends DomainClient {
 }
 
 export class WorkbenchClient extends DomainClient {
-  createBundle(
+  async createBundle(
     projectId: string,
     input: CreateWorkbenchBundleInputDto,
     options?: ClientMutationOptions,
   ) {
-    return this.http.post<WorkbenchBundleDto, CreateWorkbenchBundleInputDto>(
+    const result = await this.http.post<WorkbenchBundleDto, CreateWorkbenchBundleInputDto>(
       `/v1/projects/${segment(projectId)}/build-manifests`,
       { ...input, prototypeRevision: wireVersionRef(input.prototypeRevision) },
       mutationOptions(options, true),
     )
+    return { ...result, data: normalizeWorkbenchBundle(result.data) }
   }
 
-  getBundle(bundleId: string, options?: ClientRequestOptions) {
-    return this.http.get<WorkbenchBundleDto>(
+  async getBundle(bundleId: string, options?: ClientRequestOptions) {
+    const result = await this.http.get<WorkbenchBundleDto>(
       `/v1/build-manifests/${segment(bundleId)}`,
       requestOptions(options),
     )
+    return { ...result, data: normalizeWorkbenchBundle(result.data) }
   }
 }
 

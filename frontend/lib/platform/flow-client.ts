@@ -24,6 +24,10 @@ import type {
 } from './flow-contract'
 import { HttpClient } from './http'
 import { wireVersionRef } from './wire-version-ref'
+import {
+  normalizeWorkbenchBundle,
+  normalizeWorkbenchLineageState,
+} from './workbench-normalization'
 
 function segment(value: string) {
   return encodeURIComponent(value)
@@ -300,44 +304,48 @@ export class PlatformFlowClient {
     )
   }
 
-  createWorkbenchBundle(
+  async createWorkbenchBundle(
     projectId: string,
     input: CreateWorkbenchBundleInputDto,
     options?: ClientMutationOptions,
   ) {
-    return this.http.post<WorkbenchBundleDto, CreateWorkbenchBundleInputDto>(
+    const result = await this.http.post<WorkbenchBundleDto, CreateWorkbenchBundleInputDto>(
       `/v1/projects/${segment(projectId)}/build-manifests`,
       { ...input, prototypeRevision: wireVersionRef(input.prototypeRevision) },
       mutationOptions(options),
     )
+    return { ...result, data: normalizeWorkbenchBundle(result.data) }
   }
 
-  getWorkbenchBundle(bundleId: string, options?: ClientRequestOptions) {
-    return this.http.get<WorkbenchBundleDto>(
+  async getWorkbenchBundle(bundleId: string, options?: ClientRequestOptions) {
+    const result = await this.http.get<WorkbenchBundleDto>(
       `/v1/build-manifests/${segment(bundleId)}`,
       requestOptions(options),
     )
+    return { ...result, data: normalizeWorkbenchBundle(result.data) }
   }
 
-  getWorkbenchBundleLineageState(rootBundleId: string, options?: ClientRequestOptions) {
-    return this.http.get<WorkbenchBundleLineageStateDto>(
+  async getWorkbenchBundleLineageState(rootBundleId: string, options?: ClientRequestOptions) {
+    const result = await this.http.get<WorkbenchBundleLineageStateDto>(
       `/v1/build-manifests/${segment(rootBundleId)}/lineage-state`,
       requestOptions(options),
     )
+    return { ...result, data: normalizeWorkbenchLineageState(result.data) }
   }
 
-  rebaseWorkbenchBundle(
+  async rebaseWorkbenchBundle(
     bundleId: string,
     workspaceRevision: ExactArtifactRefDto,
     options?: ClientMutationOptions,
   ) {
-    return this.http.post<WorkbenchBundleDto, {
+    const result = await this.http.post<WorkbenchBundleDto, {
       readonly workspaceRevision: ExactArtifactRefDto
     }>(
       `/v1/build-manifests/${segment(bundleId)}/rebase`,
       { workspaceRevision: wireVersionRef(workspaceRevision) },
       mutationOptions(options),
     )
+    return { ...result, data: normalizeWorkbenchBundle(result.data) }
   }
 
   generateImplementation(
