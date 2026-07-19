@@ -91,6 +91,27 @@ func TestPublicDataRuntimeMigrationAppliesToPostgres(t *testing.T) {
 			t.Fatalf("apply %s: %v", name, err)
 		}
 	}
+	var migrationLedgerAbsent bool
+	if err := transaction.QueryRowContext(ctx, `SELECT to_regclass($1) IS NULL`,
+		schema+".schema_migrations").Scan(&migrationLedgerAbsent); err != nil {
+		t.Fatal(err)
+	}
+	if !migrationLedgerAbsent {
+		t.Fatal("raw migration chain synthesized an external schema ledger")
+	}
+	// This test exercises public data-policy migrations with an already-existing
+	// legacy production deployment. New legacy production writes and their
+	// ReleaseBundle authority are covered independently by release canaries, so
+	// isolate both admission triggers instead of synthesizing unrelated receipts
+	// or weakening the production-only public-capability scenario.
+	if _, err := transaction.ExecContext(ctx, `
+ALTER TABLE deployment_versions
+DISABLE TRIGGER deployment_version_release_authority_insert_guard;
+ALTER TABLE deployment_versions
+DISABLE TRIGGER deployment_version_controller_singleflight_guard
+`); err != nil {
+		t.Fatalf("isolate historical release authority from public runtime fixture: %v", err)
+	}
 
 	var policyTable, capabilityTable string
 	if err := transaction.QueryRowContext(ctx, `

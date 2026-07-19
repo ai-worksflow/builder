@@ -1,0 +1,4 @@
+DROP TRIGGER IF EXISTS deployment_version_release_authority_insert_guard ON deployment_versions;
+DROP FUNCTION IF EXISTS validate_deployment_version_release_authority_insert();
+
+DROP INDEX IF EXISTS deployment_versions_release_bundle_idx;

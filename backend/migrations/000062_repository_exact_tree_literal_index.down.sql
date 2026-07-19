@@ -1,0 +1,32 @@
+DROP TRIGGER IF EXISTS repository_exact_tree_literal_index_member_insert_guard
+  ON repository_exact_tree_literal_index_members;
+DROP TRIGGER IF EXISTS repository_exact_tree_literal_index_member_immutable
+  ON repository_exact_tree_literal_index_members;
+DROP TRIGGER IF EXISTS repository_exact_tree_literal_index_member_no_truncate
+  ON repository_exact_tree_literal_index_members;
+DROP TRIGGER IF EXISTS repository_exact_tree_literal_index_manifest_insert_guard
+  ON repository_exact_tree_literal_index_manifests;
+DROP TRIGGER IF EXISTS repository_exact_tree_literal_index_manifest_publish_guard
+  ON repository_exact_tree_literal_index_manifests;
+DROP TRIGGER IF EXISTS repository_exact_tree_literal_index_manifest_no_delete
+  ON repository_exact_tree_literal_index_manifests;
+DROP TRIGGER IF EXISTS repository_exact_tree_literal_index_manifest_no_truncate
+  ON repository_exact_tree_literal_index_manifests;
+DROP TRIGGER IF EXISTS repository_exact_tree_literal_index_blob_immutable
+  ON repository_exact_tree_literal_index_blobs;
+DROP TRIGGER IF EXISTS repository_exact_tree_literal_index_blob_no_truncate
+  ON repository_exact_tree_literal_index_blobs;
+
+DROP FUNCTION IF EXISTS publish_repository_exact_tree_literal_index_manifest();
+DROP FUNCTION IF EXISTS guard_repository_exact_tree_literal_index_manifest_delete();
+DROP FUNCTION IF EXISTS guard_repository_exact_tree_literal_index_manifest_insert();
+DROP FUNCTION IF EXISTS guard_repository_exact_tree_literal_index_member_mutation();
+DROP FUNCTION IF EXISTS guard_repository_exact_tree_literal_index_member_insert();
+DROP FUNCTION IF EXISTS guard_repository_exact_tree_literal_index_blob_mutation();
+
+DROP TABLE IF EXISTS repository_exact_tree_literal_index_members;
+DROP TABLE IF EXISTS repository_exact_tree_literal_index_manifests;
+DROP TABLE IF EXISTS repository_exact_tree_literal_index_blobs;
+
+-- pg_trgm is shared infrastructure and may predate this feature. Downgrade
+-- intentionally leaves the extension installed.

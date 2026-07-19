@@ -1,0 +1,34 @@
+DROP TRIGGER canonical_verification_receipt_cleanup_guard
+  ON canonical_verification_receipts;
+DROP TRIGGER candidate_verification_receipt_cleanup_guard
+  ON candidate_verification_receipts;
+DROP FUNCTION require_verification_receipt_cleanup_complete();
+
+DROP TRIGGER canonical_verification_attempt_claim_cleanup_guard
+  ON canonical_verification_attempts;
+DROP TRIGGER canonical_verification_run_claim_cleanup_guard
+  ON canonical_verification_runs;
+DROP TRIGGER candidate_verification_attempt_claim_cleanup_guard
+  ON candidate_verification_attempts;
+DROP TRIGGER candidate_verification_run_claim_cleanup_guard
+  ON candidate_verification_runs;
+DROP FUNCTION require_verification_claim_cleanup_registration();
+
+DROP TRIGGER canonical_verification_attempt_transition_guard
+  ON canonical_verification_attempts;
+CREATE TRIGGER canonical_verification_attempt_transition_guard
+BEFORE UPDATE OR DELETE ON canonical_verification_attempts
+FOR EACH ROW EXECUTE FUNCTION guard_canonical_verification_attempt_transition();
+DROP FUNCTION guard_canonical_verification_attempt_transition_v2();
+
+DROP TRIGGER canonical_verification_run_transition_guard
+  ON canonical_verification_runs;
+CREATE TRIGGER canonical_verification_run_transition_guard
+BEFORE UPDATE OR DELETE ON canonical_verification_runs
+FOR EACH ROW EXECUTE FUNCTION guard_canonical_verification_run_transition();
+DROP FUNCTION guard_canonical_verification_run_transition_v2();
+
+DROP TRIGGER verification_execution_cleanup_mutation_guard
+  ON verification_execution_cleanups;
+DROP FUNCTION validate_verification_execution_cleanup_mutation();
+DROP TABLE verification_execution_cleanups;

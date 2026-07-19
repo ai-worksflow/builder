@@ -99,6 +99,14 @@ func TestConversationControlPlaneImmutabilityOnPostgres(t *testing.T) {
 			t.Fatalf("apply %s: %v", name, err)
 		}
 	}
+	var migrationLedgerAbsent bool
+	if err := transaction.QueryRowContext(ctx, `SELECT to_regclass($1) IS NULL`,
+		schema+".schema_migrations").Scan(&migrationLedgerAbsent); err != nil {
+		t.Fatal(err)
+	}
+	if !migrationLedgerAbsent {
+		t.Fatal("raw migration chain synthesized an external schema ledger")
+	}
 
 	userID, projectID := uuid.New(), uuid.New()
 	definitionID, definitionVersionID := uuid.New(), uuid.New()

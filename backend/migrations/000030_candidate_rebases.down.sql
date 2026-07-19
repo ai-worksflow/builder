@@ -1,0 +1,14 @@
+DROP TRIGGER IF EXISTS candidate_rebase_conflict_guard ON candidate_rebase_conflicts;
+DROP FUNCTION IF EXISTS validate_candidate_rebase_conflict_mutation();
+DROP TRIGGER IF EXISTS candidate_rebase_conflict_insert_guard ON candidate_rebase_conflicts;
+DROP TRIGGER IF EXISTS candidate_rebase_operation_insert_guard ON candidate_rebase_operations;
+DROP FUNCTION IF EXISTS validate_candidate_rebase_plan_insert();
+DROP TRIGGER IF EXISTS candidate_rebase_operation_immutable ON candidate_rebase_operations;
+DROP FUNCTION IF EXISTS prevent_candidate_rebase_plan_mutation();
+DROP TRIGGER IF EXISTS candidate_rebase_mutation_guard ON candidate_rebases;
+DROP FUNCTION IF EXISTS validate_candidate_rebase_mutation();
+DROP TRIGGER IF EXISTS candidate_rebase_insert_guard ON candidate_rebases;
+DROP FUNCTION IF EXISTS validate_candidate_rebase_insert();
+DROP TABLE IF EXISTS candidate_rebase_conflicts;
+DROP TABLE IF EXISTS candidate_rebase_operations;
+DROP TABLE IF EXISTS candidate_rebases;

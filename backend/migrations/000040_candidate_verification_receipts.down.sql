@@ -1,0 +1,29 @@
+DROP TRIGGER IF EXISTS candidate_verification_run_terminal_receipt_guard ON candidate_verification_runs;
+DROP FUNCTION IF EXISTS validate_candidate_verification_run_terminal_receipt();
+
+DROP TRIGGER IF EXISTS candidate_verification_coverage_complete_guard ON candidate_verification_obligation_coverage;
+DROP TRIGGER IF EXISTS candidate_verification_check_complete_guard ON candidate_verification_checks;
+DROP TRIGGER IF EXISTS candidate_verification_receipt_complete_guard ON candidate_verification_receipts;
+DROP FUNCTION IF EXISTS validate_candidate_verification_receipt_complete();
+
+DROP TRIGGER IF EXISTS candidate_verification_coverage_immutable ON candidate_verification_obligation_coverage;
+DROP TRIGGER IF EXISTS candidate_verification_check_immutable ON candidate_verification_checks;
+DROP TRIGGER IF EXISTS candidate_verification_receipt_immutable ON candidate_verification_receipts;
+DROP FUNCTION IF EXISTS prevent_candidate_verification_receipt_fact_mutation();
+
+DROP TRIGGER IF EXISTS candidate_verification_coverage_insert_guard ON candidate_verification_obligation_coverage;
+DROP FUNCTION IF EXISTS validate_candidate_verification_coverage_insert();
+DROP TRIGGER IF EXISTS candidate_verification_check_insert_guard ON candidate_verification_checks;
+DROP FUNCTION IF EXISTS validate_candidate_verification_check_insert();
+DROP TRIGGER IF EXISTS candidate_verification_receipt_insert_guard ON candidate_verification_receipts;
+DROP FUNCTION IF EXISTS validate_candidate_verification_receipt_insert();
+
+DROP TABLE IF EXISTS candidate_verification_obligation_coverage;
+DROP TABLE IF EXISTS candidate_verification_checks;
+DROP TABLE IF EXISTS candidate_verification_receipts;
+
+DROP FUNCTION IF EXISTS verification_diagnostics_are_valid(jsonb);
+DROP FUNCTION IF EXISTS verification_blob_reference_is_valid(jsonb, uuid);
+DROP FUNCTION IF EXISTS verification_argv_is_valid(jsonb);
+DROP FUNCTION IF EXISTS verification_uuid_array_is_valid(jsonb, integer, integer);
+DROP FUNCTION IF EXISTS verification_sorted_string_array_is_valid(jsonb, integer, integer, integer);

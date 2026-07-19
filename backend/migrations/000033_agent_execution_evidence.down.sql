@@ -1,0 +1,2 @@
+DROP INDEX IF EXISTS agent_attempts_evidence_refs_idx;
+DROP INDEX IF EXISTS candidate_workspace_journal_exact_after_tree_idx;

@@ -16,17 +16,18 @@ func TestArtifactHealthBackfillPostgresCanary(t *testing.T) {
 	if dsn == "" {
 		t.Skip("WORKSFLOW_TEST_POSTGRES_DSN is not configured")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
 	base, err := sql.Open("pgx", dsn)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer base.Close()
 	schema := "artifact_health_backfill_" + strings.ReplaceAll(uuid.NewString(), "-", "")
-	if _, err := base.ExecContext(ctx, `CREATE SCHEMA "`+schema+`"`); err != nil {
+	setupCtx, setupCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	if _, err := base.ExecContext(setupCtx, `CREATE SCHEMA "`+schema+`"`); err != nil {
+		setupCancel()
 		t.Fatal(err)
 	}
+	setupCancel()
 	t.Cleanup(func() {
 		_, _ = base.ExecContext(context.Background(), `DROP SCHEMA IF EXISTS "`+schema+`" CASCADE`)
 	})
@@ -35,9 +36,10 @@ func TestArtifactHealthBackfillPostgresCanary(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer database.Close()
-	if err := Up(ctx, database); err != nil {
-		t.Fatalf("migrations.Up failed in temporary schema: %v", err)
-	}
+	applyPostgresMigrationsForCanary(t, database)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
 
 	userID := uuid.New()
 	projectID := uuid.New()
