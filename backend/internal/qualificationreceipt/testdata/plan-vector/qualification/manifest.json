@@ -1,0 +1,55 @@
+{
+  "schemaVersion": "worksflow-qualification-manifest/v1",
+  "subject": "worksflow-project-level-ai-constructor",
+  "sourceDocuments": ["docs/architecture.md"],
+  "qualificationSupportPaths": [
+    "contracts/reference-acceptance-criteria.json",
+    "frontend/playwright.golden.config.ts",
+    "frontend/scripts/check-golden-environment.mjs",
+    "frontend/tests/golden-reference.spec.ts",
+    "frontend/tests/qualification-fixture.ts",
+    "qualification/artifact-hygiene.json",
+    "qualification/test-inventory.json"
+  ],
+  "policy": {
+    "stageExitRequiresExternalQualification": true,
+    "allowSkippedTests": false,
+    "allowMocks": false,
+    "allowMutableRuntimeImages": false,
+    "credentialBearingArtifacts": "restricted-encrypted-until-revocation",
+    "passingInternalSuitesAreStageExitEvidence": false
+  },
+  "suites": [
+    {
+      "id": "golden-external",
+      "mode": "external-qualification",
+      "executionKind": "playwright",
+      "status": "not-qualified",
+      "coverage": "external-complete",
+      "qualificationGroup": "golden",
+      "requirementIds": ["AIC-E2E-003", "AIC-E2E-004"],
+      "qualificationCommand": "pnpm qualification:golden",
+      "testPaths": ["frontend/tests/golden-reference.spec.ts"],
+      "criterionSource": {
+        "path": "contracts/reference-acceptance-criteria.json",
+        "schemaVersion": "reference-acceptance-criteria/v1",
+        "applicationId": "plan-vector-v1"
+      },
+      "requiredArtifacts": ["browser-video", "credential-safe-trace"],
+      "blockers": ["not run"]
+    },
+    {
+      "id": "artifact-hygiene",
+      "mode": "external-qualification",
+      "executionKind": "post-run-verifier",
+      "status": "not-qualified",
+      "coverage": "external-complete",
+      "qualificationGroup": "golden",
+      "requirementIds": ["FQP-E2E-016"],
+      "qualificationCommand": "pnpm qualification:golden",
+      "verificationContractPath": "qualification/artifact-hygiene.json",
+      "requiredArtifacts": ["credential-set-revocation-receipt"],
+      "blockers": ["not run"]
+    }
+  ]
+}

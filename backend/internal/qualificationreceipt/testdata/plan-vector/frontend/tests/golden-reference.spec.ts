@@ -1,0 +1,2 @@
+QG-GOLDEN-001 Golden A
+QG-GOLDEN-002 Golden B

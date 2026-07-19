@@ -1,0 +1,16 @@
+{
+  "schemaVersion": "reference-acceptance-criteria/v1",
+  "applicationId": "plan-vector-v1",
+  "criteria": [
+    {
+      "id": "AC-GOLDEN-001",
+      "requirementIds": ["REQ-GOLDEN-A"],
+      "statement": "The first fixed-vector Golden case passes against the exact external environment."
+    },
+    {
+      "id": "AC-GOLDEN-002",
+      "requirementIds": ["REQ-GOLDEN-B"],
+      "statement": "The second fixed-vector Golden case passes against the exact external environment."
+    }
+  ]
+}
