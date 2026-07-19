@@ -30,7 +30,7 @@ export interface WebSocketLike {
   onmessage: ((event: MessageEvent) => void) | null
   onerror: ((event: Event) => void) | null
   onclose: ((event: CloseEvent) => void) | null
-  send(data: string): void
+  send(data: string | ArrayBufferLike | Blob | ArrayBufferView): void
   close(code?: number, reason?: string): void
 }
 

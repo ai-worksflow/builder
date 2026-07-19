@@ -1228,7 +1228,7 @@ export interface TraceMatrixDto {
 
 export interface ValidationResultDto {
   readonly code: string
-  readonly severity: 'info' | 'warning' | 'error'
+  readonly severity: 'info' | 'warning' | 'error' | 'blocker'
   readonly message: string
   readonly path?: string
   readonly sourceId?: EntityId

@@ -30,6 +30,7 @@ export interface HttpRequestOptions<TBody = unknown> {
   readonly idempotencyKey?: string | true
   readonly ifMatch?: string
   readonly responseType?: 'json' | 'text' | 'blob' | 'arrayBuffer' | 'void'
+  readonly acceptedStatuses?: readonly number[]
   readonly clearCsrfOnSuccess?: boolean
 }
 
@@ -102,6 +103,50 @@ export class PlatformProtocolError extends PlatformClientError {
     super(message, 'platform_protocol_error', requestId)
     this.name = 'PlatformProtocolError'
     this.status = status
+  }
+}
+
+const SHA256_DIGEST_PATTERN = /^sha256:[0-9a-f]{64}$/
+
+/**
+ * Recomputes a response body's byte-level SHA-256 before a higher-level
+ * decoder is allowed to interpret it. Web Crypto is available in supported
+ * browsers and modern Node test runtimes; absence is an integrity failure,
+ * never a reason to trust the server-supplied digest.
+ */
+export async function verifyResponseBodySha256(
+  value: ArrayBuffer,
+  expectedDigest: string,
+  detail: string,
+  requestId?: string,
+  status?: number,
+) {
+  if (!(value instanceof ArrayBuffer) || !SHA256_DIGEST_PATTERN.test(expectedDigest)) {
+    throw new PlatformProtocolError(detail, requestId, status)
+  }
+  const subtle = globalThis.crypto?.subtle
+  if (!subtle) {
+    throw new PlatformProtocolError(
+      'This runtime cannot verify the platform response body SHA-256.',
+      requestId,
+      status,
+    )
+  }
+  let digest: ArrayBuffer
+  try {
+    digest = await subtle.digest('SHA-256', value)
+  } catch {
+    throw new PlatformProtocolError(
+      'The platform response body SHA-256 could not be verified.',
+      requestId,
+      status,
+    )
+  }
+  const actualDigest = `sha256:${Array.from(new Uint8Array(digest), (byte) => (
+    byte.toString(16).padStart(2, '0')
+  )).join('')}`
+  if (actualDigest !== expectedDigest) {
+    throw new PlatformProtocolError(detail, requestId, status)
   }
 }
 
@@ -353,7 +398,10 @@ export class HttpClient {
     }
 
     const responseRequestId = response.headers.get('x-request-id') ?? requestId
-    if (!response.ok) {
+    const contentType = response.headers.get('content-type')?.toLowerCase() ?? ''
+    const acceptedStatus = options.acceptedStatuses?.includes(response.status) === true
+      && !contentType.includes('application/problem+json')
+    if (!response.ok && !acceptedStatus) {
       let bodyValue: unknown
       try {
         bodyValue = await parseJsonText(response, responseRequestId)
@@ -372,14 +420,17 @@ export class HttpClient {
 
     let data: unknown
     const responseType = options.responseType ?? 'json'
-    if (responseType === 'void' || response.status === 204 || response.status === 205) {
+    if (responseType === 'arrayBuffer') {
+      // A 204 patch-file response still carries an authoritative empty byte
+      // representation. Preserve those actual transport bytes instead of
+      // fabricating an empty buffer in a higher-level client.
+      data = await response.arrayBuffer()
+    } else if (responseType === 'void' || response.status === 204 || response.status === 205) {
       data = undefined
     } else if (responseType === 'text') {
       data = await response.text()
     } else if (responseType === 'blob') {
       data = await response.blob()
-    } else if (responseType === 'arrayBuffer') {
-      data = await response.arrayBuffer()
     } else {
       data = await parseJsonText(response, responseRequestId)
     }

@@ -7,7 +7,6 @@ import type {
   CreateWorkflowDefinitionInputDto,
   CreateWorkflowDefinitionVersionInputDto,
   ExactArtifactRefDto,
-  ImplementationGenerationResultDto,
   ImplementationProposalDto,
   InputManifestDto,
   ManifestRefDto,
@@ -23,6 +22,7 @@ import type {
   WorkspaceRevisionDto,
 } from './flow-contract'
 import { HttpClient } from './http'
+import { normalizeImplementationProposal } from './implementation-proposal'
 import { wireVersionRef } from './wire-version-ref'
 import {
   normalizeWorkbenchBundle,
@@ -348,59 +348,35 @@ export class PlatformFlowClient {
     return { ...result, data: normalizeWorkbenchBundle(result.data) }
   }
 
-  generateImplementation(
-    bundleId: string,
-    model: string,
-    instruction: string,
-    replaceProposal?: Pick<ImplementationProposalDto, 'id' | 'version'>,
-    options?: ClientMutationOptions,
-  ) {
-    return this.http.post<ImplementationGenerationResultDto, {
-      readonly model: string
-      readonly instruction: string
-      readonly replaceProposalId?: string
-      readonly replaceProposalVersion?: number
-    }>(
-      `/v1/build-manifests/${segment(bundleId)}/generate`,
-      {
-        model,
-        instruction,
-        ...(replaceProposal ? {
-          replaceProposalId: replaceProposal.id,
-          replaceProposalVersion: replaceProposal.version,
-        } : {}),
-      },
-      mutationOptions(options),
-    )
-  }
-
-  createImplementationProposal(
+  async createImplementationProposal(
     projectId: string,
     input: CreateImplementationProposalInputDto,
     options?: ClientMutationOptions,
   ) {
-    return this.http.post<ImplementationProposalDto, CreateImplementationProposalInputDto>(
+    const result = await this.http.post<unknown, CreateImplementationProposalInputDto>(
       `/v1/projects/${segment(projectId)}/implementation-proposals`,
       input,
       mutationOptions(options),
     )
+    return { ...result, data: normalizeImplementationProposal(result.data) }
   }
 
-  getImplementationProposal(proposalId: string, options?: ClientRequestOptions) {
-    return this.http.get<ImplementationProposalDto>(
+  async getImplementationProposal(proposalId: string, options?: ClientRequestOptions) {
+    const result = await this.http.get<unknown>(
       `/v1/implementation-proposals/${segment(proposalId)}`,
       requestOptions(options),
     )
+    return { ...result, data: normalizeImplementationProposal(result.data) }
   }
 
-  decideImplementationOperation(
+  async decideImplementationOperation(
     proposal: Pick<ImplementationProposalDto, 'id' | 'version'>,
     operationId: string,
     decision: 'accepted' | 'rejected',
     reason = '',
     options?: ClientMutationOptions,
   ) {
-    return this.http.post<ImplementationProposalDto, {
+    const result = await this.http.post<unknown, {
       readonly operationId: string
       readonly decision: typeof decision
       readonly reason: string
@@ -410,6 +386,20 @@ export class PlatformFlowClient {
       { operationId, decision, reason, version: proposal.version },
       mutationOptions(options, `"implementation-proposal:${proposal.id}:${proposal.version}"`),
     )
+    return { ...result, data: normalizeImplementationProposal(result.data) }
+  }
+
+  async quarantineImplementationProposal(
+    proposal: Pick<ImplementationProposalDto, 'id' | 'version'>,
+    reason: string,
+    options?: ClientMutationOptions,
+  ) {
+    const result = await this.http.post<unknown, { readonly version: number; readonly reason: string }>(
+      `/v1/implementation-proposals/${segment(proposal.id)}/quarantine`,
+      { version: proposal.version, reason },
+      mutationOptions(options, `"implementation-proposal:${proposal.id}:${proposal.version}"`),
+    )
+    return { ...result, data: normalizeImplementationProposal(result.data) }
   }
 
   applyImplementationProposal(

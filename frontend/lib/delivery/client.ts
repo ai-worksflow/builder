@@ -31,6 +31,10 @@ export interface DeliveryPublishInput {
   readonly workspaceRevision: DeliveryVersionRef
   readonly buildManifestId: string
   readonly qualityRunId: string
+  readonly canonicalReceiptId: string
+  readonly canonicalReceiptHash: string
+  readonly releaseBundleId: string
+  readonly releaseBundleHash: string
   readonly message?: string
 }
 
@@ -60,6 +64,10 @@ export interface DeploymentVersionDto {
   readonly workspaceRevision: DeliveryVersionRef
   readonly buildManifestId?: string
   readonly qualityRunId?: string
+  readonly canonicalReceiptId?: string
+  readonly canonicalReceiptHash?: string
+  readonly releaseBundleId?: string
+  readonly releaseBundleHash?: string
   readonly status: string
   readonly publicUrl?: string
   readonly entryPath: string
@@ -173,6 +181,10 @@ function publishBody(input: DeliveryPublishInput) {
     workspaceRevision: exactVersionRef(input.workspaceRevision),
     buildManifestId: input.buildManifestId,
     qualityRunId: input.qualityRunId,
+    canonicalReceiptId: input.canonicalReceiptId,
+    canonicalReceiptHash: input.canonicalReceiptHash,
+    releaseBundleId: input.releaseBundleId,
+    releaseBundleHash: input.releaseBundleHash,
     ...(input.message ? { message: input.message } : {}),
   }
 }

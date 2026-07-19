@@ -14,6 +14,8 @@ import { useCollaboration } from '../collaboration/provider'
 import { collaborationErrorMessage } from '../collaboration/platform-adapter'
 import { useI18n, type MessageKey, type MessageValues } from '../i18n'
 import { useArtifactWorkspace } from './artifact-provider'
+import type { ExactApplicationBuildContractRefDto } from './constructor-contract'
+import { exactBuildContractRefForActiveManifest } from './build-contract-gate'
 import { PlatformFlowClient } from './flow-client'
 import {
   projectBriefEntryAction,
@@ -153,15 +155,16 @@ interface PlatformFlowContextState {
     expectation?: WorkbenchBundleExpectation,
   ) => Promise<WorkbenchBundleDto | null>
   readonly rebaseWorkbenchBundle: () => Promise<WorkbenchBundleDto | null>
-  readonly generateImplementation: (
-    instruction: string,
-    model?: string,
-    expectedBundleId?: string,
-  ) => Promise<ImplementationProposalDto | null>
   readonly loadProposal: (
     proposalId: string,
     expectation?: WorkbenchProposalExpectation,
   ) => Promise<ImplementationProposalDto | null>
+  /**
+   * Adopt an exact Candidate freeze response into the active workbench without
+   * rehydrating Blueprint or artifact authoring state.
+   */
+  readonly adoptImplementationProposal: (proposal: ImplementationProposalDto) => boolean
+  readonly quarantineProposal: (reason: string) => Promise<ImplementationProposalDto | null>
   readonly decideOperation: (
     operation: FileOperationDto,
     decision: 'accepted' | 'rejected',
@@ -172,6 +175,8 @@ interface PlatformFlowContextState {
   readonly proposeFileChange: (
     path: string,
     content: string,
+    buildContract: ExactApplicationBuildContractRefDto,
+    expectedBundleId: string,
     language?: string,
     expectedHash?: string,
   ) => Promise<ImplementationProposalDto | null>
@@ -1267,87 +1272,66 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
     }
   }, [activateWorkbenchItem, can, client, fail, flowMessage, storeWorkbenchQueue])
 
-  const generateImplementation = useCallback(async (
-    instruction: string,
-    model = 'gpt-5',
-    expectedBundleId?: string,
-  ) => {
+  const adoptImplementationProposal = useCallback((nextProposal: ImplementationProposalDto) => {
     const activeBundle = bundleRef.current
-    if (!activeBundle || !can('edit')) return null
     const queue = workbenchQueueRef.current
     const activeItem = queue.find((item) => item.bundleId === selectedBundleIdRef.current)
-      ?? queue.find((item) => item.bundle?.id === activeBundle.id)
-    if (!activeItem) {
-      setError(flowMessage('runtime.flow.manifestNotAttached'))
-      return null
-    }
-    const activeItemIndex = queue.findIndex((item) => item.bundleId === activeItem.bundleId)
-    if (!workbenchQueueItemHasAppliedPredecessors(queue, activeItemIndex)) {
-      const predecessor = queue.slice(0, Math.max(activeItemIndex, 0)).find(
-        (item) => !proposalIsApplied(item.proposal),
-      )
-      setError(predecessor
-        ? flowMessage('runtime.flow.applyBeforeGenerate', {
-            before: predecessor.sliceId ?? predecessor.bundleId,
-            target: activeItem.sliceId ?? activeItem.bundleId,
-          })
-        : flowMessage('runtime.flow.selectQueueBeforeGenerate'))
-      return null
-    }
+      ?? queue.find((item) => item.bundle?.id === activeBundle?.id)
     if (
-      expectedBundleId
-      && activeItem.bundleId !== expectedBundleId
-      && activeBundle.id !== expectedBundleId
+      !projectIdRef.current
+      || !activeBundle
+      || !activeItem
+      || nextProposal.projectId !== projectIdRef.current
+      || nextProposal.buildManifestId !== activeBundle.id
+      || nextProposal.buildManifestId !== activeItem.bundle?.id
+      || nextProposal.executionSource !== 'candidate_freeze'
+      || !nextProposal.candidateSource
     ) {
-      setError(flowMessage('runtime.flow.exactBundleInactive'))
-      return null
+      setError('The frozen Candidate Proposal does not match the active project and build manifest.')
+      return false
     }
-    const workspace = workspaceRevisionRef.current
-    if (activeBundle.currentWorkspaceRevision && !workspace) {
-      setError(flowMessage('runtime.flow.loadWorkspaceBeforeGenerate'))
-      return null
+    const nextQueue = replaceWorkbenchQueueProposal(queue, nextProposal, activeBundle)
+    const itemIndex = workbenchQueueItemIndexForProposal(nextQueue, nextProposal)
+    if (itemIndex < 0) {
+      setError('The frozen Candidate Proposal could not be attached to the active workbench queue.')
+      return false
     }
-    if (workbenchBundleNeedsRebase(activeBundle, workspace)) {
-      setError(flowMessage('runtime.flow.rebaseBeforeGenerate'))
-      return null
-    }
-    const replaceProposal = activeItem.proposal
-    if (
-      replaceProposal
-      && (
-        replaceProposal.status !== 'open'
-        || replaceProposal.operations.some((operation) => operation.decision !== 'pending')
-        || replaceProposal.executionSource === 'conversation_command'
-      )
-    ) {
-      setError(flowMessage('runtime.flow.proposalAlreadyReviewed'))
+    storeWorkbenchQueue(nextQueue)
+    activateWorkbenchItem(nextQueue[itemIndex] ?? null)
+    setError(null)
+    return true
+  }, [activateWorkbenchItem, storeWorkbenchQueue])
+
+  const quarantineProposal = useCallback(async (reason: string) => {
+    if (!proposal || !can('edit')) return null
+    const normalizedReason = reason.trim()
+    if (!normalizedReason) {
+      setError('A quarantine reason is required for the unreviewable Proposal.')
       return null
     }
     setBusy(true)
     setError(null)
     try {
-      const result = await client.generateImplementation(
-        activeBundle.id,
-        model,
-        instruction.trim(),
-        replaceProposal ? { id: replaceProposal.id, version: replaceProposal.version } : undefined,
+      const result = await client.quarantineImplementationProposal(
+        proposal,
+        normalizedReason,
       )
       const nextQueue = replaceWorkbenchQueueProposal(
         workbenchQueueRef.current,
-        result.data.proposal,
-        activeBundle,
+        result.data,
+        bundle,
       )
       storeWorkbenchQueue(nextQueue)
-      const itemIndex = workbenchQueueItemIndexForProposal(nextQueue, result.data.proposal)
+      const itemIndex = workbenchQueueItemIndexForProposal(nextQueue, result.data)
       activateWorkbenchItem(itemIndex >= 0 ? nextQueue[itemIndex] : null)
-      return result.data.proposal
+      return result.data
     } catch (cause) {
-      fail(cause, 'runtime.flow.generateProposalFailed')
+      fail(cause, 'runtime.flow.quarantineProposalFailed')
       return null
     } finally {
       setBusy(false)
     }
-  }, [activateWorkbenchItem, can, client, fail, flowMessage, storeWorkbenchQueue])
+  }, [activateWorkbenchItem, bundle, can, client, fail, proposal, storeWorkbenchQueue])
 
   const decideOperation = useCallback(async (
     operation: FileOperationDto,
@@ -1459,6 +1443,13 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
       }
     }
     if (proposal.status !== 'ready') return null
+    if (
+      proposal.candidateSource
+      && proposal.operations.some((operation) => operation.decision !== 'accepted')
+    ) {
+      setError('An exact frozen Candidate must be accepted in full before creating its immutable revision.')
+      return null
+    }
     const queueIndex = workbenchQueueItemIndexForProposal(queue, proposal)
     if (!canApplyWorkbenchQueueItem(queue, queueIndex)) {
       const previous = queue.slice(0, Math.max(queueIndex, 0)).find(
@@ -1510,32 +1501,50 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
   const proposeFileChange = useCallback(async (
     path: string,
     content: string,
+    buildContract: ExactApplicationBuildContractRefDto,
+    expectedBundleId: string,
     language?: string,
     expectedHash?: string,
   ) => {
-    if (!projectId || !bundle || !can('edit')) return null
+    const activeBundle = bundleRef.current
+    if (!projectId || !activeBundle || !can('edit')) return null
     const queue = workbenchQueueRef.current
     const queueIndex = queue.findIndex((item) =>
-      item.bundleId === selectedBundleIdRef.current || item.bundle?.id === bundle.id,
+      item.bundleId === selectedBundleIdRef.current || item.bundle?.id === activeBundle.id,
     )
+    const activeItem = queueIndex >= 0 ? queue[queueIndex] : undefined
+    if (!activeItem) {
+      setError(flowMessage('runtime.flow.manifestNotAttached'))
+      return null
+    }
+    const exactBuildContract = exactBuildContractRefForActiveManifest(
+      buildContract,
+      expectedBundleId,
+      activeBundle.id,
+    )
+    if (!exactBuildContract) {
+      setError(expectedBundleId !== activeBundle.id
+        ? flowMessage('runtime.flow.exactBundleInactive')
+        : flowMessage('runtime.flow.buildContractRequired'))
+      return null
+    }
     if (!workbenchQueueItemHasAppliedPredecessors(queue, queueIndex)) {
-      const current = queue[queueIndex]
       const predecessor = queue.slice(0, Math.max(queueIndex, 0)).find(
         (item) => !proposalIsApplied(item.proposal),
       )
       setError(predecessor
         ? flowMessage('runtime.flow.applyBeforeFile', {
             before: predecessor.sliceId ?? predecessor.bundleId,
-            target: current?.sliceId ?? current?.bundleId ?? bundle.id,
+            target: activeItem.sliceId ?? activeItem.bundleId,
           })
         : flowMessage('runtime.flow.selectQueueBeforeFile'))
       return null
     }
-    if (bundle.currentWorkspaceRevision && !workspaceRevisionRef.current) {
+    if (activeBundle.currentWorkspaceRevision && !workspaceRevisionRef.current) {
       setError(flowMessage('runtime.flow.loadWorkspaceBeforeFile'))
       return null
     }
-    if (workbenchBundleNeedsRebase(bundle, workspaceRevisionRef.current)) {
+    if (workbenchBundleNeedsRebase(activeBundle, workspaceRevisionRef.current)) {
       setError(flowMessage('runtime.flow.rebaseBeforeFile'))
       return null
     }
@@ -1548,17 +1557,18 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
       expectedHash,
       rationale: flowMessage('runtime.flow.manualEdit'),
       dependsOn: [],
-      traceSource: [bundle.prototypeRevision.revisionId],
+      traceSource: [activeBundle.prototypeRevision.revisionId],
     }
     setBusy(true)
     setError(null)
     try {
       const result = await client.createImplementationProposal(projectId, {
-        buildManifestId: bundle.id,
+        buildManifestId: activeBundle.id,
+        applicationBuildContract: exactBuildContract,
         operations: [operation],
         assumptions: [flowMessage('runtime.flow.manualEditAssumption')],
       })
-      const nextQueue = replaceWorkbenchQueueProposal(workbenchQueueRef.current, result.data, bundle)
+      const nextQueue = replaceWorkbenchQueueProposal(workbenchQueueRef.current, result.data, activeBundle)
       storeWorkbenchQueue(nextQueue)
       const itemIndex = workbenchQueueItemIndexForProposal(nextQueue, result.data)
       activateWorkbenchItem(itemIndex >= 0 ? nextQueue[itemIndex] : null)
@@ -1569,7 +1579,7 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
     } finally {
       setBusy(false)
     }
-  }, [activateWorkbenchItem, bundle, can, client, fail, flowMessage, projectId, storeWorkbenchQueue])
+  }, [activateWorkbenchItem, can, client, fail, flowMessage, projectId, storeWorkbenchQueue])
 
   const selectedDefinition = definitions.find((item) => item.id === selectedDefinitionId)
     ?? definitionVersions[0]
@@ -1638,8 +1648,9 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
     selectWorkbenchBundle,
     loadBundle,
     rebaseWorkbenchBundle,
-    generateImplementation,
     loadProposal,
+    adoptImplementationProposal,
+    quarantineProposal,
     decideOperation,
     decideAllPending,
     applyProposal,
@@ -1647,6 +1658,7 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
     clearError: () => setError(null),
   }), [
     applyProposal,
+    adoptImplementationProposal,
     authorizeExecution,
     backendStatus,
     bundle,
@@ -1664,7 +1676,6 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
     definitionVersions,
     error,
     events,
-    generateImplementation,
     loadBundle,
     loadDefinitionVersions,
     loadProposal,
@@ -1673,6 +1684,7 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
     proposal,
     proposeFileChange,
     publishDefinitionVersion,
+    quarantineProposal,
     refresh,
     rebaseWorkbenchBundle,
     requiresWorkbenchRebase,

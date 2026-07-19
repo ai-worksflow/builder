@@ -9,6 +9,7 @@ import type {
   ProjectGovernanceMode,
   ValidationResultDto,
 } from './dto'
+import type { ExactApplicationBuildContractRefDto } from './constructor-contract'
 
 export type WorkflowNodeType =
   | 'artifact_input'
@@ -598,6 +599,7 @@ export interface FileOperationDto {
   readonly fromPath?: string
   readonly content?: string
   readonly language?: string
+  readonly mode?: '100644' | '100755'
   readonly expectedHash?: string
   readonly dependsOn?: readonly string[]
   readonly rationale?: string
@@ -607,17 +609,41 @@ export interface FileOperationDto {
   readonly reason?: string
 }
 
+export interface CandidateImplementationSourceDto {
+  readonly freezeReceiptId: string
+  readonly repositorySnapshotId: string
+  readonly sessionId: string
+  readonly candidateId: string
+  readonly candidateSnapshotId: string
+  readonly candidateVersion: number
+  readonly journalSequence: number
+  readonly sessionEpoch: number
+  readonly writerLeaseEpoch: number
+  readonly baseTreeHash: string
+  readonly treeHash: string
+  readonly fullStackTemplate: {
+    readonly id: string
+    readonly contentHash: string
+  }
+  readonly verificationReceipt: {
+    readonly id: string
+    readonly contentHash: string
+  }
+}
+
 export interface ImplementationProposalDto {
   readonly id: string
   readonly projectId: string
   readonly buildManifestId: string
+  readonly applicationBuildContract: ExactApplicationBuildContractRefDto
   readonly baseWorkspaceRevision?: ExactArtifactRefDto
-  readonly executionSource: 'manual_submission' | 'manual_generation' | 'workflow_runner' | 'conversation_command'
+  readonly executionSource: 'manual_submission' | 'manual_generation' | 'workflow_runner' | 'conversation_command' | 'candidate_freeze'
   readonly conversationCommandId?: string
   readonly supersedesProposalId?: string
   readonly instructionHash?: string
   readonly aiProvider?: string
   readonly aiModel?: string
+  readonly candidateSource?: CandidateImplementationSourceDto
   readonly operations: readonly FileOperationDto[]
   readonly routes: readonly JsonValue[]
   readonly apis: readonly JsonValue[]
@@ -628,7 +654,7 @@ export interface ImplementationProposalDto {
   readonly diagnostics: readonly ValidationResultDto[]
   readonly assumptions: readonly string[]
   readonly unimplementedItems: readonly string[]
-  readonly status: 'open' | 'reviewing' | 'ready' | 'applied' | 'partially_applied' | 'stale'
+  readonly status: 'open' | 'reviewing' | 'ready' | 'rejected' | 'applied' | 'partially_applied' | 'stale'
   readonly version: number
   readonly payloadHash: string
   readonly createdBy: string
@@ -638,6 +664,7 @@ export interface ImplementationProposalDto {
 
 export interface CreateImplementationProposalInputDto {
   readonly buildManifestId: string
+  readonly applicationBuildContract: ExactApplicationBuildContractRefDto
   readonly operations: readonly Omit<FileOperationDto, 'decision' | 'decidedBy' | 'reason'>[]
   readonly routes?: readonly JsonValue[]
   readonly apis?: readonly JsonValue[]
@@ -666,13 +693,6 @@ export interface WorkspaceContentDto {
 }
 
 export type WorkspaceRevisionDto = ArtifactRevisionDto<WorkspaceContentDto>
-
-export interface ImplementationGenerationResultDto {
-  readonly proposal: ImplementationProposalDto
-  readonly provider: string
-  readonly model: string
-  readonly usage?: JsonValue
-}
 
 export interface FlowServiceErrorDto extends ProblemDetailsDto {
   readonly retryAfterSeconds?: number

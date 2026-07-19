@@ -36,6 +36,11 @@ import type {
 } from './types'
 
 export interface CollaborationPlatformClient {
+  readonly sandbox?: PlatformClient['sandbox']
+  readonly repository?: PlatformClient['repository']
+  readonly agent?: PlatformClient['agent']
+  readonly verification?: PlatformClient['verification']
+  readonly lsp?: PlatformClient['lsp']
   readonly http: PlatformClient['http']
   readonly data: PlatformClient['data']
   readonly flow: PlatformClient['flow']
