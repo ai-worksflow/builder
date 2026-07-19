@@ -238,6 +238,10 @@ type DeploymentVersion struct {
 	WorkspaceRevision        core.VersionRef         `json:"workspaceRevision"`
 	BuildManifestID          *string                 `json:"buildManifestId,omitempty"`
 	QualityRunID             *string                 `json:"qualityRunId,omitempty"`
+	CanonicalReceiptID       *string                 `json:"canonicalReceiptId,omitempty"`
+	CanonicalReceiptHash     *string                 `json:"canonicalReceiptHash,omitempty"`
+	ReleaseBundleID          *string                 `json:"releaseBundleId,omitempty"`
+	ReleaseBundleHash        *string                 `json:"releaseBundleHash,omitempty"`
 	BuildArtifact            *BuildArtifactReference `json:"buildArtifact,omitempty"`
 	Status                   string                  `json:"status"`
 	PublicURL                string                  `json:"publicUrl,omitempty"`
@@ -287,6 +291,10 @@ type PublishInput struct {
 	WorkspaceRevision    *core.VersionRef `json:"workspaceRevision,omitempty"`
 	BuildManifestID      string           `json:"buildManifestId,omitempty"`
 	QualityRunID         string           `json:"qualityRunId,omitempty"`
+	CanonicalReceiptID   string           `json:"canonicalReceiptId,omitempty"`
+	CanonicalReceiptHash string           `json:"canonicalReceiptHash,omitempty"`
+	ReleaseBundleID      string           `json:"releaseBundleId,omitempty"`
+	ReleaseBundleHash    string           `json:"releaseBundleHash,omitempty"`
 	Message              string           `json:"message,omitempty"`
 	WorkflowQualityRunID string           `json:"-"`
 }

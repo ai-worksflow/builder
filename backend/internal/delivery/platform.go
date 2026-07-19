@@ -1,10 +1,12 @@
 package delivery
 
 import (
+	"context"
 	"errors"
 
 	"github.com/worksflow/builder/backend/internal/core"
 	"github.com/worksflow/builder/backend/internal/dataruntime"
+	"github.com/worksflow/builder/backend/internal/release"
 	"github.com/worksflow/builder/backend/internal/storage/content"
 	"gorm.io/gorm"
 )
@@ -13,14 +15,17 @@ import (
 // package. All security-sensitive implementations are explicit; the factory
 // never falls back to host command execution or an ephemeral publish store.
 type PlatformDependencies struct {
-	Database      *gorm.DB
-	Contents      content.Store
-	Access        AccessControl
-	Sandbox       Sandbox
-	QualityRoot   string
-	Provider      PublishProvider
-	Environments  EnvironmentResolver
-	PublicRuntime dataruntime.DeploymentPublicRuntimeProvisioner
+	Database       *gorm.DB
+	Contents       content.Store
+	Access         AccessControl
+	Sandbox        Sandbox
+	QualityRoot    string
+	Provider       PublishProvider
+	Environments   EnvironmentResolver
+	PublicRuntime  dataruntime.DeploymentPublicRuntimeProvisioner
+	ReleaseBundles interface {
+		Get(context.Context, string, string, string) (release.Bundle, error)
+	}
 }
 
 type PlatformServices struct {
@@ -65,7 +70,7 @@ func NewPlatformServices(dependencies PlatformDependencies) (*PlatformServices, 
 	}
 	publisher, err := NewPublishService(
 		dependencies.Database, access, loader, quality,
-		dependencies.Provider, dependencies.Environments, dependencies.PublicRuntime,
+		dependencies.ReleaseBundles, dependencies.Provider, dependencies.Environments, dependencies.PublicRuntime,
 	)
 	if err != nil {
 		return nil, err

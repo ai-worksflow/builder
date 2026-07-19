@@ -198,6 +198,29 @@ func TestLocalStaticProviderPublishesImmutableSanitizedVersion(t *testing.T) {
 	}
 }
 
+func TestLocalStaticProviderIsPreviewOnly(t *testing.T) {
+	provider, err := NewLocalStaticProvider(t.TempDir(), "https://preview.example.test/apps")
+	if err != nil {
+		t.Fatal(err)
+	}
+	deploymentID, versionID := uuid.NewString(), uuid.NewString()
+	_, err = provider.Deploy(context.Background(), ProviderRequest{
+		DeploymentID: deploymentID,
+		VersionID:    versionID,
+		Environment:  EnvironmentProduction,
+		BuildArtifact: testBuildArtifact(
+			t, []WorkspaceFile{{Path: "index.html", Content: "production"}}, "index.html",
+		),
+	})
+	typed, ok := AsError(err)
+	if !ok || typed.Code != CodeConflict || typed.Status != http.StatusConflict || typed.Detail != legacyProductionControllerConflictDetail {
+		t.Fatalf("LocalStaticProvider accepted production authority: %v", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(provider.rootDirectory, deploymentID)); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("production rejection left provider state behind: %v", statErr)
+	}
+}
+
 func TestPublicConnectOriginsRejectCredentialsAndNonHTTPProtocols(t *testing.T) {
 	t.Parallel()
 	origins, err := publicConnectOrigins(map[string]string{
@@ -353,7 +376,7 @@ func TestPlatformFactoryRequiresExplicitSafeImplementations(t *testing.T) {
 	}
 	services, err := NewPlatformServices(PlatformDependencies{
 		Database: dryRunDeliveryDB(t), Contents: fakeContentStore{}, Access: fakeAccess{},
-		Sandbox: &testSandbox{t: t}, Provider: fakeProvider{},
+		Sandbox: &testSandbox{t: t}, Provider: fakeProvider{}, ReleaseBundles: publishReleaseStub{},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -367,7 +390,7 @@ func TestPlatformFactoryRequiresExplicitSafeImplementations(t *testing.T) {
 	}
 	services, err = NewPlatformServices(PlatformDependencies{
 		Database: dryRunDeliveryDB(t), Contents: fakeContentStore{}, Access: fakeAccess{},
-		Sandbox: &testSandbox{t: t}, Provider: local,
+		Sandbox: &testSandbox{t: t}, Provider: local, ReleaseBundles: publishReleaseStub{},
 	})
 	if err != nil || services.StaticAssets == nil {
 		t.Fatalf("local static asset gate was not wired: services=%+v err=%v", services, err)

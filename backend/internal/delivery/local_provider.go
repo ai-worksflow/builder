@@ -95,6 +95,9 @@ func (p *LocalStaticProvider) Deploy(ctx context.Context, request ProviderReques
 	if !request.Environment.Valid() {
 		return ProviderResult{}, Invalid("environment", "environment must be preview or production")
 	}
+	if request.Environment != EnvironmentPreview {
+		return ProviderResult{}, conflict(legacyProductionControllerConflictDetail)
+	}
 	environmentRef := strings.TrimSpace(request.EnvironmentRef)
 	if environmentRef == "" {
 		environmentRef = "default"

@@ -12,13 +12,21 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/worksflow/builder/backend/internal/core"
 	"github.com/worksflow/builder/backend/internal/dataruntime"
+	platformdomain "github.com/worksflow/builder/backend/internal/domain"
+	"github.com/worksflow/builder/backend/internal/release"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
 
 const maxDeploymentHistory = 200
+
+const (
+	legacyProductionControllerConflictDetail = "production deployment mutations require the Release Controller v3 workflow; the legacy deployments endpoint is preview-only"
+	legacyPreviewControllerConflictDetail    = "a Release Controller v3 delivery operation is active or awaiting reconciliation for this project"
+)
 
 var (
 	publicEnvironmentNamePattern = regexp.MustCompile(`^(?:PUBLIC_|NEXT_PUBLIC_|VITE_|REACT_APP_)[A-Z][A-Z0-9_]{0,127}$`)
@@ -37,11 +45,16 @@ type publishQualityReader interface {
 	LoadBuildArtifact(context.Context, string, BuildArtifactReference) (BuildArtifact, error)
 }
 
+type publishReleaseBundleReader interface {
+	Get(context.Context, string, string, string) (release.Bundle, error)
+}
+
 type PublishService struct {
 	database      *gorm.DB
 	access        AccessControl
 	loader        publishRevisionLoader
 	quality       publishQualityReader
+	releases      publishReleaseBundleReader
 	provider      PublishProvider
 	environments  EnvironmentResolver
 	publicRuntime dataruntime.DeploymentPublicRuntimeProvisioner
@@ -53,12 +66,13 @@ func NewPublishService(
 	access AccessControl,
 	loader publishRevisionLoader,
 	quality publishQualityReader,
+	releases publishReleaseBundleReader,
 	provider PublishProvider,
 	environments EnvironmentResolver,
 	publicRuntimes ...dataruntime.DeploymentPublicRuntimeProvisioner,
 ) (*PublishService, error) {
-	if database == nil || access == nil || loader == nil || quality == nil || provider == nil {
-		return nil, errors.New("publish database, access control, revision loader, quality service and provider are required")
+	if database == nil || access == nil || loader == nil || quality == nil || releases == nil || provider == nil {
+		return nil, errors.New("publish database, access control, revision loader, quality service, ReleaseBundle store and provider are required")
 	}
 	if environments == nil {
 		environments = EmptyEnvironmentResolver{}
@@ -74,17 +88,22 @@ func NewPublishService(
 		publicRuntime = publicRuntimes[0]
 	}
 	return &PublishService{
-		database: database, access: access, loader: loader, quality: quality,
+		database: database, access: access, loader: loader, quality: quality, releases: releases,
 		provider: provider, environments: environments, publicRuntime: publicRuntime, now: time.Now,
 	}, nil
 }
 
 type publishSource struct {
-	workspace       WorkspaceSnapshot
-	buildManifestID *uuid.UUID
-	qualityRunID    *uuid.UUID
-	buildReference  *BuildArtifactReference
-	buildArtifact   BuildArtifact
+	workspace            WorkspaceSnapshot
+	buildManifestID      *uuid.UUID
+	buildManifestHash    string
+	qualityRunID         *uuid.UUID
+	canonicalReceiptID   *uuid.UUID
+	canonicalReceiptHash string
+	releaseBundleID      *uuid.UUID
+	releaseBundleHash    string
+	buildReference       *BuildArtifactReference
+	buildArtifact        BuildArtifact
 }
 
 type publishReservation struct {
@@ -100,6 +119,9 @@ func (s *PublishService) Publish(ctx context.Context, projectID, actorID, expect
 	if !input.Environment.Valid() {
 		return Deployment{}, Invalid("environment", "environment must be preview or production")
 	}
+	if input.Environment == EnvironmentProduction {
+		return Deployment{}, conflict(legacyProductionControllerConflictDetail)
+	}
 	qualityRunID, err := requestedPublishQualityRunID(input)
 	if err != nil {
 		return Deployment{}, err
@@ -109,6 +131,10 @@ func (s *PublishService) Publish(ctx context.Context, projectID, actorID, expect
 	}
 	if strings.TrimSpace(input.BuildManifestID) == "" {
 		return Deployment{}, Invalid("buildManifestId", "the BuildManifest that produced the workspaceRevision is required")
+	}
+	receiptID, bundleID, err := requestedPublishReleaseAuthority(input)
+	if err != nil {
+		return Deployment{}, err
 	}
 	if err := validatePublishText(input.EnvironmentRef, input.Message); err != nil {
 		return Deployment{}, err
@@ -122,6 +148,13 @@ func (s *PublishService) Publish(ctx context.Context, projectID, actorID, expect
 		return Deployment{}, err
 	}
 	if err := validatePublishableWorkspace(source.workspace); err != nil {
+		return Deployment{}, err
+	}
+	bundle, err := s.releases.Get(ctx, projectID, bundleID.String(), strings.TrimSpace(input.ReleaseBundleHash))
+	if err != nil {
+		return Deployment{}, conflict("publishing requires the exact immutable ReleaseBundle selected by the request")
+	}
+	if err := validatePublishReleaseBundle(projectID, input, source, receiptID, bundleID, bundle); err != nil {
 		return Deployment{}, err
 	}
 	report, err := s.quality.Get(ctx, qualityRunID.String(), actorID)
@@ -148,7 +181,14 @@ func (s *PublishService) Publish(ctx context.Context, projectID, actorID, expect
 	if !exactVersionRefEqual(buildArtifact.WorkspaceRevision, source.workspace.Revision) {
 		return Deployment{}, conflict("immutable quality build artifact does not match the publish workspace")
 	}
+	if !releaseBundleContainsStaticArtifact(bundle, *report.BuildArtifact) {
+		return Deployment{}, conflict("the ReleaseBundle does not contain the exact immutable web-static artifact selected for deployment")
+	}
 	source.qualityRunID = &qualityRunID
+	source.canonicalReceiptID = &receiptID
+	source.canonicalReceiptHash = strings.TrimSpace(input.CanonicalReceiptHash)
+	source.releaseBundleID = &bundleID
+	source.releaseBundleHash = strings.TrimSpace(input.ReleaseBundleHash)
 	source.buildReference = report.BuildArtifact
 	source.buildArtifact = buildArtifact
 	resolved, err := s.environments.Resolve(ctx, projectID, input.Environment, strings.TrimSpace(input.EnvironmentRef), actorID)
@@ -194,6 +234,9 @@ func (s *PublishService) Rollback(ctx context.Context, deploymentID, actorID, ex
 	if _, err := s.access.Authorize(ctx, deployment.ProjectID.String(), actorID, actionForEnvironment(environment)); err != nil {
 		return Deployment{}, err
 	}
+	if environment == EnvironmentProduction {
+		return Deployment{}, conflict(legacyProductionControllerConflictDetail)
+	}
 	var target deploymentVersionModel
 	if err := s.database.WithContext(ctx).Where("id = ? AND deployment_id = ? AND status = 'ready'", targetUUID, deploymentUUID).Take(&target).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
@@ -223,8 +266,9 @@ func (s *PublishService) Rollback(ctx context.Context, deploymentID, actorID, ex
 	if err != nil {
 		return Deployment{}, Invalid("actorId", "actorId must be a UUID")
 	}
-	if target.QualityRunID == nil || target.BuildArtifactID == nil || target.BuildContentRef == nil || target.BuildContentHash == nil || target.BuildHash == nil || target.BuildEntryPath == nil || target.BuildFileCount == nil || target.BuildTotalBytes == nil {
-		return Deployment{}, conflict("rollback target has no reusable immutable quality build artifact")
+	if target.QualityRunID == nil || target.BuildArtifactID == nil || target.BuildContentRef == nil || target.BuildContentHash == nil || target.BuildHash == nil || target.BuildEntryPath == nil || target.BuildFileCount == nil || target.BuildTotalBytes == nil ||
+		target.CanonicalReceiptID == nil || target.CanonicalReceiptHash == nil || target.ReleaseBundleID == nil || target.ReleaseBundleHash == nil {
+		return Deployment{}, conflict("rollback target has no reusable immutable ReleaseBundle authority and quality build artifact")
 	}
 	buildReference := BuildArtifactReference{
 		ID: target.BuildArtifactID.String(), ContentRef: *target.BuildContentRef,
@@ -238,8 +282,19 @@ func (s *PublishService) Rollback(ctx context.Context, deploymentID, actorID, ex
 	if !exactVersionRefEqual(buildArtifact.WorkspaceRevision, workspace.Revision) {
 		return Deployment{}, conflict("rollback build artifact no longer matches its exact workspace relation")
 	}
+	bundle, err := s.releases.Get(ctx, deployment.ProjectID.String(), target.ReleaseBundleID.String(), *target.ReleaseBundleHash)
+	if err != nil || bundle.CanonicalReceipt.ID != target.CanonicalReceiptID.String() ||
+		bundle.CanonicalReceipt.ContentHash != *target.CanonicalReceiptHash ||
+		bundle.Workspace.WorkspaceArtifactID != workspace.Revision.ArtifactID ||
+		bundle.Workspace.WorkspaceRevisionID != workspace.Revision.RevisionID ||
+		bundle.Workspace.WorkspaceContentHash != workspace.Revision.ContentHash ||
+		!releaseBundleContainsStaticArtifact(bundle, buildReference) {
+		return Deployment{}, conflict("rollback target ReleaseBundle authority can no longer be verified")
+	}
 	source := publishSource{
 		workspace: workspace, buildManifestID: target.BuildManifestID, qualityRunID: target.QualityRunID,
+		canonicalReceiptID: target.CanonicalReceiptID, canonicalReceiptHash: *target.CanonicalReceiptHash,
+		releaseBundleID: target.ReleaseBundleID, releaseBundleHash: *target.ReleaseBundleHash,
 		buildReference: &buildReference, buildArtifact: buildArtifact,
 	}
 	rollbackInput := PublishInput{
@@ -273,6 +328,63 @@ func requestedPublishQualityRunID(input PublishInput) (uuid.UUID, error) {
 	return parsed, nil
 }
 
+func requestedPublishReleaseAuthority(input PublishInput) (uuid.UUID, uuid.UUID, error) {
+	receiptID, err := uuid.Parse(strings.TrimSpace(input.CanonicalReceiptID))
+	if err != nil {
+		return uuid.Nil, uuid.Nil, Invalid("canonicalReceiptId", "an exact Canonical Receipt UUID is required")
+	}
+	if !exactPublishHash(input.CanonicalReceiptHash) {
+		return uuid.Nil, uuid.Nil, Invalid("canonicalReceiptHash", "an exact Canonical Receipt sha256 hash is required")
+	}
+	bundleID, err := uuid.Parse(strings.TrimSpace(input.ReleaseBundleID))
+	if err != nil {
+		return uuid.Nil, uuid.Nil, Invalid("releaseBundleId", "an exact ReleaseBundle UUID is required")
+	}
+	if !exactPublishHash(input.ReleaseBundleHash) {
+		return uuid.Nil, uuid.Nil, Invalid("releaseBundleHash", "an exact ReleaseBundle sha256 hash is required")
+	}
+	return receiptID, bundleID, nil
+}
+
+func exactPublishHash(value string) bool {
+	value = strings.TrimSpace(value)
+	return len(value) == 71 && strings.HasPrefix(value, "sha256:") && platformdomain.IsCanonicalHash(value)
+}
+
+func validatePublishReleaseBundle(
+	projectID string,
+	input PublishInput,
+	source publishSource,
+	receiptID, bundleID uuid.UUID,
+	bundle release.Bundle,
+) error {
+	if bundle.ID != bundleID.String() || bundle.BundleHash != strings.TrimSpace(input.ReleaseBundleHash) ||
+		bundle.ProjectID != projectID || bundle.CanonicalReceipt.ID != receiptID.String() ||
+		bundle.CanonicalReceipt.ContentHash != strings.TrimSpace(input.CanonicalReceiptHash) {
+		return conflict("the selected ReleaseBundle and Canonical Receipt do not match the exact publish request")
+	}
+	workspace := bundle.Workspace
+	if workspace.WorkspaceArtifactID != source.workspace.Revision.ArtifactID ||
+		workspace.WorkspaceRevisionID != source.workspace.Revision.RevisionID ||
+		workspace.WorkspaceContentHash != source.workspace.Revision.ContentHash {
+		return conflict("the selected ReleaseBundle does not belong to the exact frozen WorkspaceRevision")
+	}
+	if source.buildManifestID == nil || bundle.BuildManifest.ID != source.buildManifestID.String() ||
+		bundle.BuildManifest.ContentHash != source.buildManifestHash {
+		return conflict("the selected ReleaseBundle does not match the exact producer BuildManifest")
+	}
+	return nil
+}
+
+func releaseBundleContainsStaticArtifact(bundle release.Bundle, reference BuildArtifactReference) bool {
+	for _, artifact := range bundle.ReleaseArtifacts {
+		if artifact.Kind == "web-static" && artifact.ContentHash == reference.BuildHash {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *PublishService) resolvePublishSource(ctx context.Context, projectID, actorID string, action core.Action, revision core.VersionRef, manifestID string) (publishSource, error) {
 	workspace, err := s.loader.LoadFrozenWorkspace(ctx, projectID, actorID, revision, action)
 	if err != nil {
@@ -298,7 +410,17 @@ func (s *PublishService) resolvePublishSource(ctx context.Context, projectID, ac
 	if err != nil {
 		return publishSource{}, conflict("resolved workspace producer manifest is invalid")
 	}
-	return publishSource{workspace: workspace, buildManifestID: &producerUUID}, nil
+	producerBundle := bundle
+	if producerManifestID != bundle.ID {
+		producerBundle, err = s.loader.LoadBuildManifest(ctx, projectID, actorID, producerManifestID, action)
+		if err != nil {
+			return publishSource{}, err
+		}
+	}
+	if producerBundle.ID != producerManifestID || producerBundle.ProjectID != projectID || !exactPublishHash(producerBundle.ManifestHash) {
+		return publishSource{}, conflict("resolved producer BuildManifest content is invalid")
+	}
+	return publishSource{workspace: workspace, buildManifestID: &producerUUID, buildManifestHash: producerBundle.ManifestHash}, nil
 }
 
 func (s *PublishService) reserve(
@@ -327,6 +449,9 @@ func (s *PublishService) reserve(
 	}
 	reservation := publishReservation{public: cloneStringMap(resolved.Public), artifact: source.buildArtifact}
 	err := s.database.WithContext(ctx).Transaction(func(transaction *gorm.DB) error {
+		if err := lockLegacyPreviewDeliveryAuthority(transaction, projectID); err != nil {
+			return err
+		}
 		var deployment deploymentModel
 		err := transaction.Clauses(clause.Locking{Strength: "UPDATE"}).
 			Where("project_id = ? AND environment = ?", projectID, input.Environment).Take(&deployment).Error
@@ -382,6 +507,8 @@ func (s *PublishService) reserve(
 			ID: versionID, DeploymentID: deployment.ID, Number: number, Action: action, SourceVersionID: sourceVersionID,
 			WorkspaceArtifactID: mustUUID(source.workspace.Revision.ArtifactID), WorkspaceRevisionID: mustUUID(source.workspace.Revision.RevisionID),
 			WorkspaceContentHash: source.workspace.Revision.ContentHash, BuildManifestID: source.buildManifestID, QualityRunID: source.qualityRunID,
+			CanonicalReceiptID: source.canonicalReceiptID, CanonicalReceiptHash: stringPointer(source.canonicalReceiptHash),
+			ReleaseBundleID: source.releaseBundleID, ReleaseBundleHash: stringPointer(source.releaseBundleHash),
 			BuildArtifactID: mustUUIDPointer(source.buildReference.ID), BuildContentRef: stringPointer(source.buildReference.ContentRef),
 			BuildContentHash: stringPointer(source.buildReference.ContentHash), BuildHash: stringPointer(source.buildReference.BuildHash),
 			BuildEntryPath: stringPointer(source.buildReference.EntryPath), BuildFileCount: intPointer(source.buildReference.FileCount), BuildTotalBytes: int64Pointer(source.buildReference.TotalBytes),
@@ -411,9 +538,78 @@ func (s *PublishService) reserve(
 		if deliveryError, ok := AsError(err); ok {
 			return publishReservation{}, deliveryError
 		}
+		if isLegacyControllerDatabaseConflict(err) {
+			return publishReservation{}, conflict(legacyPreviewControllerConflictDetail)
+		}
 		return publishReservation{}, wrapInternal("reserve deployment version", err)
 	}
 	return reservation, nil
+}
+
+// lockLegacyPreviewDeliveryAuthority is the application-side projection of
+// migration 000059. The project row is the mutex shared with v2 Run admission;
+// checking before mutation gives callers a stable 409 instead of leaking a
+// PostgreSQL trigger failure as a 500. The trigger remains the final authority
+// for direct SQL and mixed-version processes.
+func lockLegacyPreviewDeliveryAuthority(transaction *gorm.DB, projectID uuid.UUID) error {
+	if transaction == nil || transaction.Dialector == nil || transaction.Dialector.Name() != "postgres" {
+		return conflict("legacy preview deployment requires PostgreSQL Release Controller fencing")
+	}
+	var lockedProject struct {
+		ID string `gorm:"column:id"`
+	}
+	locked := transaction.Raw(`
+SELECT id::text
+FROM projects
+WHERE id = ?
+FOR UPDATE
+`, projectID).Scan(&lockedProject)
+	if locked.Error != nil {
+		return locked.Error
+	}
+	if locked.RowsAffected != 1 || lockedProject.ID != projectID.String() {
+		return conflict("legacy preview deployment requires its durable project")
+	}
+
+	var active bool
+	if err := transaction.Raw(`
+SELECT EXISTS (
+  SELECT 1
+  FROM release_preview_runs
+  WHERE project_id = ?
+    AND schema_version = 'release-preview-run/v2'
+    AND state IN (
+      'queued','claimed','submitting','reconcile_wait','reconciling',
+      'verifying','reconcile_blocked'
+    )
+  UNION ALL
+  SELECT 1
+  FROM release_deployment_runs
+  WHERE project_id = ?
+    AND schema_version = 'release-deployment-run/v2'
+    AND state IN (
+      'queued','claimed','submitting','reconcile_wait','reconciling',
+      'verifying','reconcile_blocked'
+    )
+)
+`, projectID, projectID).Row().Scan(&active); err != nil {
+		return err
+	}
+	if active {
+		return conflict(legacyPreviewControllerConflictDetail)
+	}
+	return nil
+}
+
+func isLegacyControllerDatabaseConflict(err error) bool {
+	var postgres *pgconn.PgError
+	if !errors.As(err, &postgres) || postgres.Code != "40001" {
+		return false
+	}
+	message := strings.ToLower(postgres.Message)
+	return strings.Contains(message, "legacy production deployment is disabled") ||
+		strings.Contains(message, "legacy preview deployment conflicts with active release controller v3 authority") ||
+		strings.Contains(message, "release controller v3 run conflicts with a deploying legacy deployment")
 }
 
 func (s *PublishService) deployReservation(ctx context.Context, actorID uuid.UUID, reservation publishReservation) (Deployment, error) {
@@ -795,6 +991,14 @@ func deploymentVersionFromModel(model deploymentVersionModel) (DeploymentVersion
 	if model.QualityRunID != nil {
 		value := model.QualityRunID.String()
 		result.QualityRunID = &value
+	}
+	if model.CanonicalReceiptID != nil {
+		if model.CanonicalReceiptHash == nil || model.ReleaseBundleID == nil || model.ReleaseBundleHash == nil {
+			return DeploymentVersion{}, conflict("deployment ReleaseBundle authority relation is incomplete")
+		}
+		receiptID, bundleID := model.CanonicalReceiptID.String(), model.ReleaseBundleID.String()
+		result.CanonicalReceiptID, result.CanonicalReceiptHash = &receiptID, model.CanonicalReceiptHash
+		result.ReleaseBundleID, result.ReleaseBundleHash = &bundleID, model.ReleaseBundleHash
 	}
 	if model.BuildArtifactID != nil {
 		if model.BuildContentRef == nil || model.BuildContentHash == nil || model.BuildHash == nil || model.BuildEntryPath == nil || model.BuildFileCount == nil || model.BuildTotalBytes == nil {

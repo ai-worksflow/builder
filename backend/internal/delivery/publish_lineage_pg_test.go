@@ -16,8 +16,12 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/worksflow/builder/backend/internal/core"
+	"github.com/worksflow/builder/backend/internal/release"
+	"github.com/worksflow/builder/backend/internal/repository"
 	"github.com/worksflow/builder/backend/internal/storage/content"
 	storage "github.com/worksflow/builder/backend/internal/storage/postgres"
+	"github.com/worksflow/builder/backend/internal/testsupport"
+	"github.com/worksflow/builder/backend/internal/verification"
 	runtime "github.com/worksflow/builder/backend/internal/workflow"
 	"github.com/worksflow/builder/backend/migrations"
 	gormpostgres "gorm.io/driver/postgres"
@@ -210,15 +214,16 @@ func TestPublishResolvesAndStoresDerivedWorkspaceProducerPostgres(t *testing.T) 
 
 	proposalID := uuid.New()
 	appliedAt := now.Add(2 * time.Second)
-	if err := database.Create(&storage.ImplementationProposalModel{
+	completionCount := 0
+	proposal := &storage.ImplementationProposalModel{
 		ID: proposalID, ProjectID: projectID, BuildManifestID: derivedID,
 		Status: "applied", Version: 2, ContentStore: "mongo", ContentRef: uuid.NewString(),
 		ContentHash: publishLineagePGHash("proposal-content"), PayloadHash: publishLineagePGHash("proposal-payload"),
 		OperationCount: 1, AcceptedCount: 1, CreatedBy: actorID, CreatedAt: now.Add(time.Second),
+		UnimplementedCount: &completionCount, BlockingDiagnosticCount: &completionCount,
 		AppliedBy: &actorID, AppliedAt: &appliedAt,
-	}).Error; err != nil {
-		t.Fatal(err)
 	}
+	testsupport.CreateBoundImplementationProposal(t, database, proposal)
 
 	workspaceArtifactID := uuid.New()
 	workspaceRevisionID := uuid.New()
@@ -294,14 +299,44 @@ func TestPublishResolvesAndStoresDerivedWorkspaceProducerPostgres(t *testing.T) 
 	if err := database.Create(&qualityRunModel{
 		ID: qualityRunUUID, ProjectID: projectID, WorkflowRunID: &runID,
 		WorkspaceArtifactID: workspaceArtifactID, WorkspaceRevisionID: workspaceRevisionID,
-		WorkspaceContentHash: workspaceRef.ContentHash, Status: "passed", Score: 100,
+		WorkspaceContentHash: workspaceRef.ContentHash,
+		BuildArtifactID:      mustUUIDPointer(buildReference.ID), BuildContentRef: &buildReference.ContentRef,
+		BuildContentHash: &buildReference.ContentHash, BuildHash: &buildReference.BuildHash,
+		BuildEntryPath: &buildReference.EntryPath, BuildFileCount: &buildReference.FileCount, BuildTotalBytes: &buildReference.TotalBytes,
+		Status: "passed", Score: 100,
 		RunnerVersion: "lineage-pg", SandboxKind: "test", Version: 1,
 		CreatedBy: actorID, StartedAt: now, CompletedAt: &completedAt, CreatedAt: now,
 	}).Error; err != nil {
 		t.Fatal(err)
 	}
+	// This test isolates manifest lineage from migration 45's independently
+	// exercised database authority trigger while retaining its projection columns.
+	if err := database.Exec(`
+DROP TRIGGER deployment_version_release_authority_insert_guard ON deployment_versions;
+ALTER TABLE deployment_versions
+  DROP CONSTRAINT deployment_versions_release_bundle_exact_fk,
+  DROP CONSTRAINT deployment_versions_canonical_receipt_exact_fk;
+`).Error; err != nil {
+		t.Fatal(err)
+	}
+	receiptID, bundleID := uuid.NewString(), uuid.NewString()
+	receiptHash, bundleHash := publishLineagePGHash("canonical-receipt"), publishLineagePGHash("release-bundle")
+	publishBundle := release.Bundle{
+		ID: bundleID, BundleHash: bundleHash, ProjectID: projectID.String(),
+		Workspace: verification.CanonicalPlanSubject{
+			WorkspaceArtifactID: workspaceRef.ArtifactID, WorkspaceRevisionID: workspaceRef.RevisionID,
+			WorkspaceContentHash: workspaceRef.ContentHash,
+		},
+		CanonicalReceipt: repository.ExactReference{ID: receiptID, ContentHash: receiptHash},
+		BuildManifest:    repository.ExactReference{ID: derivedID.String(), ContentHash: derivedBundle.ManifestHash},
+		ReleaseArtifacts: []verification.CanonicalReleaseArtifact{{
+			ID: "web", Kind: "web-static", Store: "content", Ref: buildReference.ContentRef,
+			ContentHash: buildReference.BuildHash, MediaType: "application/vnd.worksflow.static-tree", ByteSize: buildReference.TotalBytes,
+		}},
+	}
 	publishService, err := NewPublishService(
-		database, access, loader, quality, publishLineagePGProvider{}, publishLineagePGEnvironment{},
+		database, access, loader, quality, publishReleaseStub{bundle: publishBundle},
+		publishLineagePGProvider{}, publishLineagePGEnvironment{},
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -310,6 +345,8 @@ func TestPublishResolvesAndStoresDerivedWorkspaceProducerPostgres(t *testing.T) 
 		ctx, projectID.String(), actorID.String(), "", PublishInput{
 			Environment: EnvironmentPreview, WorkspaceRevision: &workspaceRef,
 			BuildManifestID: rootID.String(), QualityRunID: qualityRunID,
+			CanonicalReceiptID: receiptID, CanonicalReceiptHash: receiptHash,
+			ReleaseBundleID: bundleID, ReleaseBundleHash: bundleHash,
 		},
 	)
 	if err != nil {

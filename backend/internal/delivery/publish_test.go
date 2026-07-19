@@ -7,7 +7,11 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/worksflow/builder/backend/internal/core"
+	"github.com/worksflow/builder/backend/internal/release"
+	"github.com/worksflow/builder/backend/internal/repository"
+	"github.com/worksflow/builder/backend/internal/verification"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 )
@@ -17,6 +21,51 @@ type publishFakeProvider struct{}
 func (publishFakeProvider) Name() string { return "fake" }
 func (publishFakeProvider) Deploy(context.Context, ProviderRequest) (ProviderResult, error) {
 	return ProviderResult{}, nil
+}
+
+type publishReleaseStub struct {
+	bundle release.Bundle
+	err    error
+	loader *publishLoaderStub
+}
+
+const (
+	publishTestReceiptID = "11111111-1111-4111-8111-111111111111"
+	publishTestBundleID  = "22222222-2222-4222-8222-222222222222"
+)
+
+var (
+	publishTestReceiptHash  = "sha256:" + strings.Repeat("c", 64)
+	publishTestBundleHash   = "sha256:" + strings.Repeat("d", 64)
+	publishTestManifestHash = "sha256:" + strings.Repeat("b", 64)
+)
+
+func (stub publishReleaseStub) Get(_ context.Context, projectID, bundleID, bundleHash string) (release.Bundle, error) {
+	if stub.loader != nil {
+		manifestID := stub.loader.bundle.ID
+		if stub.loader.resolvedManifest != "" {
+			manifestID = stub.loader.resolvedManifest
+		}
+		return release.Bundle{
+			ID: bundleID, BundleHash: bundleHash, ProjectID: projectID,
+			Workspace: verification.CanonicalPlanSubject{
+				WorkspaceArtifactID:  stub.loader.workspace.Revision.ArtifactID,
+				WorkspaceRevisionID:  stub.loader.workspace.Revision.RevisionID,
+				WorkspaceContentHash: stub.loader.workspace.Revision.ContentHash,
+			},
+			CanonicalReceipt: repository.ExactReference{ID: publishTestReceiptID, ContentHash: publishTestReceiptHash},
+			BuildManifest:    repository.ExactReference{ID: manifestID, ContentHash: publishTestManifestHash},
+		}, nil
+	}
+	return stub.bundle, stub.err
+}
+
+func withPublishAuthority(input PublishInput) PublishInput {
+	input.CanonicalReceiptID = publishTestReceiptID
+	input.CanonicalReceiptHash = publishTestReceiptHash
+	input.ReleaseBundleID = publishTestBundleID
+	input.ReleaseBundleHash = publishTestBundleHash
+	return input
 }
 
 func publishExactRef() core.VersionRef {
@@ -72,7 +121,14 @@ func (s *publishLoaderStub) LoadFrozenWorkspace(_ context.Context, _, _ string, 
 
 func (s *publishLoaderStub) LoadBuildManifest(_ context.Context, _, _, manifestID string, _ core.Action) (core.WorkbenchBundle, error) {
 	s.manifest = manifestID
-	return s.bundle, s.err
+	bundle := s.bundle
+	if manifestID == s.resolvedManifest {
+		bundle.ID = manifestID
+	}
+	if bundle.ManifestHash == "" {
+		bundle.ManifestHash = publishTestManifestHash
+	}
+	return bundle, s.err
 }
 
 func (s *publishLoaderStub) ResolveWorkspaceManifestLineage(_ context.Context, _, _ string, revision core.VersionRef, manifestID string, _ core.Action) (string, error) {
@@ -97,7 +153,7 @@ func TestPublishSourceStoresResolvedDerivedProducerManifest(t *testing.T) {
 	reference := publishExactRef()
 	loader := &publishLoaderStub{
 		workspace:        WorkspaceSnapshot{ProjectID: projectID, Revision: reference},
-		bundle:           core.WorkbenchBundle{ID: rootID, ProjectID: projectID},
+		bundle:           core.WorkbenchBundle{ID: rootID, ProjectID: projectID, ManifestHash: "sha256:" + strings.Repeat("b", 64)},
 		resolvedManifest: derivedID,
 	}
 	service := &PublishService{loader: loader}
@@ -150,14 +206,17 @@ func (s *environmentResolverStub) Resolve(_ context.Context, _ string, _ Environ
 
 func newPublishServiceForBoundaryTest(t *testing.T, access AccessControl, loader publishRevisionLoader, quality publishQualityReader, environments EnvironmentResolver) *PublishService {
 	t.Helper()
-	service, err := NewPublishService(publishDryRunDB(t), access, loader, quality, publishFakeProvider{}, environments)
+	service, err := NewPublishService(
+		publishDryRunDB(t), access, loader, quality,
+		publishReleaseStub{loader: loader.(*publishLoaderStub)}, publishFakeProvider{}, environments,
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return service
 }
 
-func TestPublishProductionRequiresPassingReportForExactWorkspace(t *testing.T) {
+func TestLegacyPublishProductionRequiresReleaseControllerV3BeforeDependencies(t *testing.T) {
 	requested := publishExactRef()
 	different := publishExactRef()
 	projectID, manifestID, qualityRunID := uuid.NewString(), uuid.NewString(), uuid.NewString()
@@ -171,19 +230,19 @@ func TestPublishProductionRequiresPassingReportForExactWorkspace(t *testing.T) {
 	}}
 	environments := &environmentResolverStub{}
 	service := newPublishServiceForBoundaryTest(t, access, loader, quality, environments)
-	_, err := service.Publish(context.Background(), projectID, uuid.NewString(), "", PublishInput{
+	_, err := service.Publish(context.Background(), projectID, uuid.NewString(), "", withPublishAuthority(PublishInput{
 		Environment: EnvironmentProduction, WorkspaceRevision: &requested,
 		BuildManifestID: manifestID, QualityRunID: qualityRunID,
-	})
+	}))
 	typed, ok := AsError(err)
-	if !ok || typed.Code != CodeConflict {
-		t.Fatalf("mismatched production quality report was accepted: %v", err)
+	if !ok || typed.Code != CodeConflict || typed.Status != 409 || typed.Detail != legacyProductionControllerConflictDetail {
+		t.Fatalf("legacy production publish did not require Release Controller v3: %v", err)
 	}
-	if access.action != core.ActionPublish || !quality.called || quality.getID != qualityRunID || quality.latestCalled || environments.called {
-		t.Fatalf("production boundary ordering is incorrect: action=%s quality=%v get=%q latest=%v environment=%v", access.action, quality.called, quality.getID, quality.latestCalled, environments.called)
+	if access.action != "" || quality.called || quality.getID != "" || quality.latestCalled || environments.called {
+		t.Fatalf("legacy production crossed a disabled dependency boundary: action=%s quality=%v get=%q latest=%v environment=%v", access.action, quality.called, quality.getID, quality.latestCalled, environments.called)
 	}
-	if !loader.lineageCalled || loader.lineageManifest != manifestID || !exactVersionRefEqual(loader.lineageRevision, requested) {
-		t.Fatalf("publish did not validate the exact workspace/manifest lineage: %+v", loader)
+	if loader.lineageCalled || loader.lineageManifest != "" {
+		t.Fatalf("legacy production loaded workspace lineage despite the v3-only gate: %+v", loader)
 	}
 }
 
@@ -200,10 +259,10 @@ func TestPublishPreviewAlsoRequiresPassingImmutableBuildArtifact(t *testing.T) {
 	}}
 	environments := &environmentResolverStub{}
 	service := newPublishServiceForBoundaryTest(t, access, loader, quality, environments)
-	_, err := service.Publish(context.Background(), projectID, uuid.NewString(), "", PublishInput{
+	_, err := service.Publish(context.Background(), projectID, uuid.NewString(), "", withPublishAuthority(PublishInput{
 		Environment: EnvironmentPreview, WorkspaceRevision: &requested,
 		BuildManifestID: manifestID, QualityRunID: qualityRunID,
-	})
+	}))
 	typed, ok := AsError(err)
 	if !ok || typed.Code != CodeConflict {
 		t.Fatalf("preview accepted a quality report without an immutable build artifact: %v", err)
@@ -224,10 +283,10 @@ func TestPublishRejectsSensitiveWorkspaceBeforeEnvironmentOrProvider(t *testing.
 	quality := &publishQualityStub{}
 	environments := &environmentResolverStub{}
 	service := newPublishServiceForBoundaryTest(t, access, loader, quality, environments)
-	_, err := service.Publish(context.Background(), projectID, uuid.NewString(), "", PublishInput{
+	_, err := service.Publish(context.Background(), projectID, uuid.NewString(), "", withPublishAuthority(PublishInput{
 		Environment: EnvironmentPreview, WorkspaceRevision: &requested,
 		BuildManifestID: manifestID, QualityRunID: qualityRunID,
-	})
+	}))
 	typed, ok := AsError(err)
 	if !ok || typed.Code != CodeSensitiveContent {
 		t.Fatalf("sensitive workspace was not blocked: %v", err)
@@ -273,6 +332,43 @@ func TestPublishRequiresExplicitQualityWorkspaceAndManifestProvenance(t *testing
 	}
 }
 
+func TestPublishRequiresExactCanonicalReceiptAndReleaseBundleAuthority(t *testing.T) {
+	reference := publishExactRef()
+	manifestID, qualityRunID := uuid.NewString(), uuid.NewString()
+	base := withPublishAuthority(PublishInput{
+		Environment: EnvironmentPreview, WorkspaceRevision: &reference,
+		BuildManifestID: manifestID, QualityRunID: qualityRunID,
+	})
+	tests := []struct {
+		name  string
+		field string
+		clear func(*PublishInput)
+	}{
+		{name: "receipt id", field: "canonicalReceiptId", clear: func(input *PublishInput) { input.CanonicalReceiptID = "" }},
+		{name: "receipt hash", field: "canonicalReceiptHash", clear: func(input *PublishInput) { input.CanonicalReceiptHash = "" }},
+		{name: "bundle id", field: "releaseBundleId", clear: func(input *PublishInput) { input.ReleaseBundleID = "" }},
+		{name: "bundle hash", field: "releaseBundleHash", clear: func(input *PublishInput) { input.ReleaseBundleHash = "" }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			input := base
+			test.clear(&input)
+			access := &publishAccessStub{}
+			loader := &publishLoaderStub{}
+			quality := &publishQualityStub{}
+			service := newPublishServiceForBoundaryTest(t, access, loader, quality, EmptyEnvironmentResolver{})
+			_, err := service.Publish(context.Background(), uuid.NewString(), uuid.NewString(), "", input)
+			typed, ok := AsError(err)
+			if !ok || typed.Code != CodeInvalidInput || len(typed.Fields[test.field]) == 0 {
+				t.Fatalf("missing %s was accepted: %v", test.field, err)
+			}
+			if access.action != "" || loader.manifest != "" || quality.called {
+				t.Fatalf("invalid release authority crossed the publish boundary: access=%s loader=%+v quality=%+v", access.action, loader, quality)
+			}
+		})
+	}
+}
+
 func TestPublishRejectsUntrustedWorkspaceManifestPairBeforeQuality(t *testing.T) {
 	reference := publishExactRef()
 	projectID, manifestID, qualityRunID := uuid.NewString(), uuid.NewString(), uuid.NewString()
@@ -283,10 +379,10 @@ func TestPublishRejectsUntrustedWorkspaceManifestPairBeforeQuality(t *testing.T)
 	}
 	quality := &publishQualityStub{}
 	service := newPublishServiceForBoundaryTest(t, &publishAccessStub{}, loader, quality, EmptyEnvironmentResolver{})
-	_, err := service.Publish(context.Background(), projectID, uuid.NewString(), "", PublishInput{
+	_, err := service.Publish(context.Background(), projectID, uuid.NewString(), "", withPublishAuthority(PublishInput{
 		Environment: EnvironmentPreview, WorkspaceRevision: &reference,
 		BuildManifestID: manifestID, QualityRunID: qualityRunID,
-	})
+	}))
 	if typed, ok := AsError(err); !ok || typed.Code != CodeConflict {
 		t.Fatalf("forged workspace/manifest provenance was accepted: %v", err)
 	}
@@ -313,12 +409,34 @@ func TestPublishAuthorizationFailsBeforeLoadingFrozenContent(t *testing.T) {
 	access := &publishAccessStub{err: core.ErrForbidden}
 	loader := &publishLoaderStub{err: errors.New("must not load"), bundle: core.WorkbenchBundle{ID: manifestID}}
 	service := newPublishServiceForBoundaryTest(t, access, loader, &publishQualityStub{}, EmptyEnvironmentResolver{})
-	_, err := service.Publish(context.Background(), uuid.NewString(), uuid.NewString(), "", PublishInput{
-		Environment: EnvironmentProduction, WorkspaceRevision: &requested,
+	_, err := service.Publish(context.Background(), uuid.NewString(), uuid.NewString(), "", withPublishAuthority(PublishInput{
+		Environment: EnvironmentPreview, WorkspaceRevision: &requested,
 		BuildManifestID: manifestID, QualityRunID: uuid.NewString(),
-	})
+	}))
 	if !errors.Is(err, core.ErrForbidden) {
 		t.Fatalf("authorization error was not preserved: %v", err)
+	}
+}
+
+func TestLegacyControllerDatabaseConflictsMapOnlyKnownGateFailures(t *testing.T) {
+	t.Parallel()
+	for _, message := range []string{
+		"legacy production deployment is disabled; use Release Controller v3",
+		"legacy preview deployment conflicts with active Release Controller v3 authority",
+		"Release Controller v3 Run conflicts with a deploying legacy deployment",
+	} {
+		if !isLegacyControllerDatabaseConflict(&pgconn.PgError{Code: "40001", Message: message}) {
+			t.Fatalf("known database gate was not mapped to a stable conflict: %q", message)
+		}
+	}
+	for _, err := range []error{
+		&pgconn.PgError{Code: "40001", Message: "unrelated serialization failure"},
+		&pgconn.PgError{Code: "23505", Message: "legacy preview deployment conflicts with active Release Controller v3 authority"},
+		errors.New("legacy preview deployment conflicts with active Release Controller v3 authority"),
+	} {
+		if isLegacyControllerDatabaseConflict(err) {
+			t.Fatalf("unrelated database failure was misclassified: %v", err)
+		}
 	}
 }
 

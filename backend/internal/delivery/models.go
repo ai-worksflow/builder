@@ -81,6 +81,10 @@ type deploymentVersionModel struct {
 	WorkspaceContentHash     string     `gorm:"not null"`
 	BuildManifestID          *uuid.UUID `gorm:"type:uuid"`
 	QualityRunID             *uuid.UUID `gorm:"type:uuid"`
+	CanonicalReceiptID       *uuid.UUID `gorm:"type:uuid"`
+	CanonicalReceiptHash     *string
+	ReleaseBundleID          *uuid.UUID `gorm:"type:uuid"`
+	ReleaseBundleHash        *string
 	BuildArtifactID          *uuid.UUID `gorm:"type:uuid"`
 	BuildContentRef          *string
 	BuildContentHash         *string
