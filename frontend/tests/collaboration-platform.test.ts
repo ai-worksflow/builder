@@ -466,8 +466,8 @@ class FakeSocket implements WebSocketLike {
   onclose: ((event: CloseEvent) => void) | null = null
   readonly sent: unknown[] = []
 
-  send(data: string) {
-    this.sent.push(JSON.parse(data) as unknown)
+  send(data: string | ArrayBufferLike | Blob | ArrayBufferView) {
+    this.sent.push(JSON.parse(String(data)) as unknown)
   }
 
   close(code?: number, reason?: string) {

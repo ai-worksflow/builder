@@ -238,6 +238,30 @@ test('problem+json responses become structured PlatformHttpError values', async 
   )
 })
 
+test('accepted non-problem statuses preserve structured conflict payloads', async () => {
+  const conflict = { plan: { disposition: 'conflicted', conflicts: [{ path: 'src/app.ts' }] } }
+  const accepted = new HttpClient({
+    baseUrl: 'https://platform.example.test',
+    fetch: (async () => json(conflict, 409, { 'content-type': 'application/json' })) as FetchLike,
+  })
+  const result = await accepted.post('/v1/agent-attempts/attempt-1/merge', {}, {
+    acceptedStatuses: [409],
+  })
+  assert.equal(result.status, 409)
+  assert.deepEqual(result.data, conflict)
+
+  const problem = new HttpClient({
+    baseUrl: 'https://platform.example.test',
+    fetch: (async () => json({
+      title: 'Merge fenced', status: 409, code: 'agent_patch_merge_fenced',
+    }, 409, { 'content-type': 'application/problem+json' })) as FetchLike,
+  })
+  await assert.rejects(
+    problem.post('/v1/agent-attempts/attempt-1/merge', {}, { acceptedStatuses: [409] }),
+    PlatformHttpError,
+  )
+})
+
 test('HTTP captures CSRF tokens, sends them on mutations, and clears them after auth failure', async () => {
   let token: string | undefined
   const store: CsrfTokenStore = {
@@ -348,8 +372,8 @@ class FakeSocket implements WebSocketLike {
   readonly sent: unknown[] = []
   readonly closes: Array<{ code?: number; reason?: string }> = []
 
-  send(data: string) {
-    this.sent.push(JSON.parse(data) as unknown)
+  send(data: string | ArrayBufferLike | Blob | ArrayBufferView) {
+    this.sent.push(JSON.parse(String(data)) as unknown)
   }
 
   close(code?: number, reason?: string) {

@@ -5,6 +5,41 @@ const now = '2026-07-10T08:00:00Z'
 const hash = (character: string) => character.repeat(64)
 const workflowExecutionProfile = { version: 'workflow-engine/v2', hash: 'dd247a77ce3cfa1095a575a238b93c4bd41dd991eac07e8b62ec170864470da1' }
 
+const fullStackTemplateComponents = [
+  {
+    role: 'web',
+    mountPath: 'frontend',
+    release: { id: 'template-release-web-e2e', contentHash: hash('d'), subjectHash: hash('e') },
+  },
+  {
+    role: 'api',
+    mountPath: 'backend',
+    release: { id: 'template-release-api-e2e', contentHash: hash('7'), subjectHash: hash('8') },
+  },
+]
+
+const fullStackTemplateRegistration = {
+  template: {
+    id: 'full-stack-template-e2e',
+    schemaVersion: 'full-stack-template/v1',
+    templateId: 'react-fastapi-postgres',
+    version: '1.0.0',
+    components: fullStackTemplateComponents,
+    layout: {
+      contractTruthSource: 'openapi',
+      openapiPath: 'backend/openapi.yaml',
+      generatedClientPath: 'frontend/lib/generated',
+      deploymentPath: 'deploy',
+      testPath: 'tests',
+      databaseEngine: 'postgres',
+    },
+    contentHash: hash('f'),
+    createdBy: '11111111-1111-4111-8111-111111111111',
+    createdAt: now,
+  },
+  components: fullStackTemplateComponents,
+}
+
 interface Deferred {
   readonly promise: Promise<void>
   readonly release: () => void
@@ -49,6 +84,61 @@ const project = {
   createdAt: now,
   updatedAt: now,
   etag: '"project:1"',
+}
+
+function readyApplicationBuildContract(buildManifestId: string) {
+  return {
+    id: `build-contract-${buildManifestId}`,
+    projectId: project.id,
+    buildManifestId,
+    status: 'ready',
+    version: 1,
+    etag: `"application-build-contract:${buildManifestId}:1"`,
+    contentHash: hash('a'),
+    contractHash: hash('b'),
+    contract: {
+      schemaVersion: 'application-build-contract/v2',
+      compiler: { version: 'e2e-v1', hash: hash('c') },
+      projectId: project.id,
+      deliverySliceId: 'page-orders',
+      buildManifest: { id: buildManifestId, contentHash: hash('6') },
+      sourceRevisions: [],
+      fullStackTemplate: {
+        id: fullStackTemplateRegistration.template.id,
+        contentHash: fullStackTemplateRegistration.template.contentHash,
+        certification: 'qualified',
+        policyStatus: 'approved',
+      },
+      templateReleaseRefs: [],
+      routes: [],
+      states: [],
+      contractBindings: [],
+      acceptanceCriteria: [],
+      oracles: [],
+      obligations: [{
+        id: 'must-build-exact-manifest',
+        level: 'must',
+        kind: 'build_manifest',
+        sourceRevision: {},
+        sourceAnchorId: buildManifestId,
+        oracleIds: [],
+        dependsOn: [],
+        waivable: false,
+        status: 'ready',
+      }],
+      waivers: [],
+      gaps: [],
+      conflicts: [],
+      forbiddenClaims: [],
+      status: 'ready',
+    },
+    mustCount: 1,
+    mustReadyCount: 1,
+    blockingCount: 0,
+    conflictCount: 0,
+    createdBy: user.id,
+    createdAt: now,
+  }
 }
 
 const briefRevision = {
@@ -483,6 +573,8 @@ interface MockPlatformState {
   workspaceRevision: ReturnType<typeof applicationRevision> | null
   workbenchBundle: ReturnType<typeof buildManifest>
   multiWorkbench: ReturnType<typeof multiWorkbenchState> | null
+  sandboxCandidate: ReturnType<typeof freshCandidateWorkspace> | null
+  sandboxSession: ReturnType<typeof readySandboxSession> | null
   blueprintProposal: ReturnType<typeof blueprintArtifactProposal> | null
   pageSpecProposals: Array<ReturnType<typeof pageSpecArtifactProposal>>
   blueprintCreatedRevision: MockBlueprintRevision | null
@@ -593,6 +685,8 @@ async function installPlatformMock(page: Page, options: MockPlatformOptions = {}
     multiWorkbench: options.multiWorkbenchGroups
       ? multiGroupWorkbenchState()
       : options.multiBundleWorkbench ? multiWorkbenchState() : null,
+    sandboxCandidate: null,
+    sandboxSession: null,
     blueprintProposal: options.blueprintProposal ? blueprintArtifactProposal() : null,
     pageSpecProposals: [],
     blueprintCreatedRevision: null,
@@ -2016,6 +2110,217 @@ async function handlePlatformRoute(
     await respond(state.run ?? workflowRun('run-started', 'waiting_input'))
     return
   }
+  if (path === '/v1/full-stack-templates' && method === 'GET') {
+    await respond({ items: [fullStackTemplateRegistration] })
+    return
+  }
+  const fullStackTemplatePath = path.match(/^\/v1\/full-stack-templates\/([^/]+)$/)
+  if (fullStackTemplatePath && method === 'GET') {
+    const matches = fullStackTemplatePath[1] === fullStackTemplateRegistration.template.id
+      && (!url.searchParams.get('contentHash')
+        || url.searchParams.get('contentHash') === fullStackTemplateRegistration.template.contentHash)
+    await respond(matches ? fullStackTemplateRegistration : { title: 'Not found' }, matches ? 200 : 404)
+    return
+  }
+  const buildContractPath = path.match(/^\/v1\/build-manifests\/([^/]+)\/build-contract$/)
+  if (buildContractPath && method === 'GET') {
+    await respond(readyApplicationBuildContract(buildContractPath[1]))
+    return
+  }
+  const buildContractCreatePath = path.match(/^\/v1\/build-manifests\/([^/]+)\/build-contracts$/)
+  if (buildContractCreatePath && method === 'POST') {
+    await respond(readyApplicationBuildContract(buildContractCreatePath[1]), 201)
+    return
+  }
+  if (path === `/v1/projects/${project.id}/repository-candidates` && method === 'GET') {
+    await respond({
+      schemaVersion: 'repository-candidate-head-list/v1',
+      candidates: state.sandboxCandidate ? [{ candidate: state.sandboxCandidate }] : [],
+    })
+    return
+  }
+  if (path === `/v1/projects/${project.id}/repository-candidates` && method === 'POST') {
+    const input = body as { buildManifestId: string }
+    const existing = state.sandboxCandidate?.buildManifest.id === input.buildManifestId
+      ? state.sandboxCandidate
+      : undefined
+    state.sandboxCandidate = existing ?? freshCandidateWorkspace(input.buildManifestId)
+    await respond({
+      candidate: state.sandboxCandidate,
+      created: !existing,
+      recovered: Boolean(existing),
+      finalizationPending: false,
+    }, existing ? 200 : 201)
+    return
+  }
+  const repositoryCandidatePath = path.match(
+    new RegExp(`^/v1/projects/${project.id}/repository-candidates/([^/]+)$`),
+  )
+  if (repositoryCandidatePath && method === 'GET') {
+    const candidate = state.sandboxCandidate
+    await respond(
+      candidate?.id === repositoryCandidatePath[1]
+        ? candidate
+        : { title: 'Not found', status: 404 },
+      candidate?.id === repositoryCandidatePath[1] ? 200 : 404,
+    )
+    return
+  }
+  if (path === `/v1/projects/${project.id}/sandbox-sessions` && method === 'POST') {
+    const input = body as { candidateId: string }
+    const candidate = state.sandboxCandidate
+    if (!candidate || candidate.id !== input.candidateId) {
+      await respond({ title: 'Candidate not found', status: 404 }, 404)
+      return
+    }
+    state.sandboxSession = readySandboxSession(candidate)
+    await respond(
+      state.sandboxSession,
+      201,
+      sandboxFenceHeaders(state.sandboxSession, candidate),
+    )
+    return
+  }
+  const sandboxWriterLeasePath = path.match(/^\/v1\/sandbox-sessions\/([^/]+)\/writer-lease$/)
+  if (sandboxWriterLeasePath && method === 'POST') {
+    const session = state.sandboxSession
+    const candidate = state.sandboxCandidate
+    if (!session || !candidate || session.id !== sandboxWriterLeasePath[1]) {
+      await respond({ title: 'Sandbox not found', status: 404 }, 404)
+      return
+    }
+    state.sandboxCandidate = {
+      ...candidate,
+      version: candidate.version + 1,
+      writerLeaseEpoch: candidate.writerLeaseEpoch + 1,
+      lease: {
+        ownerId: user.id,
+        epoch: candidate.writerLeaseEpoch + 1,
+        expiresAt: '2026-07-10T08:15:00Z',
+      },
+      updatedAt: now,
+    }
+    state.sandboxSession = {
+      ...session,
+      version: session.version + 1,
+      candidate: state.sandboxCandidate,
+      updatedAt: now,
+    }
+    await respond(
+      { session: state.sandboxSession, candidate: state.sandboxCandidate },
+      200,
+      sandboxFenceHeaders(state.sandboxSession, state.sandboxCandidate),
+    )
+    return
+  }
+  const sandboxTreePath = path.match(/^\/v1\/sandbox-sessions\/([^/]+)\/tree$/)
+  if (sandboxTreePath && method === 'GET') {
+    const session = state.sandboxSession
+    const candidate = state.sandboxCandidate
+    if (!session || !candidate || session.id !== sandboxTreePath[1]) {
+      await respond({ title: 'Sandbox not found', status: 404 }, 404)
+      return
+    }
+    await respond(
+      { session, candidate, tree: candidate.currentTree },
+      200,
+      sandboxFenceHeaders(session, candidate),
+    )
+    return
+  }
+  const sandboxFilePath = path.match(/^\/v1\/sandbox-sessions\/([^/]+)\/files\/(.+)$/)
+  if (sandboxFilePath && method === 'GET') {
+    const session = state.sandboxSession
+    const candidate = state.sandboxCandidate
+    const requestedPath = sandboxFilePath[2].split('/').map(decodeURIComponent).join('/')
+    const file = candidate?.currentTree.files.find((item) => item.path === requestedPath)
+    if (!session || !candidate || session.id !== sandboxFilePath[1] || !file) {
+      await respond({ title: 'File not found', status: 404 }, 404)
+      return
+    }
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/octet-stream',
+      headers: {
+        ...corsHeaders(),
+        ...sandboxFenceHeaders(session, candidate),
+        'x-content-hash': file.contentHash,
+        'x-file-mode': file.mode,
+      },
+      body: freshCandidateFile,
+    })
+    return
+  }
+  const sandboxProcessListPath = path.match(/^\/v1\/sandbox-sessions\/([^/]+)\/processes$/)
+  if (sandboxProcessListPath && method === 'GET') {
+    const session = state.sandboxSession
+    if (!session || session.id !== sandboxProcessListPath[1]) {
+      await respond({ title: 'Sandbox not found', status: 404 }, 404)
+      return
+    }
+    await respond(
+      { session, processes: [] },
+      200,
+      sandboxFenceHeaders(session, state.sandboxCandidate),
+    )
+    return
+  }
+  const sandboxTerminalListPath = path.match(/^\/v1\/sandbox-sessions\/([^/]+)\/ptys$/)
+  if (sandboxTerminalListPath && method === 'GET') {
+    const session = state.sandboxSession
+    if (!session || session.id !== sandboxTerminalListPath[1]) {
+      await respond({ title: 'Sandbox not found', status: 404 }, 404)
+      return
+    }
+    await respond(
+      { session, terminals: [] },
+      200,
+      sandboxFenceHeaders(session, state.sandboxCandidate),
+    )
+    return
+  }
+  const sandboxPortListPath = path.match(/^\/v1\/sandbox-sessions\/([^/]+)\/ports$/)
+  if (sandboxPortListPath && method === 'GET') {
+    const session = state.sandboxSession
+    if (!session || session.id !== sandboxPortListPath[1]) {
+      await respond({ title: 'Sandbox not found', status: 404 }, 404)
+      return
+    }
+    await respond(
+      { session, ports: [] },
+      200,
+      sandboxFenceHeaders(session, state.sandboxCandidate),
+    )
+    return
+  }
+  const verificationProfilePath = path.match(
+    /^\/v1\/sandbox-sessions\/([^/]+)\/verification-profiles$/,
+  )
+  if (verificationProfilePath && method === 'GET') {
+    await respond({ profiles: [] })
+    return
+  }
+  const verificationRunListPath = path.match(
+    /^\/v1\/sandbox-sessions\/([^/]+)\/verification-runs$/,
+  )
+  if (verificationRunListPath && method === 'GET') {
+    await respond({ runs: [] })
+    return
+  }
+  const sandboxSessionPath = path.match(/^\/v1\/sandbox-sessions\/([^/]+)$/)
+  if (sandboxSessionPath && method === 'GET') {
+    const session = state.sandboxSession
+    await respond(
+      session?.id === sandboxSessionPath[1]
+        ? session
+        : { title: 'Not found', status: 404 },
+      session?.id === sandboxSessionPath[1] ? 200 : 404,
+      session?.id === sandboxSessionPath[1]
+        ? sandboxFenceHeaders(session, state.sandboxCandidate)
+        : {},
+    )
+    return
+  }
   const multi = state.multiWorkbench
   const lineagePath = path.match(/^\/v1\/build-manifests\/([^/]+)\/lineage-state$/)
   if (lineagePath && method === 'GET') {
@@ -2082,23 +2387,6 @@ async function handlePlatformRoute(
     multi.activeBundleIds[rootId] = derived.id
     delete multi.currentProposalIds[rootId]
     await respond(derived, 201)
-    return
-  }
-  const multiGeneratePath = path.match(/^\/v1\/build-manifests\/([^/]+)\/generate$/)
-  if (multi && multiGeneratePath && method === 'POST') {
-    const bundleId = multiGeneratePath[1]
-    const proposal = multiImplementationProposal(
-      'proposal-checkout',
-      bundleId,
-      'open',
-      'pending',
-      1,
-      'Checkout updates the exact shared file produced by Home.',
-      hash('a'),
-    )
-    multi.proposals[proposal.id] = proposal
-    multi.currentProposalIds['bundle-checkout'] = proposal.id
-    await respond({ proposal, provider: 'openai', model: 'gpt-5' }, 201)
     return
   }
   const multiDecisionPath = path.match(/^\/v1\/implementation-proposals\/([^/]+)\/decisions$/)
@@ -2191,11 +2479,6 @@ async function handlePlatformRoute(
     await respond(state.workbenchBundle)
     return
   }
-  if (path === '/v1/build-manifests/build-1/generate' && method === 'POST') {
-    state.proposal = implementationProposal('open')
-    await respond({ proposal: state.proposal, provider: 'openai', model: 'gpt-5' }, 201)
-    return
-  }
   if (path === '/v1/implementation-proposals/implementation-1/decisions' && method === 'POST') {
     state.proposal = implementationProposal('ready', 'accepted', 2)
     await respond(state.proposal, 200, { etag: '"implementation-proposal:implementation-1:2"' })
@@ -2231,6 +2514,65 @@ test('anonymous Workbench fails closed without browser generation fallback', asy
   await expect(page.getByText('Sign in to use the application Workbench')).toBeVisible()
   await expect(page.getByText('Workbench does not generate from browser mock data.')).toBeVisible()
   await expect(page.getByRole('button', { name: 'Freeze build input' })).toBeDisabled()
+})
+
+test('incomplete manual Proposal cannot expose review or Apply controls', async ({ page }) => {
+  const state = await installPlatformMock(page, { authenticated: true })
+  state.proposal = {
+    ...implementationProposal('open'),
+    diagnostics: [{
+      code: 'missing_contract',
+      severity: 'blocker',
+      message: 'API contract is absent.',
+    }],
+    unimplementedItems: ['Persistence is not implemented.'],
+  }
+
+  await page.goto('/workbench/planning?view=code&proposalId=implementation-1')
+
+  const blocker = page.getByRole('alert').filter({
+    hasText: 'This immutable manual Proposal contains 2 unimplemented or blocking diagnostic item(s).',
+  })
+  await expect(blocker).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Accept pending' })).toBeDisabled()
+  await expect(page.getByRole('button', { name: 'Reject pending' })).toBeDisabled()
+  await expect(page.getByRole('button', { name: 'Quarantine and open Candidate' })).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Apply accepted operations' })).toBeDisabled()
+})
+
+test('pre-verification Candidate history can only be quarantined', async ({ page }) => {
+  const state = await installPlatformMock(page, { authenticated: true })
+  state.proposal = {
+    ...implementationProposal('open'),
+    executionSource: 'candidate_freeze',
+    candidateSource: {
+      freezeReceiptId: 'historical-freeze',
+      repositorySnapshotId: 'historical-repository-snapshot',
+      sessionId: 'historical-session',
+      candidateId: 'historical-candidate',
+      candidateSnapshotId: 'historical-checkpoint',
+      candidateVersion: 2,
+      journalSequence: 3,
+      sessionEpoch: 1,
+      writerLeaseEpoch: 1,
+      baseTreeHash: hash('1'),
+      treeHash: hash('2'),
+      fullStackTemplate: { id: 'historical-template', contentHash: hash('3') },
+      verificationReceipt: { id: '', contentHash: '' },
+    },
+  }
+
+  await page.goto('/workbench/planning?view=code&proposalId=implementation-1')
+
+  const blocker = page.getByRole('alert').filter({
+    hasText: 'This historical Candidate Proposal predates the exact VerificationReceipt gate.',
+  })
+  await expect(blocker).toBeVisible()
+  await expect(page.getByText('Exact frozen Candidate')).toHaveCount(0)
+  await expect(page.getByRole('button', { name: 'Accept pending' })).toBeDisabled()
+  await expect(page.getByRole('button', { name: 'Reject pending' })).toBeDisabled()
+  await expect(page.getByRole('button', { name: 'Quarantine and open Candidate' })).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Apply accepted operations' })).toBeDisabled()
 })
 
 test('first-time users receive a server-state getting started guide', async ({ page }) => {
@@ -2626,7 +2968,7 @@ test('workflow authoring ignores an older definition-version response after a ne
 })
 
 test('an older run lineage response cannot replace the current run Workbench bundle', async ({ page }) => {
-  await installPlatformMock(page, { authenticated: true })
+  const state = await installPlatformMock(page, { authenticated: true })
   const runA = selectionWorkflowRun('run-race-a', 'bundle-race-a')
   const runB = selectionWorkflowRun('run-race-b', 'bundle-race-b')
   const bundleA = {
@@ -2669,12 +3011,24 @@ test('an older run lineage response cannot replace the current run Workbench bun
   if (await closeConversation.isVisible()) await closeConversation.click()
   await lineageAStarted
   await page.getByRole('button', { name: new RegExp(runB.id) }).click()
-  await expect(page.getByText(new RegExp(`${bundleB.id} ·`))).toBeVisible()
+  const openSandbox = page.getByRole('button', { name: 'Open development sandbox' })
+  await expect(openSandbox).toBeVisible()
+  await openSandbox.click()
+  await expect(page.getByText('frontend/app/page.tsx', { exact: true }).first()).toBeVisible()
+  const bundleBBootstrap = state.requests.find((item) =>
+    item.method === 'POST'
+      && item.path === `/v1/projects/${project.id}/repository-candidates`
+      && (item.body as { buildManifestId?: string })?.buildManifestId === bundleB.id)
+  expect(bundleBBootstrap).toBeTruthy()
   releaseLineageA()
   await lineageAFinished
 
-  await expect(page.getByText(new RegExp(`${bundleB.id} ·`))).toBeVisible()
-  await expect(page.getByText(new RegExp(`${bundleA.id} ·`))).toHaveCount(0)
+  await expect(page.getByText('frontend/app/page.tsx', { exact: true }).first()).toBeVisible()
+  expect(state.sandboxCandidate?.buildManifest.id).toBe(bundleB.id)
+  expect(state.requests.some((item) =>
+    item.method === 'POST'
+      && item.path === `/v1/projects/${project.id}/repository-candidates`
+      && (item.body as { buildManifestId?: string })?.buildManifestId === bundleA.id)).toBe(false)
 })
 
 test('direct Bundle and Proposal URL hydration is latest-wins across delayed responses', async ({ page }) => {
@@ -3335,7 +3689,7 @@ test('conversation hydration ignores a delayed response from the previously sele
   await expect(page.getByText(messageA.content, { exact: true })).toHaveCount(0)
 })
 
-test('conversation polling does not cancel an in-flight controlled Workbench execution', async ({ page }) => {
+test('conversation polling does not cancel execution before the legacy Proposal quarantine gate', async ({ page }) => {
   const state = await installPlatformMock(page, {
     authenticated: true,
     conversationSelectionTarget: true,
@@ -3395,7 +3749,11 @@ test('conversation polling does not cancel an in-flight controlled Workbench exe
     item.method === 'GET'
       && item.path.endsWith(`/workflow-runs/${proposal.workbenchInstruction.expectedRunId}`))).toBe(true)
   await expect(page.getByText(proposal.workbenchInstruction.expectedRunId, { exact: true }).first()).toBeVisible()
-  await expect(page.getByRole('button', { name: 'Finish current review' })).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Quarantine and open Candidate' })).toBeVisible()
+  await expect(page.getByRole('alert').filter({
+    hasText: 'This Proposal came from the retired direct-model path',
+  })).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Finish current review' })).toHaveCount(0)
 })
 
 test('same-run polling coalesces with delayed receipt lineage hydration', async ({ page }) => {
@@ -3443,7 +3801,11 @@ test('same-run polling coalesces with delayed receipt lineage hydration', async 
   await page.waitForTimeout(3_600)
   releaseLineage()
 
-  await expect(page.getByRole('button', { name: 'Finish current review' })).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Quarantine and open Candidate' })).toBeVisible()
+  await expect(page.getByRole('alert').filter({
+    hasText: 'This Proposal came from the retired direct-model path',
+  })).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Finish current review' })).toHaveCount(0)
   await expect(panel.getByRole('alert')).toHaveCount(0)
   expect(state.requests.filter((item) => (
     item.method === 'GET'
@@ -3769,27 +4131,33 @@ test('an existing project conversation exposes an explicit new-conversation path
   expect(createRequest?.headers['idempotency-key']).toBeTruthy()
 })
 
-test('frozen build input produces a reviewed proposal and applied preview', async ({ page }) => {
+test('fresh frozen build input opens a template-backed Candidate without direct generation', async ({ page }) => {
   const state = await installPlatformMock(page, { authenticated: true })
   await page.goto('/workbench/complete?view=code')
 
   await page.getByRole('button', { name: 'Freeze build input' }).click()
-  await expect(page.getByText('Frozen application build manifest')).toBeVisible()
-  await page.getByRole('button', { name: 'Generate proposal' }).click()
-  await expect(page.getByText('src/index.html', { exact: true })).toBeVisible()
-  await page.getByRole('button', { name: 'Accept pending' }).click()
-  await expect(page.getByRole('button', {
-    name: 'src/index.html Create or update file · Accepted',
-  })).toBeVisible()
-  await page.getByRole('button', { name: 'Apply accepted operations' }).click()
+  const openSandbox = page.getByRole('button', { name: 'Open development sandbox' })
+  await expect(openSandbox).toBeVisible()
+  await expect(page.getByText(
+    'Edits are saved to a durable Candidate. Blueprint and document state are not reloaded by autosave.',
+    { exact: true },
+  )).toBeVisible()
+  await expect(page.getByRole('textbox', { name: 'Generation model' })).toHaveCount(0)
+  await expect(page.getByRole('textbox', { name: 'Implementation instruction' })).toHaveCount(0)
+  await expect(page.getByRole('button', { name: 'Generate proposal' })).toHaveCount(0)
 
-  const closeConversation = page.getByRole('button', { name: 'Close conversation panel' })
-  if (await closeConversation.isVisible()) await closeConversation.click()
-  await page.getByRole('button', { name: 'Preview', exact: true }).click()
-  const preview = page.frameLocator('iframe[title="Canonical application preview"]')
-  await expect(preview.getByText('SERVER_APPLIED_APPLICATION', { exact: true })).toBeVisible()
-  expect(state.requests.some((item) => item.path.endsWith('/build-manifests/build-1/generate'))).toBe(true)
-  expect(state.requests.some((item) => item.path.endsWith('/implementation-proposals/implementation-1/apply'))).toBe(true)
+  await openSandbox.click()
+  await expect(page.getByText('frontend/app/page.tsx', { exact: true }).first()).toBeVisible()
+  await expect(page.getByRole('region', { name: 'Candidate verification' })).toBeVisible()
+  await expect(page.getByRole('combobox', { name: 'Verification profile' })).toHaveValue('')
+
+  const bootstrap = state.requests.find((item) =>
+    item.method === 'POST'
+      && item.path === `/v1/projects/${project.id}/repository-candidates`)
+  expect(bootstrap?.body).toEqual({ buildManifestId: 'build-1' })
+  expect(state.sandboxCandidate).not.toHaveProperty('baseWorkspaceRevision')
+  expect(state.requests.some((item) => item.path.endsWith('/build-manifests/build-1/generate'))).toBe(false)
+  expect(state.requests.some((item) => item.path.endsWith('/implementation-proposals/implementation-1/apply'))).toBe(false)
   expect(state.requests.some((item) => item.path.includes('/api/generate'))).toBe(false)
 })
 
@@ -3808,17 +4176,12 @@ test('Workbench renders production-shaped nullable build manifest collections', 
   await page.goto('/workbench/complete?view=code')
   await page.getByRole('button', { name: 'Freeze build input' }).click()
 
-  await expect(page.getByText('Frozen application build manifest')).toBeVisible()
-  for (const label of [
-    'Contracts',
-    'Design system refs',
-  ]) {
-    await expect(page.getByText(label, { exact: true }).locator('..')).toContainText('0')
-  }
-  await expect(page.getByRole('button', { name: 'Generate proposal' })).toBeEnabled()
+  await expect(page.getByRole('button', { name: 'Open development sandbox' })).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Generate proposal' })).toHaveCount(0)
+  expect(state.requests.some((item) => item.path.endsWith('/build-manifests/build-1/generate'))).toBe(false)
 })
 
-test('multi-bundle Workbench rebases exact shared-file inputs and survives both reload boundaries', async ({ page }) => {
+test('multi-bundle Workbench applies the existing proposal then hands the rebased bundle to Candidate', async ({ page }) => {
   const state = await installPlatformMock(page, {
     authenticated: true,
     multiBundleWorkbench: true,
@@ -3833,47 +4196,19 @@ test('multi-bundle Workbench rebases exact shared-file inputs and survives both 
   await expect(page.getByText('blueprint_selection_node', { exact: false })).toBeVisible()
   await expect(page.getByText('reviewed-start-proposal', { exact: false })).toBeVisible()
   await expect(page.getByText('page-home', { exact: true })).toBeVisible()
-  await page.getByRole('button', { name: '2 page-checkout blocked' }).click()
-  await expect(page.getByRole('button', { name: 'Blocked by order' })).toBeDisabled()
-  await expect(page.getByRole('status')).toContainText(
-    'Apply page-home before generating or proposing file changes for page-checkout',
-  )
-  await page.getByPlaceholder('src/new-file.ts').fill('src/blocked.ts')
-  await page.getByRole('button', { name: 'Prepare new file proposal' }).click()
-  await expect(page.getByRole('button', { name: 'Propose change' })).toBeDisabled()
-  expect(state.requests.some((item) =>
-    item.method === 'POST' && item.path.includes('/implementation-proposals'),
-  )).toBe(false)
-  await page.getByRole('button', { name: '1 page-home review' }).click()
   await page.getByRole('button', { name: 'Accept pending' }).click()
   await page.getByRole('button', { name: 'Apply and continue' }).click()
-  await expect(page.getByRole('button', { name: 'Rebase next bundle' })).toBeVisible()
-
-  const firstReloadRequestIndex = state.requests.length
-  await page.reload()
-  await expect(page.getByText('page-checkout', { exact: true })).toBeVisible()
-  await expect(page.getByRole('status')).toContainText('workspace r1 (workspace-r1)')
-  await expect(page.getByRole('button', { name: 'Generate proposal' })).toBeDisabled()
-  await expect(page.getByRole('button', { name: 'Rebase next bundle' })).toBeVisible()
-  expect(state.requests.slice(firstReloadRequestIndex).some((item) =>
-    item.method === 'GET' && item.path === '/v1/revisions/workspace-r1',
-  )).toBe(true)
-
-  await page.getByRole('button', { name: 'Rebase next bundle' }).click()
-  await expect(page.getByText(/bundle-checkout → bundle-checkout-w1/)).toBeVisible()
-  await page.getByRole('button', { name: 'Generate proposal' }).click()
-  await expect(page.getByText('src/shared.ts', { exact: true }).first()).toBeVisible()
-  await page.getByRole('button', { name: 'Accept pending' }).click()
-  await expect(page.getByRole('button', {
-    name: 'src/shared.ts Create or update file · Accepted',
-  })).toBeVisible()
+  const rebaseNext = page.getByRole('button', { name: 'Rebase next bundle' })
+  await expect(rebaseNext).toBeEnabled()
+  await rebaseNext.click()
+  await expect(page.getByRole('button', { name: 'Open development sandbox' })).toBeVisible()
+  await expect(page.getByRole('textbox', { name: 'Generation model' })).toHaveCount(0)
+  await expect(page.getByRole('textbox', { name: 'Implementation instruction' })).toHaveCount(0)
+  await expect(page.getByRole('button', { name: 'Generate proposal' })).toHaveCount(0)
 
   await page.reload()
-  await expect(page.getByText(/bundle-checkout → bundle-checkout-w1/)).toBeVisible()
-  await expect(page.getByRole('button', {
-    name: 'src/shared.ts Create or update file · Accepted',
-  })).toBeVisible()
-  await page.getByRole('button', { name: 'Apply and complete Workbench' }).click()
+  await expect(page.getByRole('button', { name: 'Open development sandbox' })).toBeVisible()
+  expect(state.multiWorkbench?.activeBundleIds['bundle-checkout']).toBe('bundle-checkout-w1')
 
   const rebaseRequest = state.requests.find((item) =>
     item.method === 'POST' && item.path === '/v1/build-manifests/bundle-checkout/rebase')
@@ -3884,32 +4219,15 @@ test('multi-bundle Workbench rebases exact shared-file inputs and survives both 
       contentHash: hash('1'),
     },
   })
-  const rebaseIndex = state.requests.findIndex((item) => item === rebaseRequest)
-  const generateIndex = state.requests.findIndex((item) =>
+  expect(state.requests.some((item) =>
     item.method === 'POST'
-      && item.path === '/v1/build-manifests/bundle-checkout-w1/generate')
-  expect(generateIndex).toBeGreaterThan(rebaseIndex)
-  expect(state.multiWorkbench?.proposals['proposal-checkout'].operations[0].expectedHash)
-    .toBe(hash('a'))
-
-  await expect.poll(() => state.requests.some((item) =>
+      && item.path === '/v1/build-manifests/bundle-checkout-w1/generate')).toBe(false)
+  expect(state.requests.some((item) =>
     item.method === 'POST'
-      && item.path === `/v1/projects/${project.id}/workflow-runs/run-multi/resume`,
-  )).toBe(true)
-  const completion = state.requests.find((item) =>
+      && item.path === '/v1/implementation-proposals/proposal-home/apply')).toBe(true)
+  expect(state.requests.some((item) =>
     item.method === 'POST'
-      && item.path === `/v1/projects/${project.id}/workflow-runs/run-multi/resume`)
-  expect(completion?.body).toEqual({
-    nodeKey: 'workbench',
-    output: {
-      implementationProposalIds: ['proposal-home', 'proposal-checkout'],
-      workspaceRevision: {
-        artifactId: 'workspace-application',
-        revisionId: 'workspace-r2',
-        contentHash: hash('2'),
-      },
-    },
-  })
+      && item.path === `/v1/projects/${project.id}/workflow-runs/run-multi/resume`)).toBe(false)
 })
 
 test('Workbench rebases from the active derived leaf when the project workspace advances again', async ({ page }) => {
@@ -3924,18 +4242,21 @@ test('Workbench rebases from the active derived leaf when the project workspace 
   await page.getByRole('button', { name: 'Accept pending' }).click()
   await page.getByRole('button', { name: 'Apply and continue' }).click()
   await page.getByRole('button', { name: 'Rebase next bundle' }).click()
-  await expect(page.getByText(/bundle-checkout → bundle-checkout-w1/)).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Open development sandbox' })).toBeVisible()
+  expect(state.multiWorkbench?.activeBundleIds['bundle-checkout']).toBe('bundle-checkout-w1')
 
   if (!state.multiWorkbench) throw new Error('Expected multi-bundle mock state.')
   state.multiWorkbench.currentWorkspaceRevision = multiApplicationRevision(2)
   await page.reload()
   await expect(page.getByText('Frozen application build manifest')).toBeVisible()
-  await expect(page.getByRole('status')).toContainText(
+  const rebaseStatus = page.getByRole('status').filter({ hasText: 'Rebase active page bundle' })
+  await expect(rebaseStatus).toContainText(
     'active page bundle bundle-checkout-w1 (order root bundle-checkout)',
   )
-  await expect(page.getByRole('status')).toContainText('workspace r2 (workspace-r2)')
+  await expect(rebaseStatus).toContainText('workspace r2 (workspace-r2)')
   await page.getByRole('button', { name: 'Rebase next bundle' }).click()
-  await expect(page.getByText(/bundle-checkout → bundle-checkout-w2/)).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Open development sandbox' })).toBeVisible()
+  expect(state.multiWorkbench.activeBundleIds['bundle-checkout']).toBe('bundle-checkout-w2')
 
   const rebases = state.requests.filter((item) =>
     item.method === 'POST' && item.path.endsWith('/rebase'))
@@ -5725,7 +6046,8 @@ test('Use selection in workflow starts the selection DAG and does not create doc
   expect(compile?.body).toMatchObject({ nodeIds: ['page-dashboard'] })
   expect(state.requests.some((item) => item.method === 'POST' && item.path === `/v1/projects/${project.id}/documents`)).toBe(false)
   expect(state.requests.some((item) => item.method === 'POST' && item.path === `/v1/projects/${project.id}/prototypes`)).toBe(false)
-  await expect(page.getByRole('heading', { name: 'No applied application revision' })).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Open development sandbox' })).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Generate proposal' })).toHaveCount(0)
 })
 
 test('Prototype revision requests canonical review from another project member', async ({ page }) => {
@@ -6640,6 +6962,129 @@ function asset(id: string) {
   return { assetId: id, contentHash: hash('5'), mediaType: 'application/json', byteSize: 20 }
 }
 
+const freshCandidateFile = [
+  "export default function Page() {",
+  "  return <main>Template-backed Candidate</main>",
+  "}",
+  '',
+].join('\n')
+
+function freshCandidateWorkspace(buildManifestId: string) {
+  const treeHash = hash('8')
+  return {
+    schemaVersion: 'candidate-workspace/v1',
+    id: `candidate-${buildManifestId}`,
+    projectId: project.id,
+    repositorySnapshotId: `repository-snapshot-${buildManifestId}`,
+    status: 'active' as const,
+    buildManifest: { id: buildManifestId, contentHash: hash('6') },
+    buildContract: {
+      id: `build-contract-${buildManifestId}`,
+      contentHash: hash('a'),
+    },
+    fullStackTemplate: {
+      id: fullStackTemplateRegistration.template.id,
+      contentHash: fullStackTemplateRegistration.template.contentHash,
+    },
+    // A fresh project is materialized directly from the qualified template.
+    // It intentionally has no base WorkspaceRevision.
+    baseTreeHash: treeHash,
+    treeHash,
+    currentTree: {
+      schemaVersion: 'repository-tree/v1',
+      treeHash,
+      files: [{
+        path: 'frontend/app/page.tsx',
+        mode: '100644',
+        contentHash: hash('9'),
+        byteSize: freshCandidateFile.length,
+      }],
+    },
+    version: 1,
+    journalSequence: 0,
+    sessionEpoch: 1,
+    writerLeaseEpoch: 0,
+    dirty: false,
+    conflicted: false,
+    stale: false,
+    rebaseRequired: false,
+    lease: undefined as {
+      ownerId: string
+      epoch: number
+      expiresAt: string
+    } | undefined,
+    createdBy: user.id,
+    createdAt: now,
+    updatedAt: now,
+  }
+}
+
+function readySandboxSession(candidate: ReturnType<typeof freshCandidateWorkspace>) {
+  return {
+    schemaVersion: 'sandbox-session/v1',
+    id: `sandbox-${candidate.buildManifest.id}`,
+    projectId: project.id,
+    actorId: user.id,
+    buildManifest: candidate.buildManifest,
+    buildContract: candidate.buildContract,
+    fullStackTemplate: candidate.fullStackTemplate,
+    templateReleases: fullStackTemplateComponents.map((component) => component.release),
+    runnerImageDigest: `sha256:${hash('1')}`,
+    candidate,
+    sessionEpoch: candidate.sessionEpoch,
+    state: 'ready' as const,
+    version: 1,
+    ttl: {
+      policy: { idleHibernateAfter: 900, maxRuntime: 7200 },
+      idleDeadline: '2026-07-10T08:15:00Z',
+      expiresAt: '2026-07-10T10:00:00Z',
+    },
+    quota: {
+      cpuMillis: 1000,
+      memoryBytes: 1_073_741_824,
+      workspaceBytes: 536_870_912,
+      pidLimit: 256,
+      previewPortLimit: 4,
+    },
+    allowedServices: [{
+      id: 'web',
+      kind: 'web',
+      profiles: ['dev'],
+      templateRelease: fullStackTemplateComponents[0].release,
+    }],
+    allowedPorts: [{ name: 'web', serviceId: 'web', number: 3000, protocol: 'http' }],
+    allowedActions: [
+      'view',
+      'edit',
+      'pty',
+      'process',
+      'agent',
+      'checkpoint',
+      'verify',
+      'suspend',
+      'terminate',
+    ],
+    blockingReasons: [],
+    createdAt: now,
+    updatedAt: now,
+  }
+}
+
+function sandboxFenceHeaders(
+  session: ReturnType<typeof readySandboxSession>,
+  candidate: ReturnType<typeof freshCandidateWorkspace> | null,
+) {
+  const current = candidate ?? session.candidate
+  return {
+    etag: `"sandbox:${session.id}:${session.version}"`,
+    'x-sandbox-session-etag': `"sandbox:${session.id}:${session.version}"`,
+    'x-sandbox-session-epoch': String(session.sessionEpoch),
+    'x-candidate-version': String(current.version),
+    'x-writer-lease-epoch': String(current.writerLeaseEpoch),
+    'x-candidate-tree-hash': current.treeHash,
+  }
+}
+
 function implementationProposal(
   status: 'open' | 'ready' | 'applied',
   decision: 'pending' | 'accepted' | 'applied' = 'pending',
@@ -6649,9 +7094,24 @@ function implementationProposal(
     id: 'implementation-1',
     projectId: project.id,
     buildManifestId: 'build-1',
-    executionSource: 'manual_submission' as 'manual_submission' | 'manual_generation' | 'workflow_runner' | 'conversation_command',
+    executionSource: 'manual_submission' as 'manual_submission' | 'manual_generation' | 'workflow_runner' | 'conversation_command' | 'candidate_freeze',
     conversationCommandId: undefined as string | undefined,
     instructionHash: undefined as string | undefined,
+    candidateSource: undefined as {
+      freezeReceiptId: string
+      repositorySnapshotId: string
+      sessionId: string
+      candidateId: string
+      candidateSnapshotId: string
+      candidateVersion: number
+      journalSequence: number
+      sessionEpoch: number
+      writerLeaseEpoch: number
+      baseTreeHash: string
+      treeHash: string
+      fullStackTemplate: { id: string; contentHash: string }
+      verificationReceipt: { id: string; contentHash: string }
+    } | undefined,
     operations: [{
       id: 'operation-1',
       kind: 'file.upsert',
@@ -6669,9 +7129,15 @@ function implementationProposal(
     tests: [],
     previews: [],
     traceLinks: [],
-    diagnostics: [],
+    diagnostics: [] as Array<{
+      code: string
+      severity: 'info' | 'warning' | 'error' | 'blocker'
+      message: string
+      path?: string
+      sourceId?: string
+    }>,
     assumptions: [],
-    unimplementedItems: [],
+    unimplementedItems: [] as string[],
     status,
     version,
     payloadHash: hash('4'),

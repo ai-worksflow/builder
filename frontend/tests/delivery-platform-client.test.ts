@@ -41,6 +41,10 @@ const deploymentId = '33333333-3333-4333-8333-333333333333'
 const deploymentVersionId = '44444444-4444-4444-8444-444444444444'
 const buildManifestId = '66666666-6666-4666-8666-666666666666'
 const qualityRunId = '77777777-7777-4777-8777-777777777777'
+const canonicalReceiptId = '88888888-8888-4888-8888-888888888888'
+const canonicalReceiptHash = `sha256:${'d'.repeat(64)}`
+const releaseBundleId = '99999999-9999-4999-8999-999999999999'
+const releaseBundleHash = `sha256:${'e'.repeat(64)}`
 
 function deployment(includeVersions = true) {
   return {
@@ -149,6 +153,10 @@ test('publish uses CSRF, idempotency and strong conditional writes', async () =>
     workspaceRevision,
     buildManifestId,
     qualityRunId,
+    canonicalReceiptId,
+    canonicalReceiptHash,
+    releaseBundleId,
+    releaseBundleHash,
     message: 'Preview release',
   }, {
     ifMatch: `"deployment:${deploymentId}:1"`,
@@ -171,6 +179,10 @@ test('publish uses CSRF, idempotency and strong conditional writes', async () =>
     },
     buildManifestId,
     qualityRunId,
+    canonicalReceiptId,
+    canonicalReceiptHash,
+    releaseBundleId,
+    releaseBundleHash,
     message: 'Preview release',
   })
   assert.equal(result.deployment.deploymentId, deploymentId)
@@ -246,6 +258,10 @@ test('delivery RFC problems preserve actionable conflict metadata', async () => 
       workspaceRevision,
       buildManifestId,
       qualityRunId,
+      canonicalReceiptId,
+      canonicalReceiptHash,
+      releaseBundleId,
+      releaseBundleHash,
     }),
     (error: unknown) => (
       error instanceof DeliveryClientError &&

@@ -13,6 +13,7 @@ import {
   projectBriefEntryAction,
 } from '../lib/platform/workflow-entry'
 import { PlatformClient } from '../lib/platform/client'
+import { exactBuildContractRefForActiveManifest } from '../lib/platform/build-contract-gate'
 import type { FetchLike } from '../lib/platform/http'
 
 type TestCase = {
@@ -41,6 +42,59 @@ function flowClient(responder: (path: string, init?: RequestInit) => Response | 
       fetch: (async (input, init) => responder(new URL(input.toString()).pathname, init)) as FetchLike,
     },
   }).flow
+}
+
+const implementationProposalIds = {
+  actor: '11111111-1111-4111-8111-111111111111',
+  buildContract: '22222222-2222-4222-8222-222222222222',
+  manifest: '33333333-3333-4333-8333-333333333333',
+  manual: '44444444-4444-4444-8444-444444444444',
+  project: '55555555-5555-4555-8555-555555555555',
+  quarantine: '66666666-6666-4666-8666-666666666666',
+  reviewed: '77777777-7777-4777-8777-777777777777',
+} as const
+
+function implementationProposalResponse(options: {
+  readonly id: string
+  readonly status?: 'open' | 'ready' | 'stale'
+  readonly version?: number
+  readonly operationCount?: number
+}) {
+  const status = options.status ?? 'open'
+  const operationCount = options.operationCount ?? 1
+  const reviewed = status === 'ready'
+  return {
+    id: options.id,
+    projectId: implementationProposalIds.project,
+    buildManifestId: implementationProposalIds.manifest,
+    applicationBuildContract: {
+      id: implementationProposalIds.buildContract,
+      contractHash: 'c'.repeat(64),
+    },
+    executionSource: 'manual_submission',
+    operations: Array.from({ length: operationCount }, (_, index) => ({
+      id: `operation-${index + 1}`,
+      kind: 'file.upsert',
+      path: `frontend/app/page-${index + 1}.tsx`,
+      content: 'export default function Page() { return null }',
+      decision: reviewed ? 'accepted' : 'pending',
+      ...(reviewed ? { decidedBy: implementationProposalIds.actor } : {}),
+    })),
+    routes: [],
+    apis: [],
+    migrations: [],
+    tests: [],
+    previews: [],
+    traceLinks: [],
+    diagnostics: [],
+    assumptions: [],
+    unimplementedItems: [],
+    status,
+    version: options.version ?? 1,
+    payloadHash: 'd'.repeat(64),
+    createdBy: implementationProposalIds.actor,
+    createdAt: '2026-07-18T10:11:12Z',
+  }
 }
 
 test('workflow definitions and immutable versions use the Go workflow routes', async () => {
@@ -286,68 +340,129 @@ test('implementation decisions carry version ETags and apply returns a workspace
       headers: new Headers(init?.headers),
       body: typeof init?.body === 'string' ? JSON.parse(init.body) as unknown : undefined,
     })
-    if (path.endsWith('/decisions')) return json({ id: 'proposal-1', version: 8, status: 'ready' })
+    if (path.endsWith('/decisions')) {
+      return json(implementationProposalResponse({
+        id: implementationProposalIds.reviewed,
+        status: 'ready',
+        version: 8,
+        operationCount: 2,
+      }))
+    }
     return json({ id: 'workspace-r1', artifactId: 'workspace-1', revisionNumber: 1 }, 200)
   })
 
-  const proposal = { id: 'proposal-1', version: 7 }
+  const proposal = { id: implementationProposalIds.reviewed, version: 7 }
   await client.decideImplementationOperation(proposal, 'operation-1', 'accepted')
+  const reviewed = await client.decideImplementationOperation(proposal, 'operation-2', 'accepted')
   await client.applyImplementationProposal({ id: proposal.id, version: 8 })
 
-  assert.equal(calls[0].path, '/v1/implementation-proposals/proposal-1/decisions')
-  assert.equal(calls[0].headers.get('if-match'), '"implementation-proposal:proposal-1:7"')
+  assert.equal(calls[0].path, `/v1/implementation-proposals/${implementationProposalIds.reviewed}/decisions`)
+  assert.equal(calls[0].headers.get('if-match'), `"implementation-proposal:${implementationProposalIds.reviewed}:7"`)
   assert.deepEqual(calls[0].body, {
     operationId: 'operation-1',
     decision: 'accepted',
     reason: '',
     version: 7,
   })
-  assert.equal(calls[1].path, '/v1/implementation-proposals/proposal-1/apply')
-  assert.equal(calls[1].headers.get('if-match'), '"implementation-proposal:proposal-1:8"')
-  assert.deepEqual(calls[1].body, { version: 8 })
+  assert.equal(reviewed.data.operations.length, 2)
+  assert.deepEqual(reviewed.data.operations.map((operation) => operation.decision), ['accepted', 'accepted'])
+  assert.deepEqual(reviewed.data.diagnostics, [])
+  assert.deepEqual(reviewed.data.unimplementedItems, [])
+  assert.equal(calls[2].path, `/v1/implementation-proposals/${implementationProposalIds.reviewed}/apply`)
+  assert.equal(calls[2].headers.get('if-match'), `"implementation-proposal:${implementationProposalIds.reviewed}:8"`)
+  assert.deepEqual(calls[2].body, { version: 8 })
 })
 
-test('build generation is pinned to a build manifest and has no browser fallback', async () => {
+test('browser flow client does not expose retired direct-model implementation generation', () => {
+  const client = flowClient(() => json({}, 500))
+  assert.equal('generateImplementation' in client, false)
+})
+
+test('unreviewable implementation quarantine is exact-version fenced and carries an audit reason', async () => {
+  let call: { path: string; headers: Headers; body: unknown } | undefined
+  const client = flowClient((path, init) => {
+    call = {
+      path,
+      headers: new Headers(init?.headers),
+      body: typeof init?.body === 'string' ? JSON.parse(init.body) as unknown : undefined,
+    }
+    return json(implementationProposalResponse({
+      id: implementationProposalIds.quarantine,
+      status: 'stale',
+      version: 5,
+    }))
+  })
+  const result = await client.quarantineImplementationProposal(
+    { id: implementationProposalIds.quarantine, version: 4 },
+    'Replace with an exact verified Candidate.',
+  )
+  assert.equal(call?.path, `/v1/implementation-proposals/${implementationProposalIds.quarantine}/quarantine`)
+  assert.equal(call?.headers.get('if-match'), `"implementation-proposal:${implementationProposalIds.quarantine}:4"`)
+  assert.deepEqual(call?.body, {
+    version: 4,
+    reason: 'Replace with an exact verified Candidate.',
+  })
+  assert.equal(result.data.status, 'stale')
+})
+
+test('manual file proposals carry the exact application build contract', async () => {
   let call: { path: string; body: unknown } | undefined
   const client = flowClient((path, init) => {
     call = {
       path,
       body: typeof init?.body === 'string' ? JSON.parse(init.body) as unknown : undefined,
     }
-    return json({ proposal: { id: 'implementation-proposal-1' }, provider: 'openai', model: 'gpt-5' }, 201)
+    return json(implementationProposalResponse({ id: implementationProposalIds.manual }), 201)
   })
-  await client.generateImplementation(
-    'build-manifest-1',
-    'gpt-5',
-    'Build only from the exact frozen input.',
-  )
+  await client.createImplementationProposal('project-1', {
+    buildManifestId: 'build-manifest-1',
+    applicationBuildContract: {
+      id: 'build-contract-1',
+      contractHash: 'c'.repeat(64),
+    },
+    operations: [{
+      id: 'operation-1',
+      kind: 'file.upsert',
+      path: 'frontend/app/page.tsx',
+      content: 'export default function Page() { return null }',
+    }],
+  })
   assert.deepEqual(call, {
-    path: '/v1/build-manifests/build-manifest-1/generate',
+    path: '/v1/projects/project-1/implementation-proposals',
     body: {
-      model: 'gpt-5',
-      instruction: 'Build only from the exact frozen input.',
+      buildManifestId: 'build-manifest-1',
+      applicationBuildContract: {
+        id: 'build-contract-1',
+        contractHash: 'c'.repeat(64),
+      },
+      operations: [{
+        id: 'operation-1',
+        kind: 'file.upsert',
+        path: 'frontend/app/page.tsx',
+        content: 'export default function Page() { return null }',
+      }],
     },
   })
 })
 
-test('Workbench regeneration sends an exact proposal CAS instead of silently coexisting', async () => {
-  let body: unknown
-  const client = flowClient((_path, init) => {
-    body = typeof init?.body === 'string' ? JSON.parse(init.body) as unknown : undefined
-    return json({ proposal: { id: 'replacement' }, provider: 'openai', model: 'gpt-5' }, 201)
-  })
-  await client.generateImplementation(
-    'build-manifest-1',
-    'gpt-5',
-    'Regenerate from reviewed feedback.',
-    { id: 'active-proposal-1', version: 7 },
+test('manual proposal contract selection fails closed when the exact manifest is no longer active', () => {
+  const exact = { id: 'build-contract-1', contractHash: 'd'.repeat(64) }
+  assert.equal(
+    exactBuildContractRefForActiveManifest(exact, 'build-manifest-1', 'build-manifest-2'),
+    null,
   )
-  assert.deepEqual(body, {
-    model: 'gpt-5',
-    instruction: 'Regenerate from reviewed feedback.',
-    replaceProposalId: 'active-proposal-1',
-    replaceProposalVersion: 7,
-  })
+  assert.equal(
+    exactBuildContractRefForActiveManifest(
+      { ...exact, contractHash: 'LATEST' },
+      'build-manifest-1',
+      'build-manifest-1',
+    ),
+    null,
+  )
+  assert.equal(
+    exactBuildContractRefForActiveManifest(exact, 'build-manifest-1', 'build-manifest-1'),
+    exact,
+  )
 })
 
 test('Workbench lineage hydration and exact workspace rebase use root-scoped routes', async () => {

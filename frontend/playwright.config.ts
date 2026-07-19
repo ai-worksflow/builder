@@ -3,6 +3,9 @@ import { defineConfig, devices } from '@playwright/test'
 export default defineConfig({
   testDir: './tests',
   testMatch: /.*\.spec\.ts/,
+  // External Golden qualification has a separate fail-closed entrypoint. It
+  // must never appear as a skipped passing item in the ordinary regression.
+  testIgnore: /golden-[a-z0-9-]+\.spec\.ts/,
   // The integration suite exercises one filesystem-backed collaboration/data runtime.
   // Serialize it so project, session, deployment, and migration assertions stay isolated.
   fullyParallel: false,
