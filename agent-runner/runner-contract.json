@@ -1,0 +1,27 @@
+{
+  "schemaVersion": "worksflow-agent-runner-contract/v3",
+  "requestPath": "/input/runner-request.json",
+  "taskCapsulePath": "/input/task-capsule.json",
+  "contextPackPath": "/input/context-pack.json",
+  "contextIndexPath": "/input/context/index.json",
+  "promptPath": "/input/prompt.txt",
+  "outputSchemaPath": "/input/output.schema.json",
+  "embeddedOutputSchemaPath": "/opt/worksflow-agent/output.schema.json",
+  "workspacePath": "/workspace",
+  "eventsPath": "/output/events.jsonl",
+  "stderrPath": "/output/stderr.log",
+  "resultPath": "/output/result.json",
+  "executionPath": "/output/execution.json",
+  "requestBudgetFields": [
+    "maxInputTokens",
+    "maxOutputTokens",
+    "maxCommands"
+  ],
+  "executionBudgetEvidence": {
+    "commandMeasurement": "unique Codex JSONL item identities whose type is command_execution",
+    "tokenMeasurement": "Codex turn.completed usage reported by the configured model provider",
+    "inputAdmission": "conservative gateway reservation; not an exact tokenizer count",
+    "activeCommandOverrunAction": "cancel the Codex child process on the first observed command beyond maxCommands",
+    "platformEvidenceEnvelope": "worksflow.platform.runner_execution is prepended after independent validation and before stdout evidence is content-addressed"
+  }
+}

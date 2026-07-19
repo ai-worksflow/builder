@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:worksflow:agent-result:v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["summary", "changedPaths", "verification", "blockers"],
+  "properties": {
+    "summary": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4000
+    },
+    "changedPaths": {
+      "type": "array",
+      "maxItems": 2000,
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 512
+      }
+    },
+    "verification": {
+      "type": "array",
+      "maxItems": 128,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["commandId", "status", "note"],
+        "properties": {
+          "commandId": {"type": "string", "minLength": 1, "maxLength": 160},
+          "status": {"enum": ["not_run", "passed", "failed"]},
+          "note": {"type": "string", "maxLength": 2000}
+        }
+      }
+    },
+    "blockers": {
+      "type": "array",
+      "maxItems": 128,
+      "items": {"type": "string", "minLength": 1, "maxLength": 2000}
+    }
+  }
+}

@@ -1,0 +1,35 @@
+{
+  "schemaVersion": "sandbox-runner/v1",
+  "workspace": "/workspace",
+  "codexHome": "/codex",
+  "readinessFile": "/tmp/worksflow-runner-ready",
+  "gateway": {
+    "executable": "/usr/local/bin/worksflow-sandbox-gateway",
+    "readinessFile": "/tmp/worksflow-gateway-ready",
+    "targetEnvironment": "WORKSFLOW_GATEWAY_TARGET",
+    "portsEnvironment": "WORKSFLOW_GATEWAY_PORTS"
+  },
+  "processSupervisor": {
+    "executable": "/usr/local/bin/worksflow-sandbox-process",
+    "stateRoot": "/tmp/worksflow-processes",
+    "contract": "sandbox-process/v1"
+  },
+  "terminal": {
+    "executable": "/usr/local/bin/worksflow-sandbox-pty",
+    "shell": "/bin/bash",
+    "workspace": "/workspace",
+    "controlProtocol": "sandbox-pty-control/v1",
+    "browserFrameProtocol": "worksflow-pty-binary/v1"
+  },
+  "codex": {
+    "mode": "exec",
+    "requiredFlags": [
+      "--ephemeral",
+      "--sandbox",
+      "workspace-write",
+      "--json"
+    ],
+    "secretEnvironment": "CODEX_API_KEY",
+    "secretLifetime": "single-exec"
+  }
+}

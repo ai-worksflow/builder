@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+test -d /workspace
+test -w /workspace
+test -d "${CODEX_HOME:-/codex}"
+test -w "${CODEX_HOME:-/codex}"
+
+mkdir -p "${HOME:-/tmp/home}"
+umask 077
+printf '%s\n' 'sandbox-runner/v1' > /tmp/worksflow-runner-ready
+
+exec sleep infinity
