@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import {
   Check,
   ChevronDown,
@@ -27,6 +27,7 @@ import {
 import { useCollaboration } from '@/lib/collaboration/provider'
 import { useI18n } from '@/lib/i18n'
 import { useArtifactWorkspace } from '@/lib/platform/artifact-provider'
+import type { BuildContractGateSnapshot } from '@/lib/platform/build-contract-gate'
 import { usePlatformFlow } from '@/lib/platform/flow-provider'
 import type {
   FileOperationDto,
@@ -45,6 +46,8 @@ import { FlowPanel } from './flow-panel'
 import { DatabasePanel } from './database-panel'
 import { ReleasePanel } from './release-panel'
 import { ConversationPanel } from './conversation-panel'
+import { BuildContractPanel } from './build-contract-panel'
+import { SandboxWorkspace } from './sandbox-workspace'
 
 const VIEWS: readonly { id: WorkbenchView; icon: typeof Monitor }[] = [
   { id: 'preview', icon: Monitor },
@@ -64,6 +67,19 @@ export function PlatformWorkbench() {
   const selectedPrototype = artifacts.prototypes.find((item) => item.artifact.id === prototypeId)
     ?? artifacts.prototypes.find((item) => item.approvedRevision)
     ?? artifacts.prototypes[0]
+  const selectedQueueItem = flow.workbenchQueue.find(
+    (item) => item.bundleId === flow.selectedBundleId,
+  )
+  const selectedProposal = flow.proposal ?? selectedQueueItem?.proposal
+  const candidateEntryAvailable = !flow.requiresWorkbenchRebase && (
+    !selectedProposal
+    || selectedProposal.status === 'stale'
+    || selectedProposal.status === 'rejected'
+  )
+  const appliedProposal = proposalApplied(flow.proposal)
+    ? flow.proposal
+    : proposalApplied(selectedQueueItem?.proposal) ? selectedQueueItem?.proposal : null
+  const sandboxBuildManifestId = flow.bundle?.id ?? appliedProposal?.buildManifestId ?? null
 
   useEffect(() => {
     if (!prototypeId && selectedPrototype) setPrototypeId(selectedPrototype.artifact.id)
@@ -173,8 +189,32 @@ export function PlatformWorkbench() {
               <ServiceGate loading title={t('platform.gate.loading')} description={t('platform.gate.loadingDescription')} />
             ) : flow.status === 'error' ? (
               <ServiceGate title={t('platform.gate.workflowUnavailable')} description={flow.error ?? t('platform.gate.workflowFallback')} onRetry={flow.refresh} />
+            ) : view === 'preview' && project && sandboxBuildManifestId ? (
+              <div className="flex h-full min-h-0 flex-col">
+                <WorkbenchGroupTabs />
+                <div className="min-h-0 flex-1">
+                  <SandboxWorkspace
+                    key={`${project.id}:${sandboxBuildManifestId}`}
+                    mode={view}
+                    projectId={project.id}
+                    buildManifestId={sandboxBuildManifestId}
+                  />
+                </div>
+              </div>
             ) : view === 'preview' ? (
               <PlatformPreview />
+            ) : view === 'code' && project && sandboxBuildManifestId && candidateEntryAvailable ? (
+              <div className="flex h-full min-h-0 flex-col">
+                <WorkbenchGroupTabs />
+                <div className="min-h-0 flex-1">
+                  <SandboxWorkspace
+                    key={`${project.id}:${sandboxBuildManifestId}:code`}
+                    mode="code"
+                    projectId={project.id}
+                    buildManifestId={sandboxBuildManifestId}
+                  />
+                </div>
+              </div>
             ) : view === 'code' ? (
               <ImplementationWorkspace />
             ) : (
@@ -200,9 +240,14 @@ function ImplementationWorkspace() {
     : files[0]
   const [draft, setDraft] = useState(selectedFile?.content ?? '')
   const [newPath, setNewPath] = useState('')
-  const [instruction, setInstruction] = useState(() => t('platform.instruction.default'))
-  const [model, setModel] = useState('gpt-5')
   const [showManifest, setShowManifest] = useState(true)
+  const [buildContractGate, setBuildContractGate] = useState<BuildContractGateSnapshot>({
+    bundleId: '',
+    phase: 'loading',
+    contract: null,
+    ready: false,
+    reason: 'missing',
+  })
   const selectedQueueIndex = flow.workbenchQueue.findIndex(
     (item) => item.bundleId === flow.selectedBundleId,
   )
@@ -216,12 +261,15 @@ function ImplementationWorkspace() {
   const blockingPredecessor = flow.workbenchQueue
     .slice(0, Math.max(selectedQueueIndex, 0))
     .find((item) => !proposalApplied(item.proposal))
-  const activeProposal = currentQueueItem?.proposal
-  const regenerationAllowed = !activeProposal || (
-    activeProposal.status === 'open'
-    && activeProposal.executionSource !== 'conversation_command'
-    && activeProposal.operations.every((operation) => operation.decision === 'pending')
-  )
+  const buildContractReady = buildContractGate.bundleId === flow.bundle?.id
+    && buildContractGate.ready
+    && buildContractGate.contract?.buildManifestId === flow.bundle?.id
+  const updateBuildContractGate = useCallback((next: BuildContractGateSnapshot) => {
+    setBuildContractGate(next)
+  }, [])
+  const buildContractDisabledTitle = buildContractReady
+    ? undefined
+    : t('platform.buildContract.generationBlocked')
 
   useEffect(() => {
     if (!selectedPath && selectedFile) setSelectedPath(selectedFile.path)
@@ -262,12 +310,9 @@ function ImplementationWorkspace() {
                 : flow.bundle.id} · {flow.bundle.contentHash}
             </p>
           </div>
-          <div className="flex min-w-[320px] flex-1 gap-1.5 max-md:min-w-0 max-md:basis-full">
-            <input value={model} onChange={(event) => setModel(event.target.value)} className="h-8 w-24 rounded-md border border-border bg-panel px-2 text-[10px] text-foreground outline-none" aria-label={t('platform.generationModel')} />
-            <input value={instruction} onChange={(event) => setInstruction(event.target.value)} className="h-8 min-w-0 flex-1 rounded-md border border-border bg-panel px-2 text-[10px] text-foreground outline-none" aria-label={t('platform.implementationInstruction')} />
-            <button type="button" onClick={() => void flow.generateImplementation(instruction, model)} disabled={!can('edit') || flow.busy || !instruction.trim() || !model.trim() || !orderedGenerationAllowed || flow.requiresWorkbenchRebase || proposalApplied(currentQueueItem?.proposal) || !regenerationAllowed} className="inline-flex h-8 shrink-0 items-center gap-1 rounded-md bg-primary px-3 text-[10px] font-semibold text-primary-foreground disabled:opacity-40" title={!regenerationAllowed ? t('platform.reviewedCannotSupersede') : undefined}>
-              {flow.busy ? <LoaderCircle className="size-3 animate-spin" /> : <Sparkles className="size-3" />} {!orderedGenerationAllowed ? t('platform.generate.blockedOrder') : !regenerationAllowed ? t('platform.generate.finishReview') : currentQueueItem?.proposal ? t('platform.generate.regenerate') : t('platform.generate.proposal')}
-            </button>
+          <div role="status" className="flex min-w-[320px] flex-1 items-center gap-2 rounded-md border border-primary/25 bg-primary/5 px-3 py-2 text-[9px] leading-relaxed text-muted-foreground max-md:min-w-0 max-md:basis-full">
+            <ShieldCheck className="size-3.5 shrink-0 text-primary-bright" />
+            AI changes are created in the durable Candidate sandbox, verified against the exact checkpoint, then frozen into this immutable Proposal for review.
           </div>
         </div>
         {!orderedGenerationAllowed && currentQueueItem && blockingPredecessor && (
@@ -325,6 +370,11 @@ function ImplementationWorkspace() {
           </div>
         )}
         {showManifest && <ManifestFacts />}
+        <BuildContractPanel
+          bundleId={flow.bundle.id}
+          canCompile={can('edit') && !flow.busy}
+          onGateChange={updateBuildContractGate}
+        />
       </section>
 
       <div className="flex min-h-0 flex-1 max-md:flex-col">
@@ -356,15 +406,21 @@ function ImplementationWorkspace() {
             {(selectedPath || selectedFile) && (
               <button
                 type="button"
-                onClick={() => void flow.proposeFileChange(
-                  selectedPath || selectedFile!.path,
-                  draft,
-                  selectedFile?.language,
-                  selectedFile?.contentHash,
-                )}
-                disabled={!can('edit') || flow.busy || !orderedGenerationAllowed || (!selectedPath && !selectedFile) || draft === selectedFile?.content}
+                onClick={() => {
+                  const contract = buildContractGate.contract
+                  if (!buildContractReady || !contract || contract.buildManifestId !== flow.bundle?.id) return
+                  void flow.proposeFileChange(
+                    selectedPath || selectedFile!.path,
+                    draft,
+                    { id: contract.id, contractHash: contract.contractHash },
+                    contract.buildManifestId,
+                    selectedFile?.language,
+                    selectedFile?.contentHash,
+                  )
+                }}
+                disabled={!can('edit') || flow.busy || !buildContractReady || !orderedGenerationAllowed || (!selectedPath && !selectedFile) || draft === selectedFile?.content}
                 className="inline-flex h-7 items-center gap-1 rounded bg-primary px-2 text-[9px] font-semibold text-primary-foreground disabled:opacity-35"
-                title={orderedGenerationAllowed ? t('platform.proposeTitle') : t('platform.proposeBlockedTitle')}
+                title={buildContractDisabledTitle ?? (orderedGenerationAllowed ? t('platform.proposeTitle') : t('platform.proposeBlockedTitle'))}
               >
                 <Save className="size-3" /> {t('platform.proposeChange')}
               </button>
@@ -449,11 +505,36 @@ function ProposalReview() {
   const flow = usePlatformFlow()
   const { can } = useCollaboration()
   const [rejectionReason, setRejectionReason] = useState(() => t('platform.rejection.default'))
+  const [quarantineReason, setQuarantineReason] = useState('Replace this unreviewable Proposal with a governed verified Candidate.')
   const proposal = flow.proposal
   const queueIndex = flow.workbenchQueue.findIndex(
     (item) => item.bundleId === flow.selectedBundleId,
   )
   const queueTotal = flow.workbenchQueue.length
+  const candidateSource = proposal?.candidateSource
+  const unverifiedCandidateProposal = proposal?.executionSource === 'candidate_freeze'
+    && (!candidateSource?.verificationReceipt.id || !candidateSource.verificationReceipt.contentHash)
+  const exactCandidate = unverifiedCandidateProposal ? undefined : candidateSource
+  const exactCandidateFullyAccepted = Boolean(
+    proposal
+    && proposal.operations.length > 0
+    && proposal.operations.every(
+      (operation) => operation.decision === 'accepted' || operation.decision === 'applied',
+    ),
+  )
+  const legacyAIProposal = proposal?.executionSource === 'manual_generation'
+    || proposal?.executionSource === 'workflow_runner'
+    || proposal?.executionSource === 'conversation_command'
+  const completionBlockers = proposal
+    ? proposal.unimplementedItems.length
+      + proposal.diagnostics.filter((finding) => finding.severity === 'blocker').length
+    : 0
+  const governedReviewBlocked = Boolean(legacyAIProposal || unverifiedCandidateProposal || completionBlockers > 0)
+  const quarantineAvailable = Boolean(
+    legacyAIProposal
+    || unverifiedCandidateProposal
+    || proposal?.executionSource === 'manual_submission' && completionBlockers > 0,
+  )
   const isLastQueueItem = queueIndex >= 0 && queueIndex === queueTotal - 1
   const applyLabel = flow.canCompleteWorkbench
     ? t('platform.apply.complete')
@@ -492,12 +573,59 @@ function ProposalReview() {
               <span className="min-w-0 flex-1 truncate font-mono text-faint-foreground" title={proposal.payloadHash}>{proposal.payloadHash}</span>
             </div>
             <div className="mt-2 grid grid-cols-2 gap-1">
-              <button type="button" onClick={() => void flow.decideAllPending('accepted')} disabled={!can('edit') || flow.busy || flow.requiresWorkbenchRebase || proposal.operations.every((operation) => operation.decision !== 'pending')} className="inline-flex h-7 items-center justify-center gap-1 rounded bg-success/15 text-[9px] font-medium text-success disabled:opacity-35"><Check className="size-3" /> {t('platform.proposal.acceptPending')}</button>
-              <button type="button" onClick={() => void flow.decideAllPending('rejected', rejectionReason)} disabled={!can('edit') || flow.busy || flow.requiresWorkbenchRebase || proposal.operations.every((operation) => operation.decision !== 'pending')} className="inline-flex h-7 items-center justify-center gap-1 rounded bg-destructive/10 text-[9px] font-medium text-destructive disabled:opacity-35"><X className="size-3" /> {t('platform.proposal.rejectPending')}</button>
+              <button type="button" onClick={() => void flow.decideAllPending('accepted')} disabled={!can('edit') || flow.busy || flow.requiresWorkbenchRebase || governedReviewBlocked || proposal.operations.every((operation) => operation.decision !== 'pending')} className="inline-flex h-7 items-center justify-center gap-1 rounded bg-success/15 text-[9px] font-medium text-success disabled:opacity-35"><Check className="size-3" /> {t('platform.proposal.acceptPending')}</button>
+              <button type="button" onClick={() => void flow.decideAllPending('rejected', rejectionReason)} disabled={!can('edit') || flow.busy || flow.requiresWorkbenchRebase || governedReviewBlocked || proposal.operations.every((operation) => operation.decision !== 'pending')} className="inline-flex h-7 items-center justify-center gap-1 rounded bg-destructive/10 text-[9px] font-medium text-destructive disabled:opacity-35"><X className="size-3" /> {t('platform.proposal.rejectPending')}</button>
             </div>
             <input value={rejectionReason} onChange={(event) => setRejectionReason(event.target.value)} className="mt-1.5 h-7 w-full rounded border border-border bg-background px-2 text-[9px] text-foreground outline-none" aria-label={t('platform.proposal.rejectionReason')} />
           </div>
           <div className="min-h-0 flex-1 space-y-2 overflow-y-auto p-2 scrollbar-thin">
+            {exactCandidate && (
+              <section className="rounded-md border border-primary/30 bg-primary/10 p-2 text-[8px] leading-relaxed text-primary-bright">
+                <div className="flex items-center gap-1.5 font-semibold">
+                  <PackageCheck className="size-3" /> Exact frozen Candidate
+                </div>
+                <p className="mt-1 text-faint-foreground">
+                  This Proposal is the complete immutable diff for Candidate {exactCandidate.candidateId.slice(0, 12)}.
+                  Every operation must be accepted before Apply can create its WorkspaceRevision.
+                </p>
+                <p className="mt-1 truncate font-mono text-faint-foreground" title={exactCandidate.treeHash}>
+                  C{exactCandidate.candidateVersion} · J{exactCandidate.journalSequence} · {exactCandidate.treeHash}
+                </p>
+              </section>
+            )}
+            {governedReviewBlocked && (
+              <section role="alert" className="rounded-md border border-destructive/35 bg-destructive/10 p-2 text-[8px] leading-relaxed text-destructive">
+                <div className="flex items-center gap-1.5 font-semibold">
+                  <CircleAlert className="size-3" /> Proposal cannot enter the approval gate
+                </div>
+                <p className="mt-1">
+                  {legacyAIProposal
+                    ? 'This Proposal came from the retired direct-model path and has no exact Candidate VerificationReceipt. Quarantine it and create a governed Candidate instead.'
+                    : unverifiedCandidateProposal
+                      ? 'This historical Candidate Proposal predates the exact VerificationReceipt gate. It cannot be approved or repaired in place; quarantine it and freeze a new verified Candidate.'
+                      : `This immutable manual Proposal contains ${completionBlockers} unimplemented or blocking diagnostic item(s). Quarantine it and resolve them in a governed Candidate before freezing a replacement.`}
+                </p>
+                {quarantineAvailable && (
+                  <div className="mt-2 flex gap-1.5">
+                    <input
+                      value={quarantineReason}
+                      onChange={(event) => setQuarantineReason(event.target.value)}
+                      maxLength={1000}
+                      aria-label="Proposal quarantine reason"
+                      className="h-7 min-w-0 flex-1 rounded border border-destructive/30 bg-background px-2 text-[8px] text-foreground outline-none"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => void flow.quarantineProposal(quarantineReason)}
+                      disabled={!can('edit') || flow.busy || !quarantineReason.trim()}
+                      className="h-7 shrink-0 rounded bg-destructive px-2 text-[8px] font-semibold text-destructive-foreground disabled:opacity-35"
+                    >
+                      Quarantine and open Candidate
+                    </button>
+                  </div>
+                )}
+              </section>
+            )}
             <ProposalOutputSummary proposal={proposal} />
             <div className="flex items-center gap-2 px-0.5 text-[8px] font-semibold uppercase tracking-wider text-faint-foreground">
               <span>{t('platform.proposal.fileOperations')}</span>
@@ -507,10 +635,16 @@ function ProposalReview() {
           </div>
           <div className="border-t border-border p-2">
             {proposal.unimplementedItems.length > 0 && <p className="mb-2 text-[8px] leading-relaxed text-warning">{t('platform.proposal.unimplemented', { items: proposal.unimplementedItems.join(' · ') })}</p>}
-            <button type="button" onClick={() => void flow.applyProposal()} disabled={!can('edit') || flow.busy || (!flow.canCompleteWorkbench && (proposal.status !== 'ready' || !flow.canApplyProposal))} className="inline-flex h-8 w-full items-center justify-center gap-1.5 rounded bg-primary text-[10px] font-semibold text-primary-foreground disabled:cursor-not-allowed disabled:opacity-35">
+            <button type="button" onClick={() => void flow.applyProposal()} disabled={!can('edit') || flow.busy || governedReviewBlocked || (Boolean(exactCandidate) && !exactCandidateFullyAccepted) || (!flow.canCompleteWorkbench && (proposal.status !== 'ready' || !flow.canApplyProposal))} className="inline-flex h-8 w-full items-center justify-center gap-1.5 rounded bg-primary text-[10px] font-semibold text-primary-foreground disabled:cursor-not-allowed disabled:opacity-35">
               {flow.busy ? <LoaderCircle className="size-3 animate-spin" /> : <Play className="size-3" />} {applyLabel}
             </button>
-            <p className="mt-1.5 text-[8px] leading-relaxed text-faint-foreground">{applyDescription}</p>
+            <p className="mt-1.5 text-[8px] leading-relaxed text-faint-foreground">
+              {governedReviewBlocked
+                ? 'This Proposal has no admissible completion evidence and cannot create an immutable revision.'
+                : exactCandidate && !exactCandidateFullyAccepted
+                ? 'Accept every exact file operation to enable immutable revision creation.'
+                : applyDescription}
+            </p>
           </div>
         </>
       )}
