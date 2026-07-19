@@ -8,6 +8,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/worksflow/builder/backend/internal/config"
 	"github.com/worksflow/builder/backend/internal/httpapi/problem"
+	"github.com/worksflow/builder/backend/internal/httpapi/requestorigin"
 )
 
 func CORS(cfg config.CORSConfig) gin.HandlerFunc {
@@ -35,7 +36,7 @@ func CORS(cfg config.CORSConfig) gin.HandlerFunc {
 		}
 		_, exactMatch := allowedOrigins[origin]
 		_, wildcard := allowedOrigins["*"]
-		if !exactMatch && !wildcard {
+		if !exactMatch && !wildcard && !requestorigin.Same(context.Request, origin) {
 			problem.Write(context, problem.New(http.StatusForbidden, "origin_forbidden", "Origin forbidden", "Origin is not allowed."))
 			return
 		}

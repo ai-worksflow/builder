@@ -129,6 +129,7 @@ func (s *Server) RegisterBusinessRoutes(group *gin.RouterGroup, persistence ...g
 	command(http.MethodPost, "/projects/:projectId/implementation-proposals", s.CreateImplementationProposal)
 	group.GET("/implementation-proposals/:implementationProposalId", s.GetImplementationProposal)
 	conditionalCommand(http.MethodPost, "/implementation-proposals/:implementationProposalId/decisions", s.DecideImplementationProposal)
+	conditionalCommand(http.MethodPost, "/implementation-proposals/:implementationProposalId/quarantine", s.QuarantineImplementationProposal)
 	conditionalCommand(http.MethodPost, "/implementation-proposals/:implementationProposalId/apply", s.ApplyImplementationProposal)
 
 	command(http.MethodPost, "/input-manifests/:manifestId/generate", s.GenerateArtifactProposal)

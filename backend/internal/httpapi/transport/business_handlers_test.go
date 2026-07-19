@@ -40,6 +40,7 @@ func TestBusinessRouteRegistrationCoversCoreResources(t *testing.T) {
 		"POST /v1/output-proposals/:proposalId/decisions",
 		"POST /v1/output-proposals/:proposalId/apply",
 		"POST /v1/projects/:projectId/workbench-bundles",
+		"POST /v1/implementation-proposals/:implementationProposalId/quarantine",
 		"POST /v1/implementation-proposals/:implementationProposalId/apply",
 		"POST /v1/generation/artifact-proposals",
 		"GET /v1/notifications",
@@ -384,6 +385,60 @@ func TestDomainValidationErrorsUseRFC9457FieldErrors(t *testing.T) {
 	}
 }
 
+func TestCreateImplementationProposalPreservesExactBuildContract(t *testing.T) {
+	contractID := uuid.NewString()
+	manifestID := uuid.NewString()
+	contractHash := strings.Repeat("c", 64)
+	implementation := &fakeImplementationService{created: core.ImplementationProposal{
+		ID: uuid.NewString(), ProjectID: testProjectID, BuildManifestID: manifestID, Version: 1,
+	}}
+	router := newBusinessRouter(t, transport.Services{Implementation: implementation})
+	headers := authenticatedHeaders(true)
+	headers.Set("Content-Type", "application/json")
+	headers.Set("Idempotency-Key", "manual-file-exact-contract")
+	response := performRequest(
+		router,
+		http.MethodPost,
+		"/v1/projects/"+testProjectID+"/implementation-proposals",
+		[]byte(`{
+			"buildManifestId":"`+manifestID+`",
+			"applicationBuildContract":{"id":"`+contractID+`","contractHash":"`+contractHash+`"},
+			"operations":[{"id":"operation-1","kind":"file.upsert","path":"frontend/app/page.tsx","content":"export default function Page() {}"}]
+		}`),
+		headers,
+	)
+	if response.Code != http.StatusCreated {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+	}
+	if implementation.createCalls != 1 || implementation.projectID != testProjectID || implementation.actorID != testUserID {
+		t.Fatalf("create call = %d project=%q actor=%q", implementation.createCalls, implementation.projectID, implementation.actorID)
+	}
+	if implementation.input.BuildManifestID != manifestID ||
+		implementation.input.ApplicationBuildContract.ID != contractID ||
+		implementation.input.ApplicationBuildContract.ContractHash != contractHash {
+		t.Fatalf("exact build contract not preserved: %#v", implementation.input)
+	}
+}
+
+func TestCreateImplementationProposalRejectsMissingExactBuildContractBeforeService(t *testing.T) {
+	implementation := &fakeImplementationService{}
+	router := newBusinessRouter(t, transport.Services{Implementation: implementation})
+	headers := authenticatedHeaders(true)
+	headers.Set("Content-Type", "application/json")
+	headers.Set("Idempotency-Key", "manual-file-missing-contract")
+	response := performRequest(
+		router,
+		http.MethodPost,
+		"/v1/projects/"+testProjectID+"/implementation-proposals",
+		[]byte(`{"buildManifestId":"`+uuid.NewString()+`","operations":[]}`),
+		headers,
+	)
+	assertProblem(t, response, http.StatusUnprocessableEntity, "invalid_input")
+	if implementation.createCalls != 0 {
+		t.Fatalf("missing exact build contract reached implementation service: %d calls", implementation.createCalls)
+	}
+}
+
 func TestGenerationProviderErrorsHaveStableProblemStatus(t *testing.T) {
 	generator := &fakeGenerationService{artifactErr: ai.ErrRateLimited}
 	router := newBusinessRouter(t, transport.Services{Generation: generator})
@@ -404,15 +459,75 @@ func TestDirectImplementationGenerationCannotReplaceConversationOwnedProposal(t 
 	headers.Set("Content-Type", "application/json")
 	headers.Set("Idempotency-Key", "manual-generation-conversation-owned")
 	proposalID := uuid.NewString()
+	buildContractID := uuid.NewString()
 	response := performRequest(router, http.MethodPost, "/v1/build-manifests/"+uuid.NewString()+"/generate", []byte(`{
 		"model":"gpt-5","instruction":"replace reviewed command",
+		"buildContract":{"id":"`+buildContractID+`","contractHash":"`+strings.Repeat("a", 64)+`"},
 		"replaceProposalId":"`+proposalID+`","replaceProposalVersion":1
 	}`), headers)
 	assertProblem(t, response, http.StatusConflict, "active_implementation_proposal")
 	if generator.implementationRequest.ExecutionSource != core.ImplementationSourceManualGeneration ||
+		generator.implementationRequest.ApplicationBuildContract.ID != buildContractID ||
+		generator.implementationRequest.ApplicationBuildContract.ContractHash != strings.Repeat("a", 64) ||
 		generator.implementationRequest.ExpectedActiveProposalID != proposalID ||
 		generator.implementationRequest.ExpectedActiveProposalVersion != 1 {
 		t.Fatalf("direct generation did not preserve explicit manual CAS: %#v", generator.implementationRequest)
+	}
+}
+
+func TestDirectImplementationGenerationRequiresExactBuildContract(t *testing.T) {
+	t.Parallel()
+
+	generator := &fakeGenerationService{}
+	router := newBusinessRouter(t, transport.Services{Generation: generator})
+	headers := authenticatedHeaders(true)
+	headers.Set("Content-Type", "application/json")
+	headers.Set("Idempotency-Key", "manual-generation-missing-build-contract")
+	response := performRequest(
+		router,
+		http.MethodPost,
+		"/v1/build-manifests/"+uuid.NewString()+"/generate",
+		[]byte(`{"model":"gpt-5","instruction":"build"}`),
+		headers,
+	)
+	assertProblem(t, response, http.StatusUnprocessableEntity, "invalid_input")
+	if generator.implementationCalls != 0 {
+		t.Fatalf("missing exact Build Contract reached generation service: %d calls", generator.implementationCalls)
+	}
+}
+
+func TestQuarantineLegacyImplementationRequiresExactProposalFence(t *testing.T) {
+	t.Parallel()
+
+	proposalID := uuid.NewString()
+	implementation := &fakeImplementationService{
+		current: core.ImplementationProposal{
+			ID: proposalID, Version: 4, Status: "open",
+			ExecutionSource: core.ImplementationSourceManualGeneration,
+		},
+		quarantined: core.ImplementationProposal{
+			ID: proposalID, Version: 5, Status: "stale",
+			ExecutionSource: core.ImplementationSourceManualGeneration,
+		},
+	}
+	router := newBusinessRouter(t, transport.Services{Implementation: implementation})
+	headers := authenticatedHeaders(true)
+	headers.Set("Content-Type", "application/json")
+	headers.Set("Idempotency-Key", "quarantine-legacy-proposal")
+	headers.Set("If-Match", `"implementation-proposal:`+proposalID+`:4"`)
+	response := performRequest(
+		router,
+		http.MethodPost,
+		"/v1/implementation-proposals/"+proposalID+"/quarantine",
+		[]byte(`{"version":4,"reason":"Replace with an exact verified Candidate."}`),
+		headers,
+	)
+	if response.Code != http.StatusOK {
+		t.Fatalf("quarantine status = %d, body=%s", response.Code, response.Body.String())
+	}
+	if implementation.quarantineCalls != 1 || implementation.quarantineInput.Version != 4 ||
+		implementation.quarantineInput.Reason != "Replace with an exact verified Candidate." {
+		t.Fatalf("quarantine request lost exact input: %#v", implementation)
 	}
 }
 
@@ -570,6 +685,50 @@ type fakeGenerationService struct {
 	actor                 string
 	manifestID            string
 	model                 string
+	implementationCalls   int
+}
+
+type fakeImplementationService struct {
+	created         core.ImplementationProposal
+	current         core.ImplementationProposal
+	quarantined     core.ImplementationProposal
+	createErr       error
+	createCalls     int
+	quarantineCalls int
+	projectID       string
+	actorID         string
+	input           core.CreateImplementationProposalInput
+	quarantineInput core.QuarantineImplementationInput
+}
+
+func (f *fakeImplementationService) Create(
+	_ context.Context,
+	projectID, actorID string,
+	input core.CreateImplementationProposalInput,
+) (core.ImplementationProposal, error) {
+	f.createCalls++
+	f.projectID = projectID
+	f.actorID = actorID
+	f.input = input
+	return f.created, f.createErr
+}
+
+func (f *fakeImplementationService) Get(context.Context, string, string) (core.ImplementationProposal, error) {
+	return f.current, nil
+}
+
+func (*fakeImplementationService) Decide(context.Context, string, string, core.DecideImplementationInput) (core.ImplementationProposal, error) {
+	return core.ImplementationProposal{}, nil
+}
+
+func (f *fakeImplementationService) Quarantine(_ context.Context, _, _ string, input core.QuarantineImplementationInput) (core.ImplementationProposal, error) {
+	f.quarantineCalls++
+	f.quarantineInput = input
+	return f.quarantined, nil
+}
+
+func (*fakeImplementationService) Apply(context.Context, string, string, core.ApplyImplementationInput) (core.ArtifactRevision, error) {
+	return core.ArtifactRevision{}, nil
 }
 
 func (f *fakeGenerationService) GenerateArtifactProposal(_ context.Context, manifestID, actor, model string) (generation.ArtifactGenerationResult, error) {
@@ -580,6 +739,7 @@ func (f *fakeGenerationService) GenerateArtifactProposal(_ context.Context, mani
 }
 
 func (f *fakeGenerationService) GenerateImplementation(_ context.Context, request generation.ImplementationGenerationRequest) (generation.ImplementationGenerationResult, error) {
+	f.implementationCalls++
 	f.implementationRequest = request
 	return generation.ImplementationGenerationResult{}, f.implementationErr
 }

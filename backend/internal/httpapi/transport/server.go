@@ -118,6 +118,7 @@ type ImplementationService interface {
 	Create(context.Context, string, string, core.CreateImplementationProposalInput) (core.ImplementationProposal, error)
 	Get(context.Context, string, string) (core.ImplementationProposal, error)
 	Decide(context.Context, string, string, core.DecideImplementationInput) (core.ImplementationProposal, error)
+	Quarantine(context.Context, string, string, core.QuarantineImplementationInput) (core.ImplementationProposal, error)
 	Apply(context.Context, string, string, core.ApplyImplementationInput) (core.ArtifactRevision, error)
 }
 

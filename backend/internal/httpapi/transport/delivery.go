@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 	"github.com/worksflow/builder/backend/internal/ai"
 	"github.com/worksflow/builder/backend/internal/core"
 	"github.com/worksflow/builder/backend/internal/domain"
@@ -19,11 +20,17 @@ type generateArtifactInput struct {
 }
 
 type generateImplementationInput struct {
-	BundleID               string `json:"bundleId,omitempty"`
-	Model                  string `json:"model,omitempty"`
-	Instruction            string `json:"instruction,omitempty"`
-	ReplaceProposalID      string `json:"replaceProposalId,omitempty"`
-	ReplaceProposalVersion uint64 `json:"replaceProposalVersion,omitempty"`
+	BundleID               string                             `json:"bundleId,omitempty"`
+	Model                  string                             `json:"model,omitempty"`
+	Instruction            string                             `json:"instruction,omitempty"`
+	BuildContract          exactApplicationBuildContractInput `json:"buildContract"`
+	ReplaceProposalID      string                             `json:"replaceProposalId,omitempty"`
+	ReplaceProposalVersion uint64                             `json:"replaceProposalVersion,omitempty"`
+}
+
+type exactApplicationBuildContractInput struct {
+	ID           string `json:"id"`
+	ContractHash string `json:"contractHash"`
 }
 
 type createWorkbenchBundleRequest struct {
@@ -149,6 +156,15 @@ func (s *Server) CreateImplementationProposal(context *gin.Context) {
 		WriteJSONError(context, err)
 		return
 	}
+	exactContract, err := exactApplicationBuildContractRef(
+		input.ApplicationBuildContract.ID,
+		input.ApplicationBuildContract.ContractHash,
+	)
+	if err != nil {
+		s.businessError(context, err)
+		return
+	}
+	input.ApplicationBuildContract = exactContract
 	actor, ok := actorID(context)
 	if !ok {
 		return
@@ -211,6 +227,45 @@ func (s *Server) DecideImplementationProposal(context *gin.Context) {
 		return
 	}
 	writeImplementationProposal(context, http.StatusOK, updated)
+}
+
+func (s *Server) QuarantineImplementationProposal(context *gin.Context) {
+	if s.services.Implementation == nil {
+		serviceUnavailable(context, "implementation")
+		return
+	}
+	var input core.QuarantineImplementationInput
+	if err := DecodeJSON(context, &input, s.config.HTTP.MaxJSONBodyBytes); err != nil {
+		WriteJSONError(context, err)
+		return
+	}
+	actor, ok := actorID(context)
+	if !ok {
+		return
+	}
+	current, err := s.services.Implementation.Get(
+		context.Request.Context(), context.Param("implementationProposalId"), actor,
+	)
+	if err != nil {
+		s.businessError(context, err)
+		return
+	}
+	if !matchETag(context, implementationProposalETag(current), "implementation proposal") {
+		return
+	}
+	if input.Version != 0 && input.Version != current.Version {
+		preconditionFailed(context, "implementation proposal")
+		return
+	}
+	input.Version = current.Version
+	proposal, err := s.services.Implementation.Quarantine(
+		context.Request.Context(), current.ID, actor, input,
+	)
+	if err != nil {
+		conditionalServiceError(s, context, "implementation proposal", err)
+		return
+	}
+	writeImplementationProposal(context, http.StatusOK, proposal)
 }
 
 func (s *Server) ApplyImplementationProposal(context *gin.Context) {
@@ -324,6 +379,14 @@ func (s *Server) GenerateImplementation(context *gin.Context) {
 		s.businessError(context, core.ErrInvalidInput)
 		return
 	}
+	exactContract, err := exactApplicationBuildContractRef(
+		input.BuildContract.ID,
+		input.BuildContract.ContractHash,
+	)
+	if err != nil {
+		s.businessError(context, err)
+		return
+	}
 	actor, ok := actorID(context)
 	if !ok {
 		return
@@ -331,6 +394,7 @@ func (s *Server) GenerateImplementation(context *gin.Context) {
 	result, err := s.services.Generation.GenerateImplementation(
 		context.Request.Context(), generation.ImplementationGenerationRequest{
 			BundleID: bundleID, ActorID: actor, Model: strings.TrimSpace(input.Model),
+			ApplicationBuildContract:      exactContract,
 			Instruction:                   generation.ImplementationInstruction{Objective: strings.TrimSpace(input.Instruction)},
 			ExecutionSource:               core.ImplementationSourceManualGeneration,
 			ExpectedActiveProposalID:      strings.TrimSpace(input.ReplaceProposalID),
@@ -346,11 +410,31 @@ func (s *Server) GenerateImplementation(context *gin.Context) {
 	context.JSON(http.StatusCreated, result)
 }
 
+func exactApplicationBuildContractRef(id, contractHash string) (core.ApplicationBuildContractRef, error) {
+	contractID := strings.TrimSpace(id)
+	canonicalHash := strings.TrimSpace(contractHash)
+	hashDigest := strings.TrimPrefix(canonicalHash, "sha256:")
+	if contractID == "" || contractID != id ||
+		canonicalHash == "" || canonicalHash != contractHash ||
+		hashDigest != strings.ToLower(hashDigest) || !domain.IsCanonicalHash(canonicalHash) {
+		return core.ApplicationBuildContractRef{}, core.ErrInvalidInput
+	}
+	parsedContractID, err := uuid.Parse(contractID)
+	if err != nil {
+		return core.ApplicationBuildContractRef{}, core.ErrInvalidInput
+	}
+	return core.ApplicationBuildContractRef{
+		ID: parsedContractID.String(), ContractHash: canonicalHash,
+	}, nil
+}
+
 func (s *Server) generationError(context *gin.Context, err error) {
 	if s.logger != nil {
 		s.writeServiceError(context.GetString("request_id"), context.FullPath(), err)
 	}
 	switch {
+	case errors.Is(err, generation.ErrGovernedCandidateRequired):
+		problem.Write(context, problem.New(http.StatusConflict, "governed_candidate_required", "Governed Candidate implementation is required", "Open the Code sandbox, apply Agent changes to the durable Candidate, obtain an exact passing VerificationReceipt, and freeze that Candidate into an immutable Proposal."))
 	case errors.Is(err, generation.ErrImplementationGenerationProcessing):
 		context.Header("Retry-After", "5")
 		problem.Write(context, problem.New(http.StatusConflict, "implementation_generation_processing", "Implementation generation is processing", "Another fenced worker is generating this active Workbench leaf. Retry after its lease completes or expires."))

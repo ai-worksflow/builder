@@ -238,14 +238,16 @@ func TestDeliveryPublishAndRollbackEnforceStrongConditionalWrites(t *testing.T) 
 	projectID, userID := uuid.NewString(), uuid.NewString()
 	reference, encodedRef := deliveryVersionRefJSON()
 	deploymentID, manifestID, qualityRunID := uuid.NewString(), uuid.NewString(), uuid.NewString()
+	receiptID, bundleID := uuid.NewString(), uuid.NewString()
+	receiptHash, bundleHash := "sha256:"+strings.Repeat("c", 64), "sha256:"+strings.Repeat("d", 64)
 	api := &fakeDeliveryAPI{deployment: delivery.Deployment{
 		ID: deploymentID, ProjectID: projectID, Environment: delivery.EnvironmentPreview,
 		PublicURL: "/published/ready/", ETag: `"deployment:` + deploymentID + `:2"`,
 	}}
 	router := deliveryRouterForTest(t, api, userID, nil)
-	body := `{"environment":"preview","workspaceRevision":` + encodedRef + `,"buildManifestId":"` + manifestID + `","qualityRunId":"` + qualityRunID + `"}`
+	body := `{"environment":"preview","workspaceRevision":` + encodedRef + `,"buildManifestId":"` + manifestID + `","qualityRunId":"` + qualityRunID + `","canonicalReceiptId":"` + receiptID + `","canonicalReceiptHash":"` + receiptHash + `","releaseBundleId":"` + bundleID + `","releaseBundleHash":"` + bundleHash + `"}`
 	created := deliveryHTTP(router, http.MethodPost, "/v1/projects/"+projectID+"/deployments", body, nil)
-	if created.Code != http.StatusCreated || api.publishETag != "" || api.publishActor != userID || api.publishInput.WorkspaceRevision == nil || api.publishInput.WorkspaceRevision.RevisionID != reference.RevisionID || api.publishInput.BuildManifestID != manifestID || api.publishInput.QualityRunID != qualityRunID || api.publishInput.WorkflowQualityRunID != "" {
+	if created.Code != http.StatusCreated || api.publishETag != "" || api.publishActor != userID || api.publishInput.WorkspaceRevision == nil || api.publishInput.WorkspaceRevision.RevisionID != reference.RevisionID || api.publishInput.BuildManifestID != manifestID || api.publishInput.QualityRunID != qualityRunID || api.publishInput.CanonicalReceiptID != receiptID || api.publishInput.CanonicalReceiptHash != receiptHash || api.publishInput.ReleaseBundleID != bundleID || api.publishInput.ReleaseBundleHash != bundleHash || api.publishInput.WorkflowQualityRunID != "" {
 		t.Fatalf("initial publish status=%d api=%+v body=%s", created.Code, api, created.Body.String())
 	}
 	currentETag := api.deployment.ETag
@@ -265,6 +267,49 @@ func TestDeliveryPublishAndRollbackEnforceStrongConditionalWrites(t *testing.T) 
 	rolledBack := deliveryHTTP(router, http.MethodPost, "/v1/deployments/"+deploymentID+"/rollback", rollbackBody, map[string]string{"If-Match": currentETag})
 	if rolledBack.Code != http.StatusOK || api.rollbackCalls != 1 || api.rollbackActor != userID || api.rollbackETag != currentETag {
 		t.Fatalf("rollback status=%d api=%+v", rolledBack.Code, api)
+	}
+}
+
+func TestLegacyProductionMutationsReturnConflictWhileHistoricalReadsRemainAvailable(t *testing.T) {
+	projectID, userID, deploymentID := uuid.NewString(), uuid.NewString(), uuid.NewString()
+	_, encodedRef := deliveryVersionRefJSON()
+	api := &fakeDeliveryAPI{
+		deployment: delivery.Deployment{
+			ID: deploymentID, ProjectID: projectID, Environment: delivery.EnvironmentProduction,
+			Status: "ready", ETag: `"deployment:` + deploymentID + `:7"`,
+		},
+		publishErr: delivery.NewError(
+			delivery.CodeConflict,
+			http.StatusConflict,
+			"production deployment mutations require the Release Controller v3 workflow; the legacy deployments endpoint is preview-only",
+		),
+	}
+	router := deliveryRouterForTest(t, api, userID, nil)
+	publish := deliveryHTTP(
+		router,
+		http.MethodPost,
+		"/v1/projects/"+projectID+"/deployments",
+		`{"environment":"production","workspaceRevision":`+encodedRef+`,"buildManifestId":"`+uuid.NewString()+`","qualityRunId":"`+uuid.NewString()+`","canonicalReceiptId":"`+uuid.NewString()+`","canonicalReceiptHash":"sha256:`+strings.Repeat("c", 64)+`","releaseBundleId":"`+uuid.NewString()+`","releaseBundleHash":"sha256:`+strings.Repeat("d", 64)+`"}`,
+		nil,
+	)
+	if publish.Code != http.StatusConflict || !strings.Contains(publish.Body.String(), "Release Controller v3") {
+		t.Fatalf("legacy production publish status=%d body=%s", publish.Code, publish.Body.String())
+	}
+	rollback := deliveryHTTP(
+		router,
+		http.MethodPost,
+		"/v1/deployments/"+deploymentID+"/rollback",
+		`{"targetVersionId":"`+uuid.NewString()+`"}`,
+		map[string]string{"If-Match": api.deployment.ETag},
+	)
+	if rollback.Code != http.StatusConflict || !strings.Contains(rollback.Body.String(), "Release Controller v3") {
+		t.Fatalf("legacy production rollback status=%d body=%s", rollback.Code, rollback.Body.String())
+	}
+
+	api.publishErr = nil
+	historical := deliveryHTTP(router, http.MethodGet, "/v1/deployments/"+deploymentID, "", nil)
+	if historical.Code != http.StatusOK || !strings.Contains(historical.Body.String(), deploymentID) || historical.Header().Get("ETag") != api.deployment.ETag {
+		t.Fatalf("historical production GET regressed: status=%d headers=%v body=%s", historical.Code, historical.Header(), historical.Body.String())
 	}
 }
 

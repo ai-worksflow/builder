@@ -12,21 +12,34 @@ import (
 	worksmiddleware "github.com/worksflow/builder/backend/internal/httpapi/middleware"
 	"github.com/worksflow/builder/backend/internal/httpapi/problem"
 	"github.com/worksflow/builder/backend/internal/httpapi/transport"
+	"github.com/worksflow/builder/backend/internal/lsp"
 )
 
 type RouterOptions struct {
-	Readiness      *health.Readiness
-	WebSocket      http.Handler
-	Transport      *transport.Server
-	Authentication worksmiddleware.SessionAuthenticator
-	Idempotency    *worksmiddleware.IdempotencyRepository
-	Workflow       *transport.WorkflowHandler
-	Conversation   *transport.ConversationHandler
-	GitHub         *transport.GitHubHandler
-	Data           *transport.DataHandler
-	PublicData     *transport.PublicDataHandler
-	Delivery       *transport.DeliveryHandler
-	DesignImports  *transport.DesignImportHandler
+	Readiness        *health.Readiness
+	WebSocket        http.Handler
+	SandboxWebSocket http.Handler
+	LSPWebSocket     http.Handler
+	ModelGateway     http.Handler
+	GoldenFault      *transport.GoldenFaultHandler
+	Transport        *transport.Server
+	Authentication   worksmiddleware.SessionAuthenticator
+	Idempotency      *worksmiddleware.IdempotencyRepository
+	Workflow         *transport.WorkflowHandler
+	Conversation     *transport.ConversationHandler
+	GitHub           *transport.GitHubHandler
+	Data             *transport.DataHandler
+	PublicData       *transport.PublicDataHandler
+	Delivery         *transport.DeliveryHandler
+	DesignImports    *transport.DesignImportHandler
+	Constructor      *transport.ConstructorHandler
+	TemplateRegistry *transport.TemplateRegistryHandler
+	Repository       *transport.RepositoryHandler
+	Sandbox          *transport.SandboxHandler
+	LSPTickets       *transport.LSPTicketHandler
+	Verification     *transport.VerificationHandler
+	Release          *transport.ReleaseHandler
+	Agent            *transport.AgentHandler
 }
 
 func NewRouter(cfg config.Config, logger *slog.Logger, options RouterOptions) (*gin.Engine, error) {
@@ -41,6 +54,30 @@ func NewRouter(cfg config.Config, logger *slog.Logger, options RouterOptions) (*
 	}
 	if options.DesignImports != nil && options.Idempotency == nil {
 		return nil, errors.New("design import routes require durable idempotency")
+	}
+	if options.Constructor != nil && options.Idempotency == nil {
+		return nil, errors.New("constructor routes require durable idempotency")
+	}
+	if options.TemplateRegistry != nil && (options.Transport == nil || options.Authentication == nil) {
+		return nil, errors.New("template registry routes require API transport and authentication")
+	}
+	if options.LSPTickets != nil && (options.Transport == nil || options.Authentication == nil) {
+		return nil, errors.New("LSP ticket routes require API transport and authentication")
+	}
+	if options.Sandbox != nil && options.Idempotency == nil {
+		return nil, errors.New("sandbox mutation routes require durable idempotency")
+	}
+	if options.Repository != nil && options.Idempotency == nil {
+		return nil, errors.New("repository Candidate routes require durable idempotency")
+	}
+	if options.Verification != nil && options.Idempotency == nil {
+		return nil, errors.New("verification control-plane routes require durable idempotency")
+	}
+	if options.Release != nil && options.Idempotency == nil {
+		return nil, errors.New("release mutation routes require durable idempotency")
+	}
+	if options.Agent != nil && options.Idempotency == nil {
+		return nil, errors.New("Agent control-plane routes require durable idempotency")
 	}
 	if cfg.Environment == config.EnvironmentProduction {
 		gin.SetMode(gin.ReleaseMode)
@@ -88,6 +125,29 @@ func NewRouter(cfg config.Config, logger *slog.Logger, options RouterOptions) (*
 			options.WebSocket.ServeHTTP(context.Writer, context.Request)
 			context.Abort()
 		})
+	}
+	if options.SandboxWebSocket != nil {
+		router.GET("/v1/sandbox-stream", func(context *gin.Context) {
+			options.SandboxWebSocket.ServeHTTP(context.Writer, context.Request)
+			context.Abort()
+		})
+	}
+	if options.LSPWebSocket != nil {
+		router.GET(lsp.TicketWebSocketPath, func(context *gin.Context) {
+			options.LSPWebSocket.ServeHTTP(context.Writer, context.Request)
+			context.Abort()
+		})
+	}
+	if options.ModelGateway != nil {
+		router.POST("/internal/agent-model/v1/responses", func(context *gin.Context) {
+			options.ModelGateway.ServeHTTP(context.Writer, context.Request)
+			context.Abort()
+		})
+	}
+	if options.GoldenFault != nil {
+		if err := transport.RegisterGoldenFaultRoutes(router.Group("/v1"), options.GoldenFault); err != nil {
+			return nil, err
+		}
 	}
 	if options.Delivery != nil {
 		if err := transport.RegisterDeliveryPublicRoutes(router, options.Delivery); err != nil {
@@ -145,6 +205,54 @@ func NewRouter(cfg config.Config, logger *slog.Logger, options RouterOptions) (*
 		if options.DesignImports != nil {
 			designImportMutation := []gin.HandlerFunc{csrf, worksmiddleware.CaptureIdempotencyKey(true), persistIdempotency}
 			if err := transport.RegisterDesignImportRoutes(protected, options.DesignImports, designImportMutation...); err != nil {
+				return nil, err
+			}
+		}
+		if options.Constructor != nil {
+			constructorMutation := []gin.HandlerFunc{csrf, worksmiddleware.CaptureIdempotencyKey(true), persistIdempotency}
+			if err := transport.RegisterConstructorRoutes(protected, options.Constructor, constructorMutation...); err != nil {
+				return nil, err
+			}
+		}
+		if options.TemplateRegistry != nil {
+			if err := transport.RegisterTemplateRegistryRoutes(protected, options.TemplateRegistry); err != nil {
+				return nil, err
+			}
+		}
+		if options.Repository != nil {
+			repositoryMutation := []gin.HandlerFunc{csrf, worksmiddleware.CaptureIdempotencyKey(true), persistIdempotency}
+			if err := transport.RegisterRepositoryRoutes(protected, options.Repository, repositoryMutation...); err != nil {
+				return nil, err
+			}
+		}
+		if options.Sandbox != nil {
+			sandboxMutation := []gin.HandlerFunc{csrf, worksmiddleware.CaptureIdempotencyKey(true), persistIdempotency}
+			if err := transport.RegisterSandboxRoutes(protected, options.Sandbox, sandboxMutation...); err != nil {
+				return nil, err
+			}
+		}
+		if options.LSPTickets != nil {
+			// LSP ticket responses contain one-time bearer secrets. Apply CSRF,
+			// but deliberately bypass generic idempotency capture/persistence.
+			if err := transport.RegisterLSPTicketRoutes(protected, options.LSPTickets, csrf); err != nil {
+				return nil, err
+			}
+		}
+		if options.Verification != nil {
+			verificationMutation := []gin.HandlerFunc{csrf, worksmiddleware.CaptureIdempotencyKey(true), persistIdempotency}
+			if err := transport.RegisterVerificationRoutes(protected, options.Verification, verificationMutation...); err != nil {
+				return nil, err
+			}
+		}
+		if options.Release != nil {
+			releaseMutation := []gin.HandlerFunc{csrf, worksmiddleware.CaptureIdempotencyKey(true), persistIdempotency}
+			if err := transport.RegisterReleaseRoutes(protected, options.Release, releaseMutation...); err != nil {
+				return nil, err
+			}
+		}
+		if options.Agent != nil {
+			agentMutation := []gin.HandlerFunc{csrf, worksmiddleware.CaptureIdempotencyKey(true), persistIdempotency}
+			if err := transport.RegisterAgentRoutes(protected, options.Agent, agentMutation...); err != nil {
 				return nil, err
 			}
 		}

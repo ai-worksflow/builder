@@ -59,6 +59,32 @@ func TestCORSPreflight(t *testing.T) {
 	}
 }
 
+func TestAttemptScopedModelGatewayRouteBypassesBrowserSessionMiddleware(t *testing.T) {
+	cfg := config.Config{Environment: config.EnvironmentTest, ServiceName: "model-gateway-router-test"}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	called := false
+	router, err := NewRouter(cfg, logger, RouterOptions{
+		Readiness: health.NewReadiness(time.Second, nil),
+		ModelGateway: http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+			called = true
+			if request.Header.Get("Authorization") != "Bearer attempt-token" {
+				t.Fatalf("capability header = %q", request.Header.Get("Authorization"))
+			}
+			writer.WriteHeader(http.StatusNoContent)
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodPost, "/internal/agent-model/v1/responses", nil)
+	request.Header.Set("Authorization", "Bearer attempt-token")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	if !called || response.Code != http.StatusNoContent {
+		t.Fatalf("Model Gateway called=%t status=%d", called, response.Code)
+	}
+}
+
 func testRouter(t *testing.T, readiness *health.Readiness) http.Handler {
 	t.Helper()
 	cfg := config.Config{
