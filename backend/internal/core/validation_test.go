@@ -630,6 +630,25 @@ func canonicalPrototypeValidationPayload() json.RawMessage {
 }`)
 }
 
+func TestHistoricalContractDraftsRemainReviewableButMachineSchemasFailClosed(t *testing.T) {
+	t.Parallel()
+
+	for _, kind := range []string{"api_contract", "data_contract", "permission_contract"} {
+		if report := ValidateArtifactContent(kind, json.RawMessage(`{"summary":"historical prose contract","blocks":[]}`)); !report.Valid {
+			t.Fatalf("legacy %s unexpectedly blocked: %#v", kind, report.Findings)
+		}
+		if report := ValidateArtifactContent(kind, json.RawMessage(`{"schemaVersion":"unknown/v1","summary":"not a machine contract"}`)); report.Valid || !hasFinding(report, "contract_schema_invalid") {
+			t.Fatalf("versioned %s did not fail closed: %#v", kind, report.Findings)
+		}
+	}
+
+	for _, kind := range []string{"ai_runtime_contract", "deployment_contract", "verification_contract"} {
+		if report := ValidateArtifactContent(kind, json.RawMessage(`{"summary":"prose is not trusted"}`)); report.Valid || !hasFinding(report, "contract_schema_invalid") {
+			t.Fatalf("new machine-only %s accepted prose: %#v", kind, report.Findings)
+		}
+	}
+}
+
 func hasFinding(report ValidationReport, code string) bool {
 	for _, finding := range report.Findings {
 		if finding.Code == code {

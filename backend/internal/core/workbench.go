@@ -1221,13 +1221,20 @@ func (s *WorkbenchService) latestNonStaleLineageProposal(
 		return nil, err
 	}
 	normalizeLegacyImplementationExecution(&proposal, model)
-	payloadHash, err := implementationPayloadHash(proposal)
+	payloadHash, err := storedImplementationPayloadHash(proposal, model)
 	if err != nil || payloadHash != proposal.PayloadHash || payloadHash != model.PayloadHash ||
 		proposal.ID != model.ID.String() || proposal.ProjectID != model.ProjectID.String() ||
 		proposal.BuildManifestID != model.BuildManifestID.String() || proposal.Status != model.Status || proposal.Version != model.Version ||
+		!optionalApplicationBuildContractMatchesModel(proposal.ApplicationBuildContract, model) ||
 		string(proposal.ExecutionSource) != model.ExecutionSource || !optionalStringMatchesUUID(proposal.ConversationCommandID, model.ConversationCommandID) ||
 		!optionalStringMatchesUUID(proposal.SupersedesProposalID, model.SupersedesProposalID) ||
 		proposal.InstructionHash != stringValue(model.InstructionHash) || proposal.AIProvider != stringValue(model.AIProvider) || proposal.AIModel != stringValue(model.AIModel) {
+		return nil, ErrConflict
+	}
+	unimplementedCount, blockingDiagnosticCount := implementationIncompleteCounts(proposal)
+	if (model.UnimplementedCount == nil) != (model.BlockingDiagnosticCount == nil) ||
+		(model.UnimplementedCount != nil &&
+			(*model.UnimplementedCount != unimplementedCount || *model.BlockingDiagnosticCount != blockingDiagnosticCount)) {
 		return nil, ErrConflict
 	}
 	return &proposal, nil
@@ -1777,7 +1784,7 @@ func (s *WorkbenchService) classifyAndValidateRefs(ctx context.Context, projectI
 			result.blueprints = appendUniqueRef(result.blueprints, ref)
 		case "page_spec":
 			result.pageSpecs = appendUniqueRef(result.pageSpecs, ref)
-		case "api_contract", "data_contract", "permission_contract":
+		case "api_contract", "data_contract", "permission_contract", "ai_runtime_contract", "deployment_contract", "verification_contract":
 			result.contracts = appendUniqueRef(result.contracts, ref)
 		case "design_system", "token_set", "component_registry":
 			result.designSystems = appendUniqueRef(result.designSystems, ref)

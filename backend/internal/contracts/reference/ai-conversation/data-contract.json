@@ -1,0 +1,114 @@
+{
+  "schemaVersion": "data-contract/v2",
+  "entities": [
+    {
+      "id": "Conversation",
+      "tableName": "conversations",
+      "fields": [
+        {"id": "id", "name": "id", "type": "uuid", "nullable": false},
+        {"id": "projectId", "name": "project_id", "type": "uuid", "nullable": false},
+        {"id": "createdBy", "name": "created_by", "type": "string", "nullable": false},
+        {"id": "title", "name": "title", "type": "string", "nullable": false, "default": ""},
+        {"id": "createdAt", "name": "created_at", "type": "timestamp", "nullable": false},
+        {"id": "updatedAt", "name": "updated_at", "type": "timestamp", "nullable": false}
+      ],
+      "primaryKey": ["id"],
+      "indexes": [
+        {"id": "conversationProjectId", "fieldIds": ["projectId", "id"], "unique": true},
+        {"id": "conversationProjectUpdated", "fieldIds": ["projectId", "updatedAt"], "unique": false}
+      ],
+      "foreignKeys": [],
+      "tenantScope": {"mode": "project", "fieldId": "projectId"}
+    },
+    {
+      "id": "Message",
+      "tableName": "messages",
+      "fields": [
+        {"id": "id", "name": "id", "type": "uuid", "nullable": false},
+        {"id": "projectId", "name": "project_id", "type": "uuid", "nullable": false},
+        {"id": "conversationId", "name": "conversation_id", "type": "uuid", "nullable": false},
+        {"id": "role", "name": "role", "type": "string", "nullable": false},
+        {"id": "content", "name": "content", "type": "text", "nullable": false},
+        {"id": "clientMessageId", "name": "client_message_id", "type": "string", "nullable": false},
+        {"id": "sequence", "name": "sequence", "type": "integer", "nullable": false},
+        {"id": "createdAt", "name": "created_at", "type": "timestamp", "nullable": false}
+      ],
+      "primaryKey": ["id"],
+      "indexes": [
+        {"id": "messageProjectId", "fieldIds": ["projectId", "id"], "unique": true},
+        {"id": "messageProjectClient", "fieldIds": ["projectId", "clientMessageId"], "unique": true},
+        {"id": "messageConversationSequence", "fieldIds": ["projectId", "conversationId", "sequence"], "unique": true}
+      ],
+      "foreignKeys": [
+        {"id": "messageConversation", "fieldIds": ["projectId", "conversationId"], "targetEntityId": "Conversation", "targetFieldIds": ["projectId", "id"], "onDelete": "cascade"}
+      ],
+      "tenantScope": {"mode": "project", "fieldId": "projectId"}
+    },
+    {
+      "id": "Run",
+      "tableName": "runs",
+      "fields": [
+        {"id": "id", "name": "id", "type": "uuid", "nullable": false},
+        {"id": "projectId", "name": "project_id", "type": "uuid", "nullable": false},
+        {"id": "conversationId", "name": "conversation_id", "type": "uuid", "nullable": false},
+        {"id": "triggerMessageId", "name": "trigger_message_id", "type": "uuid", "nullable": false},
+        {"id": "retryOfRunId", "name": "retry_of_run_id", "type": "uuid", "nullable": true},
+        {"id": "attempt", "name": "attempt", "type": "integer", "nullable": false, "default": 1},
+        {"id": "status", "name": "status", "type": "string", "nullable": false},
+        {"id": "idempotencyKey", "name": "idempotency_key", "type": "string", "nullable": false},
+        {"id": "modelProfileId", "name": "model_profile_id", "type": "string", "nullable": false},
+        {"id": "retryReason", "name": "retry_reason", "type": "text", "nullable": true},
+        {"id": "cancelRequestedAt", "name": "cancel_requested_at", "type": "timestamp", "nullable": true},
+        {"id": "startedAt", "name": "started_at", "type": "timestamp", "nullable": true},
+        {"id": "finishedAt", "name": "finished_at", "type": "timestamp", "nullable": true},
+        {"id": "errorCode", "name": "error_code", "type": "string", "nullable": true},
+        {"id": "errorMessage", "name": "error_message", "type": "text", "nullable": true},
+        {"id": "createdAt", "name": "created_at", "type": "timestamp", "nullable": false},
+        {"id": "updatedAt", "name": "updated_at", "type": "timestamp", "nullable": false}
+      ],
+      "primaryKey": ["id"],
+      "indexes": [
+        {"id": "runProjectId", "fieldIds": ["projectId", "id"], "unique": true},
+        {"id": "runProjectIdempotency", "fieldIds": ["projectId", "idempotencyKey"], "unique": true},
+        {"id": "runConversationCreated", "fieldIds": ["projectId", "conversationId", "createdAt"], "unique": false},
+        {"id": "runRetryLineage", "fieldIds": ["projectId", "retryOfRunId", "attempt"], "unique": false}
+      ],
+      "foreignKeys": [
+        {"id": "runConversation", "fieldIds": ["projectId", "conversationId"], "targetEntityId": "Conversation", "targetFieldIds": ["projectId", "id"], "onDelete": "cascade"},
+        {"id": "runTriggerMessage", "fieldIds": ["projectId", "triggerMessageId"], "targetEntityId": "Message", "targetFieldIds": ["projectId", "id"], "onDelete": "restrict"},
+        {"id": "runRetryLineage", "fieldIds": ["projectId", "retryOfRunId"], "targetEntityId": "Run", "targetFieldIds": ["projectId", "id"], "onDelete": "restrict"}
+      ],
+      "tenantScope": {"mode": "project", "fieldId": "projectId"}
+    },
+    {
+      "id": "RunEvent",
+      "tableName": "run_events",
+      "fields": [
+        {"id": "id", "name": "id", "type": "uuid", "nullable": false},
+        {"id": "projectId", "name": "project_id", "type": "uuid", "nullable": false},
+        {"id": "conversationId", "name": "conversation_id", "type": "uuid", "nullable": false},
+        {"id": "runId", "name": "run_id", "type": "uuid", "nullable": false},
+        {"id": "sequence", "name": "sequence", "type": "integer", "nullable": false},
+        {"id": "eventType", "name": "event_type", "type": "string", "nullable": false},
+        {"id": "payload", "name": "payload", "type": "json", "nullable": false},
+        {"id": "createdAt", "name": "created_at", "type": "timestamp", "nullable": false}
+      ],
+      "primaryKey": ["id"],
+      "indexes": [
+        {"id": "runEventRunSequence", "fieldIds": ["projectId", "runId", "sequence"], "unique": true},
+        {"id": "runEventProjectRun", "fieldIds": ["projectId", "runId"], "unique": false}
+      ],
+      "foreignKeys": [
+        {"id": "runEventConversation", "fieldIds": ["projectId", "conversationId"], "targetEntityId": "Conversation", "targetFieldIds": ["projectId", "id"], "onDelete": "cascade"},
+        {"id": "runEventRun", "fieldIds": ["projectId", "runId"], "targetEntityId": "Run", "targetFieldIds": ["projectId", "id"], "onDelete": "cascade"}
+      ],
+      "tenantScope": {"mode": "project", "fieldId": "projectId"}
+    }
+  ],
+  "migrationPolicy": {
+    "tool": "goose",
+    "directory": "services/api/migrations",
+    "applyCommandId": "api-migrate",
+    "rollbackPolicy": "forward-only"
+  }
+}

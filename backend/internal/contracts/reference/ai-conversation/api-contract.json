@@ -1,0 +1,253 @@
+{
+  "schemaVersion": "api-contract/v2",
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Reference AI Conversation API",
+    "version": "1.0.0",
+    "description": "Authenticated project-scoped API for durable conversations, model runs, resumable typed events, cancellation, and retry."
+  },
+  "paths": {
+    "/api/v1/conversations": {
+      "get": {
+        "operationId": "listConversations",
+        "summary": "List project conversations",
+        "security": [{"SessionAuth": []}],
+        "responses": {
+          "200": {"description": "Project conversations", "content": {"application/json": {"schema": {"type": "array", "items": {"$ref": "#/components/schemas/Conversation"}}}}},
+          "401": {"$ref": "#/components/responses/Error"},
+          "403": {"$ref": "#/components/responses/Error"}
+        }
+      },
+      "post": {
+        "operationId": "createConversation",
+        "summary": "Create a project conversation",
+        "security": [{"SessionAuth": []}],
+        "parameters": [{"name": "Idempotency-Key", "in": "header", "required": true, "schema": {"type": "string", "minLength": 1, "maxLength": 200}}],
+        "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/CreateConversationRequest"}}}},
+        "responses": {
+          "201": {"description": "Conversation created", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Conversation"}}}},
+          "401": {"$ref": "#/components/responses/Error"},
+          "403": {"$ref": "#/components/responses/Error"},
+          "409": {"$ref": "#/components/responses/Error"},
+          "429": {"$ref": "#/components/responses/Error"}
+        }
+      }
+    },
+    "/api/v1/conversations/{conversationId}": {
+      "parameters": [{"name": "conversationId", "in": "path", "required": true, "schema": {"type": "string", "format": "uuid"}}],
+      "get": {
+        "operationId": "getConversation",
+        "summary": "Get a project conversation",
+        "security": [{"SessionAuth": []}],
+        "responses": {
+          "200": {"description": "Conversation", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Conversation"}}}},
+          "401": {"$ref": "#/components/responses/Error"},
+          "404": {"$ref": "#/components/responses/Error"}
+        }
+      }
+    },
+    "/api/v1/conversations/{conversationId}/messages": {
+      "parameters": [{"name": "conversationId", "in": "path", "required": true, "schema": {"type": "string", "format": "uuid"}}],
+      "get": {
+        "operationId": "listMessages",
+        "summary": "List durable messages",
+        "security": [{"SessionAuth": []}],
+        "responses": {
+          "200": {"description": "Messages", "content": {"application/json": {"schema": {"type": "array", "items": {"$ref": "#/components/schemas/Message"}}}}},
+          "401": {"$ref": "#/components/responses/Error"},
+          "404": {"$ref": "#/components/responses/Error"}
+        }
+      },
+      "post": {
+        "operationId": "sendMessage",
+        "summary": "Persist a user message",
+        "security": [{"SessionAuth": []}],
+        "parameters": [{"name": "Idempotency-Key", "in": "header", "required": true, "schema": {"type": "string", "minLength": 1, "maxLength": 200}}],
+        "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/SendMessageRequest"}}}},
+        "responses": {
+          "201": {"description": "Message persisted", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Message"}}}},
+          "401": {"$ref": "#/components/responses/Error"},
+          "404": {"$ref": "#/components/responses/Error"},
+          "409": {"$ref": "#/components/responses/Error"},
+          "429": {"$ref": "#/components/responses/Error"}
+        }
+      }
+    },
+    "/api/v1/conversations/{conversationId}/runs": {
+      "parameters": [{"name": "conversationId", "in": "path", "required": true, "schema": {"type": "string", "format": "uuid"}}],
+      "get": {
+        "operationId": "listRuns",
+        "summary": "List durable runs",
+        "security": [{"SessionAuth": []}],
+        "responses": {
+          "200": {"description": "Runs", "content": {"application/json": {"schema": {"type": "array", "items": {"$ref": "#/components/schemas/Run"}}}}},
+          "401": {"$ref": "#/components/responses/Error"},
+          "404": {"$ref": "#/components/responses/Error"}
+        }
+      },
+      "post": {
+        "operationId": "createRun",
+        "summary": "Create an idempotent model run",
+        "security": [{"SessionAuth": []}],
+        "parameters": [{"name": "Idempotency-Key", "in": "header", "required": true, "schema": {"type": "string", "minLength": 1, "maxLength": 200}}],
+        "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/CreateRunRequest"}}}},
+        "responses": {
+          "202": {"description": "Run queued", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Run"}}}},
+          "401": {"$ref": "#/components/responses/Error"},
+          "404": {"$ref": "#/components/responses/Error"},
+          "409": {"$ref": "#/components/responses/Error"},
+          "429": {"$ref": "#/components/responses/Error"}
+        }
+      }
+    },
+    "/api/v1/conversations/{conversationId}/runs/{runId}": {
+      "parameters": [
+        {"name": "conversationId", "in": "path", "required": true, "schema": {"type": "string", "format": "uuid"}},
+        {"name": "runId", "in": "path", "required": true, "schema": {"type": "string", "format": "uuid"}}
+      ],
+      "get": {
+        "operationId": "getRun",
+        "summary": "Get a durable run",
+        "security": [{"SessionAuth": []}],
+        "responses": {
+          "200": {"description": "Run", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Run"}}}},
+          "401": {"$ref": "#/components/responses/Error"},
+          "404": {"$ref": "#/components/responses/Error"}
+        }
+      }
+    },
+    "/api/v1/conversations/{conversationId}/runs/{runId}/events": {
+      "parameters": [
+        {"name": "conversationId", "in": "path", "required": true, "schema": {"type": "string", "format": "uuid"}},
+        {"name": "runId", "in": "path", "required": true, "schema": {"type": "string", "format": "uuid"}},
+        {"name": "Last-Event-ID", "in": "header", "required": false, "schema": {"type": "integer", "minimum": 0}}
+      ],
+      "get": {
+        "operationId": "streamRunEvents",
+        "summary": "Stream typed durable run events",
+        "security": [{"SessionAuth": []}],
+        "responses": {
+          "200": {"description": "Resumable SSE stream", "headers": {"Cache-Control": {"schema": {"const": "no-cache"}}}, "content": {"text/event-stream": {"schema": {"$ref": "#/components/schemas/RunEvent"}}}},
+          "401": {"$ref": "#/components/responses/Error"},
+          "404": {"$ref": "#/components/responses/Error"},
+          "410": {"$ref": "#/components/responses/Error"},
+          "429": {"$ref": "#/components/responses/Error"}
+        }
+      }
+    },
+    "/api/v1/conversations/{conversationId}/runs/{runId}/cancel": {
+      "parameters": [
+        {"name": "conversationId", "in": "path", "required": true, "schema": {"type": "string", "format": "uuid"}},
+        {"name": "runId", "in": "path", "required": true, "schema": {"type": "string", "format": "uuid"}}
+      ],
+      "post": {
+        "operationId": "cancelRun",
+        "summary": "Idempotently cancel a run",
+        "security": [{"SessionAuth": []}],
+        "parameters": [{"name": "Idempotency-Key", "in": "header", "required": true, "schema": {"type": "string", "minLength": 1, "maxLength": 200}}],
+        "responses": {
+          "202": {"description": "Cancellation requested", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Run"}}}},
+          "401": {"$ref": "#/components/responses/Error"},
+          "404": {"$ref": "#/components/responses/Error"},
+          "409": {"$ref": "#/components/responses/Error"}
+        }
+      }
+    },
+    "/api/v1/conversations/{conversationId}/runs/{runId}/retry": {
+      "parameters": [
+        {"name": "conversationId", "in": "path", "required": true, "schema": {"type": "string", "format": "uuid"}},
+        {"name": "runId", "in": "path", "required": true, "schema": {"type": "string", "format": "uuid"}}
+      ],
+      "post": {
+        "operationId": "retryRun",
+        "summary": "Retry a run with an explicit reason",
+        "security": [{"SessionAuth": []}],
+        "parameters": [{"name": "Idempotency-Key", "in": "header", "required": true, "schema": {"type": "string", "minLength": 1, "maxLength": 200}}],
+        "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/RetryRunRequest"}}}},
+        "responses": {
+          "202": {"description": "Retry queued", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Run"}}}},
+          "400": {"$ref": "#/components/responses/Error"},
+          "401": {"$ref": "#/components/responses/Error"},
+          "404": {"$ref": "#/components/responses/Error"},
+          "409": {"$ref": "#/components/responses/Error"},
+          "429": {"$ref": "#/components/responses/Error"}
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "SessionAuth": {"type": "apiKey", "in": "cookie", "name": "session"}
+    },
+    "responses": {
+      "Error": {
+        "description": "Stable error envelope",
+        "content": {
+          "application/json": {
+            "schema": {"$ref": "#/components/schemas/Error"}
+          }
+        }
+      }
+    },
+    "schemas": {
+      "Conversation": {"type": "object", "additionalProperties": false, "required": ["id", "projectId", "title", "createdAt", "updatedAt"], "properties": {"id": {"type": "string", "format": "uuid"}, "projectId": {"type": "string", "format": "uuid"}, "title": {"type": "string"}, "createdAt": {"type": "string", "format": "date-time"}, "updatedAt": {"type": "string", "format": "date-time"}}},
+      "Message": {"type": "object", "additionalProperties": false, "required": ["id", "projectId", "conversationId", "role", "content", "sequence", "createdAt"], "properties": {"id": {"type": "string", "format": "uuid"}, "projectId": {"type": "string", "format": "uuid"}, "conversationId": {"type": "string", "format": "uuid"}, "role": {"enum": ["system", "user", "assistant", "tool"]}, "content": {"type": "string"}, "sequence": {"type": "integer", "minimum": 1}, "createdAt": {"type": "string", "format": "date-time"}}},
+      "Run": {"type": "object", "additionalProperties": false, "required": ["id", "projectId", "conversationId", "attempt", "status", "modelProfileId", "createdAt", "updatedAt"], "properties": {"id": {"type": "string", "format": "uuid"}, "projectId": {"type": "string", "format": "uuid"}, "conversationId": {"type": "string", "format": "uuid"}, "retryOfRunId": {"type": ["string", "null"], "format": "uuid"}, "attempt": {"type": "integer", "minimum": 1}, "status": {"enum": ["queued", "running", "completed", "failed", "cancelled"]}, "modelProfileId": {"type": "string"}, "errorCode": {"type": ["string", "null"]}, "createdAt": {"type": "string", "format": "date-time"}, "updatedAt": {"type": "string", "format": "date-time"}}},
+      "RunEvent": {
+        "oneOf": [
+          {"$ref": "#/components/schemas/RunQueuedEvent"},
+          {"$ref": "#/components/schemas/RunStartedEvent"},
+          {"$ref": "#/components/schemas/OutputDeltaEvent"},
+          {"$ref": "#/components/schemas/ToolCallEvent"},
+          {"$ref": "#/components/schemas/ToolResultEvent"},
+          {"$ref": "#/components/schemas/RunCompletedEvent"},
+          {"$ref": "#/components/schemas/RunFailedEvent"},
+          {"$ref": "#/components/schemas/RunCancelledEvent"},
+          {"$ref": "#/components/schemas/HeartbeatEvent"}
+        ],
+        "discriminator": {"propertyName": "type"}
+      },
+      "RunEventCommon": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["schemaVersion", "eventId", "projectId", "conversationId", "runId", "sequence", "type", "createdAt", "data"],
+        "properties": {
+          "schemaVersion": {"const": "run-event/v1"},
+          "eventId": {"type": "string", "format": "uuid"},
+          "projectId": {"type": "string", "format": "uuid"},
+          "conversationId": {"type": "string", "format": "uuid"},
+          "runId": {"type": "string", "format": "uuid"},
+          "sequence": {"type": "integer", "minimum": 1},
+          "type": {"enum": ["run.queued", "run.started", "output.delta", "tool.call", "tool.result", "run.completed", "run.failed", "run.cancelled", "heartbeat"]},
+          "createdAt": {"type": "string", "format": "date-time"},
+          "data": {"type": "object"}
+        }
+      },
+      "RunEventUsage": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["inputTokens", "outputTokens"],
+        "properties": {
+          "inputTokens": {"type": "integer", "minimum": 0},
+          "outputTokens": {"type": "integer", "minimum": 0}
+        }
+      },
+      "RunQueuedEvent": {"allOf": [{"$ref": "#/components/schemas/RunEventCommon"}, {"properties": {"type": {"const": "run.queued"}, "data": {"type": "object", "additionalProperties": false, "required": ["queuePosition"], "properties": {"queuePosition": {"type": "integer", "minimum": 0}}}}}]},
+      "RunStartedEvent": {"allOf": [{"$ref": "#/components/schemas/RunEventCommon"}, {"properties": {"type": {"const": "run.started"}, "data": {"type": "object", "additionalProperties": false, "required": ["modelProfileId"], "properties": {"modelProfileId": {"type": "string", "minLength": 1}}}}}]},
+      "OutputDeltaEvent": {"allOf": [{"$ref": "#/components/schemas/RunEventCommon"}, {"properties": {"type": {"const": "output.delta"}, "data": {"type": "object", "additionalProperties": false, "required": ["text"], "properties": {"text": {"type": "string", "minLength": 1}}}}}]},
+      "ToolCallEvent": {"allOf": [{"$ref": "#/components/schemas/RunEventCommon"}, {"properties": {"type": {"const": "tool.call"}, "data": {"type": "object", "additionalProperties": false, "required": ["callId", "name", "arguments"], "properties": {"callId": {"type": "string", "minLength": 1}, "name": {"type": "string", "minLength": 1}, "arguments": {"type": "object"}}}}}]},
+      "ToolResultEvent": {"allOf": [{"$ref": "#/components/schemas/RunEventCommon"}, {"properties": {"type": {"const": "tool.result"}, "data": {"type": "object", "additionalProperties": false, "required": ["callId", "output"], "properties": {"callId": {"type": "string", "minLength": 1}, "output": {}}}}}]},
+      "RunCompletedEvent": {"allOf": [{"$ref": "#/components/schemas/RunEventCommon"}, {"properties": {"type": {"const": "run.completed"}, "data": {"type": "object", "additionalProperties": false, "required": ["finishReason", "usage"], "properties": {"finishReason": {"type": "string", "minLength": 1}, "usage": {"$ref": "#/components/schemas/RunEventUsage"}}}}}]},
+      "RunFailedEvent": {"allOf": [{"$ref": "#/components/schemas/RunEventCommon"}, {"properties": {"type": {"const": "run.failed"}, "data": {"type": "object", "additionalProperties": false, "required": ["errorCode", "errorMessage", "retryable"], "properties": {"errorCode": {"type": "string", "minLength": 1}, "errorMessage": {"type": "string", "minLength": 1}, "retryable": {"type": "boolean"}}}}}]},
+      "RunCancelledEvent": {"allOf": [{"$ref": "#/components/schemas/RunEventCommon"}, {"properties": {"type": {"const": "run.cancelled"}, "data": {"type": "object", "additionalProperties": false, "required": ["reason"], "properties": {"reason": {"type": "string", "minLength": 1}}}}}]},
+      "HeartbeatEvent": {"allOf": [{"$ref": "#/components/schemas/RunEventCommon"}, {"properties": {"type": {"const": "heartbeat"}, "data": {"type": "object", "additionalProperties": false, "required": ["cursor"], "properties": {"cursor": {"type": "integer", "minimum": 1}}}}}]},
+      "CreateConversationRequest": {"type": "object", "additionalProperties": false, "properties": {"title": {"type": "string", "maxLength": 200}}},
+      "SendMessageRequest": {"type": "object", "additionalProperties": false, "required": ["clientMessageId", "content"], "properties": {"clientMessageId": {"type": "string", "minLength": 1, "maxLength": 200}, "content": {"type": "string", "minLength": 1, "maxLength": 1048576}}},
+      "CreateRunRequest": {"type": "object", "additionalProperties": false, "required": ["triggerMessageId", "modelProfileId"], "properties": {"triggerMessageId": {"type": "string", "format": "uuid"}, "modelProfileId": {"type": "string", "minLength": 1, "maxLength": 120}}},
+      "RetryRunRequest": {"type": "object", "additionalProperties": false, "required": ["reason"], "properties": {"reason": {"type": "string", "minLength": 1, "maxLength": 2000}}},
+      "ProviderGenerateRequest": {"type": "object", "additionalProperties": false, "required": ["requestId", "projectId", "runId", "modelProfileId", "messages", "maxOutputBytes"], "properties": {"requestId": {"type": "string", "format": "uuid"}, "projectId": {"type": "string", "format": "uuid"}, "runId": {"type": "string", "format": "uuid"}, "modelProfileId": {"type": "string"}, "messages": {"type": "array", "minItems": 1, "items": {"$ref": "#/components/schemas/Message"}}, "maxOutputBytes": {"type": "integer", "minimum": 1}}},
+      "ProviderEvent": {"type": "object", "additionalProperties": false, "required": ["requestId", "type", "data"], "properties": {"requestId": {"type": "string", "format": "uuid"}, "type": {"enum": ["output.delta", "tool.call", "tool.result", "completed", "failed", "usage"]}, "data": {"type": "object"}}},
+      "Error": {"type": "object", "additionalProperties": false, "required": ["code", "message"], "properties": {"code": {"type": "string"}, "message": {"type": "string"}, "retryAfterSeconds": {"type": "integer", "minimum": 1}}}
+    }
+  }
+}

@@ -18,11 +18,11 @@ import (
 	platformdomain "github.com/worksflow/builder/backend/internal/domain"
 	"github.com/worksflow/builder/backend/internal/generation"
 	storage "github.com/worksflow/builder/backend/internal/storage/postgres"
+	"github.com/worksflow/builder/backend/internal/testsupport"
 	runtime "github.com/worksflow/builder/backend/internal/workflow"
 	"github.com/worksflow/builder/backend/migrations"
 	gormpostgres "gorm.io/driver/postgres"
 	"gorm.io/gorm"
-	"gorm.io/gorm/clause"
 	"gorm.io/gorm/logger"
 )
 
@@ -741,7 +741,7 @@ func TestConversationWorkbenchTargetUsesIndependentGovernanceManifestPostgres(t 
 	}
 }
 
-func TestAtomicWorkbenchCommandCompletionPostgres(t *testing.T) {
+func TestWorkbenchCommandCannotAdoptGovernedManualProposalPostgres(t *testing.T) {
 	database, cleanup := conversationPostgresDatabase(t)
 	defer cleanup()
 
@@ -750,116 +750,30 @@ func TestAtomicWorkbenchCommandCompletionPostgres(t *testing.T) {
 	completed, err := fixture.store.CompleteWorkbenchCommand(
 		ctx, fixture.claim, fixture.actorID, fixture.receipt,
 	)
-	if err != nil {
+	if !errors.Is(err, core.ErrConflict) || completed.Status == CommandExecuted {
+		t.Fatalf("legacy command adopted a governed manual Proposal: command=%+v err=%v", completed, err)
+	}
+	var persistedCommand storage.ConversationCommandModel
+	if err := database.Where("id = ?", fixture.commandID).Take(&persistedCommand).Error; err != nil {
 		t.Fatal(err)
 	}
-	if completed.Status != CommandExecuted || completed.Version != 3 ||
-		!strings.Contains(string(completed.Result), fixture.implementationProposalID.String()) {
-		t.Fatalf("unexpected atomic completion: %+v", completed)
+	if persistedCommand.Status != string(CommandPending) || persistedCommand.Version != 2 ||
+		persistedCommand.ExecutedAt != nil || persistedCommand.ExecutedBy != nil ||
+		persistedCommand.ExecutionClaim == nil || *persistedCommand.ExecutionClaim != fixture.claim.Token {
+		t.Fatalf("failed governed writeback mutated command or lease: %+v", persistedCommand)
 	}
-
-	cases := []struct {
-		name   string
-		mutate func(atomicWorkbenchFixture) error
-	}{
-		{
-			name: "workspace advanced",
-			mutate: func(fixture atomicWorkbenchFixture) error {
-				now := time.Now().UTC()
-				artifactID, revisionID := uuid.New(), uuid.New()
-				if err := database.Create(&storage.ArtifactModel{
-					ID: artifactID, ProjectID: fixture.projectID, Kind: "workspace", ArtifactKey: "WORKSPACE-MAIN",
-					Title: "Concurrent workspace", Lifecycle: "active", Version: 1, CreatedBy: fixture.actorID,
-					CreatedAt: now, UpdatedAt: now,
-				}).Error; err != nil {
-					return err
-				}
-				if err := database.Create(&storage.ArtifactRevisionModel{
-					ID: revisionID, ArtifactID: artifactID, RevisionNumber: 1, SchemaVersion: 1,
-					ContentStore: "mongo", ContentRef: "atomic-workspace", ContentHash: conversationTestHash("atomic-workspace-" + fixture.commandID.String()),
-					ByteSize: 1, WorkflowStatus: "approved", ChangeSource: "human", ChangeSummary: "Concurrent advance",
-					CreatedBy: fixture.actorID, CreatedAt: now, ApprovedAt: &now,
-				}).Error; err != nil {
-					return err
-				}
-				return database.Model(&storage.ArtifactModel{}).Where("id = ?", artifactID).
-					Updates(map[string]any{"latest_revision_id": revisionID, "latest_approved_revision_id": revisionID}).Error
-			},
-		},
-		{
-			name: "leaf rebased",
-			mutate: func(fixture atomicWorkbenchFixture) error {
-				derivedID := uuid.New()
-				derivedFromID := fixture.rootBundleID
-				group := fixture.manifestGroup
-				ordinal := 0
-				now := time.Now().UTC()
-				if err := database.Create(&storage.ApplicationBuildManifestModel{
-					ID: derivedID, ProjectID: fixture.projectID, WorkflowRunID: &fixture.runID,
-					RootManifestID: fixture.rootBundleID, DerivedFromID: &derivedFromID,
-					RootOrdinal: &ordinal, ManifestGroupKey: &group, DeliverySliceID: &fixture.deliverySliceID, SchemaVersion: 1, ContentStore: "mongo",
-					ContentRef: "atomic-rebased-" + derivedID.String(), ContentHash: conversationTestHash("atomic-rebased-" + derivedID.String()),
-					ManifestHash: conversationTestHash("atomic-rebased-manifest-" + derivedID.String()), Status: "frozen",
-					CreatedBy: fixture.actorID, CreatedAt: now,
-				}).Error; err != nil {
-					return err
-				}
-				reason := "concurrent_rebase"
-				return database.Model(&storage.ApplicationBuildManifestModel{}).Where("id = ?", fixture.rootBundleID).
-					Updates(map[string]any{"status": "invalidated", "invalidated_at": now, "invalidation_reason": reason}).Error
-			},
-		},
+	var persistedProposal storage.ImplementationProposalModel
+	if err := database.Where("id = ?", fixture.implementationProposalID).Take(&persistedProposal).Error; err != nil {
+		t.Fatal(err)
 	}
-	for _, testCase := range cases {
-		t.Run(testCase.name, func(t *testing.T) {
-			fixture := createAtomicWorkbenchFixture(t, database)
-			blocker := database.Begin()
-			if blocker.Error != nil {
-				t.Fatal(blocker.Error)
-			}
-			defer blocker.Rollback()
-			var locked storage.ConversationCommandModel
-			if err := blocker.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id = ?", fixture.commandID).
-				Take(&locked).Error; err != nil {
-				t.Fatal(err)
-			}
-			type completion struct {
-				command ConversationCommand
-				err     error
-			}
-			completed := make(chan completion, 1)
-			started := make(chan struct{})
-			go func() {
-				close(started)
-				command, err := fixture.store.CompleteWorkbenchCommand(
-					ctx, fixture.claim, fixture.actorID, fixture.receipt,
-				)
-				completed <- completion{command: command, err: err}
-			}()
-			<-started
-			if err := testCase.mutate(fixture); err != nil {
-				_ = blocker.Rollback().Error
-				t.Fatal(err)
-			}
-			if err := blocker.Commit().Error; err != nil {
-				t.Fatal(err)
-			}
-			outcome := <-completed
-			if !errors.Is(outcome.err, core.ErrConflict) || outcome.command.Status == CommandExecuted {
-				t.Fatalf("completion crossed concurrent mutation: command=%+v err=%v", outcome.command, outcome.err)
-			}
-			var persisted storage.ConversationCommandModel
-			if err := database.Where("id = ?", fixture.commandID).Take(&persisted).Error; err != nil {
-				t.Fatal(err)
-			}
-			if persisted.Status != string(CommandPending) || persisted.Version != 2 || persisted.ExecutedAt != nil {
-				t.Fatalf("failed atomic completion mutated command: %+v", persisted)
-			}
-		})
+	if persistedProposal.ExecutionSource != string(core.ImplementationSourceManualSubmission) ||
+		persistedProposal.Status != "open" || persistedProposal.Version != 1 ||
+		persistedProposal.ConversationCommandID != nil || persistedProposal.AppliedAt != nil || persistedProposal.AppliedBy != nil {
+		t.Fatalf("failed legacy adoption mutated governed Proposal: %+v", persistedProposal)
 	}
 }
 
-func TestWorkbenchCommandLeaseAllowsCrossActorRecoveryPostgres(t *testing.T) {
+func TestWorkbenchCommandLeaseTakeoverCannotAdoptGovernedManualProposalPostgres(t *testing.T) {
 	database, cleanup := conversationPostgresDatabase(t)
 	defer cleanup()
 	ctx := context.Background()
@@ -908,24 +822,32 @@ func TestWorkbenchCommandLeaseAllowsCrossActorRecoveryPostgres(t *testing.T) {
 				t.Fatalf("actor B could not take over actor A's %s command: %v", mode, err)
 			}
 			completed, err := fixture.store.CompleteWorkbenchCommand(ctx, claimB, actorB, fixture.receipt)
-			if err != nil {
-				t.Fatalf("actor B could not recover actor A's deterministic proposal: %v", err)
+			if !errors.Is(err, core.ErrConflict) || completed.Status == CommandExecuted {
+				t.Fatalf("actor B adopted actor A's governed manual Proposal: command=%+v err=%v", completed, err)
 			}
-			if completed.Status != CommandExecuted || completed.ExecutedBy == nil || *completed.ExecutedBy != actorB.String() {
-				t.Fatalf("cross-actor completion lost final executor: %+v", completed)
+			var command storage.ConversationCommandModel
+			if err := database.Where("id = ?", fixture.commandID).Take(&command).Error; err != nil {
+				t.Fatal(err)
+			}
+			if command.Status != string(CommandPending) || command.Version != claimB.Command.Version ||
+				command.ExecutionActorID == nil || *command.ExecutionActorID != actorB ||
+				command.ExecutionClaim == nil || *command.ExecutionClaim != claimB.Token || command.ExecutedAt != nil {
+				t.Fatalf("failed cross-actor adoption mutated command or takeover lease: %+v", command)
 			}
 			var proposal storage.ImplementationProposalModel
 			if err := database.Where("id = ?", fixture.implementationProposalID).Take(&proposal).Error; err != nil {
 				t.Fatal(err)
 			}
-			if proposal.CreatedBy != fixture.actorID {
-				t.Fatalf("takeover rewrote original generatedBy provenance: %+v", proposal)
+			if proposal.CreatedBy != fixture.actorID ||
+				proposal.ExecutionSource != string(core.ImplementationSourceManualSubmission) ||
+				proposal.Status != "open" || proposal.Version != 1 || proposal.ConversationCommandID != nil {
+				t.Fatalf("takeover rewrote governed manual Proposal provenance: %+v", proposal)
 			}
 		})
 	}
 }
 
-func TestWorkbenchCommandWithCommittedProposalCannotBeRejectedAfterReceiptLossPostgres(t *testing.T) {
+func TestWorkbenchCommandCanBeRejectedWhenOnlyGovernedManualProposalExistsPostgres(t *testing.T) {
 	database, cleanup := conversationPostgresDatabase(t)
 	defer cleanup()
 	ctx := context.Background()
@@ -938,7 +860,7 @@ func TestWorkbenchCommandWithCommittedProposalCannotBeRejectedAfterReceiptLossPo
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := fixture.store.RejectCommand(
+	rejected, err := fixture.store.RejectCommand(
 		ctx,
 		fixture.projectID,
 		fixture.conversationID,
@@ -946,15 +868,25 @@ func TestWorkbenchCommandWithCommittedProposalCannotBeRejectedAfterReceiptLossPo
 		fixture.actorID,
 		current.ETag,
 		"reject after generation",
-	); !errors.Is(err, core.ErrConflict) {
-		t.Fatalf("command with committed deterministic proposal was rejectable: %v", err)
+	)
+	if err != nil || rejected.Status != CommandRejected {
+		t.Fatalf("unbound governed manual Proposal held the legacy command hostage: command=%+v err=%v", rejected, err)
 	}
 	var persisted storage.ConversationCommandModel
 	if err := database.Where("id = ?", fixture.commandID).Take(&persisted).Error; err != nil {
 		t.Fatal(err)
 	}
-	if persisted.Status != string(CommandPending) || persisted.RejectedAt != nil {
-		t.Fatalf("rejected command mutated despite committed proposal: %+v", persisted)
+	if persisted.Status != string(CommandRejected) || persisted.RejectedAt == nil || persisted.RejectedBy == nil ||
+		*persisted.RejectedBy != fixture.actorID {
+		t.Fatalf("legacy command rejection was not committed atomically: %+v", persisted)
+	}
+	var proposal storage.ImplementationProposalModel
+	if err := database.Where("id = ?", fixture.implementationProposalID).Take(&proposal).Error; err != nil {
+		t.Fatal(err)
+	}
+	if proposal.ExecutionSource != string(core.ImplementationSourceManualSubmission) || proposal.Status != "open" ||
+		proposal.Version != 1 || proposal.ConversationCommandID != nil || proposal.AppliedAt != nil || proposal.AppliedBy != nil {
+		t.Fatalf("rejecting the legacy command mutated the unbound governed Proposal: %+v", proposal)
 	}
 }
 
@@ -1022,7 +954,7 @@ func createAtomicWorkbenchFixture(t *testing.T, database *gorm.DB) atomicWorkben
 func createAtomicWorkbenchFixtureWithGeneration(
 	t *testing.T,
 	database *gorm.DB,
-	completeGeneration bool,
+	seedGovernedManualProposal bool,
 ) atomicWorkbenchFixture {
 	t.Helper()
 	now := time.Now().UTC().Truncate(time.Microsecond)
@@ -1170,42 +1102,37 @@ func createAtomicWorkbenchFixtureWithGeneration(
 	if err != nil {
 		t.Fatal(err)
 	}
-	generationClaimID, generationToken := uuid.New(), uuid.New()
-	generationExpires := now.Add(10 * time.Minute)
-	commandIDCopy := commandID
-	if err := database.Create(&storage.ImplementationGenerationClaimModel{
-		ID: generationClaimID, BuildManifestID: rootBundleID, ProjectID: projectID, RootManifestID: rootBundleID,
-		RequestKey: commandID, ReservedProposalID: implementationProposalID,
-		ExecutionSource: string(core.ImplementationSourceConversationCommand), ConversationCommandID: &commandIDCopy,
-		GovernanceManifestID: &governanceManifestID, GovernanceManifestHash: &governanceHash,
-		GovernanceSourceRefs: encodedSources,
-		Instruction:          generationInstruction, InstructionHash: instructionHash,
-		RequestedModel: "gpt-5", GenerationContractVersion: "implementation-proposal-generation/v1",
-		SystemPromptHash: conversationTestHash("system-prompt"), OutputSchemaHash: conversationTestHash("output-schema"),
-		ActorID: actorID, ClaimToken: &generationToken,
-		ClaimExpiresAt: &generationExpires, Status: "processing", AttemptCount: 1, CreatedAt: now, UpdatedAt: now,
-	}).Error; err != nil {
-		t.Fatal(err)
-	}
-	if completeGeneration {
-		provider, model := "test-provider", "test-model"
-		if err := database.Create(&storage.ImplementationProposalModel{
+	if seedGovernedManualProposal {
+		completeCount := 0
+		proposal := &storage.ImplementationProposalModel{
 			ID: implementationProposalID, ProjectID: projectID, BuildManifestID: rootBundleID,
-			ExecutionSource: string(core.ImplementationSourceConversationCommand), ConversationCommandID: &commandIDCopy,
-			InstructionHash: &instructionHash, AIProvider: &provider, AIModel: &model,
-			Status: "open", Version: 1, ContentStore: "mongo", ContentRef: "atomic-proposal-" + fixtureID,
+			ExecutionSource: string(core.ImplementationSourceManualSubmission),
+			Status:          "open", Version: 1, ContentStore: "mongo", ContentRef: "atomic-proposal-" + fixtureID,
 			ContentHash: conversationTestHash("atomic-proposal-content-" + fixtureID),
 			PayloadHash: conversationTestHash("atomic-proposal-payload-" + fixtureID), OperationCount: 1,
+			UnimplementedCount: &completeCount, BlockingDiagnosticCount: &completeCount,
 			CreatedBy: actorID, CreatedAt: now.Add(time.Millisecond),
-		}).Error; err != nil {
-			t.Fatal(err)
 		}
-		if err := database.Model(&storage.ImplementationGenerationClaimModel{}).Where(
-			"id = ? AND claim_token = ?", generationClaimID, generationToken,
-		).Updates(map[string]any{
-			"status": "completed", "completed_proposal_id": implementationProposalID,
-			"claim_token": nil, "claim_expires_at": nil,
-		}).Error; err != nil {
+		testsupport.CreateBoundImplementationProposal(t, database, proposal)
+	} else {
+		generationClaimID, generationToken := uuid.New(), uuid.New()
+		generationExpires := now.Add(10 * time.Minute)
+		commandIDCopy := commandID
+		buildContract := testsupport.ReadyApplicationBuildContract(t, database, projectID, actorID, rootBundleID)
+		generationClaim := &storage.ImplementationGenerationClaimModel{
+			ID: generationClaimID, BuildManifestID: rootBundleID, ProjectID: projectID, RootManifestID: rootBundleID,
+			ApplicationBuildContractID: &buildContract.ID, ApplicationBuildContractHash: &buildContract.ContractHash,
+			RequestKey: commandID, ReservedProposalID: implementationProposalID,
+			ExecutionSource: string(core.ImplementationSourceConversationCommand), ConversationCommandID: &commandIDCopy,
+			GovernanceManifestID: &governanceManifestID, GovernanceManifestHash: &governanceHash,
+			GovernanceSourceRefs: encodedSources,
+			Instruction:          generationInstruction, InstructionHash: instructionHash,
+			RequestedModel: "gpt-5", GenerationContractVersion: "implementation-proposal-generation/v1",
+			SystemPromptHash: conversationTestHash("system-prompt"), OutputSchemaHash: conversationTestHash("output-schema"),
+			ActorID: actorID, ClaimToken: &generationToken,
+			ClaimExpiresAt: &generationExpires, Status: "processing", AttemptCount: 1, CreatedAt: now, UpdatedAt: now,
+		}
+		if err := database.Create(generationClaim).Error; err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -1287,14 +1214,16 @@ func createConversationWorkbenchLineage(
 	}).Error; err != nil {
 		t.Fatal(err)
 	}
-	if err := database.Create(&storage.ImplementationProposalModel{
-		ID: proposalID, ProjectID: projectID, BuildManifestID: leafID, Status: "open", Version: 1,
+	completeCount := 0
+	proposal := &storage.ImplementationProposalModel{
+		ID: proposalID, ProjectID: projectID, BuildManifestID: leafID,
+		ExecutionSource: string(core.ImplementationSourceManualSubmission), Status: "open", Version: 1,
 		ContentStore: "mongo", ContentRef: "conversation-" + group + "-proposal",
 		ContentHash: conversationTestHash(group + "-proposal-content"), PayloadHash: conversationTestHash(group + "-proposal-payload"),
-		OperationCount: 1, CreatedBy: userID, CreatedAt: now.Add(2 * time.Second),
-	}).Error; err != nil {
-		t.Fatal(err)
+		OperationCount: 1, UnimplementedCount: &completeCount, BlockingDiagnosticCount: &completeCount,
+		CreatedBy: userID, CreatedAt: now.Add(2 * time.Second),
 	}
+	testsupport.CreateBoundImplementationProposal(t, database, proposal)
 	var run storage.WorkflowRunModel
 	if err := database.Where("id = ? AND project_id = ?", runID, projectID).Take(&run).Error; err != nil {
 		t.Fatal(err)

@@ -1,0 +1,25 @@
+{
+  "schemaVersion": "deployment-contract/v1",
+  "services": [
+    {"id": "web", "role": "web", "sourceRoot": "apps/web", "portName": "web", "healthCheckId": "web-health", "buildOutput": "apps/web/.next"},
+    {"id": "api", "role": "api", "sourceRoot": "services/api", "portName": "api", "healthCheckId": "api-readiness", "buildOutput": "services/api/bin/server"}
+  ],
+  "ports": [
+    {"name": "web", "containerPort": 3000, "protocol": "http"},
+    {"name": "api", "containerPort": 8080, "protocol": "http"}
+  ],
+  "environmentVariables": [
+    {"name": "PUBLIC_API_ORIGIN", "required": true, "secret": false, "scope": "web-build"},
+    {"name": "DATABASE_URL", "required": true, "secret": true, "scope": "api-runtime"},
+    {"name": "SESSION_SIGNING_KEY", "required": true, "secret": true, "scope": "api-runtime"},
+    {"name": "AI_GATEWAY_URL", "required": true, "secret": false, "scope": "api-runtime"},
+    {"name": "AI_GATEWAY_CAPABILITY_FILE", "required": true, "secret": true, "scope": "api-runtime"},
+    {"name": "MODEL_PROFILE_ID", "required": true, "secret": false, "scope": "api-runtime"}
+  ],
+  "healthChecks": [
+    {"id": "web-health", "portName": "web", "method": "GET", "path": "/healthz", "expectedStatuses": [200]},
+    {"id": "api-readiness", "portName": "api", "method": "GET", "path": "/readyz", "expectedStatuses": [200]}
+  ],
+  "migration": {"required": true, "commandId": "api-migrate", "beforeTraffic": true},
+  "releasePolicy": {"strategy": "canary", "rollbackRequired": true, "immutableImages": true}
+}

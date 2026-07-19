@@ -3,6 +3,7 @@ package core
 import (
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/worksflow/builder/backend/internal/domain"
@@ -61,11 +62,12 @@ func decodeRequirementTrace(payload json.RawMessage) (requirementTraceSnapshot, 
 	if len(result.requirements) == 0 {
 		return requirementTraceSnapshot{}, fmt.Errorf("Requirement Baseline contains no stable requirement IDs")
 	}
-	for requirementID, acceptanceIDs := range result.acceptanceByRequirement {
+	for _, requirementID := range sortedSemanticKeys(result.acceptanceByRequirement) {
+		acceptanceIDs := result.acceptanceByRequirement[requirementID]
 		if result.mustRequirements[requirementID] && len(acceptanceIDs) == 0 {
 			return requirementTraceSnapshot{}, fmt.Errorf("Must Requirement %q has no acceptance criteria", requirementID)
 		}
-		for acceptanceID := range acceptanceIDs {
+		for _, acceptanceID := range sortedSemanticKeys(acceptanceIDs) {
 			if !result.acceptance[acceptanceID] {
 				return requirementTraceSnapshot{}, fmt.Errorf("Requirement %q references missing acceptance criterion %q", requirementID, acceptanceID)
 			}
@@ -89,6 +91,288 @@ func ValidateBlueprintAgainstRequirementBaseline(
 		return fmt.Errorf("validate Blueprint against Requirement Baseline trace: %w", err)
 	}
 	return nil
+}
+
+// ExactSemanticArtifact binds one immutable artifact revision to the payload
+// whose canonical hash it claims. It is intentionally storage-independent so
+// callers that already resolved canonical revisions can reuse the same strict
+// semantic authority checks as artifact review.
+type ExactSemanticArtifact struct {
+	Payload  json.RawMessage `json:"payload"`
+	Revision VersionRef      `json:"revision"`
+}
+
+// ExactSemanticAuthorityInput is the complete frozen authority chain required
+// to implement one Blueprint Page. All four payloads and revision pins are
+// validated before any semantic relation is trusted.
+type ExactSemanticAuthorityInput struct {
+	RequirementBaseline ExactSemanticArtifact `json:"requirementBaseline"`
+	Blueprint           ExactSemanticArtifact `json:"blueprint"`
+	PageSpec            ExactSemanticArtifact `json:"pageSpec"`
+	Prototype           ExactSemanticArtifact `json:"prototype"`
+}
+
+// ExactSemanticAPIOperation is an API operation owned by the selected
+// Blueprint Page through a calls/uses edge.
+type ExactSemanticAPIOperation struct {
+	ID     string `json:"id"`
+	Method string `json:"method"`
+	Path   string `json:"path"`
+}
+
+// ExactSemanticAuthority is the deterministic projection callers may compare
+// with separately validated machine contracts.
+type ExactSemanticAuthority struct {
+	PageNodeID         string                      `json:"pageNodeId"`
+	OwnedAPIOperations []ExactSemanticAPIOperation `json:"ownedApiOperations"`
+}
+
+// ExactSemanticAuthorityError gives non-storage callers a stable diagnostic
+// code and JSON path while retaining the detailed Core validation cause.
+type ExactSemanticAuthorityError struct {
+	Code  string
+	Path  string
+	Cause error
+}
+
+func (err *ExactSemanticAuthorityError) Error() string {
+	if err == nil {
+		return ""
+	}
+	if err.Cause == nil {
+		return err.Code
+	}
+	return err.Code + ": " + err.Cause.Error()
+}
+
+func (err *ExactSemanticAuthorityError) Unwrap() error {
+	if err == nil {
+		return nil
+	}
+	return err.Cause
+}
+
+// ValidateExactSemanticAuthority validates one immutable
+// Requirement Baseline -> Blueprint Page -> PageSpec -> Prototype chain. It
+// deliberately invokes the same strict semantic trace validators used by
+// artifact review, but performs no database or service calls.
+func ValidateExactSemanticAuthority(input ExactSemanticAuthorityInput) (ExactSemanticAuthority, error) {
+	artifacts := []struct {
+		name         string
+		kind         string
+		path         string
+		artifact     ExactSemanticArtifact
+		requireWhole bool
+	}{
+		{name: "Requirement Baseline", kind: "requirement_baseline", path: "$.requirementBaseline", artifact: input.RequirementBaseline, requireWhole: true},
+		{name: "Blueprint", kind: "blueprint", path: "$.blueprint", artifact: input.Blueprint},
+		{name: "PageSpec", kind: "page_spec", path: "$.pageSpec", artifact: input.PageSpec, requireWhole: true},
+		{name: "Prototype", kind: "prototype", path: "$.prototype", artifact: input.Prototype, requireWhole: true},
+	}
+	for _, candidate := range artifacts {
+		if err := validateExactSemanticArtifact(candidate.name, candidate.artifact, candidate.requireWhole); err != nil {
+			return ExactSemanticAuthority{}, exactSemanticAuthorityError(
+				"semantic_revision_invalid", candidate.path+".revision", err,
+			)
+		}
+		if finding, blocked := firstSemanticSchemaBlocker(ValidateArtifactContent(candidate.kind, candidate.artifact.Payload)); blocked {
+			return ExactSemanticAuthority{}, exactSemanticAuthorityError(
+				candidate.kind+"_schema_invalid", semanticSchemaPath(candidate.path+".payload", finding.Path),
+				fmt.Errorf("%s: %s", finding.Code, finding.Message),
+			)
+		}
+	}
+
+	trace, err := decodeRequirementTrace(input.RequirementBaseline.Payload)
+	if err != nil {
+		return ExactSemanticAuthority{}, exactSemanticAuthorityError(
+			"requirement_baseline_trace_invalid", "$.requirementBaseline.payload", err,
+		)
+	}
+	if err := validateBlueprintRequirementTrace(input.Blueprint.Payload, trace, true); err != nil {
+		return ExactSemanticAuthority{}, exactSemanticAuthorityError(
+			"blueprint_requirement_trace_invalid", "$.blueprint.payload", err,
+		)
+	}
+
+	nodes, edges, err := DecodeBlueprintSemanticGraph(input.Blueprint.Payload)
+	if err != nil {
+		return ExactSemanticAuthority{}, exactSemanticAuthorityError(
+			"blueprint_semantic_graph_invalid", "$.blueprint.payload", err,
+		)
+	}
+	var pageSpec map[string]any
+	if err := json.Unmarshal(input.PageSpec.Payload, &pageSpec); err != nil || pageSpec == nil {
+		if err == nil {
+			err = fmt.Errorf("PageSpec payload must be a JSON object")
+		}
+		return ExactSemanticAuthority{}, exactSemanticAuthorityError(
+			"page_spec_semantic_trace_invalid", "$.pageSpec.payload", err,
+		)
+	}
+	pageNodeID := strings.TrimSpace(firstString(pageSpec, "blueprintPageNodeId"))
+	var page *BlueprintSemanticNode
+	for index := range nodes {
+		if nodes[index].ID == pageNodeID && nodes[index].Kind == "page" {
+			page = &nodes[index]
+			break
+		}
+	}
+	if page == nil {
+		return ExactSemanticAuthority{}, exactSemanticAuthorityError(
+			"page_spec_blueprint_page_invalid", "$.pageSpec.payload.blueprintPageNodeId",
+			fmt.Errorf("PageSpec blueprintPageNodeId %q does not identify a semantic Page in the exact Blueprint revision", pageNodeID),
+		)
+	}
+	if hasVersionAnchor(input.Blueprint.Revision) && strings.TrimSpace(*input.Blueprint.Revision.AnchorID) != pageNodeID {
+		return ExactSemanticAuthority{}, exactSemanticAuthorityError(
+			"page_spec_blueprint_page_invalid", "$.blueprint.revision.anchorId",
+			fmt.Errorf("Blueprint revision anchor must match PageSpec blueprintPageNodeId %q", pageNodeID),
+		)
+	}
+
+	relations := blueprintPageRelations(*page, nodes, edges)
+	nodeByID := make(map[string]BlueprintSemanticNode, len(nodes))
+	for _, node := range nodes {
+		nodeByID[node.ID] = node
+	}
+	for index, binding := range objectSlice(pageSpec["dataBindings"]) {
+		if strings.TrimSpace(firstString(binding, "source")) != "api" {
+			continue
+		}
+		operationID := strings.TrimSpace(firstString(binding, "operationId"))
+		if operationID == "" || !relations.ownedAPIs[operationID] {
+			return ExactSemanticAuthority{}, exactSemanticAuthorityError(
+				"page_spec_api_ownership_invalid", fmt.Sprintf("$.pageSpec.payload.dataBindings[%d].operationId", index),
+				fmt.Errorf("PageSpec API operation %q is not owned by Blueprint Page %q through calls/uses", operationID, pageNodeID),
+			)
+		}
+		if !relations.protectedAPIs[operationID] {
+			return ExactSemanticAuthority{}, exactSemanticAuthorityError(
+				"blueprint_api_permission_missing", "$.blueprint.payload",
+				fmt.Errorf("Blueprint API operation %q has no requires edge to a Permission node", operationID),
+			)
+		}
+	}
+
+	ownedOperationIDs := sortedSemanticKeys(relations.ownedAPIs)
+	ownedOperations := make([]ExactSemanticAPIOperation, 0, len(ownedOperationIDs))
+	for _, operationID := range ownedOperationIDs {
+		operation := nodeByID[operationID]
+		if operation.ID == "" || (operation.Kind != "apioperation" && operation.Kind != "api") {
+			return ExactSemanticAuthority{}, exactSemanticAuthorityError(
+				"blueprint_page_api_invalid", "$.blueprint.payload",
+				fmt.Errorf("Blueprint Page %q calls/uses non-API node %q", pageNodeID, operationID),
+			)
+		}
+		if !relations.protectedAPIs[operationID] {
+			return ExactSemanticAuthority{}, exactSemanticAuthorityError(
+				"blueprint_api_permission_missing", "$.blueprint.payload",
+				fmt.Errorf("Blueprint API operation %q has no requires edge to a Permission node", operationID),
+			)
+		}
+		ownedOperations = append(ownedOperations, ExactSemanticAPIOperation{
+			ID: operation.ID, Method: operation.Method, Path: operation.Path,
+		})
+	}
+
+	if err := validatePageSpecSemanticTrace(input.PageSpec.Payload, *page, nodes, edges, trace, true); err != nil {
+		return ExactSemanticAuthority{}, exactSemanticAuthorityError(
+			"page_spec_semantic_trace_invalid", "$.pageSpec.payload", err,
+		)
+	}
+
+	var prototype map[string]any
+	if err := json.Unmarshal(input.Prototype.Payload, &prototype); err != nil || prototype == nil {
+		if err == nil {
+			err = fmt.Errorf("Prototype payload must be a JSON object")
+		}
+		return ExactSemanticAuthority{}, exactSemanticAuthorityError(
+			"prototype_semantic_trace_invalid", "$.prototype.payload", err,
+		)
+	}
+	pageSpecRevision, refOK := semanticVersionRef(prototype["pageSpecRevision"])
+	if !refOK || !sameWholeVersionRef(pageSpecRevision, input.PageSpec.Revision) {
+		return ExactSemanticAuthority{}, exactSemanticAuthorityError(
+			"prototype_page_spec_revision_mismatch", "$.prototype.payload.pageSpecRevision",
+			fmt.Errorf("Prototype pageSpecRevision does not exactly match the frozen PageSpec revision"),
+		)
+	}
+	if exploratory, exists := prototype["exploratory"].(bool); !exists || exploratory {
+		return ExactSemanticAuthority{}, exactSemanticAuthorityError(
+			"prototype_formal_required", "$.prototype.payload.exploratory",
+			fmt.Errorf("strict semantic authority requires an explicit non-exploratory Prototype"),
+		)
+	}
+
+	authority := prototypeSemanticAuthority{
+		requirementIDs:     stringSet(page.RequirementIDs),
+		acceptanceIDs:      pageAcceptanceSet(*page, trace),
+		pageNodeID:         pageNodeID,
+		pageSpecArtifactID: input.PageSpec.Revision.ArtifactID,
+		baselineRef:        input.RequirementBaseline.Revision,
+		pageSpecRef:        input.PageSpec.Revision,
+	}
+	authority.blueprintRef = input.Blueprint.Revision
+	if !hasVersionAnchor(authority.blueprintRef) {
+		authority.blueprintRef.AnchorID = &pageNodeID
+	}
+	if err := validatePrototypeSemanticTrace(input.Prototype.Payload, input.PageSpec.Payload, true, authority); err != nil {
+		return ExactSemanticAuthority{}, exactSemanticAuthorityError(
+			"prototype_semantic_trace_invalid", "$.prototype.payload", err,
+		)
+	}
+	return ExactSemanticAuthority{PageNodeID: pageNodeID, OwnedAPIOperations: ownedOperations}, nil
+}
+
+func validateExactSemanticArtifact(name string, artifact ExactSemanticArtifact, requireWhole bool) error {
+	reference := artifact.Revision
+	if strings.TrimSpace(reference.ArtifactID) == "" || strings.TrimSpace(reference.RevisionID) == "" ||
+		!domain.IsCanonicalHash(strings.TrimSpace(reference.ContentHash)) {
+		return fmt.Errorf("%s requires an exact artifact ID, revision ID, and canonical content hash", name)
+	}
+	if requireWhole && hasVersionAnchor(reference) {
+		return fmt.Errorf("%s authority must pin a whole revision without an anchor", name)
+	}
+	actualHash, err := domain.CanonicalHash(artifact.Payload)
+	if err != nil {
+		return fmt.Errorf("hash %s payload: %w", name, err)
+	}
+	expectedHash := strings.TrimPrefix(strings.TrimSpace(reference.ContentHash), "sha256:")
+	if actualHash != expectedHash {
+		return fmt.Errorf("%s payload hash %s does not match exact revision hash %s", name, actualHash, reference.ContentHash)
+	}
+	return nil
+}
+
+func exactSemanticAuthorityError(code, path string, cause error) *ExactSemanticAuthorityError {
+	return &ExactSemanticAuthorityError{Code: code, Path: path, Cause: cause}
+}
+
+func firstSemanticSchemaBlocker(report ValidationReport) (ValidationFinding, bool) {
+	blockers := make([]ValidationFinding, 0, len(report.Findings))
+	for _, finding := range report.Findings {
+		if finding.Severity == "blocker" {
+			blockers = append(blockers, finding)
+		}
+	}
+	if len(blockers) == 0 {
+		return ValidationFinding{}, false
+	}
+	sort.Slice(blockers, func(left, right int) bool {
+		leftKey := blockers[left].Code + "\x00" + blockers[left].Path + "\x00" + blockers[left].Message
+		rightKey := blockers[right].Code + "\x00" + blockers[right].Path + "\x00" + blockers[right].Message
+		return leftKey < rightKey
+	})
+	return blockers[0], true
+}
+
+func semanticSchemaPath(prefix, findingPath string) string {
+	findingPath = strings.TrimSpace(findingPath)
+	if findingPath == "" || findingPath == "$" {
+		return prefix
+	}
+	return prefix + strings.TrimPrefix(findingPath, "$")
 }
 
 func validateBlueprintRequirementTrace(payload json.RawMessage, trace requirementTraceSnapshot, strictValues ...bool) error {
@@ -124,7 +408,7 @@ func validateBlueprintRequirementTrace(payload json.RawMessage, trace requiremen
 		}
 	}
 	if semanticStrict(strictValues) {
-		for requirementID := range trace.mustRequirements {
+		for _, requirementID := range sortedSemanticKeys(trace.mustRequirements) {
 			if !covered[requirementID] {
 				return fmt.Errorf("Blueprint does not cover Must Requirement Baseline ID %q", requirementID)
 			}
@@ -252,6 +536,13 @@ func validatePageSpecSemanticTrace(
 		return fmt.Errorf("PageSpec content must be a JSON object")
 	}
 	strict := semanticStrict(strictValues)
+	title := strings.TrimSpace(firstString(content, "title"))
+	// PageSpec titles are editable while the artifact is still a draft or an
+	// exploratory Prototype source. Formal review and frozen BuildContract
+	// compilation use strict mode and must preserve the Blueprint Page title.
+	if strict && title != page.Title {
+		return fmt.Errorf("PageSpec title must exactly match its Blueprint Page")
+	}
 	route := strings.TrimSpace(firstString(content, "route"))
 	if (strict && route != page.Route) || (!strict && route != "" && route != page.Route) {
 		return fmt.Errorf("PageSpec route must exactly match its Blueprint Page")
@@ -296,7 +587,7 @@ func validatePageSpecSemanticTrace(
 		}
 	}
 	if strict {
-		for acceptanceID := range allowedAcceptance {
+		for _, acceptanceID := range sortedSemanticKeys(allowedAcceptance) {
 			if !usedAcceptance[acceptanceID] {
 				return fmt.Errorf("PageSpec does not cover acceptance criterion %q required by its Blueprint Page", acceptanceID)
 			}
@@ -320,7 +611,7 @@ func validatePageSpecSemanticTrace(
 		usedAPIs[operationID] = true
 	}
 	if strict {
-		for operationID := range relations.requiredAPIs {
+		for _, operationID := range sortedSemanticKeys(relations.requiredAPIs) {
 			if !usedAPIs[operationID] {
 				return fmt.Errorf("PageSpec does not realize required Blueprint API edge to %q", operationID)
 			}
@@ -328,7 +619,7 @@ func validatePageSpecSemanticTrace(
 	}
 
 	roles := stringSet(stringSlice(content["requiredRoles"]))
-	for role := range roles {
+	for _, role := range sortedSemanticKeys(roles) {
 		if !relations.allowedRoles[role] {
 			return fmt.Errorf("PageSpec required role %q is not authorized by a Page requires Permission edge", role)
 		}
@@ -357,7 +648,7 @@ func validatePageSpecSemanticTrace(
 		usedNavigation[targetNodeID] = true
 	}
 	if strict {
-		for targetNodeID := range relations.requiredNavigation {
+		for _, targetNodeID := range sortedSemanticKeys(relations.requiredNavigation) {
 			if !usedNavigation[targetNodeID] {
 				return fmt.Errorf("PageSpec does not realize required Blueprint navigation to %q", targetNodeID)
 			}
@@ -438,7 +729,8 @@ func validatePrototypeSemanticTrace(
 		}
 	}
 	if requireCoverage {
-		for id, state := range pageSpecStates {
+		for _, id := range sortedSemanticKeys(pageSpecStates) {
+			state := pageSpecStates[id]
 			candidate := prototypeStates[id]
 			if candidate == nil || strings.TrimSpace(firstString(candidate, "key")) != strings.TrimSpace(firstString(state, "key", "name")) {
 				return fmt.Errorf("Prototype does not contain PageSpec state %q with the same stable id/key", id)
@@ -462,11 +754,12 @@ func validatePrototypeSemanticTrace(
 		frameCoverage[stateID+"\x00"+breakpointID] = true
 	}
 	if requireCoverage {
-		for stateID, state := range pageSpecStates {
+		for _, stateID := range sortedSemanticKeys(pageSpecStates) {
+			state := pageSpecStates[stateID]
 			if !pageSpecStateRequired(state) {
 				continue
 			}
-			for breakpointID := range breakpoints {
+			for _, breakpointID := range sortedSemanticKeys(breakpoints) {
 				if !frameCoverage[stateID+"\x00"+breakpointID] {
 					return fmt.Errorf("required PageSpec state %q has no Prototype frame at breakpoint %q", stateID, breakpointID)
 				}
@@ -487,7 +780,8 @@ func validatePrototypeSemanticTrace(
 	}
 
 	declaredFixtureState := map[string]string{}
-	for stateID, state := range pageSpecStates {
+	for _, stateID := range sortedSemanticKeys(pageSpecStates) {
+		state := pageSpecStates[stateID]
 		for _, fixtureID := range stringSlice(state["fixtureIds"]) {
 			if fixtureID = strings.TrimSpace(fixtureID); fixtureID != "" {
 				if prior := declaredFixtureState[fixtureID]; prior != "" && prior != stateID {
@@ -524,9 +818,10 @@ func validatePrototypeSemanticTrace(
 			}
 		}
 	}
-	for stateID, state := range prototypeStates {
+	for _, stateID := range sortedSemanticKeys(prototypeStates) {
+		state := prototypeStates[stateID]
 		fixtureIDs := stringSet(stringSlice(state["fixtureIds"]))
-		for fixtureID := range fixtureIDs {
+		for _, fixtureID := range sortedSemanticKeys(fixtureIDs) {
 			fixture := prototypeFixtures[fixtureID]
 			if fixture == nil || strings.TrimSpace(firstString(fixture, "stateId")) != stateID {
 				return fmt.Errorf("Prototype state %q references missing or foreign fixture %q", stateID, fixtureID)
@@ -537,7 +832,7 @@ func validatePrototypeSemanticTrace(
 		}
 	}
 	if requireCoverage {
-		for fixtureID := range declaredFixtureState {
+		for _, fixtureID := range sortedSemanticKeys(declaredFixtureState) {
 			if prototypeFixtures[fixtureID] == nil {
 				return fmt.Errorf("Prototype is missing PageSpec fixture %q", fixtureID)
 			}
@@ -620,14 +915,15 @@ func validatePrototypeSemanticTrace(
 		}
 	}
 	if requireCoverage {
-		for interactionID := range pageSpecInteractions {
+		for _, interactionID := range sortedSemanticKeys(pageSpecInteractions) {
 			if prototypeInteractions[interactionID] == nil {
 				return fmt.Errorf("Prototype is missing PageSpec interaction %q", interactionID)
 			}
 		}
 	}
 
-	for layerID, layer := range layers {
+	for _, layerID := range sortedSemanticKeys(layers) {
+		layer := layers[layerID]
 		if bindingID := strings.TrimSpace(firstString(layer, "dataBindingId")); bindingID != "" {
 			if pageSpecBindings[bindingID] == nil {
 				return fmt.Errorf("Prototype layer %q references unknown PageSpec data binding %q", layerID, bindingID)
@@ -643,7 +939,8 @@ func validatePrototypeSemanticTrace(
 			return fmt.Errorf("Prototype layer %q has an invalid componentRef", layerID)
 		}
 	}
-	for bindingID, binding := range pageSpecBindings {
+	for _, bindingID := range sortedSemanticKeys(pageSpecBindings) {
+		binding := pageSpecBindings[bindingID]
 		if requireCoverage && boolean(binding["required"]) && !referencedBindings[bindingID] {
 			return fmt.Errorf("Prototype does not realize required PageSpec data binding %q", bindingID)
 		}
@@ -732,10 +1029,14 @@ func validatePrototypeAuxiliaryReferences(
 			return fmt.Errorf("Prototype override %q references unknown breakpoint", id)
 		}
 	}
-	for field, required := range map[string][]string{
-		"tokenBindings":     {"propertyPath", "tokenId"},
-		"componentBindings": {"componentId", "componentVersion"},
+	for _, contract := range []struct {
+		field    string
+		required []string
+	}{
+		{field: "tokenBindings", required: []string{"propertyPath", "tokenId"}},
+		{field: "componentBindings", required: []string{"componentId", "componentVersion"}},
 	} {
+		field, required := contract.field, contract.required
 		seen = map[string]bool{}
 		for _, binding := range objectSlice(prototype[field]) {
 			id := strings.TrimSpace(firstString(binding, "id"))
@@ -900,10 +1201,19 @@ func sameSemanticSet(left, right map[string]bool) bool {
 	if len(left) != len(right) {
 		return false
 	}
-	for value := range left {
+	for _, value := range sortedSemanticKeys(left) {
 		if !right[value] {
 			return false
 		}
 	}
 	return true
+}
+
+func sortedSemanticKeys[T any](values map[string]T) []string {
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
 }

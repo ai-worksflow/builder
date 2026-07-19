@@ -6,6 +6,7 @@ import (
 	"math"
 	"strings"
 
+	"github.com/worksflow/builder/backend/internal/contracts"
 	"github.com/worksflow/builder/backend/internal/domain"
 )
 
@@ -45,6 +46,26 @@ func ValidateArtifactContent(kind string, payload json.RawMessage) ValidationRep
 		findings = append(findings, validatePageSpec(value)...)
 	case "prototype":
 		findings = append(findings, validatePrototype(value)...)
+	case contracts.KindAPI, contracts.KindData, contracts.KindPermission:
+		// These artifact kinds predate the machine-contract schemas. Historical
+		// prose documents without a schemaVersion remain reviewable, while any
+		// document that opts into a machine schema is validated fail closed. The
+		// BuildContract compiler always calls contracts.Inspect directly, so
+		// legacy prose can never become trusted implementation input.
+		if _, machineContract := value["schemaVersion"]; !machineContract {
+			break
+		}
+		for _, finding := range contracts.Validate(kind, payload) {
+			findings = append(findings, ValidationFinding{
+				Code: finding.Code, Path: finding.Path, Message: finding.Message, Severity: finding.Severity,
+			})
+		}
+	case contracts.KindAIRuntime, contracts.KindDeployment, contracts.KindVerification:
+		for _, finding := range contracts.Validate(kind, payload) {
+			findings = append(findings, ValidationFinding{
+				Code: finding.Code, Path: finding.Path, Message: finding.Message, Severity: finding.Severity,
+			})
+		}
 	}
 	valid := true
 	for _, finding := range findings {

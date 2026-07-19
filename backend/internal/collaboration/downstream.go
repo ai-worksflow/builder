@@ -99,19 +99,7 @@ func (s *Service) GenerateDownstreamDocument(
 	if !ok {
 		return DownstreamDocumentGeneration{}, core.ErrInvalidInput
 	}
-	scaffold, err := json.Marshal(map[string]any{
-		"schemaVersion":      1,
-		"kind":               documentContentKind,
-		"summary":            "",
-		"blocks":             []any{},
-		"acceptanceCriteria": []any{},
-		"requirements":       []any{},
-		"openQuestions":      []any{},
-		"assumptions":        []any{},
-		"generation": map[string]any{
-			"state": "awaiting_reviewable_proposal", "sourceRevision": input.SourceRevision,
-		},
-	})
+	scaffold, err := downstreamDocumentScaffold(input.TargetKind, documentContentKind, input.SourceRevision)
 	if err != nil {
 		return DownstreamDocumentGeneration{}, err
 	}
@@ -257,6 +245,77 @@ func (s *Service) GenerateDownstreamDocument(
 		Provider: command.Provider, Model: command.Model, CommandID: command.ID.String(),
 		ResolvedOwnerIDs: resolvedOwnerIDs,
 	}, nil
+}
+
+func downstreamDocumentScaffold(
+	artifactKind, contentKind string,
+	source core.VersionRef,
+) (json.RawMessage, error) {
+	var value any
+	switch artifactKind {
+	case "api_contract":
+		value = map[string]any{
+			"schemaVersion": "api-contract/v1", "openapi": "3.1.0",
+			"info": map[string]any{
+				"title": "Generated API contract draft", "version": "0.0.0-draft",
+				"description": "Structurally valid placeholder; replace through the governed Proposal before review.",
+			},
+			"paths": map[string]any{
+				"/__pending_contract_review": map[string]any{
+					"get": map[string]any{
+						"operationId": "reviewPendingContract",
+						"responses": map[string]any{"501": map[string]any{
+							"description": "The generated contract has not been reviewed.",
+						}},
+					},
+				},
+			},
+		}
+	case "data_contract":
+		value = map[string]any{
+			"schemaVersion": "data-contract/v1",
+			"entities": []any{map[string]any{
+				"id": "PendingContractReview", "tableName": "pending_contract_review",
+				"fields": []any{map[string]any{
+					"id": "id", "name": "id", "type": "uuid", "nullable": false,
+				}},
+				"primaryKey": []string{"id"}, "indexes": []any{},
+				"tenantScope": map[string]any{"mode": "global"},
+			}},
+			"migrationPolicy": map[string]any{
+				"tool": "pending", "directory": "migrations",
+				"applyCommandId": "migrate", "rollbackPolicy": "required",
+			},
+		}
+	case "permission_contract":
+		value = map[string]any{
+			"schemaVersion": "permission-contract/v1",
+			"identity":      map[string]any{"subjectClaim": "sub", "authentication": "session"},
+			"tenant":        map[string]any{"mode": "project", "claim": "project_id"},
+			"roles":         []any{map[string]any{"id": "PendingReviewer"}},
+			"policies": []any{map[string]any{
+				"id": "ReviewPendingContract", "roles": []string{"PendingReviewer"},
+				"resource": "pending_contract_review", "actions": []string{"review"},
+				"tenantScoped": true, "effect": "allow",
+			}},
+		}
+	default:
+		value = map[string]any{
+			"schemaVersion":      1,
+			"kind":               contentKind,
+			"summary":            "",
+			"blocks":             []any{},
+			"acceptanceCriteria": []any{},
+			"requirements":       []any{},
+			"openQuestions":      []any{},
+			"assumptions":        []any{},
+			"generation": map[string]any{
+				"state": "awaiting_reviewable_proposal", "sourceRevision": source,
+			},
+		}
+	}
+	payload, err := json.Marshal(value)
+	return json.RawMessage(payload), err
 }
 
 func downstreamDocumentContentKind(artifactKind string) (string, bool) {

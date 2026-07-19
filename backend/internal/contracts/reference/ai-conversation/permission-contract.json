@@ -1,0 +1,16 @@
+{
+  "schemaVersion": "permission-contract/v1",
+  "identity": {"subjectClaim": "sub", "authentication": "session"},
+  "tenant": {"mode": "project", "claim": "project_id"},
+  "roles": [
+    {"id": "conversation-member", "description": "Use AI conversations within an assigned project."},
+    {"id": "conversation-admin", "description": "Administer retention and audit access within an assigned project."}
+  ],
+  "policies": [
+    {"id": "conversation-member-conversations", "roles": ["conversation-member", "conversation-admin"], "resource": "conversations", "actions": ["create", "read", "list"], "tenantScoped": true, "effect": "allow"},
+    {"id": "conversation-member-messages", "roles": ["conversation-member", "conversation-admin"], "resource": "messages", "actions": ["create", "read", "list"], "tenantScoped": true, "effect": "allow"},
+    {"id": "conversation-member-runs", "roles": ["conversation-member", "conversation-admin"], "resource": "runs", "actions": ["create", "read", "list", "cancel", "retry"], "tenantScoped": true, "effect": "allow"},
+    {"id": "conversation-member-run-events", "roles": ["conversation-member", "conversation-admin"], "resource": "run_events", "actions": ["read", "stream", "resume"], "tenantScoped": true, "effect": "allow"},
+    {"id": "conversation-admin-audit", "roles": ["conversation-admin"], "resource": "ai_audit", "actions": ["read", "export"], "tenantScoped": true, "effect": "allow"}
+  ]
+}

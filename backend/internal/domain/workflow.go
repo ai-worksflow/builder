@@ -75,7 +75,8 @@ func validWorkflowArtifactKind(kind string) bool {
 		"reference_source", "change_request", "requirement_baseline", "blueprint",
 		"page_spec", "prototype", "prototype_flow", "fixture_bundle", "design_system",
 		"token_set", "component_registry", "api_contract", "data_contract",
-		"permission_contract", "workspace", "test_report", "quality_report":
+		"permission_contract", "ai_runtime_contract", "deployment_contract",
+		"verification_contract", "workspace", "test_report", "quality_report":
 		return true
 	default:
 		return false
@@ -90,7 +91,8 @@ func WorkflowArtifactTypeForKind(kind string) (ArtifactType, bool) {
 	case "project_brief", "product_requirements", "decision_record", "glossary_policy",
 		"reference_source", "change_request", "requirement_baseline":
 		return ArtifactDocument, true
-	case "blueprint", "page_spec", "api_contract", "data_contract", "permission_contract":
+	case "blueprint", "page_spec", "api_contract", "data_contract", "permission_contract",
+		"ai_runtime_contract", "deployment_contract", "verification_contract":
 		return ArtifactBlueprint, true
 	case "prototype", "prototype_flow", "fixture_bundle", "design_system", "token_set", "component_registry":
 		return ArtifactPrototype, true

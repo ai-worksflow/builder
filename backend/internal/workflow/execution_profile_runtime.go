@@ -29,8 +29,8 @@ func sealRuntimeV1(bootstrap workflowExecutionRuntime, descriptor WorkflowExecut
 }
 
 func sealRuntimeV2(bootstrap workflowExecutionRuntime, descriptor WorkflowExecutionProfileDescriptor) (workflowExecutionRuntime, error) {
-	if descriptor.Components != CurrentWorkflowExecutionProfileDescriptor().Components {
-		return workflowExecutionRuntime{}, &domain.DomainError{Kind: domain.ErrConflict, Field: "workflow.executionProfile", Message: "current runtime component identity drifted"}
+	if descriptor.Components != WorkflowExecutionProfileV2Descriptor().Components {
+		return workflowExecutionRuntime{}, &domain.DomainError{Kind: domain.ErrConflict, Field: "workflow.executionProfile", Message: "workflow-engine/v2 runtime component identity drifted"}
 	}
 	runtime := cloneExecutionRuntime(bootstrap)
 	runtime.conditionEvaluator = DeclarativeConditionEvaluatorV1{}

@@ -36,6 +36,8 @@ CREATE TEMP TABLE implementation_generation_claims (
   id uuid PRIMARY KEY,
   build_manifest_id uuid NOT NULL,
   project_id uuid NOT NULL,
+  application_build_contract_id uuid,
+  application_build_contract_hash text,
   root_manifest_id uuid NOT NULL,
   request_key uuid NOT NULL UNIQUE,
   reserved_proposal_id uuid NOT NULL UNIQUE,
@@ -96,16 +98,27 @@ CREATE TEMP TABLE outbox_events (
 	if err != nil {
 		t.Fatal(err)
 	}
-	replay := currentImplementationGenerationReplayIdentity(instructionJSON, instructionHash, "gpt-5")
+	applicationBuildContractID := uuid.New()
+	applicationBuildContract := core.ApplicationBuildContractRef{
+		ID: applicationBuildContractID.String(), ContractHash: strings.Repeat("a", 64),
+	}
+	replay, err := currentImplementationGenerationReplayIdentity(
+		instructionJSON, instructionHash, "gpt-5", applicationBuildContract,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
 	completedProposalID := commandID
 	now := time.Now().UTC()
 	if err := transaction.Create(&storage.ImplementationGenerationClaimModel{
 		ID: uuid.New(), BuildManifestID: leafID, ProjectID: projectID, RootManifestID: rootID,
-		RequestKey: commandID, ReservedProposalID: commandID,
+		ApplicationBuildContractID:   &applicationBuildContractID,
+		ApplicationBuildContractHash: &applicationBuildContract.ContractHash,
+		RequestKey:                   commandID, ReservedProposalID: commandID,
 		ExecutionSource: string(core.ImplementationSourceConversationCommand), ConversationCommandID: &commandID,
 		GovernanceManifestID: &governanceManifestID, GovernanceManifestHash: &governanceHash,
 		GovernanceSourceRefs: governanceRefs,
-		Instruction:          instructionJSON, InstructionHash: instructionHash, RequestedModel: replay.RequestedModel,
+		Instruction:          replay.Instruction, InstructionHash: instructionHash, RequestedModel: replay.RequestedModel,
 		GenerationContractVersion: replay.GenerationContractVersion, SystemPromptHash: replay.SystemPromptHash,
 		OutputSchemaHash: replay.OutputSchemaHash, ActorID: actorA, Status: "completed", AttemptCount: 1,
 		CompletedProposalID: &completedProposalID, CreatedAt: now, UpdatedAt: now,
@@ -115,8 +128,9 @@ CREATE TEMP TABLE outbox_events (
 	commandIDString := commandID.String()
 	request := ImplementationGenerationRequest{
 		ActorID: actorB.String(), Model: "gpt-5", Instruction: instruction,
-		ExecutionSource: core.ImplementationSourceConversationCommand,
-		RequestKey:      commandIDString, ProposalID: commandIDString, ConversationCommandID: &commandIDString,
+		ApplicationBuildContract: applicationBuildContract,
+		ExecutionSource:          core.ImplementationSourceConversationCommand,
+		RequestKey:               commandIDString, ProposalID: commandIDString, ConversationCommandID: &commandIDString,
 		GovernanceManifest:   &domain.ManifestRef{ID: governanceManifestID.String(), Hash: governanceHash},
 		GovernanceSourceRefs: []domain.ArtifactRef{{ArtifactID: "a", RevisionID: "r", ContentHash: "sha256:content"}},
 	}
@@ -124,7 +138,8 @@ CREATE TEMP TABLE outbox_events (
 	proposal := core.ImplementationProposal{
 		ID: commandIDString, BuildManifestID: leafID.String(), CreatedBy: actorA.String(), Status: "open", Version: 1,
 		ExecutionSource: core.ImplementationSourceConversationCommand, ConversationCommandID: &commandIDString,
-		InstructionHash: instructionHash,
+		InstructionHash:          instructionHash,
+		ApplicationBuildContract: &applicationBuildContract,
 	}
 	service := &Service{database: transaction}
 	if _, err := service.recoverCompletedImplementationClaim(
@@ -141,11 +156,20 @@ CREATE TEMP TABLE outbox_events (
 		t.Fatalf("changed requested model recovery error = %v, want conflict", err)
 	}
 	changedContract := replay
-	changedContract.GenerationContractVersion = "implementation-proposal-generation/v2"
+	changedContract.GenerationContractVersion = "implementation-proposal-generation/v3"
 	if _, err := service.recoverCompletedImplementationClaim(
 		context.Background(), bundle, rootID.String(), request, changedContract, proposal,
 	); !errors.Is(err, core.ErrConflict) {
 		t.Fatalf("changed generation contract recovery error = %v, want conflict", err)
+	}
+	changedBuildContractRequest := request
+	changedBuildContractRequest.ApplicationBuildContract = core.ApplicationBuildContractRef{
+		ID: uuid.NewString(), ContractHash: applicationBuildContract.ContractHash,
+	}
+	if _, err := service.recoverCompletedImplementationClaim(
+		context.Background(), bundle, rootID.String(), changedBuildContractRequest, replay, proposal,
+	); !errors.Is(err, core.ErrConflict) {
+		t.Fatalf("changed Application Build Contract recovery error = %v, want conflict", err)
 	}
 	changedGovernance := request
 	changedGovernance.GovernanceManifest = &domain.ManifestRef{
@@ -178,11 +202,13 @@ CREATE TEMP TABLE outbox_events (
 	}
 	if err := transaction.Create(&storage.ImplementationGenerationClaimModel{
 		ID: uuid.New(), BuildManifestID: leafID, ProjectID: projectID, RootManifestID: rootID,
-		RequestKey: failedCommandID, ReservedProposalID: failedProposalID,
+		ApplicationBuildContractID:   &applicationBuildContractID,
+		ApplicationBuildContractHash: &applicationBuildContract.ContractHash,
+		RequestKey:                   failedCommandID, ReservedProposalID: failedProposalID,
 		ExecutionSource: string(core.ImplementationSourceConversationCommand), ConversationCommandID: &failedCommandID,
 		GovernanceManifestID: &governanceManifestID, GovernanceManifestHash: &governanceHash,
 		GovernanceSourceRefs: governanceRefs,
-		Instruction:          instructionJSON, InstructionHash: instructionHash, RequestedModel: replay.RequestedModel,
+		Instruction:          replay.Instruction, InstructionHash: instructionHash, RequestedModel: replay.RequestedModel,
 		GenerationContractVersion: replay.GenerationContractVersion, SystemPromptHash: replay.SystemPromptHash,
 		OutputSchemaHash: replay.OutputSchemaHash, ActorID: actorA, Status: "failed", AttemptCount: 1,
 		LastFailure: &failure, LastFailedAt: &failedAt, CreatedAt: now, UpdatedAt: now,

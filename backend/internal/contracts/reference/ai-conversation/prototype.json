@@ -1,0 +1,174 @@
+{
+  "pageSpecRevision": {
+    "artifactId": "reference-ai-conversation-page-spec",
+    "revisionId": "reference-ai-conversation-page-spec-r1",
+    "contentHash": "e451115ba955e4fe25e29769f162b805851b8aaead02e113d6771eff586acf09"
+  },
+  "exploratory": false,
+  "states": [
+    {"id": "state-ready", "key": "ready", "title": "Ready", "required": true, "fixtureIds": []},
+    {"id": "state-loading", "key": "loading", "title": "Loading", "required": true, "fixtureIds": []},
+    {"id": "state-empty", "key": "empty", "title": "Empty", "required": true, "fixtureIds": []},
+    {"id": "state-error", "key": "error", "title": "Error", "required": true, "fixtureIds": []},
+    {"id": "state-streaming", "key": "streaming", "title": "Streaming", "required": true, "fixtureIds": []},
+    {"id": "state-cancelled", "key": "cancelled", "title": "Cancelled", "required": true, "fixtureIds": []}
+  ],
+  "breakpoints": [
+    {"id": "breakpoint-desktop", "name": "desktop", "minWidth": 1024, "viewportWidth": 1440, "viewportHeight": 900},
+    {"id": "breakpoint-tablet", "name": "tablet", "minWidth": 768, "maxWidth": 1023, "viewportWidth": 768, "viewportHeight": 1024},
+    {"id": "breakpoint-mobile", "name": "mobile", "minWidth": 0, "maxWidth": 767, "viewportWidth": 390, "viewportHeight": 844}
+  ],
+  "layers": {
+    "layer-root": {
+      "id": "layer-root",
+      "childIds": [
+        "layer-create-conversation",
+        "layer-list-conversations",
+        "layer-get-conversation",
+        "layer-list-messages",
+        "layer-send-message",
+        "layer-list-runs",
+        "layer-create-run",
+        "layer-get-run",
+        "layer-stream-run-events",
+        "layer-cancel-run",
+        "layer-retry-run",
+        "layer-conversations-data",
+        "layer-messages-data",
+        "layer-runs-data",
+        "layer-run-events-data",
+        "layer-composer",
+        "layer-cancel",
+        "layer-retry"
+      ],
+      "kind": "frame",
+      "name": "AI conversations",
+      "layout": {"x": 0, "y": 0, "width": 1440, "height": 900},
+      "style": {},
+      "properties": {},
+      "requirementIds": [
+        "REQ-CONVERSATION-PERSISTENCE",
+        "REQ-IDEMPOTENCY",
+        "REQ-TYPED-STREAM",
+        "REQ-CANCEL",
+        "REQ-RETRY",
+        "REQ-TENANT-AUTH",
+        "REQ-OPERABILITY",
+        "REQ-GATEWAY-GOVERNANCE",
+        "REQ-RETENTION",
+        "REQ-RECOVERY"
+      ],
+      "acceptanceCriterionIds": [
+        "AC-AI-001",
+        "AC-AI-002",
+        "AC-AI-003",
+        "AC-AI-004",
+        "AC-AI-005",
+        "AC-AI-006",
+        "AC-AI-007",
+        "AC-AI-008",
+        "AC-AI-009",
+        "AC-AI-010",
+        "AC-AI-011",
+        "AC-AI-012",
+        "AC-AI-013",
+        "AC-AI-014",
+        "AC-AI-015"
+      ],
+      "fieldMetadata": {}
+    },
+    "layer-create-conversation": {"id": "layer-create-conversation", "childIds": [], "kind": "group", "name": "Create conversation binding", "layout": {"x": 16, "y": 16, "width": 320, "height": 40}, "style": {}, "properties": {}, "dataBindingId": "api-create-conversation", "requirementIds": [], "acceptanceCriterionIds": [], "fieldMetadata": {}},
+    "layer-list-conversations": {"id": "layer-list-conversations", "childIds": [], "kind": "list", "name": "List conversations binding", "layout": {"x": 16, "y": 64, "width": 280, "height": 720}, "style": {}, "properties": {}, "dataBindingId": "api-list-conversations", "requirementIds": [], "acceptanceCriterionIds": [], "fieldMetadata": {}},
+    "layer-get-conversation": {"id": "layer-get-conversation", "childIds": [], "kind": "group", "name": "Get conversation binding", "layout": {"x": 320, "y": 16, "width": 800, "height": 48}, "style": {}, "properties": {}, "dataBindingId": "api-get-conversation", "requirementIds": [], "acceptanceCriterionIds": [], "fieldMetadata": {}},
+    "layer-list-messages": {"id": "layer-list-messages", "childIds": [], "kind": "list", "name": "List messages binding", "layout": {"x": 320, "y": 80, "width": 800, "height": 560}, "style": {}, "properties": {}, "dataBindingId": "api-list-messages", "requirementIds": [], "acceptanceCriterionIds": [], "fieldMetadata": {}},
+    "layer-send-message": {"id": "layer-send-message", "childIds": [], "kind": "group", "name": "Send message binding", "layout": {"x": 320, "y": 656, "width": 800, "height": 96}, "style": {}, "properties": {}, "dataBindingId": "api-send-message", "requirementIds": [], "acceptanceCriterionIds": [], "fieldMetadata": {}},
+    "layer-list-runs": {"id": "layer-list-runs", "childIds": [], "kind": "list", "name": "List runs binding", "layout": {"x": 1136, "y": 80, "width": 288, "height": 240}, "style": {}, "properties": {}, "dataBindingId": "api-list-runs", "requirementIds": [], "acceptanceCriterionIds": [], "fieldMetadata": {}},
+    "layer-create-run": {"id": "layer-create-run", "childIds": [], "kind": "group", "name": "Create run binding", "layout": {"x": 1136, "y": 336, "width": 288, "height": 40}, "style": {}, "properties": {}, "dataBindingId": "api-create-run", "requirementIds": [], "acceptanceCriterionIds": [], "fieldMetadata": {}},
+    "layer-get-run": {"id": "layer-get-run", "childIds": [], "kind": "group", "name": "Get run binding", "layout": {"x": 1136, "y": 392, "width": 288, "height": 40}, "style": {}, "properties": {}, "dataBindingId": "api-get-run", "requirementIds": [], "acceptanceCriterionIds": [], "fieldMetadata": {}},
+    "layer-stream-run-events": {"id": "layer-stream-run-events", "childIds": [], "kind": "group", "name": "Stream events binding", "layout": {"x": 1136, "y": 448, "width": 288, "height": 40}, "style": {}, "properties": {}, "dataBindingId": "api-stream-run-events", "requirementIds": [], "acceptanceCriterionIds": [], "fieldMetadata": {}},
+    "layer-cancel-run": {"id": "layer-cancel-run", "childIds": [], "kind": "group", "name": "Cancel run binding", "layout": {"x": 1136, "y": 504, "width": 136, "height": 40}, "style": {}, "properties": {}, "dataBindingId": "api-cancel-run", "requirementIds": [], "acceptanceCriterionIds": [], "fieldMetadata": {}},
+    "layer-retry-run": {"id": "layer-retry-run", "childIds": [], "kind": "group", "name": "Retry run binding", "layout": {"x": 1288, "y": 504, "width": 136, "height": 40}, "style": {}, "properties": {}, "dataBindingId": "api-retry-run", "requirementIds": [], "acceptanceCriterionIds": [], "fieldMetadata": {}},
+    "layer-conversations-data": {"id": "layer-conversations-data", "childIds": [], "kind": "group", "name": "Conversation data binding", "layout": {"x": 16, "y": 800, "width": 64, "height": 32}, "style": {}, "properties": {}, "dataBindingId": "data-conversations", "requirementIds": [], "acceptanceCriterionIds": [], "fieldMetadata": {}},
+    "layer-messages-data": {"id": "layer-messages-data", "childIds": [], "kind": "group", "name": "Message data binding", "layout": {"x": 88, "y": 800, "width": 64, "height": 32}, "style": {}, "properties": {}, "dataBindingId": "data-messages", "requirementIds": [], "acceptanceCriterionIds": [], "fieldMetadata": {}},
+    "layer-runs-data": {"id": "layer-runs-data", "childIds": [], "kind": "group", "name": "Run data binding", "layout": {"x": 160, "y": 800, "width": 64, "height": 32}, "style": {}, "properties": {}, "dataBindingId": "data-runs", "requirementIds": [], "acceptanceCriterionIds": [], "fieldMetadata": {}},
+    "layer-run-events-data": {"id": "layer-run-events-data", "childIds": [], "kind": "group", "name": "Run event data binding", "layout": {"x": 232, "y": 800, "width": 64, "height": 32}, "style": {}, "properties": {}, "dataBindingId": "data-run-events", "requirementIds": [], "acceptanceCriterionIds": [], "fieldMetadata": {}},
+    "layer-composer": {"id": "layer-composer", "childIds": [], "kind": "input", "name": "Message composer", "layout": {"x": 320, "y": 768, "width": 800, "height": 80}, "style": {}, "properties": {}, "requirementIds": ["REQ-IDEMPOTENCY"], "acceptanceCriterionIds": ["AC-AI-003"], "fieldMetadata": {}},
+    "layer-cancel": {"id": "layer-cancel", "childIds": [], "kind": "button", "name": "Cancel run", "layout": {"x": 1136, "y": 560, "width": 136, "height": 40}, "style": {}, "properties": {}, "requirementIds": ["REQ-CANCEL"], "acceptanceCriterionIds": ["AC-AI-005"], "fieldMetadata": {}},
+    "layer-retry": {"id": "layer-retry", "childIds": [], "kind": "input", "name": "Retry reason", "layout": {"x": 1136, "y": 616, "width": 288, "height": 80}, "style": {}, "properties": {}, "requirementIds": ["REQ-RETRY"], "acceptanceCriterionIds": ["AC-AI-006"], "fieldMetadata": {}}
+  },
+  "frames": [
+    {"id": "frame-ready-desktop", "stateId": "state-ready", "breakpointId": "breakpoint-desktop", "rootLayerId": "layer-root", "title": "Ready · desktop"},
+    {"id": "frame-ready-tablet", "stateId": "state-ready", "breakpointId": "breakpoint-tablet", "rootLayerId": "layer-root", "title": "Ready · tablet"},
+    {"id": "frame-ready-mobile", "stateId": "state-ready", "breakpointId": "breakpoint-mobile", "rootLayerId": "layer-root", "title": "Ready · mobile"},
+    {"id": "frame-loading-desktop", "stateId": "state-loading", "breakpointId": "breakpoint-desktop", "rootLayerId": "layer-root", "title": "Loading · desktop"},
+    {"id": "frame-loading-tablet", "stateId": "state-loading", "breakpointId": "breakpoint-tablet", "rootLayerId": "layer-root", "title": "Loading · tablet"},
+    {"id": "frame-loading-mobile", "stateId": "state-loading", "breakpointId": "breakpoint-mobile", "rootLayerId": "layer-root", "title": "Loading · mobile"},
+    {"id": "frame-empty-desktop", "stateId": "state-empty", "breakpointId": "breakpoint-desktop", "rootLayerId": "layer-root", "title": "Empty · desktop"},
+    {"id": "frame-empty-tablet", "stateId": "state-empty", "breakpointId": "breakpoint-tablet", "rootLayerId": "layer-root", "title": "Empty · tablet"},
+    {"id": "frame-empty-mobile", "stateId": "state-empty", "breakpointId": "breakpoint-mobile", "rootLayerId": "layer-root", "title": "Empty · mobile"},
+    {"id": "frame-error-desktop", "stateId": "state-error", "breakpointId": "breakpoint-desktop", "rootLayerId": "layer-root", "title": "Error · desktop"},
+    {"id": "frame-error-tablet", "stateId": "state-error", "breakpointId": "breakpoint-tablet", "rootLayerId": "layer-root", "title": "Error · tablet"},
+    {"id": "frame-error-mobile", "stateId": "state-error", "breakpointId": "breakpoint-mobile", "rootLayerId": "layer-root", "title": "Error · mobile"},
+    {"id": "frame-streaming-desktop", "stateId": "state-streaming", "breakpointId": "breakpoint-desktop", "rootLayerId": "layer-root", "title": "Streaming · desktop"},
+    {"id": "frame-streaming-tablet", "stateId": "state-streaming", "breakpointId": "breakpoint-tablet", "rootLayerId": "layer-root", "title": "Streaming · tablet"},
+    {"id": "frame-streaming-mobile", "stateId": "state-streaming", "breakpointId": "breakpoint-mobile", "rootLayerId": "layer-root", "title": "Streaming · mobile"},
+    {"id": "frame-cancelled-desktop", "stateId": "state-cancelled", "breakpointId": "breakpoint-desktop", "rootLayerId": "layer-root", "title": "Cancelled · desktop"},
+    {"id": "frame-cancelled-tablet", "stateId": "state-cancelled", "breakpointId": "breakpoint-tablet", "rootLayerId": "layer-root", "title": "Cancelled · tablet"},
+    {"id": "frame-cancelled-mobile", "stateId": "state-cancelled", "breakpointId": "breakpoint-mobile", "rootLayerId": "layer-root", "title": "Cancelled · mobile"}
+  ],
+  "overrides": [
+    {"id": "override-state-ready", "layerId": "layer-root", "stateId": "state-ready", "propertyPath": "properties.stateKey", "value": "ready"},
+    {"id": "override-state-loading", "layerId": "layer-root", "stateId": "state-loading", "propertyPath": "properties.stateKey", "value": "loading"},
+    {"id": "override-state-empty", "layerId": "layer-root", "stateId": "state-empty", "propertyPath": "properties.stateKey", "value": "empty"},
+    {"id": "override-state-error", "layerId": "layer-root", "stateId": "state-error", "propertyPath": "properties.stateKey", "value": "error"},
+    {"id": "override-state-streaming", "layerId": "layer-root", "stateId": "state-streaming", "propertyPath": "properties.stateKey", "value": "streaming"},
+    {"id": "override-state-cancelled", "layerId": "layer-root", "stateId": "state-cancelled", "propertyPath": "properties.stateKey", "value": "cancelled"},
+    {"id": "override-desktop-width", "layerId": "layer-root", "breakpointId": "breakpoint-desktop", "propertyPath": "layout.width", "value": 1440},
+    {"id": "override-desktop-height", "layerId": "layer-root", "breakpointId": "breakpoint-desktop", "propertyPath": "layout.height", "value": 900},
+    {"id": "override-tablet-width", "layerId": "layer-root", "breakpointId": "breakpoint-tablet", "propertyPath": "layout.width", "value": 768},
+    {"id": "override-tablet-height", "layerId": "layer-root", "breakpointId": "breakpoint-tablet", "propertyPath": "layout.height", "value": 1024},
+    {"id": "override-mobile-width", "layerId": "layer-root", "breakpointId": "breakpoint-mobile", "propertyPath": "layout.width", "value": 390},
+    {"id": "override-mobile-height", "layerId": "layer-root", "breakpointId": "breakpoint-mobile", "propertyPath": "layout.height", "value": 844}
+  ],
+  "interactions": [
+    {
+      "id": "interaction-send-message",
+      "trigger": "submit",
+      "outcome": "Create a message and start a run.",
+      "sourceLayerId": "layer-composer",
+      "guards": [],
+      "actions": [
+        {"type": "updateBinding", "bindingId": "api-send-message", "value": {"intent": "persist-message"}},
+        {"type": "updateBinding", "bindingId": "api-create-run", "value": {"intent": "start-run"}},
+        {"type": "setState", "stateId": "state-streaming"}
+      ]
+    },
+    {
+      "id": "interaction-cancel-run",
+      "trigger": "click",
+      "outcome": "Cancel the active run and show the cancelled state.",
+      "sourceLayerId": "layer-cancel",
+      "guards": [],
+      "actions": [
+        {"type": "updateBinding", "bindingId": "api-cancel-run", "value": {"intent": "cancel-run"}},
+        {"type": "setState", "stateId": "state-cancelled"}
+      ]
+    },
+    {
+      "id": "interaction-retry-run",
+      "trigger": "submit",
+      "outcome": "Create a traceable retry attempt.",
+      "sourceLayerId": "layer-retry",
+      "guards": [],
+      "actions": [
+        {"type": "updateBinding", "bindingId": "api-retry-run", "value": {"intent": "retry-run"}},
+        {"type": "setState", "stateId": "state-streaming"}
+      ]
+    }
+  ],
+  "fixtures": [],
+  "tokenBindings": [],
+  "componentBindings": [],
+  "assets": [],
+  "traceLinks": []
+}

@@ -84,6 +84,7 @@ type ImplementationGenerationResult struct {
 var (
 	ErrImplementationGenerationProcessing = errors.New("implementation generation is already processing")
 	ErrActiveImplementationProposal       = errors.New("active implementation proposal already exists")
+	ErrGovernedCandidateRequired          = errors.New("governed Candidate implementation is required")
 )
 
 type ImplementationInstruction struct {
@@ -96,6 +97,7 @@ type ImplementationGenerationRequest struct {
 	ActorID                       string
 	Model                         string
 	Instruction                   ImplementationInstruction
+	ApplicationBuildContract      core.ApplicationBuildContractRef
 	ExecutionSource               core.ImplementationExecutionSource
 	RequestKey                    string
 	ProposalID                    string
@@ -124,8 +126,14 @@ type Service struct {
 	proposals      *core.ProposalService
 	workbench      implementationWorkbench
 	implementation *core.ImplementationService
+	buildContracts core.ApplicationBuildContractVerifier
 	claimLease     time.Duration
 	now            func() time.Time
+	// The legacy provider-to-Proposal path cannot bind an exact Candidate,
+	// checkpoint, and passing VerificationReceipt. It is deliberately
+	// unreachable in a configured service; package tests may opt in only to
+	// preserve coverage of its recovery machinery while it is being removed.
+	allowUngovernedImplementationForTests bool
 }
 
 func NewService(
@@ -135,9 +143,10 @@ func NewService(
 	proposals *core.ProposalService,
 	workbench *core.WorkbenchService,
 	implementation *core.ImplementationService,
+	buildContracts core.ApplicationBuildContractVerifier,
 	configs ...ServiceConfig,
 ) (*Service, error) {
-	if database == nil || contents == nil || provider == nil || proposals == nil || workbench == nil || implementation == nil {
+	if database == nil || contents == nil || provider == nil || proposals == nil || workbench == nil || implementation == nil || buildContracts == nil {
 		return nil, errors.New("generation dependencies are required")
 	}
 	claimLease := 7 * time.Minute
@@ -147,7 +156,8 @@ func NewService(
 	return &Service{
 		database: database, contents: contents, provider: provider,
 		proposals: proposals, workbench: workbench, implementation: implementation,
-		claimLease: claimLease, now: time.Now,
+		buildContracts: buildContracts,
+		claimLease:     claimLease, now: time.Now,
 	}, nil
 }
 
@@ -431,6 +441,13 @@ func (s *Service) GenerateImplementation(ctx context.Context, request Implementa
 		request.ExecutionSource != core.ImplementationSourceConversationCommand {
 		return ImplementationGenerationResult{}, fmt.Errorf("%w: implementation execution source", core.ErrInvalidInput)
 	}
+	if !s.allowUngovernedImplementationForTests {
+		return ImplementationGenerationResult{}, ErrGovernedCandidateRequired
+	}
+	request.ApplicationBuildContract, err = normalizeImplementationBuildContractRef(request.ApplicationBuildContract)
+	if err != nil {
+		return ImplementationGenerationResult{}, err
+	}
 	request.ExpectedRunID = strings.TrimSpace(request.ExpectedRunID)
 	request.ExpectedRootBundleID = strings.TrimSpace(request.ExpectedRootBundleID)
 	if request.ExecutionSource == core.ImplementationSourceConversationCommand &&
@@ -461,7 +478,17 @@ func (s *Service) GenerateImplementation(ctx context.Context, request Implementa
 	if err != nil {
 		return ImplementationGenerationResult{}, err
 	}
-	replayIdentity := currentImplementationGenerationReplayIdentity(instructionJSON, instructionHash, request.Model)
+	verifiedBuildContract, err := s.requireImplementationBuildContract(ctx, bundle, request.ActorID, request.ApplicationBuildContract)
+	if err != nil {
+		return ImplementationGenerationResult{}, err
+	}
+	request.ApplicationBuildContract = verifiedBuildContract
+	replayIdentity, err := currentImplementationGenerationReplayIdentity(
+		instructionJSON, instructionHash, request.Model, verifiedBuildContract,
+	)
+	if err != nil {
+		return ImplementationGenerationResult{}, err
+	}
 	if matchingProposal := recoverMatchingImplementationProposal(state.CurrentProposal, request, instructionHash); matchingProposal != nil {
 		if _, err := s.governanceImplementationInput(ctx, bundle.ProjectID, request); err != nil {
 			return ImplementationGenerationResult{}, err
@@ -505,7 +532,7 @@ func (s *Service) GenerateImplementation(ctx context.Context, request Implementa
 		}
 		return ImplementationGenerationResult{Proposal: recovered, Provider: recovered.AIProvider, Model: recovered.AIModel}, nil
 	}
-	input, err := s.implementationInput(ctx, bundle, string(instructionJSON), governanceInput)
+	input, err := s.implementationInput(ctx, bundle, string(instructionJSON), verifiedBuildContract, governanceInput)
 	if err != nil {
 		s.failImplementationClaim(context.WithoutCancel(ctx), claim, classifyImplementationGenerationFailure(err))
 		return ImplementationGenerationResult{}, err
@@ -525,13 +552,15 @@ func (s *Service) GenerateImplementation(ctx context.Context, request Implementa
 		return ImplementationGenerationResult{}, err
 	}
 	output.BuildManifestID = bundle.ID
+	output.ApplicationBuildContract = verifiedBuildContract
 	proposal, err := s.implementation.CreateGenerated(ctx, bundle.ProjectID, request.ActorID, output, core.GeneratedImplementationIdentity{
 		ProposalID: claim.ReservedProposalID.String(), RequestKey: claim.RequestKey.String(),
 		ExecutionSource: request.ExecutionSource, ConversationCommandID: request.ConversationCommandID,
 		ExpectedActiveProposalID:      uuidStringPointer(claim.ExpectedActiveProposalID),
 		ExpectedActiveProposalVersion: claim.ExpectedActiveProposalVersion,
 		InstructionHash:               instructionHash, AIProvider: result.Provider, AIModel: result.Model,
-		ClaimToken: claim.Token.String(),
+		ClaimToken:               claim.Token.String(),
+		ApplicationBuildContract: verifiedBuildContract,
 	})
 	if err != nil {
 		s.failImplementationClaim(context.WithoutCancel(ctx), claim, classifyImplementationGenerationFailure(err))
@@ -627,19 +656,71 @@ type implementationGenerationReplayIdentity struct {
 	OutputSchemaHash          string
 }
 
+type implementationGenerationReplayInput struct {
+	Instruction              json.RawMessage                  `json:"instruction"`
+	ApplicationBuildContract core.ApplicationBuildContractRef `json:"applicationBuildContract"`
+}
+
+func normalizeImplementationBuildContractRef(value core.ApplicationBuildContractRef) (core.ApplicationBuildContractRef, error) {
+	if value.ID == "" || value.ID != strings.TrimSpace(value.ID) ||
+		value.ContractHash == "" || value.ContractHash != strings.TrimSpace(value.ContractHash) ||
+		!domain.IsCanonicalHash(value.ContractHash) {
+		return core.ApplicationBuildContractRef{}, fmt.Errorf("%w: exact Application Build Contract reference", core.ErrInvalidInput)
+	}
+	id, err := uuid.Parse(value.ID)
+	if err != nil {
+		return core.ApplicationBuildContractRef{}, fmt.Errorf("%w: Application Build Contract id", core.ErrInvalidInput)
+	}
+	digest := strings.TrimPrefix(value.ContractHash, "sha256:")
+	if digest != strings.ToLower(digest) {
+		return core.ApplicationBuildContractRef{}, fmt.Errorf("%w: Application Build Contract hash", core.ErrInvalidInput)
+	}
+	return core.ApplicationBuildContractRef{ID: id.String(), ContractHash: value.ContractHash}, nil
+}
+
+func (s *Service) requireImplementationBuildContract(
+	ctx context.Context,
+	bundle core.WorkbenchBundle,
+	actorID string,
+	selection core.ApplicationBuildContractRef,
+) (core.ApplicationBuildContractRef, error) {
+	if s == nil || s.buildContracts == nil {
+		return core.ApplicationBuildContractRef{}, fmt.Errorf("%w: Application Build Contract verifier is unavailable", core.ErrBlockingGate)
+	}
+	verified, err := s.buildContracts.RequireReadyForImplementation(
+		ctx, bundle.ProjectID, bundle.ID, actorID, selection,
+	)
+	if err != nil {
+		return core.ApplicationBuildContractRef{}, err
+	}
+	verified, err = normalizeImplementationBuildContractRef(verified)
+	if err != nil || verified != selection {
+		return core.ApplicationBuildContractRef{}, fmt.Errorf("%w: Application Build Contract verifier returned a different identity", core.ErrConflict)
+	}
+	return verified, nil
+}
+
 func currentImplementationGenerationReplayIdentity(
 	instruction json.RawMessage,
 	instructionHash string,
 	requestedModel string,
-) implementationGenerationReplayIdentity {
+	applicationBuildContract core.ApplicationBuildContractRef,
+) (implementationGenerationReplayIdentity, error) {
+	replayInput, err := domain.CanonicalJSON(implementationGenerationReplayInput{
+		Instruction:              append(json.RawMessage(nil), instruction...),
+		ApplicationBuildContract: applicationBuildContract,
+	})
+	if err != nil {
+		return implementationGenerationReplayIdentity{}, err
+	}
 	return implementationGenerationReplayIdentity{
-		Instruction:               append(json.RawMessage(nil), instruction...),
+		Instruction:               replayInput,
 		InstructionHash:           instructionHash,
 		RequestedModel:            strings.TrimSpace(requestedModel),
 		GenerationContractVersion: implementationGenerationContractVersion,
 		SystemPromptHash:          generationSHA256([]byte(implementationInstructions)),
 		OutputSchemaHash:          generationSHA256(implementationProposalSchema),
-	}
+	}, nil
 }
 
 func CanonicalImplementationInstruction(
@@ -700,6 +781,8 @@ func recoverMatchingImplementationProposal(
 	}
 	if !matchedIdentity || proposal.ExecutionSource != request.ExecutionSource ||
 		proposal.InstructionHash != instructionHash ||
+		proposal.ApplicationBuildContract == nil ||
+		*proposal.ApplicationBuildContract != request.ApplicationBuildContract ||
 		(request.ExecutionSource != core.ImplementationSourceConversationCommand && proposal.CreatedBy != request.ActorID) ||
 		(proposal.Status != "open" && proposal.Status != "reviewing" && proposal.Status != "ready") || proposal.AppliedAt != nil {
 		return nil
@@ -720,9 +803,11 @@ func (s *Service) recoverCompletedImplementationClaim(
 	leafID, leafErr := uuid.Parse(bundle.ID)
 	rootID, rootErr := uuid.Parse(rootBundleID)
 	actorID, actorErr := uuid.Parse(request.ActorID)
+	applicationBuildContractID, contractErr := uuid.Parse(request.ApplicationBuildContract.ID)
 	requestKey, proposalID, commandID, identityErr := normalizeGenerationRequestIdentity(request)
 	governanceManifestID, governanceManifestHash, governanceSourceRefs, governanceErr := generationGovernanceClaimIdentity(request)
-	if projectErr != nil || leafErr != nil || rootErr != nil || actorErr != nil || identityErr != nil || governanceErr != nil {
+	if projectErr != nil || leafErr != nil || rootErr != nil || actorErr != nil || contractErr != nil ||
+		identityErr != nil || governanceErr != nil {
 		return core.ImplementationProposal{}, core.ErrConflict
 	}
 	var claim storage.ImplementationGenerationClaimModel
@@ -730,6 +815,8 @@ func (s *Service) recoverCompletedImplementationClaim(
 		return core.ImplementationProposal{}, core.ErrConflict
 	}
 	if claim.ProjectID != projectID || claim.BuildManifestID != leafID || claim.RootManifestID != rootID ||
+		claim.ApplicationBuildContractID == nil || *claim.ApplicationBuildContractID != applicationBuildContractID ||
+		claim.ApplicationBuildContractHash == nil || *claim.ApplicationBuildContractHash != request.ApplicationBuildContract.ContractHash ||
 		claim.ReservedProposalID != proposalID || claim.ExecutionSource != string(request.ExecutionSource) ||
 		!sameOptionalUUID(claim.ConversationCommandID, commandID) ||
 		!implementationGenerationGovernanceMatches(claim, governanceManifestID, governanceManifestHash, governanceSourceRefs) ||
@@ -778,6 +865,10 @@ func (s *Service) acquireImplementationClaim(
 	rootID, err := uuid.Parse(rootBundleID)
 	if err != nil {
 		return implementationGenerationClaim{}, uuid.Nil, fmt.Errorf("%w: root build manifest id", core.ErrInvalidInput)
+	}
+	applicationBuildContractID, err := uuid.Parse(request.ApplicationBuildContract.ID)
+	if err != nil || !domain.IsCanonicalHash(request.ApplicationBuildContract.ContractHash) {
+		return implementationGenerationClaim{}, uuid.Nil, fmt.Errorf("%w: exact Application Build Contract reference", core.ErrInvalidInput)
 	}
 	requestKey, proposalID, commandID, err := normalizeGenerationRequestIdentity(request)
 	if err != nil {
@@ -844,6 +935,8 @@ func (s *Service) acquireImplementationClaim(
 		existingRequestErr := transaction.Clauses(clause.Locking{Strength: "UPDATE"}).Where("request_key = ?", requestKey).Take(&existingRequest).Error
 		if existingRequestErr == nil {
 			if existingRequest.ProjectID != projectID || existingRequest.BuildManifestID != leafID ||
+				existingRequest.ApplicationBuildContractID == nil || *existingRequest.ApplicationBuildContractID != applicationBuildContractID ||
+				existingRequest.ApplicationBuildContractHash == nil || *existingRequest.ApplicationBuildContractHash != request.ApplicationBuildContract.ContractHash ||
 				existingRequest.RootManifestID != rootID || existingRequest.ReservedProposalID != proposalID ||
 				existingRequest.ExecutionSource != string(request.ExecutionSource) ||
 				!sameOptionalUUID(existingRequest.ConversationCommandID, commandID) ||
@@ -926,7 +1019,9 @@ func (s *Service) acquireImplementationClaim(
 			current := storage.ImplementationGenerationClaimModel{
 				ID:              claim.ID,
 				BuildManifestID: leafID, ProjectID: projectID, RootManifestID: rootID,
-				RequestKey: requestKey, ReservedProposalID: proposalID,
+				ApplicationBuildContractID:   &applicationBuildContractID,
+				ApplicationBuildContractHash: nonEmptyGenerationString(request.ApplicationBuildContract.ContractHash),
+				RequestKey:                   requestKey, ReservedProposalID: proposalID,
 				ExecutionSource: string(request.ExecutionSource), ConversationCommandID: commandID,
 				GovernanceManifestID:      governanceManifestID,
 				GovernanceManifestHash:    nonEmptyGenerationString(governanceManifestHash),
@@ -951,7 +1046,9 @@ func (s *Service) acquireImplementationClaim(
 			"rootBuildManifestId": rootID.String(), "requestKey": requestKey.String(),
 			"reservedProposalId": proposalID.String(), "executionSource": request.ExecutionSource,
 			"conversationCommandId": uuidPointerString(commandID), "instructionHash": replayIdentity.InstructionHash,
-			"requestedModel": replayIdentity.RequestedModel, "generationContractVersion": replayIdentity.GenerationContractVersion,
+			"applicationBuildContractId":   request.ApplicationBuildContract.ID,
+			"applicationBuildContractHash": request.ApplicationBuildContract.ContractHash,
+			"requestedModel":               replayIdentity.RequestedModel, "generationContractVersion": replayIdentity.GenerationContractVersion,
 			"systemPromptHash": replayIdentity.SystemPromptHash, "outputSchemaHash": replayIdentity.OutputSchemaHash,
 			"expectedActiveProposalId":      uuidPointerString(expectedActiveProposalID),
 			"expectedActiveProposalVersion": request.ExpectedActiveProposalVersion,
@@ -964,6 +1061,8 @@ func (s *Service) acquireImplementationClaim(
 		return generationOutbox(transaction, leafID.String(), "implementation.generation_claimed", map[string]any{
 			"projectId": projectID.String(), "buildManifestId": leafID.String(),
 			"requestKey": requestKey.String(), "executionSource": request.ExecutionSource,
+			"applicationBuildContractId":   request.ApplicationBuildContract.ID,
+			"applicationBuildContractHash": request.ApplicationBuildContract.ContractHash,
 		})
 	})
 	if err != nil {
@@ -1074,6 +1173,8 @@ func classifyImplementationGenerationFailure(err error) string {
 	switch {
 	case errors.Is(err, context.Canceled):
 		return "canceled"
+	case errors.Is(err, ErrGovernedCandidateRequired):
+		return "governed_candidate_required"
 	case errors.Is(err, context.DeadlineExceeded):
 		return "deadline_exceeded"
 	case errors.Is(err, core.ErrNotFound):
@@ -1291,7 +1392,13 @@ func (s *Service) artifactInput(ctx context.Context, manifest domain.InputManife
 	})
 }
 
-func (s *Service) implementationInput(ctx context.Context, bundle core.WorkbenchBundle, instruction string, governanceInput json.RawMessage) (json.RawMessage, error) {
+func (s *Service) implementationInput(
+	ctx context.Context,
+	bundle core.WorkbenchBundle,
+	instruction string,
+	applicationBuildContract core.ApplicationBuildContractRef,
+	governanceInput json.RawMessage,
+) (json.RawMessage, error) {
 	sourceContents := make([]map[string]any, 0)
 	refs := []core.VersionRef{bundle.BlueprintRevision, bundle.PageSpecRevision, bundle.PrototypeRevision}
 	refs = append(refs, bundle.RequirementRevisions...)
@@ -1346,12 +1453,13 @@ func (s *Service) implementationInput(ctx context.Context, bundle core.Workbench
 			return nil, err
 		}
 	}
-	return marshalImplementationInput(bundle, instruction, sourceContents, workflowInput, workspace, governanceInput)
+	return marshalImplementationInput(bundle, instruction, applicationBuildContract, sourceContents, workflowInput, workspace, governanceInput)
 }
 
 func marshalImplementationInput(
 	bundle core.WorkbenchBundle,
 	instruction string,
+	applicationBuildContract core.ApplicationBuildContractRef,
 	sourceContents []map[string]any,
 	workflowInput any,
 	workspace any,
@@ -1359,6 +1467,7 @@ func marshalImplementationInput(
 ) (json.RawMessage, error) {
 	return json.Marshal(map[string]any{
 		"applicationBuildManifest": bundle,
+		"applicationBuildContract": applicationBuildContract,
 		"instruction":              strings.TrimSpace(instruction),
 		"sourceContents":           sourceContents,
 		"workflowInput":            workflowInput,
@@ -1533,7 +1642,7 @@ func artifactProposalJobContract(jobType string) string {
 	}
 }
 
-const implementationGenerationContractVersion = "implementation-proposal-generation/v1"
+const implementationGenerationContractVersion = "implementation-proposal-generation/v2"
 
 const implementationInstructions = "You are an application implementation worker. Consume only the frozen ApplicationBuildManifest and pinned source contents. Return a reviewable implementation proposal; never claim to have written files. Use safe relative paths and never generate .env, credentials, .git, dependency caches, or build output. For every existing file update/delete/rename, copy its exact contentHash into expectedHash. New files must use an empty expectedHash. Include routes, APIs, migrations, tests, preview expectations, trace links, diagnostics, assumptions, and explicit unimplemented items. Every item in routes, apis, migrations, tests, previews, and traceLinks must be a JSON string that encodes exactly one object; the server decodes these transport strings before review. Generate tests for acceptance criteria and preserve human workspace changes. The proposed workspace must be reproducibly buildable by the governed quality sandbox: prefer dependency-free static HTML/CSS/JavaScript when a framework is unnecessary; otherwise use npm with a genuine package-lock.json that is consistent with package.json and an npm build script that emits a static dist/, out/, or build/ directory containing index.html. Never invent lockfile integrity values, rely on a CDN at build/runtime, or claim a dynamic server-only output is publishable as a static artifact. When a generated application needs the platform public data plane, read PUBLIC_WORKSFLOW_DATA_API_BASE and PUBLIC_WORKSFLOW_DATA_CAPABILITY only from window.__WORKSFLOW_ENV__ at runtime, send the capability as a Bearer token, and handle denied table/field policies explicitly. Never hardcode or persist a deployment capability in source, build artifacts, logs, or browser storage."
 

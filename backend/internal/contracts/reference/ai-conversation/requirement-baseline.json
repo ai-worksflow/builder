@@ -1,0 +1,157 @@
+{
+  "sourceVersions": [
+    {
+      "artifactId": "reference-ai-conversation-requirements",
+      "revisionId": "reference-ai-conversation-requirements-r1",
+      "contentHash": "4b479e70714d7feebbf23e3ad35913c211863be90eb8c73a301e73f62796ed2f"
+    }
+  ],
+  "requirements": [
+    {
+      "type": "requirement",
+      "requirementId": "REQ-CONVERSATION-PERSISTENCE",
+      "statement": "Persist project-scoped conversations and messages across browser and service restarts.",
+      "priority": "must",
+      "acceptanceCriterionIds": ["AC-AI-001", "AC-AI-002"]
+    },
+    {
+      "type": "requirement",
+      "requirementId": "REQ-IDEMPOTENCY",
+      "statement": "Make message and run creation project-scoped and idempotent.",
+      "priority": "must",
+      "acceptanceCriterionIds": ["AC-AI-003"]
+    },
+    {
+      "type": "requirement",
+      "requirementId": "REQ-TYPED-STREAM",
+      "statement": "Stream typed durable run events over resumable SSE.",
+      "priority": "must",
+      "acceptanceCriterionIds": ["AC-AI-004"]
+    },
+    {
+      "type": "requirement",
+      "requirementId": "REQ-CANCEL",
+      "statement": "Allow project members to cancel queued or running model executions.",
+      "priority": "must",
+      "acceptanceCriterionIds": ["AC-AI-005"]
+    },
+    {
+      "type": "requirement",
+      "requirementId": "REQ-RETRY",
+      "statement": "Retry failed or cancelled runs with a required reason and bounded attempts.",
+      "priority": "must",
+      "acceptanceCriterionIds": ["AC-AI-006"]
+    },
+    {
+      "type": "requirement",
+      "requirementId": "REQ-TENANT-AUTH",
+      "statement": "Authenticate every operation and enforce project tenant isolation.",
+      "priority": "must",
+      "acceptanceCriterionIds": ["AC-AI-007", "AC-AI-008"]
+    },
+    {
+      "type": "requirement",
+      "requirementId": "REQ-OPERABILITY",
+      "statement": "Provide health, readiness, and migration-before-traffic controls.",
+      "priority": "must",
+      "acceptanceCriterionIds": ["AC-AI-009", "AC-AI-010"]
+    },
+    {
+      "type": "requirement",
+      "requirementId": "REQ-GATEWAY-GOVERNANCE",
+      "statement": "Route model execution through a governed gateway with secret isolation, rate limits, and timeouts.",
+      "priority": "must",
+      "acceptanceCriterionIds": ["AC-AI-011", "AC-AI-012", "AC-AI-013"]
+    },
+    {
+      "type": "requirement",
+      "requirementId": "REQ-RETENTION",
+      "statement": "Apply bounded retention and mandatory diagnostic redaction.",
+      "priority": "must",
+      "acceptanceCriterionIds": ["AC-AI-014"]
+    },
+    {
+      "type": "requirement",
+      "requirementId": "REQ-RECOVERY",
+      "statement": "Recover interrupted streams from durable event cursors without creating a second terminal outcome.",
+      "priority": "must",
+      "acceptanceCriterionIds": ["AC-AI-015"]
+    },
+    {
+      "type": "acceptanceCriterion",
+      "acceptanceCriterionId": "AC-AI-001",
+      "statement": "An authenticated project member can create a conversation and list it in the same project."
+    },
+    {
+      "type": "acceptanceCriterion",
+      "acceptanceCriterionId": "AC-AI-002",
+      "statement": "Conversation and message history remains readable after the API process and browser session are restarted."
+    },
+    {
+      "type": "acceptanceCriterion",
+      "acceptanceCriterionId": "AC-AI-003",
+      "statement": "Replaying a message or run creation request with the same project-scoped idempotency key returns the original resource without duplicate model execution."
+    },
+    {
+      "type": "acceptanceCriterion",
+      "acceptanceCriterionId": "AC-AI-004",
+      "statement": "A run emits schema-valid, monotonically sequenced SSE events and resumes after Last-Event-ID without replay gaps or reordering."
+    },
+    {
+      "type": "acceptanceCriterion",
+      "acceptanceCriterionId": "AC-AI-005",
+      "statement": "Cancelling a queued or running run is idempotent, stops further model output, and persists the cancelled terminal status."
+    },
+    {
+      "type": "acceptanceCriterion",
+      "acceptanceCriterionId": "AC-AI-006",
+      "statement": "Retry requires a non-empty reason, creates a traceable new attempt, and never exceeds the configured maximum attempt count."
+    },
+    {
+      "type": "acceptanceCriterion",
+      "acceptanceCriterionId": "AC-AI-007",
+      "statement": "Two independently authenticated principals cannot read, stream, cancel, retry, or infer resources belonging to another project."
+    },
+    {
+      "type": "acceptanceCriterion",
+      "acceptanceCriterionId": "AC-AI-008",
+      "statement": "Every conversation, message, run, and event operation requires an authenticated project member role and is audited with actor and project identity."
+    },
+    {
+      "type": "acceptanceCriterion",
+      "acceptanceCriterionId": "AC-AI-009",
+      "statement": "Web liveness and API readiness endpoints report healthy only when their required runtime dependencies are available."
+    },
+    {
+      "type": "acceptanceCriterion",
+      "acceptanceCriterionId": "AC-AI-010",
+      "statement": "Database migrations complete successfully before application traffic is enabled and are safe to re-run."
+    },
+    {
+      "type": "acceptanceCriterion",
+      "acceptanceCriterionId": "AC-AI-011",
+      "statement": "Model execution uses the declared AI gateway policy and obtains credentials only from runtime secret injection; provider secrets never reach the browser or workspace."
+    },
+    {
+      "type": "acceptanceCriterion",
+      "acceptanceCriterionId": "AC-AI-012",
+      "statement": "Per-project and per-actor rate limits reject excess requests with a machine-readable error and Retry-After guidance."
+    },
+    {
+      "type": "acceptanceCriterion",
+      "acceptanceCriterionId": "AC-AI-013",
+      "statement": "A run that exceeds its configured timeout becomes failed exactly once, records a stable error code, and emits a terminal run.failed event."
+    },
+    {
+      "type": "acceptanceCriterion",
+      "acceptanceCriterionId": "AC-AI-014",
+      "statement": "Message and run retention jobs use the declared windows and redact secret-bearing diagnostic fields before persistence or export."
+    },
+    {
+      "type": "acceptanceCriterion",
+      "acceptanceCriterionId": "AC-AI-015",
+      "statement": "After an API or stream connection failure, the client reconnects from the last durable cursor and the run reaches one durable terminal state."
+    }
+  ],
+  "baselineHash": "c66dafd13f2cc26fa8cdf36441e2fd416d3b81e33cd46f3758f517f1bd0189b5"
+}

@@ -21,7 +21,7 @@ func TestWorkflowExecutionProfileV2CancelsUnselectedFanOutMergeAndReleasesShared
 	}
 	now := time.Date(2026, 7, 11, 10, 0, 0, 0, time.UTC)
 	builder := newMutationBuilder(engine, run, now)
-	currentExecutionProfileBundle().reconcile(engine, run, definition, builder)
+	workflowExecutionProfileV2Bundle().reconcile(engine, run, definition, builder)
 
 	if run.Nodes["fan"].Status != NodeCancelled {
 		t.Fatalf("unselected fan-out status = %s, want cancelled", run.Nodes["fan"].Status)
@@ -38,7 +38,7 @@ func TestWorkflowExecutionProfileV2CancelsUnselectedFanOutMergeAndReleasesShared
 	// than turning the whole run into a failed or permanently pending join.
 	run.Nodes["shared"].Status = NodeCompleted
 	run.Nodes["shared"].CompletedAt = timePointer(now)
-	currentExecutionProfileBundle().reconcile(engine, run, definition, newMutationBuilder(engine, run, now.Add(time.Second)))
+	workflowExecutionProfileV2Bundle().reconcile(engine, run, definition, newMutationBuilder(engine, run, now.Add(time.Second)))
 	if run.Nodes["terminal"].Status != NodeReady {
 		t.Fatalf("terminal did not become runnable through the shared tail: %s", run.Nodes["terminal"].Status)
 	}
@@ -57,7 +57,7 @@ func TestWorkflowExecutionProfileV2DoesNotCancelMergeWithValidUnfinishedFanOutPr
 	if err != nil {
 		t.Fatal(err)
 	}
-	currentExecutionProfileBundle().reconcile(engine, run, definition, newMutationBuilder(engine, run, time.Now().UTC()))
+	workflowExecutionProfileV2Bundle().reconcile(engine, run, definition, newMutationBuilder(engine, run, time.Now().UTC()))
 
 	if run.Nodes["fan"].Status != NodePending {
 		t.Fatalf("fan-out with a valid unfinished predecessor = %s, want pending", run.Nodes["fan"].Status)

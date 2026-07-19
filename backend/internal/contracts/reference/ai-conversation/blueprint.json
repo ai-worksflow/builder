@@ -1,0 +1,73 @@
+{
+  "semantic": {
+    "nodes": [
+      {"id": "feature-ai-conversations", "key": "ai-conversations", "type": "feature", "title": "AI conversations"},
+      {
+        "id": "page-conversations",
+        "key": "conversations",
+        "type": "page",
+        "title": "AI conversations",
+        "route": "/conversations",
+        "userGoal": "Create a durable conversation, send a prompt, observe model output, and recover or control the run.",
+        "requirementIds": [
+          "REQ-CONVERSATION-PERSISTENCE",
+          "REQ-IDEMPOTENCY",
+          "REQ-TYPED-STREAM",
+          "REQ-CANCEL",
+          "REQ-RETRY",
+          "REQ-TENANT-AUTH",
+          "REQ-OPERABILITY",
+          "REQ-GATEWAY-GOVERNANCE",
+          "REQ-RETENTION",
+          "REQ-RECOVERY"
+        ]
+      },
+      {"id": "createConversation", "key": "create-conversation", "type": "apiOperation", "title": "Create conversation", "method": "POST", "path": "/api/v1/conversations"},
+      {"id": "listConversations", "key": "list-conversations", "type": "apiOperation", "title": "List conversations", "method": "GET", "path": "/api/v1/conversations"},
+      {"id": "getConversation", "key": "get-conversation", "type": "apiOperation", "title": "Get conversation", "method": "GET", "path": "/api/v1/conversations/{conversationId}"},
+      {"id": "listMessages", "key": "list-messages", "type": "apiOperation", "title": "List messages", "method": "GET", "path": "/api/v1/conversations/{conversationId}/messages"},
+      {"id": "sendMessage", "key": "send-message", "type": "apiOperation", "title": "Send message", "method": "POST", "path": "/api/v1/conversations/{conversationId}/messages"},
+      {"id": "listRuns", "key": "list-runs", "type": "apiOperation", "title": "List runs", "method": "GET", "path": "/api/v1/conversations/{conversationId}/runs"},
+      {"id": "createRun", "key": "create-run", "type": "apiOperation", "title": "Create run", "method": "POST", "path": "/api/v1/conversations/{conversationId}/runs"},
+      {"id": "getRun", "key": "get-run", "type": "apiOperation", "title": "Get run", "method": "GET", "path": "/api/v1/conversations/{conversationId}/runs/{runId}"},
+      {"id": "streamRunEvents", "key": "stream-run-events", "type": "apiOperation", "title": "Stream run events", "method": "GET", "path": "/api/v1/conversations/{conversationId}/runs/{runId}/events"},
+      {"id": "cancelRun", "key": "cancel-run", "type": "apiOperation", "title": "Cancel run", "method": "POST", "path": "/api/v1/conversations/{conversationId}/runs/{runId}/cancel"},
+      {"id": "retryRun", "key": "retry-run", "type": "apiOperation", "title": "Retry run", "method": "POST", "path": "/api/v1/conversations/{conversationId}/runs/{runId}/retry"},
+      {"id": "data-conversation", "key": "conversation", "type": "dataEntity", "title": "Conversation"},
+      {"id": "data-message", "key": "message", "type": "dataEntity", "title": "Message"},
+      {"id": "data-run", "key": "run", "type": "dataEntity", "title": "Run"},
+      {"id": "data-run-event", "key": "run-event", "type": "dataEntity", "title": "Run event"},
+      {"id": "permission-conversation-member", "key": "conversation-member", "type": "permission", "title": "Conversation project member", "roles": ["conversation-member"]}
+    ],
+    "edges": [
+      {"id": "contains-conversations", "sourceNodeId": "feature-ai-conversations", "targetNodeId": "page-conversations", "kind": "contains", "required": true},
+      {"id": "page-requires-member", "sourceNodeId": "page-conversations", "targetNodeId": "permission-conversation-member", "kind": "requires", "required": true},
+      {"id": "page-calls-create-conversation", "sourceNodeId": "page-conversations", "targetNodeId": "createConversation", "kind": "calls", "required": true},
+      {"id": "page-calls-list-conversations", "sourceNodeId": "page-conversations", "targetNodeId": "listConversations", "kind": "calls", "required": true},
+      {"id": "page-calls-get-conversation", "sourceNodeId": "page-conversations", "targetNodeId": "getConversation", "kind": "calls", "required": true},
+      {"id": "page-calls-list-messages", "sourceNodeId": "page-conversations", "targetNodeId": "listMessages", "kind": "calls", "required": true},
+      {"id": "page-calls-send-message", "sourceNodeId": "page-conversations", "targetNodeId": "sendMessage", "kind": "calls", "required": true},
+      {"id": "page-calls-list-runs", "sourceNodeId": "page-conversations", "targetNodeId": "listRuns", "kind": "calls", "required": true},
+      {"id": "page-calls-create-run", "sourceNodeId": "page-conversations", "targetNodeId": "createRun", "kind": "calls", "required": true},
+      {"id": "page-calls-get-run", "sourceNodeId": "page-conversations", "targetNodeId": "getRun", "kind": "calls", "required": true},
+      {"id": "page-calls-stream-run-events", "sourceNodeId": "page-conversations", "targetNodeId": "streamRunEvents", "kind": "calls", "required": true},
+      {"id": "page-calls-cancel-run", "sourceNodeId": "page-conversations", "targetNodeId": "cancelRun", "kind": "calls", "required": true},
+      {"id": "page-calls-retry-run", "sourceNodeId": "page-conversations", "targetNodeId": "retryRun", "kind": "calls", "required": true},
+      {"id": "create-conversation-requires-member", "sourceNodeId": "createConversation", "targetNodeId": "permission-conversation-member", "kind": "requires", "required": true},
+      {"id": "list-conversations-requires-member", "sourceNodeId": "listConversations", "targetNodeId": "permission-conversation-member", "kind": "requires", "required": true},
+      {"id": "get-conversation-requires-member", "sourceNodeId": "getConversation", "targetNodeId": "permission-conversation-member", "kind": "requires", "required": true},
+      {"id": "list-messages-requires-member", "sourceNodeId": "listMessages", "targetNodeId": "permission-conversation-member", "kind": "requires", "required": true},
+      {"id": "send-message-requires-member", "sourceNodeId": "sendMessage", "targetNodeId": "permission-conversation-member", "kind": "requires", "required": true},
+      {"id": "list-runs-requires-member", "sourceNodeId": "listRuns", "targetNodeId": "permission-conversation-member", "kind": "requires", "required": true},
+      {"id": "create-run-requires-member", "sourceNodeId": "createRun", "targetNodeId": "permission-conversation-member", "kind": "requires", "required": true},
+      {"id": "get-run-requires-member", "sourceNodeId": "getRun", "targetNodeId": "permission-conversation-member", "kind": "requires", "required": true},
+      {"id": "stream-run-events-requires-member", "sourceNodeId": "streamRunEvents", "targetNodeId": "permission-conversation-member", "kind": "requires", "required": true},
+      {"id": "cancel-run-requires-member", "sourceNodeId": "cancelRun", "targetNodeId": "permission-conversation-member", "kind": "requires", "required": true},
+      {"id": "retry-run-requires-member", "sourceNodeId": "retryRun", "targetNodeId": "permission-conversation-member", "kind": "requires", "required": true},
+      {"id": "page-uses-conversation", "sourceNodeId": "page-conversations", "targetNodeId": "data-conversation", "kind": "uses", "required": true},
+      {"id": "page-uses-message", "sourceNodeId": "page-conversations", "targetNodeId": "data-message", "kind": "uses", "required": true},
+      {"id": "page-uses-run", "sourceNodeId": "page-conversations", "targetNodeId": "data-run", "kind": "uses", "required": true},
+      {"id": "page-uses-run-event", "sourceNodeId": "page-conversations", "targetNodeId": "data-run-event", "kind": "uses", "required": true}
+    ]
+  }
+}

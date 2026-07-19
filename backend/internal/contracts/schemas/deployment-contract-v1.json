@@ -1,0 +1,77 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://worksflow.dev/schemas/deployment-contract-v1.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "services", "ports", "environmentVariables", "healthChecks", "migration", "releasePolicy"],
+  "properties": {
+    "schemaVersion": {"const": "deployment-contract/v1"},
+    "services": {
+      "type": "array", "minItems": 2,
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["id", "role", "sourceRoot", "portName", "healthCheckId", "buildOutput"],
+        "properties": {
+          "id": {"type": "string", "pattern": "^[a-z][a-z0-9._-]{0,79}$"},
+          "role": {"enum": ["web", "api", "worker"]},
+          "sourceRoot": {"type": "string", "pattern": "^[A-Za-z0-9._-][A-Za-z0-9._/-]*$"},
+          "portName": {"type": "string", "minLength": 1},
+          "healthCheckId": {"type": "string", "minLength": 1},
+          "buildOutput": {"type": "string", "pattern": "^[A-Za-z0-9._-][A-Za-z0-9._/-]*$"}
+        }
+      }
+    },
+    "ports": {
+      "type": "array", "minItems": 2,
+      "items": {
+        "type": "object", "additionalProperties": false, "required": ["name", "containerPort", "protocol"],
+        "properties": {
+          "name": {"type": "string", "pattern": "^[a-z][a-z0-9-]{0,62}$"},
+          "containerPort": {"type": "integer", "minimum": 1024, "maximum": 65535},
+          "protocol": {"enum": ["http", "tcp"]}
+        }
+      }
+    },
+    "environmentVariables": {
+      "type": "array",
+      "items": {
+        "type": "object", "additionalProperties": false, "required": ["name", "required", "secret", "scope"],
+        "properties": {
+          "name": {"type": "string", "pattern": "^[A-Z][A-Z0-9_]{0,126}$"},
+          "required": {"type": "boolean"},
+          "secret": {"type": "boolean"},
+          "scope": {"enum": ["web-build", "api-runtime", "worker-runtime"]}
+        }
+      }
+    },
+    "healthChecks": {
+      "type": "array", "minItems": 2,
+      "items": {
+        "type": "object", "additionalProperties": false, "required": ["id", "portName", "method", "path", "expectedStatuses"],
+        "properties": {
+          "id": {"type": "string", "pattern": "^[a-z][a-z0-9._-]{0,79}$"},
+          "portName": {"type": "string", "minLength": 1},
+          "method": {"enum": ["GET", "HEAD"]},
+          "path": {"type": "string", "pattern": "^/"},
+          "expectedStatuses": {"type": "array", "minItems": 1, "items": {"type": "integer", "minimum": 200, "maximum": 399}, "uniqueItems": true}
+        }
+      }
+    },
+    "migration": {
+      "type": "object", "additionalProperties": false, "required": ["required", "commandId", "beforeTraffic"],
+      "properties": {
+        "required": {"type": "boolean"},
+        "commandId": {"type": "string", "minLength": 1},
+        "beforeTraffic": {"const": true}
+      }
+    },
+    "releasePolicy": {
+      "type": "object", "additionalProperties": false, "required": ["strategy", "rollbackRequired", "immutableImages"],
+      "properties": {
+        "strategy": {"enum": ["rolling", "blue-green", "canary"]},
+        "rollbackRequired": {"const": true},
+        "immutableImages": {"const": true}
+      }
+    }
+  }
+}

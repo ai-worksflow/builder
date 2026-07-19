@@ -210,7 +210,8 @@ func (s *GORMStore) AppendUserMessage(ctx context.Context, projectID, conversati
 		}
 		model = storage.ConversationMessageModel{
 			ID: uuid.New(), ConversationID: conversation.ID, Sequence: sequence,
-			Role: string(MessageUser), Content: content, CreatedBy: actorID, CreatedAt: s.now().UTC(),
+			Role: string(MessageUser), Content: content, CreatedBy: actorID,
+			CreatedAt: s.now().UTC().Truncate(time.Microsecond),
 		}
 		if err := transaction.Create(&model).Error; err != nil {
 			return err
@@ -312,7 +313,7 @@ func (s *GORMStore) CreateIntentProposal(ctx context.Context, projectID, convers
 		if err != nil {
 			return err
 		}
-		now := s.now().UTC()
+		now := s.now().UTC().Truncate(time.Microsecond)
 		proposalID, assistantMessageID := uuid.New(), uuid.New()
 		reviewedScope, err := reviewedConversationIntentScope(
 			input.Scope,

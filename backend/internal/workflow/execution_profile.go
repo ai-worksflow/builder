@@ -11,12 +11,18 @@ import (
 )
 
 const (
-	CurrentWorkflowExecutionProfileVersion = "workflow-engine/v2"
-	WorkflowExecutionProfileV1Version      = "workflow-engine/v1"
-	LegacyWorkflowExecutionProfileVersion  = "legacy-pre-pin/v0"
-	CurrentWorkflowExecutionProfileHash    = "dd247a77ce3cfa1095a575a238b93c4bd41dd991eac07e8b62ec170864470da1"
-	WorkflowExecutionProfileV1Hash         = "648034d2edc8f82ac2b2959b89e181b8b67db80dadbfcd354672f386d81cbdc1"
-	LegacyWorkflowExecutionProfileHash     = "bee729c4921a93fd2e229cd610314359ca420610c195ada00a201507bfd7a14c"
+	WorkflowExecutionProfileV2Version     = "workflow-engine/v2"
+	WorkflowExecutionProfileV1Version     = "workflow-engine/v1"
+	LegacyWorkflowExecutionProfileVersion = "legacy-pre-pin/v0"
+	WorkflowExecutionProfileV2Hash        = "dd247a77ce3cfa1095a575a238b93c4bd41dd991eac07e8b62ec170864470da1"
+	WorkflowExecutionProfileV1Hash        = "648034d2edc8f82ac2b2959b89e181b8b67db80dadbfcd354672f386d81cbdc1"
+	LegacyWorkflowExecutionProfileHash    = "bee729c4921a93fd2e229cd610314359ca420610c195ada00a201507bfd7a14c"
+
+	// Current remains an exact alias of the immutable workflow-engine/v2
+	// identity. A future authoring profile must move these aliases to a new
+	// descriptor; it must never rebuild v2 from the mutable capability factory.
+	CurrentWorkflowExecutionProfileVersion = WorkflowExecutionProfileV2Version
+	CurrentWorkflowExecutionProfileHash    = WorkflowExecutionProfileV2Hash
 )
 
 // WorkflowExecutionComponents names every version-sensitive seam involved in
@@ -50,9 +56,16 @@ func (d WorkflowExecutionProfileDescriptor) Ref() (domain.WorkflowExecutionProfi
 }
 
 func CurrentWorkflowExecutionProfileDescriptor() WorkflowExecutionProfileDescriptor {
+	return WorkflowExecutionProfileV2Descriptor()
+}
+
+// WorkflowExecutionProfileV2Descriptor is the literal immutable descriptor
+// used by already-persisted workflow-engine/v2 definitions and runs. Current
+// aliases this exact descriptor until a separately versioned profile exists.
+func WorkflowExecutionProfileV2Descriptor() WorkflowExecutionProfileDescriptor {
 	return WorkflowExecutionProfileDescriptor{
-		Version:      CurrentWorkflowExecutionProfileVersion,
-		Capabilities: PlatformWorkflowCapabilities(true, true),
+		Version:      WorkflowExecutionProfileV2Version,
+		Capabilities: workflowCapabilitiesV2Snapshot(),
 		Components: WorkflowExecutionComponents{
 			CoreInterpreterID: "typed-dag-interpreter/v1", InputBuilderID: "typed-input-envelope/v1",
 			ResultValidatorID: "typed-result-validator/v1", ResultApplyID: "cas-result-apply/v1",
@@ -165,14 +178,54 @@ func workflowCapabilitiesV1Snapshot() WorkflowCapabilities {
 	}
 }
 
+// workflowCapabilitiesV2Snapshot is intentionally literal. Although v2 has
+// the same capability payload as v1, it owns an independent frozen snapshot so
+// future changes to either historical descriptor or to the current authoring
+// factory cannot reinterpret persisted v2 definitions and runs.
+func workflowCapabilitiesV2Snapshot() WorkflowCapabilities {
+	return WorkflowCapabilities{
+		Version: 4,
+		NodeTypes: []domain.WorkflowNodeType{
+			domain.NodeAITransform, domain.NodeArtifactInput, domain.NodeCondition, domain.NodeFanOut,
+			domain.NodeHumanEdit, domain.NodeManifestCompiler, domain.NodeMerge, domain.NodePublish,
+			domain.NodeQualityGate, domain.NodeReviewGate, domain.NodeTransform, domain.NodeWorkbenchBuild,
+		},
+		InputContracts: []domain.WorkflowInputContract{
+			{Capability: domain.WorkflowInputProjectBrief, ManifestJobTypes: []string{"conversation.workflow_intent", "workflow_start"}, ArtifactKinds: []string{"project_brief"}, MinimumArtifacts: 1, MaximumArtifacts: 1, RequiredSourcePurposes: []string{"project_brief"}, ManifestSchemaContracts: map[string]string{"conversation.workflow_intent": "workflow-intent-input/v1", "workflow_start": "workflow-input/v1"}},
+			{Capability: domain.WorkflowInputBlueprintSelection, ManifestJobTypes: []string{"blueprint.selection"}, ArtifactKinds: []string{"blueprint"}, MinimumArtifacts: 2, MaximumArtifacts: 101, RequireApproved: true, RequiredSourcePurposes: []string{"blueprint_selection_node", "blueprint_selection_root"}, ManifestSchemaContracts: map[string]string{"blueprint.selection": "blueprint-selection/v1"}},
+		},
+		OutputContracts: []domain.WorkflowOutputContract{{Capability: domain.WorkflowOutputApplication, ProducedArtifactKinds: []string{"workspace"}, TerminalOutcome: domain.WorkflowOutcomeDeployment, TerminalNodeType: domain.NodePublish}},
+		AITransforms: []AITransformCapability{
+			{JobType: "refine_project_brief", OutputSchemaVersion: "project-brief-proposal/v1", ModelPolicies: []string{"project-default"}, RequiredArtifactKinds: []string{"project_brief"}, ProducedArtifactKinds: []string{"project_brief"}},
+			{JobType: "derive_requirements", OutputSchemaVersion: "requirements-proposal/v1", ModelPolicies: []string{"project-default"}, RequiredArtifactKinds: []string{"project_brief"}, RequiredApprovedKinds: []string{"project_brief"}, ProducedArtifactKinds: []string{"product_requirements"}},
+			{JobType: "decompose_pages", OutputSchemaVersion: "blueprint-proposal/v1", ModelPolicies: []string{"project-default"}, RequiredArtifactKinds: []string{"product_requirements"}, RequiredApprovedKinds: []string{"product_requirements"}, ProducedArtifactKinds: []string{"blueprint"}},
+			{JobType: "generate_page_spec", OutputSchemaVersion: "page-spec-proposal/v1", ModelPolicies: []string{"project-default"}, RequiredArtifactKinds: []string{"blueprint"}, RequiredApprovedKinds: []string{"blueprint"}, ProducedArtifactKinds: []string{"page_spec"}},
+			{JobType: "generate_prototype", OutputSchemaVersion: "prototype-proposal/v1", ModelPolicies: []string{"project-default"}, RequiredArtifactKinds: []string{"page_spec"}, RequiredApprovedKinds: []string{"page_spec"}, ProducedArtifactKinds: []string{"prototype"}},
+		},
+		ManifestCompilers: []ManifestCompilerCapability{{
+			ManifestKind: "application_build", SchemaVersion: 1, Hook: "application-build-manifest/v1",
+			RequiredArtifactKinds: []string{"blueprint", "page_spec", "prototype"}, RequiredApprovedKinds: []string{"blueprint", "page_spec", "prototype"}, RequiresMergedSlices: true,
+			ProducedSemanticKinds: []string{"application_build_manifest"}, AllowedContextArtifactKinds: []string{"project_brief", "product_requirements", "decision_record", "glossary_policy", "reference_source", "change_request", "requirement_baseline", "blueprint", "page_spec", "prototype", "prototype_flow", "fixture_bundle", "api_contract", "data_contract", "permission_contract", "design_system", "token_set", "component_registry"},
+		}},
+		Transforms: []string{"selection_passthrough"}, FanOutItemKinds: []string{"blueprint_page", "blueprint_selection_page"},
+		FanOutMaximumItems: map[string]int{"blueprint_page": domain.MaximumWorkflowFanOutItems, "blueprint_selection_page": domain.MaximumWorkflowFanOutItems},
+		QualityGates:       []string{"release"}, PublishEnvironments: []string{"preview", "production"}, WorkbenchSchemaVersions: []int{1},
+		AnalysisLimits: WorkflowAnalysisLimits{MaximumDefinitionNodes: 200, MaximumDefinitionEdges: 1000, MaxSemanticPathStates: 256, MaximumConditionExpression: 8 << 10},
+	}
+}
+
 func CurrentWorkflowExecutionProfileRef() domain.WorkflowExecutionProfileRef {
-	ref, err := CurrentWorkflowExecutionProfileDescriptor().Ref()
+	return WorkflowExecutionProfileV2Ref()
+}
+
+func WorkflowExecutionProfileV2Ref() domain.WorkflowExecutionProfileRef {
+	ref, err := WorkflowExecutionProfileV2Descriptor().Ref()
 	if err != nil {
 		panic(err)
 	}
-	expected := domain.WorkflowExecutionProfileRef{Version: CurrentWorkflowExecutionProfileVersion, Hash: CurrentWorkflowExecutionProfileHash}
+	expected := domain.WorkflowExecutionProfileRef{Version: WorkflowExecutionProfileV2Version, Hash: WorkflowExecutionProfileV2Hash}
 	if ref != expected {
-		panic("current workflow execution profile descriptor changed without a version/hash bump")
+		panic("workflow-engine/v2 execution profile descriptor drifted from its frozen snapshot")
 	}
 	return expected
 }
@@ -391,7 +444,7 @@ func NewBuiltinWorkflowExecutionProfileRegistry() (*WorkflowExecutionProfileRegi
 	// Every persisted profile keeps an independent registration. Historical refs
 	// must never be redirected to the current interpreter behavior.
 	for _, bundle := range []WorkflowExecutionProfileBundle{
-		legacyExecutionProfileBundle(), workflowExecutionProfileV1Bundle(), currentExecutionProfileBundle(),
+		legacyExecutionProfileBundle(), workflowExecutionProfileV1Bundle(), workflowExecutionProfileV2Bundle(),
 	} {
 		if err := registry.Register(bundle); err != nil {
 			return nil, err
@@ -412,7 +465,11 @@ func legacyExecutionProfileBundle() WorkflowExecutionProfileBundle {
 }
 
 func currentExecutionProfileBundle() WorkflowExecutionProfileBundle {
-	descriptor := CurrentWorkflowExecutionProfileDescriptor()
+	return workflowExecutionProfileV2Bundle()
+}
+
+func workflowExecutionProfileV2Bundle() WorkflowExecutionProfileBundle {
+	descriptor := WorkflowExecutionProfileV2Descriptor()
 	return WorkflowExecutionProfileBundle{
 		Descriptor: descriptor, componentIdentity: descriptor.Components,
 		nodeDispatch:   frozenV0V1NodeDispatchOwnership(descriptor),
@@ -622,7 +679,7 @@ func validateNodeDispatchOwnership(
 	runnerDispatchID := descriptor.Components.RunnerDispatchID
 	if runnerDispatchID == LegacyWorkflowExecutionProfileDescriptor().Components.RunnerDispatchID ||
 		runnerDispatchID == WorkflowExecutionProfileV1Descriptor().Components.RunnerDispatchID ||
-		runnerDispatchID == CurrentWorkflowExecutionProfileDescriptor().Components.RunnerDispatchID {
+		runnerDispatchID == WorkflowExecutionProfileV2Descriptor().Components.RunnerDispatchID {
 		expected := frozenV0V1NodeDispatchOwnership(descriptor)
 		if len(expected) != len(ownership) {
 			return fmt.Errorf("workflow execution profile changed its frozen dispatch ownership set")

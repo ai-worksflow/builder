@@ -513,6 +513,14 @@ func artifactGraphEntityType(kind string) string {
 		return "api"
 	case "data_contract":
 		return "data"
+	case "permission_contract":
+		return "permission"
+	case "ai_runtime_contract":
+		return "ai_runtime"
+	case "deployment_contract":
+		return "deployment"
+	case "verification_contract":
+		return "verification"
 	case "workspace":
 		return "workspace"
 	default:

@@ -22,8 +22,13 @@ func (f *executionProfileCaptureFreezer) Freeze(_ context.Context, execution Exe
 func TestWorkflowExecutionProfileDescriptorsHaveGoldenRefs(t *testing.T) {
 	t.Parallel()
 	currentDescriptor := CurrentWorkflowExecutionProfileDescriptor()
+	v2Descriptor := WorkflowExecutionProfileV2Descriptor()
 	v1Descriptor := WorkflowExecutionProfileV1Descriptor()
 	current, err := currentDescriptor.Ref()
+	if err != nil {
+		t.Fatal(err)
+	}
+	v2, err := v2Descriptor.Ref()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -35,8 +40,11 @@ func TestWorkflowExecutionProfileDescriptorsHaveGoldenRefs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if current != (domain.WorkflowExecutionProfileRef{Version: CurrentWorkflowExecutionProfileVersion, Hash: CurrentWorkflowExecutionProfileHash}) {
-		t.Fatalf("current execution profile descriptor changed without a version/hash bump: %+v", current)
+	if v2 != (domain.WorkflowExecutionProfileRef{Version: WorkflowExecutionProfileV2Version, Hash: WorkflowExecutionProfileV2Hash}) {
+		t.Fatalf("workflow-engine/v2 descriptor drifted from its frozen snapshot: %+v", v2)
+	}
+	if current != v2 || CurrentWorkflowExecutionProfileRef() != WorkflowExecutionProfileV2Ref() {
+		t.Fatalf("current execution profile is not the exact workflow-engine/v2 alias: current=%+v v2=%+v", current, v2)
 	}
 	if v1 != (domain.WorkflowExecutionProfileRef{Version: WorkflowExecutionProfileV1Version, Hash: WorkflowExecutionProfileV1Hash}) {
 		t.Fatalf("workflow-engine/v1 descriptor drifted from its frozen snapshot: %+v", v1)
@@ -44,26 +52,26 @@ func TestWorkflowExecutionProfileDescriptorsHaveGoldenRefs(t *testing.T) {
 	if legacy != (domain.WorkflowExecutionProfileRef{Version: LegacyWorkflowExecutionProfileVersion, Hash: LegacyWorkflowExecutionProfileHash}) {
 		t.Fatalf("legacy execution profile descriptor drifted from the migration snapshot: %+v", legacy)
 	}
-	if legacy.Version == v1.Version || legacy.Version == current.Version || v1.Version == current.Version ||
-		legacy.Hash == v1.Hash || legacy.Hash == current.Hash || v1.Hash == current.Hash ||
-		legacyWorkflowCapabilitiesSnapshot().Version != 3 || workflowCapabilitiesV1Snapshot().Version != 4 || currentProfileCapabilitiesVersion() != 4 {
-		t.Fatalf("legacy, v1 and current execution profiles are not independent: legacy=%+v v1=%+v current=%+v", legacy, v1, current)
+	if legacy.Version == v1.Version || legacy.Version == v2.Version || v1.Version == v2.Version ||
+		legacy.Hash == v1.Hash || legacy.Hash == v2.Hash || v1.Hash == v2.Hash ||
+		legacyWorkflowCapabilitiesSnapshot().Version != 3 || workflowCapabilitiesV1Snapshot().Version != 4 || workflowCapabilitiesV2Snapshot().Version != 4 || currentProfileCapabilitiesVersion() != 4 {
+		t.Fatalf("legacy, v1 and v2 execution profiles are not independent: legacy=%+v v1=%+v v2=%+v", legacy, v1, v2)
 	}
 	v1CapabilitiesHash, err := domain.CanonicalHash(v1Descriptor.Capabilities)
 	if err != nil {
 		t.Fatal(err)
 	}
-	currentCapabilitiesHash, err := domain.CanonicalHash(currentDescriptor.Capabilities)
+	v2CapabilitiesHash, err := domain.CanonicalHash(v2Descriptor.Capabilities)
 	if err != nil {
 		t.Fatal(err)
 	}
 	v1Components := v1Descriptor.Components
-	if v1Components.ReconcileID == currentDescriptor.Components.ReconcileID {
+	if v1Components.ReconcileID == v2Descriptor.Components.ReconcileID {
 		t.Fatal("workflow-engine/v2 did not pin a distinct reconciliation component")
 	}
-	v1Components.ReconcileID = currentDescriptor.Components.ReconcileID
-	if v1CapabilitiesHash != currentCapabilitiesHash || v1Components != currentDescriptor.Components {
-		t.Fatalf("workflow-engine/v2 changed more than its reconciliation component: v1=%+v v2=%+v", v1Descriptor, currentDescriptor)
+	v1Components.ReconcileID = v2Descriptor.Components.ReconcileID
+	if v1CapabilitiesHash != v2CapabilitiesHash || v1Components != v2Descriptor.Components {
+		t.Fatalf("workflow-engine/v2 changed more than its reconciliation component: v1=%+v v2=%+v", v1Descriptor, v2Descriptor)
 	}
 
 	mutations := []func(*WorkflowExecutionProfileDescriptor){
@@ -74,7 +82,7 @@ func TestWorkflowExecutionProfileDescriptorsHaveGoldenRefs(t *testing.T) {
 		},
 	}
 	for index, mutate := range mutations {
-		descriptor := CurrentWorkflowExecutionProfileDescriptor()
+		descriptor := WorkflowExecutionProfileV2Descriptor()
 		// Clone the nested map before mutation so this test cannot alter a shared
 		// capability snapshot if the implementation changes later.
 		limits := make(map[string]int, len(descriptor.Capabilities.FanOutMaximumItems))
@@ -87,9 +95,54 @@ func TestWorkflowExecutionProfileDescriptorsHaveGoldenRefs(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if ref.Hash == current.Hash {
+		if ref.Hash == v2.Hash {
 			t.Fatalf("descriptor mutation %d did not change the execution profile hash", index)
 		}
+	}
+}
+
+func TestWorkflowExecutionProfileV2SnapshotIsIndependentFromAuthoringFactory(t *testing.T) {
+	t.Parallel()
+	frozen := WorkflowExecutionProfileV2Descriptor()
+	frozenCapabilitiesHash, err := domain.CanonicalHash(frozen.Capabilities)
+	if err != nil {
+		t.Fatal(err)
+	}
+	authoring := PlatformWorkflowCapabilities(true, true)
+	authoring.Version++
+	authoring.FanOutMaximumItems["blueprint_page"]--
+	authoring.ManifestCompilers[0].AllowedContextArtifactKinds = append(
+		authoring.ManifestCompilers[0].AllowedContextArtifactKinds,
+		"future_contract",
+	)
+	authoring.InputContracts[0].ManifestSchemaContracts["workflow_start"] = "workflow-input/future"
+	driftedAuthoringHash, err := domain.CanonicalHash(authoring)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if driftedAuthoringHash == frozenCapabilitiesHash {
+		t.Fatal("mutated authoring factory value did not diverge from the frozen v2 snapshot")
+	}
+	after := WorkflowExecutionProfileV2Descriptor()
+	afterCapabilitiesHash, err := domain.CanonicalHash(after.Capabilities)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterCapabilitiesHash != frozenCapabilitiesHash || WorkflowExecutionProfileV2Ref() != (domain.WorkflowExecutionProfileRef{Version: WorkflowExecutionProfileV2Version, Hash: WorkflowExecutionProfileV2Hash}) {
+		t.Fatalf("authoring capability mutation affected workflow-engine/v2: before=%s after=%s", frozenCapabilitiesHash, afterCapabilitiesHash)
+	}
+}
+
+func TestProductionSealRejectsAuthoringCapabilitiesThatDriftFromFrozenV2(t *testing.T) {
+	t.Parallel()
+	engine, err := NewEngine(NewMemoryStore(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	engine.Capabilities = PlatformWorkflowCapabilities(true, true)
+	engine.Capabilities.Version++
+	if err := engine.SealProductionExecutionProfiles(); err == nil || !strings.Contains(err.Error(), "capabilities do not match") {
+		t.Fatalf("production seal accepted authoring capability drift: %v", err)
 	}
 }
 
@@ -106,15 +159,31 @@ func TestExecutionProfileRegistryRequiresExactCompleteBundle(t *testing.T) {
 	if len(registry.SupportedRefs()) != 3 {
 		t.Fatalf("built-in profile registry = %+v", registry.SupportedRefs())
 	}
+	wantRefs := map[domain.WorkflowExecutionProfileRef]bool{
+		LegacyWorkflowExecutionProfileRef(): false,
+		WorkflowExecutionProfileV1Ref():     false,
+		WorkflowExecutionProfileV2Ref():     false,
+	}
+	for _, ref := range registry.SupportedRefs() {
+		if _, expected := wantRefs[ref]; !expected {
+			t.Fatalf("built-in profile registry contains unexpected ref %+v", ref)
+		}
+		wantRefs[ref] = true
+	}
+	for ref, present := range wantRefs {
+		if !present {
+			t.Fatalf("built-in profile registry is missing exact ref %+v", ref)
+		}
+	}
 	wrong := CurrentWorkflowExecutionProfileRef()
 	wrong.Hash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	if _, err := registry.Resolve(wrong); err == nil {
 		t.Fatal("same-version profile with a different descriptor hash fell back to current")
 	}
-	if err := NewWorkflowExecutionProfileRegistry().Register(WorkflowExecutionProfileBundle{Descriptor: CurrentWorkflowExecutionProfileDescriptor()}); err == nil {
+	if err := NewWorkflowExecutionProfileRegistry().Register(WorkflowExecutionProfileBundle{Descriptor: WorkflowExecutionProfileV2Descriptor()}); err == nil {
 		t.Fatal("incomplete execution profile bundle was registered")
 	}
-	drifted := currentExecutionProfileBundle()
+	drifted := workflowExecutionProfileV2Bundle()
 	drifted.componentIdentity.RunnerDispatchID = "different-runtime"
 	if err := NewWorkflowExecutionProfileRegistry().Register(drifted); err == nil {
 		t.Fatal("runtime component identity different from the hashed descriptor was registered")

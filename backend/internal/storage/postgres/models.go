@@ -650,23 +650,36 @@ type ApplicationBuildManifestModel struct {
 func (ApplicationBuildManifestModel) TableName() string { return "application_build_manifests" }
 
 type ImplementationProposalModel struct {
-	ID                      uuid.UUID  `gorm:"type:uuid;primaryKey"`
-	ProjectID               uuid.UUID  `gorm:"type:uuid;not null;index"`
-	BuildManifestID         uuid.UUID  `gorm:"type:uuid;not null"`
-	BaseWorkspaceRevisionID *uuid.UUID `gorm:"type:uuid"`
-	ExecutionSource         string     `gorm:"not null;default:manual_submission"`
-	ConversationCommandID   *uuid.UUID `gorm:"type:uuid"`
-	SupersedesProposalID    *uuid.UUID `gorm:"type:uuid"`
-	InstructionHash         *string
-	AIProvider              *string   `gorm:"column:ai_provider"`
-	AIModel                 *string   `gorm:"column:ai_model"`
-	Status                  string    `gorm:"not null"`
-	Version                 uint64    `gorm:"not null"`
-	ContentStore            string    `gorm:"not null"`
-	ContentRef              string    `gorm:"not null"`
-	ContentHash             string    `gorm:"not null"`
-	PayloadHash             string    `gorm:"not null"`
-	OperationCount          int       `gorm:"not null"`
+	ID                                  uuid.UUID  `gorm:"type:uuid;primaryKey"`
+	ProjectID                           uuid.UUID  `gorm:"type:uuid;not null;index"`
+	BuildManifestID                     uuid.UUID  `gorm:"type:uuid;not null"`
+	ApplicationBuildContractID          *uuid.UUID `gorm:"type:uuid"`
+	ApplicationBuildContractHash        *string
+	BaseWorkspaceRevisionID             *uuid.UUID `gorm:"type:uuid"`
+	ExecutionSource                     string     `gorm:"not null;default:manual_submission"`
+	ConversationCommandID               *uuid.UUID `gorm:"type:uuid"`
+	SupersedesProposalID                *uuid.UUID `gorm:"type:uuid"`
+	InstructionHash                     *string
+	AIProvider                          *string    `gorm:"column:ai_provider"`
+	AIModel                             *string    `gorm:"column:ai_model"`
+	CandidateSnapshotID                 *uuid.UUID `gorm:"type:uuid"`
+	CandidateBaseTreeHash               *string
+	CandidateTreeHash                   *string
+	CandidateVerificationBindingVersion *string
+	CandidateVerificationReceiptID      *uuid.UUID `gorm:"type:uuid"`
+	CandidateVerificationReceiptHash    *string
+	Status                              string `gorm:"not null"`
+	Version                             uint64 `gorm:"not null"`
+	ContentStore                        string `gorm:"not null"`
+	ContentRef                          string `gorm:"not null"`
+	ContentHash                         string `gorm:"not null"`
+	PayloadHash                         string `gorm:"not null"`
+	OperationCount                      int    `gorm:"not null"`
+	// Nullable preserves the distinction between historical proposals whose
+	// content was never projected and new proposals whose completeness was
+	// counted from the exact immutable payload.
+	UnimplementedCount      *int
+	BlockingDiagnosticCount *int
 	AcceptedCount           int       `gorm:"not null"`
 	RejectedCount           int       `gorm:"not null"`
 	CreatedBy               uuid.UUID `gorm:"type:uuid;not null"`
@@ -677,10 +690,55 @@ type ImplementationProposalModel struct {
 
 func (ImplementationProposalModel) TableName() string { return "implementation_proposals" }
 
+type CandidateImplementationFreezeModel struct {
+	ID                         uuid.UUID  `gorm:"type:uuid;primaryKey"`
+	ProjectID                  uuid.UUID  `gorm:"type:uuid;not null;index"`
+	SessionID                  uuid.UUID  `gorm:"type:uuid;not null"`
+	CandidateID                uuid.UUID  `gorm:"type:uuid;not null;index"`
+	CandidateSnapshotID        uuid.UUID  `gorm:"type:uuid;not null;uniqueIndex"`
+	ImplementationProposalID   uuid.UUID  `gorm:"type:uuid;not null;uniqueIndex"`
+	RequestKey                 string     `gorm:"not null"`
+	RequestHash                string     `gorm:"not null"`
+	SessionVersion             uint64     `gorm:"not null"`
+	CandidateVersion           uint64     `gorm:"not null"`
+	JournalSequence            uint64     `gorm:"not null"`
+	SessionEpoch               uint64     `gorm:"not null"`
+	WriterLeaseEpoch           uint64     `gorm:"not null"`
+	BaseTreeHash               string     `gorm:"not null"`
+	CandidateTreeStore         string     `gorm:"not null"`
+	CandidateTreeOwnerID       uuid.UUID  `gorm:"type:uuid;not null"`
+	CandidateTreeRef           string     `gorm:"not null"`
+	CandidateTreeContentHash   string     `gorm:"not null"`
+	CandidateTreeHash          string     `gorm:"not null"`
+	VerificationBindingVersion string     `gorm:"not null"`
+	VerificationReceiptID      *uuid.UUID `gorm:"type:uuid"`
+	VerificationReceiptHash    *string
+	BuildManifestID            uuid.UUID  `gorm:"type:uuid;not null"`
+	BuildManifestHash          string     `gorm:"not null"`
+	BuildContractID            uuid.UUID  `gorm:"type:uuid;not null"`
+	BuildContractHash          string     `gorm:"not null"`
+	FullStackTemplateID        uuid.UUID  `gorm:"type:uuid;not null"`
+	FullStackTemplateHash      string     `gorm:"not null"`
+	BaseWorkspaceArtifactID    *uuid.UUID `gorm:"type:uuid"`
+	BaseWorkspaceRevisionID    *uuid.UUID `gorm:"type:uuid"`
+	BaseWorkspaceContentHash   *string
+	ProposalPayloadHash        string    `gorm:"not null"`
+	OperationCount             int       `gorm:"not null"`
+	Reason                     string    `gorm:"not null"`
+	CreatedBy                  uuid.UUID `gorm:"type:uuid;not null"`
+	CreatedAt                  time.Time
+}
+
+func (CandidateImplementationFreezeModel) TableName() string {
+	return "candidate_implementation_freezes"
+}
+
 type ImplementationGenerationClaimModel struct {
 	ID                            uuid.UUID  `gorm:"type:uuid;primaryKey"`
 	BuildManifestID               uuid.UUID  `gorm:"type:uuid;not null;index"`
 	ProjectID                     uuid.UUID  `gorm:"type:uuid;not null;index"`
+	ApplicationBuildContractID    *uuid.UUID `gorm:"type:uuid"`
+	ApplicationBuildContractHash  *string
 	RootManifestID                uuid.UUID  `gorm:"type:uuid;not null"`
 	RequestKey                    uuid.UUID  `gorm:"type:uuid;not null;uniqueIndex"`
 	ReservedProposalID            uuid.UUID  `gorm:"type:uuid;not null;uniqueIndex"`

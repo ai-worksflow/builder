@@ -759,6 +759,12 @@ func (s *Service) ExecuteCommand(ctx context.Context, projectID, conversationID,
 
 func safeWorkbenchCommandFailure(err error) *CommandFailure {
 	class := generation.SafeImplementationFailureClass(err)
+	if class == "governed_candidate_required" {
+		return &CommandFailure{
+			Code:    class,
+			Message: "Direct model-to-Proposal generation is retired. Open the Code sandbox, produce a durable Candidate, pass exact verification, and freeze it for review.",
+		}
+	}
 	return &CommandFailure{
 		Code:    class,
 		Message: "Server-side Workbench generation did not complete safely; no browser-supplied result was accepted and the command remains retryable.",

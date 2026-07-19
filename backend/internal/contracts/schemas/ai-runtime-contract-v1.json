@@ -1,0 +1,68 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://worksflow.dev/schemas/ai-runtime-contract-v1.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "providerPolicy", "conversation", "run", "streaming", "cancellation", "retry", "limits", "retention"],
+  "properties": {
+    "schemaVersion": {"const": "ai-runtime-contract/v1"},
+    "providerPolicy": {
+      "type": "object", "additionalProperties": false, "required": ["policyId", "modelClass", "fallbackAllowed"],
+      "properties": {
+        "policyId": {"type": "string", "minLength": 1},
+        "modelClass": {"type": "string", "minLength": 1},
+        "fallbackAllowed": {"type": "boolean"}
+      }
+    },
+    "conversation": {
+      "type": "object", "additionalProperties": false, "required": ["persistence", "messageRoles"],
+      "properties": {
+        "persistence": {"enum": ["required", "disabled"]},
+        "messageRoles": {"type": "array", "minItems": 2, "items": {"enum": ["system", "user", "assistant", "tool"]}, "uniqueItems": true}
+      }
+    },
+    "run": {
+      "type": "object", "additionalProperties": false, "required": ["idempotencyRequired", "statusValues"],
+      "properties": {
+        "idempotencyRequired": {"const": true},
+        "statusValues": {"type": "array", "minItems": 4, "items": {"enum": ["queued", "running", "completed", "failed", "cancelled"]}, "uniqueItems": true}
+      }
+    },
+    "streaming": {
+      "type": "object", "additionalProperties": false, "required": ["transport", "eventTypes", "resumeCursor"],
+      "properties": {
+        "transport": {"enum": ["sse", "websocket"]},
+        "eventTypes": {"type": "array", "minItems": 3, "items": {"type": "string", "minLength": 1}, "uniqueItems": true},
+        "resumeCursor": {"type": "boolean"}
+      }
+    },
+    "cancellation": {
+      "type": "object", "additionalProperties": false, "required": ["supported", "terminalStatus"],
+      "properties": {"supported": {"const": true}, "terminalStatus": {"const": "cancelled"}}
+    },
+    "retry": {
+      "type": "object", "additionalProperties": false, "required": ["reasonRequired", "maxAttempts", "supersedeOnModelChange"],
+      "properties": {
+        "reasonRequired": {"const": true},
+        "maxAttempts": {"type": "integer", "minimum": 1, "maximum": 20},
+        "supersedeOnModelChange": {"const": true}
+      }
+    },
+    "limits": {
+      "type": "object", "additionalProperties": false, "required": ["maxInputBytes", "maxOutputBytes", "timeoutSeconds"],
+      "properties": {
+        "maxInputBytes": {"type": "integer", "minimum": 1},
+        "maxOutputBytes": {"type": "integer", "minimum": 1},
+        "timeoutSeconds": {"type": "integer", "minimum": 1, "maximum": 3600}
+      }
+    },
+    "retention": {
+      "type": "object", "additionalProperties": false, "required": ["messageDays", "runDays", "redactionRequired"],
+      "properties": {
+        "messageDays": {"type": "integer", "minimum": 1},
+        "runDays": {"type": "integer", "minimum": 1},
+        "redactionRequired": {"const": true}
+      }
+    }
+  }
+}

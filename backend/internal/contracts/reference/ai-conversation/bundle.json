@@ -1,0 +1,28 @@
+{
+  "schemaVersion": "reference-ai-conversation-bundle/v1",
+  "profileId": "reference-ai-conversation/v1",
+  "deliverySliceId": "page-conversations",
+  "components": [
+    {"kind": "acceptance_index", "path": "acceptance-criteria.json", "artifactId": "reference-ai-conversation-acceptance", "revisionId": "reference-ai-conversation-acceptance-r1", "sha256": "c4db58955e72b3e8f4d50a15caedd365345267cc96000e01682a1469978c34f4"},
+    {"kind": "requirement_baseline", "path": "requirement-baseline.json", "artifactId": "reference-ai-conversation-baseline", "revisionId": "reference-ai-conversation-baseline-r1", "sha256": "dae335060658d2789af8df4e62e2794ac28b433824978b5298d6f1b42dc09515"},
+    {"kind": "blueprint", "path": "blueprint.json", "artifactId": "reference-ai-conversation-blueprint", "revisionId": "reference-ai-conversation-blueprint-r1", "sha256": "c49c8c251a49f6130b5f15a62caebb49f688724dcfbf5f481daebd25a72546b9"},
+    {"kind": "page_spec", "path": "page-spec.json", "artifactId": "reference-ai-conversation-page-spec", "revisionId": "reference-ai-conversation-page-spec-r1", "sha256": "f6426ebee2405f87498a85bcf910d8a19de39243a043a60c9941f04b579895d7"},
+    {"kind": "prototype", "path": "prototype.json", "artifactId": "reference-ai-conversation-prototype", "revisionId": "reference-ai-conversation-prototype-r1", "sha256": "37f647f552d45fd426c0997811c9ac27ea7ca452813a304e54a1c67947dbc22a"},
+    {"kind": "api_contract", "path": "api-contract.json", "artifactId": "reference-ai-conversation-api", "revisionId": "reference-ai-conversation-api-r1", "sha256": "86681f1ff82c5a0e905e77816952cbb7694b98841e9f048230e6c00d0a016e4a"},
+    {"kind": "data_contract", "path": "data-contract.json", "artifactId": "reference-ai-conversation-data", "revisionId": "reference-ai-conversation-data-r1", "sha256": "20cc60b569e7f204a9358e39173d5f9b992e3a50a56e629a9d54eb9c02727e1c"},
+    {"kind": "permission_contract", "path": "permission-contract.json", "artifactId": "reference-ai-conversation-permission", "revisionId": "reference-ai-conversation-permission-r1", "sha256": "9a94ce065fa3b3aac76cac934d638f505334d47e145a7faad99c190bd27c2aad"},
+    {"kind": "ai_runtime_contract", "path": "ai-runtime-contract.json", "artifactId": "reference-ai-conversation-ai-runtime", "revisionId": "reference-ai-conversation-ai-runtime-r1", "sha256": "ed8aa6c4af245b7bd34e2c6b5e767c44e7fa1d7e20d60ee98b5800344bdc3fbd"},
+    {"kind": "deployment_contract", "path": "deployment-contract.json", "artifactId": "reference-ai-conversation-deployment", "revisionId": "reference-ai-conversation-deployment-r1", "sha256": "54cd9497745103cbe35b827cb499e5a8899684b37be12c3e3c635ee85223b984"},
+    {"kind": "verification_contract", "path": "verification-contract.json", "artifactId": "reference-ai-conversation-verification", "revisionId": "reference-ai-conversation-verification-r1", "sha256": "48b532702fc9e5a6ecb19cb14ab0e3fac1aa234404f61a923cf00c7eda5a634c"},
+    {"kind": "run_event_schema", "path": "run-event-schema.json", "artifactId": "reference-ai-conversation-run-event", "revisionId": "reference-ai-conversation-run-event-r1", "sha256": "2a2c389eb684a5949aa7009cd16a40e8e4f727adda169c3e42ca3683310311d1"}
+  ],
+  "expectations": {
+    "entities": ["Conversation", "Message", "Run", "RunEvent"],
+    "operations": ["cancelRun", "createConversation", "createRun", "getConversation", "getRun", "listConversations", "listMessages", "listRuns", "retryRun", "sendMessage", "streamRunEvents"],
+    "stateKeys": ["cancelled", "empty", "error", "loading", "ready", "streaming"],
+    "eventTypes": ["heartbeat", "output.delta", "run.cancelled", "run.completed", "run.failed", "run.queued", "run.started", "tool.call", "tool.result"],
+    "acceptanceCriterionIds": ["AC-AI-001", "AC-AI-002", "AC-AI-003", "AC-AI-004", "AC-AI-005", "AC-AI-006", "AC-AI-007", "AC-AI-008", "AC-AI-009", "AC-AI-010", "AC-AI-011", "AC-AI-012", "AC-AI-013", "AC-AI-014", "AC-AI-015"]
+  },
+  "contentSetSha256": "2b5a59c2ea6c07eda550109a731786662ac05826d3d66922fe4c853b5cf9df91",
+  "bundleHash": "492e2834d021b8e04f66d3508b5e5e79a5397d8992a850867e5909187d089fa5"
+}

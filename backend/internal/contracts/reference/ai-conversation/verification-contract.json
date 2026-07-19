@@ -1,0 +1,20 @@
+{
+  "schemaVersion": "verification-contract/v1",
+  "oracles": [
+    {"id": "verify-conversation-create-list", "acceptanceCriterionIds": ["AC-AI-001"], "kind": "integration", "target": "POST and GET /api/v1/conversations", "commandId": "test-conversation-persistence", "blocking": true},
+    {"id": "verify-restart-history", "acceptanceCriterionIds": ["AC-AI-002"], "kind": "browser", "target": "Browser and API restart history recovery", "commandId": "test-restart-history", "blocking": true},
+    {"id": "verify-idempotency", "acceptanceCriterionIds": ["AC-AI-003"], "kind": "integration", "target": "Message and run idempotency replay", "commandId": "test-idempotency", "blocking": true},
+    {"id": "verify-typed-resumable-sse", "acceptanceCriterionIds": ["AC-AI-004"], "kind": "contract", "target": "RunEvent schema and Last-Event-ID resume", "commandId": "test-run-event-stream", "blocking": true},
+    {"id": "verify-cancel", "acceptanceCriterionIds": ["AC-AI-005"], "kind": "integration", "target": "Queued and running run cancellation", "commandId": "test-run-cancel", "blocking": true},
+    {"id": "verify-retry-reason", "acceptanceCriterionIds": ["AC-AI-006"], "kind": "integration", "target": "Retry reason and bounded attempt lineage", "commandId": "test-run-retry", "blocking": true},
+    {"id": "verify-cross-project-isolation", "acceptanceCriterionIds": ["AC-AI-007"], "kind": "security", "target": "Two-principal cross-project resource matrix", "commandId": "test-tenant-isolation", "blocking": true},
+    {"id": "verify-auth-audit", "acceptanceCriterionIds": ["AC-AI-008"], "kind": "security", "target": "Session role enforcement and actor/project audit", "commandId": "test-auth-audit", "blocking": true},
+    {"id": "verify-health-readiness", "acceptanceCriterionIds": ["AC-AI-009"], "kind": "health", "target": "GET /healthz and GET /readyz", "commandId": "test-health-readiness", "blocking": true},
+    {"id": "verify-migration-before-traffic", "acceptanceCriterionIds": ["AC-AI-010"], "kind": "integration", "target": "Idempotent api-migrate before traffic", "commandId": "test-migration-admission", "blocking": true},
+    {"id": "verify-gateway-secret-isolation", "acceptanceCriterionIds": ["AC-AI-011"], "kind": "security", "target": "Generated-application gateway capability and provider-key isolation", "commandId": "test-gateway-secret-isolation", "blocking": true},
+    {"id": "verify-rate-limit", "acceptanceCriterionIds": ["AC-AI-012"], "kind": "integration", "target": "Tenant-actor 429 and Retry-After behavior", "commandId": "test-ai-rate-limit", "blocking": true},
+    {"id": "verify-timeout-terminal", "acceptanceCriterionIds": ["AC-AI-013"], "kind": "integration", "target": "Run timeout and single failed terminal event", "commandId": "test-run-timeout", "blocking": true},
+    {"id": "verify-retention-redaction", "acceptanceCriterionIds": ["AC-AI-014"], "kind": "security", "target": "Retention windows and pre-persistence redaction", "commandId": "test-retention-redaction", "blocking": true},
+    {"id": "verify-disconnect-recovery", "acceptanceCriterionIds": ["AC-AI-015"], "kind": "browser", "target": "Disconnect resume and durable terminal convergence", "commandId": "test-stream-recovery", "blocking": true}
+  ]
+}

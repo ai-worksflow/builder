@@ -36,6 +36,7 @@ const (
 	ImplementationSourceManualGeneration    ImplementationExecutionSource = "manual_generation"
 	ImplementationSourceWorkflowRunner      ImplementationExecutionSource = "workflow_runner"
 	ImplementationSourceConversationCommand ImplementationExecutionSource = "conversation_command"
+	ImplementationSourceCandidateFreeze     ImplementationExecutionSource = "candidate_freeze"
 )
 
 type FileOperation struct {
@@ -45,6 +46,7 @@ type FileOperation struct {
 	FromPath     string                 `json:"fromPath,omitempty"`
 	Content      *string                `json:"content,omitempty"`
 	Language     string                 `json:"language,omitempty"`
+	Mode         string                 `json:"mode,omitempty"`
 	ExpectedHash string                 `json:"expectedHash,omitempty"`
 	DependsOn    []string               `json:"dependsOn,omitempty"`
 	Rationale    string                 `json:"rationale,omitempty"`
@@ -54,47 +56,92 @@ type FileOperation struct {
 	Reason       string                 `json:"reason,omitempty"`
 }
 
+type CandidateImplementationSource struct {
+	FreezeReceiptID      string                `json:"freezeReceiptId"`
+	RepositorySnapshotID string                `json:"repositorySnapshotId"`
+	SessionID            string                `json:"sessionId"`
+	CandidateID          string                `json:"candidateId"`
+	CandidateSnapshotID  string                `json:"candidateSnapshotId"`
+	CandidateVersion     uint64                `json:"candidateVersion"`
+	JournalSequence      uint64                `json:"journalSequence"`
+	SessionEpoch         uint64                `json:"sessionEpoch"`
+	WriterLeaseEpoch     uint64                `json:"writerLeaseEpoch"`
+	BaseTreeHash         string                `json:"baseTreeHash"`
+	TreeHash             string                `json:"treeHash"`
+	FullStackTemplate    ExactContentReference `json:"fullStackTemplate"`
+	VerificationReceipt  ExactContentReference `json:"verificationReceipt"`
+}
+
+// ApplicationBuildContractRef is the exact semantic identity that authorizes
+// implementation work. ID alone is deliberately insufficient because a
+// caller must pin the canonical contract payload it reviewed.
+type ApplicationBuildContractRef struct {
+	ID           string `json:"id"`
+	ContractHash string `json:"contractHash"`
+}
+
+type ExactContentReference struct {
+	ID          string `json:"id"`
+	ContentHash string `json:"contentHash"`
+}
+
+// ApplicationBuildContractVerifier is implemented by the constructor
+// boundary. Core depends on this small interface so proposal creation and
+// apply can fail closed without importing the constructor package.
+type ApplicationBuildContractVerifier interface {
+	RequireReadyForImplementation(
+		context.Context,
+		string,
+		string,
+		string,
+		ApplicationBuildContractRef,
+	) (ApplicationBuildContractRef, error)
+}
+
 type ImplementationProposal struct {
-	ID                    string                        `json:"id"`
-	ProjectID             string                        `json:"projectId"`
-	BuildManifestID       string                        `json:"buildManifestId"`
-	BaseWorkspaceRevision *VersionRef                   `json:"baseWorkspaceRevision,omitempty"`
-	ExecutionSource       ImplementationExecutionSource `json:"executionSource"`
-	ConversationCommandID *string                       `json:"conversationCommandId,omitempty"`
-	SupersedesProposalID  *string                       `json:"supersedesProposalId,omitempty"`
-	InstructionHash       string                        `json:"instructionHash,omitempty"`
-	AIProvider            string                        `json:"aiProvider,omitempty"`
-	AIModel               string                        `json:"aiModel,omitempty"`
-	Operations            []FileOperation               `json:"operations"`
-	Routes                []json.RawMessage             `json:"routes"`
-	APIs                  []json.RawMessage             `json:"apis"`
-	Migrations            []json.RawMessage             `json:"migrations"`
-	Tests                 []json.RawMessage             `json:"tests"`
-	Previews              []json.RawMessage             `json:"previews"`
-	TraceLinks            []json.RawMessage             `json:"traceLinks"`
-	Diagnostics           []ValidationFinding           `json:"diagnostics"`
-	Assumptions           []string                      `json:"assumptions"`
-	UnimplementedItems    []string                      `json:"unimplementedItems"`
-	Status                string                        `json:"status"`
-	Version               uint64                        `json:"version"`
-	PayloadHash           string                        `json:"payloadHash"`
-	CreatedBy             string                        `json:"createdBy"`
-	CreatedAt             time.Time                     `json:"createdAt"`
-	AppliedAt             *time.Time                    `json:"appliedAt,omitempty"`
+	ID                       string                         `json:"id"`
+	ProjectID                string                         `json:"projectId"`
+	BuildManifestID          string                         `json:"buildManifestId"`
+	ApplicationBuildContract *ApplicationBuildContractRef   `json:"applicationBuildContract,omitempty"`
+	BaseWorkspaceRevision    *VersionRef                    `json:"baseWorkspaceRevision,omitempty"`
+	ExecutionSource          ImplementationExecutionSource  `json:"executionSource"`
+	ConversationCommandID    *string                        `json:"conversationCommandId,omitempty"`
+	SupersedesProposalID     *string                        `json:"supersedesProposalId,omitempty"`
+	InstructionHash          string                         `json:"instructionHash,omitempty"`
+	AIProvider               string                         `json:"aiProvider,omitempty"`
+	AIModel                  string                         `json:"aiModel,omitempty"`
+	CandidateSource          *CandidateImplementationSource `json:"candidateSource,omitempty"`
+	Operations               []FileOperation                `json:"operations"`
+	Routes                   []json.RawMessage              `json:"routes"`
+	APIs                     []json.RawMessage              `json:"apis"`
+	Migrations               []json.RawMessage              `json:"migrations"`
+	Tests                    []json.RawMessage              `json:"tests"`
+	Previews                 []json.RawMessage              `json:"previews"`
+	TraceLinks               []json.RawMessage              `json:"traceLinks"`
+	Diagnostics              []ValidationFinding            `json:"diagnostics"`
+	Assumptions              []string                       `json:"assumptions"`
+	UnimplementedItems       []string                       `json:"unimplementedItems"`
+	Status                   string                         `json:"status"`
+	Version                  uint64                         `json:"version"`
+	PayloadHash              string                         `json:"payloadHash"`
+	CreatedBy                string                         `json:"createdBy"`
+	CreatedAt                time.Time                      `json:"createdAt"`
+	AppliedAt                *time.Time                     `json:"appliedAt,omitempty"`
 }
 
 type CreateImplementationProposalInput struct {
-	BuildManifestID    string              `json:"buildManifestId"`
-	Operations         []FileOperation     `json:"operations"`
-	Routes             []json.RawMessage   `json:"routes,omitempty"`
-	APIs               []json.RawMessage   `json:"apis,omitempty"`
-	Migrations         []json.RawMessage   `json:"migrations,omitempty"`
-	Tests              []json.RawMessage   `json:"tests,omitempty"`
-	Previews           []json.RawMessage   `json:"previews,omitempty"`
-	TraceLinks         []json.RawMessage   `json:"traceLinks,omitempty"`
-	Diagnostics        []ValidationFinding `json:"diagnostics,omitempty"`
-	Assumptions        []string            `json:"assumptions,omitempty"`
-	UnimplementedItems []string            `json:"unimplementedItems,omitempty"`
+	BuildManifestID          string                      `json:"buildManifestId"`
+	ApplicationBuildContract ApplicationBuildContractRef `json:"applicationBuildContract"`
+	Operations               []FileOperation             `json:"operations"`
+	Routes                   []json.RawMessage           `json:"routes,omitempty"`
+	APIs                     []json.RawMessage           `json:"apis,omitempty"`
+	Migrations               []json.RawMessage           `json:"migrations,omitempty"`
+	Tests                    []json.RawMessage           `json:"tests,omitempty"`
+	Previews                 []json.RawMessage           `json:"previews,omitempty"`
+	TraceLinks               []json.RawMessage           `json:"traceLinks,omitempty"`
+	Diagnostics              []ValidationFinding         `json:"diagnostics,omitempty"`
+	Assumptions              []string                    `json:"assumptions,omitempty"`
+	UnimplementedItems       []string                    `json:"unimplementedItems,omitempty"`
 }
 
 // GeneratedImplementationIdentity is server-only execution provenance. It is
@@ -112,6 +159,7 @@ type GeneratedImplementationIdentity struct {
 	AIProvider                    string
 	AIModel                       string
 	ClaimToken                    string
+	ApplicationBuildContract      ApplicationBuildContractRef
 }
 
 type DecideImplementationInput struct {
@@ -125,24 +173,126 @@ type ApplyImplementationInput struct {
 	Version uint64 `json:"version"`
 }
 
-type ImplementationService struct {
-	database  *gorm.DB
-	contents  content.Store
-	access    *AccessControl
-	workbench *WorkbenchService
-	now       func() time.Time
+type QuarantineImplementationInput struct {
+	Version uint64 `json:"version"`
+	Reason  string `json:"reason"`
 }
 
-func NewImplementationService(database *gorm.DB, contents content.Store, access *AccessControl) (*ImplementationService, error) {
+type ImplementationService struct {
+	database       *gorm.DB
+	contents       content.Store
+	access         *AccessControl
+	workbench      *WorkbenchService
+	buildContracts ApplicationBuildContractVerifier
+	now            func() time.Time
+}
+
+func NewImplementationService(
+	database *gorm.DB,
+	contents content.Store,
+	access *AccessControl,
+	buildContracts ApplicationBuildContractVerifier,
+) (*ImplementationService, error) {
+	if buildContracts == nil {
+		return nil, errors.New("Application Build Contract verifier is required")
+	}
 	workbench, err := NewWorkbenchService(database, contents, access)
 	if err != nil {
 		return nil, err
 	}
-	return &ImplementationService{database: database, contents: contents, access: access, workbench: workbench, now: time.Now}, nil
+	return &ImplementationService{
+		database: database, contents: contents, access: access, workbench: workbench,
+		buildContracts: buildContracts, now: time.Now,
+	}, nil
+}
+
+func (s *ImplementationService) requireApplicationBuildContract(
+	ctx context.Context,
+	projectID, buildManifestID, actorID string,
+	selection ApplicationBuildContractRef,
+) (ApplicationBuildContractRef, error) {
+	if s == nil || s.buildContracts == nil {
+		return ApplicationBuildContractRef{}, fmt.Errorf("%w: Application Build Contract verifier is unavailable", ErrBlockingGate)
+	}
+	normalized, err := normalizeApplicationBuildContractRef(selection)
+	if err != nil {
+		return ApplicationBuildContractRef{}, err
+	}
+	verified, err := s.buildContracts.RequireReadyForImplementation(
+		ctx, projectID, buildManifestID, actorID, normalized,
+	)
+	if err != nil {
+		return ApplicationBuildContractRef{}, err
+	}
+	verified, err = normalizeApplicationBuildContractRef(verified)
+	if err != nil || !sameApplicationBuildContractRef(normalized, verified) {
+		return ApplicationBuildContractRef{}, fmt.Errorf("%w: Application Build Contract verifier returned a different identity", ErrConflict)
+	}
+	return verified, nil
+}
+
+func normalizeApplicationBuildContractRef(value ApplicationBuildContractRef) (ApplicationBuildContractRef, error) {
+	if value.ID == "" || value.ID != strings.TrimSpace(value.ID) ||
+		value.ContractHash == "" || value.ContractHash != strings.TrimSpace(value.ContractHash) ||
+		!domain.IsCanonicalHash(value.ContractHash) {
+		return ApplicationBuildContractRef{}, fmt.Errorf("%w: exact Application Build Contract reference", ErrInvalidInput)
+	}
+	id, err := uuid.Parse(value.ID)
+	if err != nil {
+		return ApplicationBuildContractRef{}, fmt.Errorf("%w: Application Build Contract id", ErrInvalidInput)
+	}
+	digest := strings.TrimPrefix(value.ContractHash, "sha256:")
+	if digest != strings.ToLower(digest) {
+		return ApplicationBuildContractRef{}, fmt.Errorf("%w: Application Build Contract hash", ErrInvalidInput)
+	}
+	return ApplicationBuildContractRef{ID: id.String(), ContractHash: value.ContractHash}, nil
+}
+
+func sameApplicationBuildContractRef(left, right ApplicationBuildContractRef) bool {
+	return left.ID == right.ID && left.ContractHash == right.ContractHash
+}
+
+func cloneApplicationBuildContractRef(value *ApplicationBuildContractRef) *ApplicationBuildContractRef {
+	if value == nil {
+		return nil
+	}
+	copy := *value
+	return &copy
+}
+
+func exactApplicationBuildContractFromProposal(
+	proposal ImplementationProposal,
+	model storage.ImplementationProposalModel,
+) (ApplicationBuildContractRef, error) {
+	if proposal.ApplicationBuildContract == nil || model.ApplicationBuildContractID == nil || model.ApplicationBuildContractHash == nil {
+		return ApplicationBuildContractRef{}, fmt.Errorf("%w: implementation proposal predates the exact Build Contract gate", ErrBlockingGate)
+	}
+	ref, err := normalizeApplicationBuildContractRef(*proposal.ApplicationBuildContract)
+	if err != nil || model.ApplicationBuildContractID.String() != ref.ID || *model.ApplicationBuildContractHash != ref.ContractHash {
+		return ApplicationBuildContractRef{}, fmt.Errorf("%w: implementation proposal Build Contract binding drift", ErrConflict)
+	}
+	return ref, nil
+}
+
+func optionalApplicationBuildContractMatchesModel(
+	value *ApplicationBuildContractRef,
+	model storage.ImplementationProposalModel,
+) bool {
+	if value == nil || model.ApplicationBuildContractID == nil || model.ApplicationBuildContractHash == nil {
+		return value == nil && model.ApplicationBuildContractID == nil && model.ApplicationBuildContractHash == nil
+	}
+	normalized, err := normalizeApplicationBuildContractRef(*value)
+	return err == nil && normalized.ID == model.ApplicationBuildContractID.String() &&
+		normalized.ContractHash == *model.ApplicationBuildContractHash
+}
+
+func nonNilUUIDPointer(value uuid.UUID) *uuid.UUID {
+	copy := value
+	return &copy
 }
 
 func (s *ImplementationService) Create(ctx context.Context, projectID, actorID string, input CreateImplementationProposalInput) (ImplementationProposal, error) {
-	return s.create(ctx, projectID, actorID, input, nil)
+	return s.create(ctx, projectID, actorID, input, nil, nil)
 }
 
 func (s *ImplementationService) CreateGenerated(
@@ -151,7 +301,7 @@ func (s *ImplementationService) CreateGenerated(
 	input CreateImplementationProposalInput,
 	identity GeneratedImplementationIdentity,
 ) (ImplementationProposal, error) {
-	return s.create(ctx, projectID, actorID, input, &identity)
+	return s.create(ctx, projectID, actorID, input, &identity, nil)
 }
 
 func (s *ImplementationService) create(
@@ -159,6 +309,7 @@ func (s *ImplementationService) create(
 	projectID, actorID string,
 	input CreateImplementationProposalInput,
 	identity *GeneratedImplementationIdentity,
+	candidateIdentity *CandidateImplementationIdentity,
 ) (ImplementationProposal, error) {
 	if _, err := s.access.Authorize(ctx, projectID, actorID, ActionEdit); err != nil {
 		return ImplementationProposal{}, err
@@ -167,12 +318,24 @@ func (s *ImplementationService) create(
 	if err != nil {
 		return ImplementationProposal{}, err
 	}
+	verifiedContract, err := s.requireApplicationBuildContract(
+		ctx, projectID, input.BuildManifestID, actorID, input.ApplicationBuildContract,
+	)
+	if err != nil {
+		return ImplementationProposal{}, err
+	}
+	input.ApplicationBuildContract = verifiedContract
 	bundle, err := s.workbench.GetBundleForGeneration(ctx, input.BuildManifestID, actorID)
 	if err != nil {
 		return ImplementationProposal{}, err
 	}
 	if bundle.ProjectID != projectID {
 		return ImplementationProposal{}, ErrNotFound
+	}
+	if candidateIdentity != nil {
+		if err := validateCandidateImplementationCreate(bundle, verifiedContract, *candidateIdentity); err != nil {
+			return ImplementationProposal{}, err
+		}
 	}
 	if err := validateFileOperations(input.Operations); err != nil {
 		return ImplementationProposal{}, err
@@ -188,9 +351,18 @@ func (s *ImplementationService) create(
 			return ImplementationProposal{}, err
 		}
 		executionSource = identity.ExecutionSource
+		if !sameApplicationBuildContractRef(identity.ApplicationBuildContract, verifiedContract) {
+			return ImplementationProposal{}, fmt.Errorf("%w: generated proposal Build Contract binding", ErrConflict)
+		}
 		instructionHash = identity.InstructionHash
 		aiProvider = strings.TrimSpace(identity.AIProvider)
 		aiModel = strings.TrimSpace(identity.AIModel)
+	} else if candidateIdentity != nil {
+		proposalID, err = uuid.Parse(candidateIdentity.ProposalID)
+		if err != nil {
+			return ImplementationProposal{}, fmt.Errorf("%w: reserved Candidate implementation proposal id", ErrInvalidInput)
+		}
+		executionSource = ImplementationSourceCandidateFreeze
 	}
 	now := s.now().UTC()
 	var supersededProposal ImplementationProposal
@@ -227,11 +399,13 @@ func (s *ImplementationService) create(
 	}
 	proposal := ImplementationProposal{
 		ID: proposalID.String(), ProjectID: projectID, BuildManifestID: input.BuildManifestID,
-		BaseWorkspaceRevision: cloneVersionRef(bundle.CurrentWorkspaceRevision),
-		ExecutionSource:       executionSource, ConversationCommandID: uuidStringPointer(conversationCommandID),
+		ApplicationBuildContract: cloneApplicationBuildContractRef(&verifiedContract),
+		BaseWorkspaceRevision:    cloneVersionRef(bundle.CurrentWorkspaceRevision),
+		ExecutionSource:          executionSource, ConversationCommandID: uuidStringPointer(conversationCommandID),
 		SupersedesProposalID: uuidStringPointer(supersedesProposalID),
 		InstructionHash:      instructionHash, AIProvider: aiProvider, AIModel: aiModel,
-		Operations: cloneFileOperations(input.Operations), Routes: cloneRawMessages(input.Routes),
+		CandidateSource: cloneCandidateImplementationSource(candidateIdentity),
+		Operations:      cloneFileOperations(input.Operations), Routes: cloneRawMessages(input.Routes),
 		APIs: cloneRawMessages(input.APIs), Migrations: cloneRawMessages(input.Migrations),
 		Tests: cloneRawMessages(input.Tests), Previews: cloneRawMessages(input.Previews),
 		TraceLinks: cloneRawMessages(input.TraceLinks), Diagnostics: append([]ValidationFinding(nil), input.Diagnostics...),
@@ -239,6 +413,7 @@ func (s *ImplementationService) create(
 		UnimplementedItems: append([]string(nil), input.UnimplementedItems...),
 		Status:             "open", Version: 1, CreatedBy: actorID, CreatedAt: now,
 	}
+	unimplementedCount, blockingDiagnosticCount := implementationIncompleteCounts(proposal)
 	payloadHash, err := implementationPayloadHash(proposal)
 	if err != nil {
 		return ImplementationProposal{}, err
@@ -269,12 +444,21 @@ func (s *ImplementationService) create(
 	}
 	model := storage.ImplementationProposalModel{
 		ID: proposalID, ProjectID: projectUUID, BuildManifestID: buildManifestUUID,
-		BaseWorkspaceRevisionID: baseRevisionID, Status: proposal.Status, Version: proposal.Version,
+		ApplicationBuildContractID:   nonNilUUIDPointer(uuid.MustParse(verifiedContract.ID)),
+		ApplicationBuildContractHash: nonEmptyStringPointer(verifiedContract.ContractHash),
+		BaseWorkspaceRevisionID:      baseRevisionID, Status: proposal.Status, Version: proposal.Version,
 		ExecutionSource: string(executionSource), ConversationCommandID: conversationCommandID,
 		SupersedesProposalID: supersedesProposalID,
 		InstructionHash:      nonEmptyStringPointer(instructionHash), AIProvider: nonEmptyStringPointer(aiProvider), AIModel: nonEmptyStringPointer(aiModel),
-		ContentStore: "mongo", ContentRef: contentRef.ID, ContentHash: contentRef.ContentHash,
+		CandidateSnapshotID:                 candidateSnapshotUUID(candidateIdentity),
+		CandidateBaseTreeHash:               candidateBaseTreeHash(candidateIdentity),
+		CandidateTreeHash:                   candidateTreeHash(candidateIdentity),
+		CandidateVerificationBindingVersion: candidateVerificationBindingVersion(candidateIdentity),
+		CandidateVerificationReceiptID:      candidateVerificationReceiptUUID(candidateIdentity),
+		CandidateVerificationReceiptHash:    candidateVerificationReceiptHash(candidateIdentity),
+		ContentStore:                        "mongo", ContentRef: contentRef.ID, ContentHash: contentRef.ContentHash,
 		PayloadHash: proposal.PayloadHash, OperationCount: len(proposal.Operations),
+		UnimplementedCount: &unimplementedCount, BlockingDiagnosticCount: &blockingDiagnosticCount,
 		CreatedBy: actorUUID, CreatedAt: now,
 	}
 	err = s.database.WithContext(ctx).Transaction(func(transaction *gorm.DB) error {
@@ -291,7 +475,8 @@ func (s *ImplementationService) create(
 		if identity != nil {
 			if err := validateImplementationGenerationClaim(
 				transaction, model, requestKey, claimToken, executionSource, conversationCommandID,
-				supersedesProposalID, identity.ExpectedActiveProposalVersion, instructionHash, actorUUID, now,
+				supersedesProposalID, identity.ExpectedActiveProposalVersion, instructionHash,
+				verifiedContract, actorUUID, now,
 			); err != nil {
 				return err
 			}
@@ -334,6 +519,13 @@ func (s *ImplementationService) create(
 		if err := transaction.Create(&model).Error; err != nil {
 			return err
 		}
+		if candidateIdentity != nil {
+			if err := persistCandidateImplementationFreeze(
+				transaction, model, proposal, *candidateIdentity, actorUUID, now,
+			); err != nil {
+				return err
+			}
+		}
 		if identity != nil {
 			result := transaction.Model(&storage.ImplementationGenerationClaimModel{}).Where(
 				"request_key = ? AND build_manifest_id = ? AND claim_token = ? AND status = 'processing' AND claim_expires_at >= ?",
@@ -352,7 +544,9 @@ func (s *ImplementationService) create(
 		}
 		auditMetadata := map[string]any{
 			"buildManifestId": input.BuildManifestID, "executionSource": executionSource,
-			"instructionHash": instructionHash, "conversationCommandId": uuidStringPointer(conversationCommandID),
+			"applicationBuildContractId":   verifiedContract.ID,
+			"applicationBuildContractHash": verifiedContract.ContractHash,
+			"instructionHash":              instructionHash, "conversationCommandId": uuidStringPointer(conversationCommandID),
 			"supersedesProposalId": uuidStringPointer(supersedesProposalID),
 		}
 		if err := insertAudit(transaction, projectUUID, actorUUID, "implementation.proposal_created", "implementation_proposal", proposal.ID, auditMetadata); err != nil {
@@ -361,6 +555,8 @@ func (s *ImplementationService) create(
 		return enqueue(transaction, "implementation_proposal", proposal.ID, "implementation.proposal_created", "worksflow.implementation.proposal.created", map[string]any{
 			"projectId": projectID, "proposalId": proposal.ID, "buildManifestId": input.BuildManifestID,
 			"executionSource": executionSource, "instructionHash": instructionHash,
+			"applicationBuildContractId":   verifiedContract.ID,
+			"applicationBuildContractHash": verifiedContract.ContractHash,
 		})
 	})
 	if err != nil {
@@ -384,12 +580,118 @@ func (s *ImplementationService) create(
 }
 
 func (s *ImplementationService) Get(ctx context.Context, proposalID, actorID string) (ImplementationProposal, error) {
-	proposal, model, err := s.load(ctx, proposalID)
+	proposal, model, err := s.loadEnvelope(ctx, proposalID)
 	if err != nil {
 		return ImplementationProposal{}, err
 	}
+	if !historicalUnverifiedCandidateImplementation(model) {
+		if err := s.validateCandidateImplementationSource(ctx, proposal, model); err != nil {
+			return ImplementationProposal{}, err
+		}
+	}
 	if _, err := s.access.Authorize(ctx, model.ProjectID.String(), actorID, ActionView); err != nil {
 		return ImplementationProposal{}, err
+	}
+	return proposal, nil
+}
+
+// Quarantine releases an active Workbench leaf that cannot enter the
+// governed review gate: a retired direct-model Proposal, a manual Proposal, or
+// pre-verification Candidate history. The old content and decisions remain
+// immutable history, while an exact version fence and required audit reason
+// prevent terminalization from being mistaken for Candidate verification.
+func (s *ImplementationService) Quarantine(
+	ctx context.Context,
+	proposalID, actorID string,
+	input QuarantineImplementationInput,
+) (ImplementationProposal, error) {
+	proposal, model, err := s.loadEnvelope(ctx, proposalID)
+	if err != nil {
+		return ImplementationProposal{}, err
+	}
+	if _, err := s.access.Authorize(ctx, model.ProjectID.String(), actorID, ActionEdit); err != nil {
+		return ImplementationProposal{}, err
+	}
+	reason := strings.TrimSpace(input.Reason)
+	if reason == "" || len(reason) > 1000 {
+		return ImplementationProposal{}, fmt.Errorf("%w: quarantine reason is required and bounded", ErrInvalidInput)
+	}
+	if input.Version == 0 {
+		input.Version = proposal.Version
+	}
+	if proposal.Version != input.Version {
+		return ImplementationProposal{}, ErrConflict
+	}
+	if !quarantinableImplementationProposal(proposal, model) {
+		return ImplementationProposal{}, fmt.Errorf("%w: only an unreviewable implementation Proposal can be quarantined", ErrInvalidInput)
+	}
+	if proposal.Status == "stale" {
+		return proposal, nil
+	}
+	if proposal.Status != "open" && proposal.Status != "reviewing" && proposal.Status != "ready" {
+		return ImplementationProposal{}, ErrConflict
+	}
+
+	proposal.Status = "stale"
+	proposal.Version++
+	proposal.AppliedAt = nil
+	payload, err := json.Marshal(proposal)
+	if err != nil {
+		return ImplementationProposal{}, err
+	}
+	contentRef, err := s.contents.PutPending(
+		ctx, model.ProjectID.String(), "implementation_proposal", proposal.ID, 1, payload,
+	)
+	if err != nil {
+		return ImplementationProposal{}, err
+	}
+	abortPending := true
+	defer func() {
+		if abortPending {
+			_ = s.contents.Abort(context.Background(), contentRef.ID)
+		}
+	}()
+	actorUUID := uuid.MustParse(actorID)
+	err = s.database.WithContext(ctx).Transaction(func(transaction *gorm.DB) error {
+		updated := transaction.Model(&storage.ImplementationProposalModel{}).
+			Where("id = ? AND version = ? AND status IN ?", model.ID, input.Version, []string{"open", "reviewing", "ready"}).
+			Updates(map[string]any{
+				"status": proposal.Status, "version": proposal.Version,
+				"content_ref": contentRef.ID, "content_hash": contentRef.ContentHash,
+			})
+		if updated.Error != nil {
+			return updated.Error
+		}
+		if updated.RowsAffected != 1 {
+			return ErrConflict
+		}
+		metadata := map[string]any{
+			"buildManifestId": model.BuildManifestID.String(),
+			"executionSource": proposal.ExecutionSource,
+			"reason":          reason,
+			"priorVersion":    input.Version,
+		}
+		if err := insertAudit(
+			transaction, model.ProjectID, actorUUID, "implementation.proposal_quarantined",
+			"implementation_proposal", proposal.ID, metadata,
+		); err != nil {
+			return err
+		}
+		return enqueue(
+			transaction, "implementation_proposal", proposal.ID,
+			"implementation.proposal_quarantined", "worksflow.implementation.proposal.quarantined",
+			map[string]any{
+				"projectId": model.ProjectID.String(), "proposalId": proposal.ID,
+				"buildManifestId": model.BuildManifestID.String(), "reason": reason,
+			},
+		)
+	})
+	if err != nil {
+		return ImplementationProposal{}, err
+	}
+	abortPending = false
+	if err := s.contents.Finalize(ctx, contentRef.ID); err != nil {
+		return ImplementationProposal{}, fmt.Errorf("%w: %v", ErrContentNotReady, err)
 	}
 	return proposal, nil
 }
@@ -408,8 +710,35 @@ func (s *ImplementationService) Decide(ctx context.Context, proposalID, actorID 
 	if proposal.Version != input.Version || proposal.Status == "applied" || proposal.Status == "partially_applied" || proposal.Status == "stale" {
 		return ImplementationProposal{}, ErrConflict
 	}
+	if legacyAIImplementationSource(proposal.ExecutionSource) {
+		return ImplementationProposal{}, fmt.Errorf(
+			"%w: AI implementation must be produced by an exact verified Candidate freeze",
+			ErrBlockingGate,
+		)
+	}
+	if err := requireGovernedImplementationReview(proposal); err != nil {
+		return ImplementationProposal{}, err
+	}
 	if err := ensureConversationProposalCommandExecuted(s.database.WithContext(ctx), model, false); err != nil {
 		return ImplementationProposal{}, err
+	}
+	if input.Decision != ImplementationAccepted && input.Decision != ImplementationRejected {
+		return ImplementationProposal{}, fmt.Errorf("%w: implementation decision", ErrInvalidInput)
+	}
+	binding, bindingErr := exactApplicationBuildContractFromProposal(proposal, model)
+	if bindingErr != nil {
+		if errors.Is(bindingErr, ErrBlockingGate) || errors.Is(bindingErr, ErrConflict) {
+			return ImplementationProposal{}, s.persistProposalStale(ctx, proposal, model, actorID)
+		}
+		return ImplementationProposal{}, bindingErr
+	}
+	if _, bindingErr = s.requireApplicationBuildContract(
+		ctx, model.ProjectID.String(), proposal.BuildManifestID, actorID, binding,
+	); bindingErr != nil {
+		if errors.Is(bindingErr, ErrBlockingGate) || errors.Is(bindingErr, ErrConflict) || errors.Is(bindingErr, ErrProposalStale) {
+			return ImplementationProposal{}, s.persistProposalStale(ctx, proposal, model, actorID)
+		}
+		return ImplementationProposal{}, bindingErr
 	}
 	// Lineage staleness is authoritative for every interaction with an otherwise
 	// mutable proposal. Persist it before validating the requested operation so a
@@ -420,9 +749,6 @@ func (s *ImplementationService) Decide(ctx context.Context, proposalID, actorID 
 			return ImplementationProposal{}, s.persistProposalStale(ctx, proposal, model, actorID)
 		}
 		return ImplementationProposal{}, err
-	}
-	if input.Decision != ImplementationAccepted && input.Decision != ImplementationRejected {
-		return ImplementationProposal{}, fmt.Errorf("%w: implementation decision", ErrInvalidInput)
 	}
 	operationIndex := -1
 	for index := range proposal.Operations {
@@ -462,6 +788,7 @@ func (s *ImplementationService) Decide(ctx context.Context, proposalID, actorID 
 		}
 	}()
 	accepted, rejected := implementationDecisionCounts(proposal.Operations)
+	unimplementedCount, blockingDiagnosticCount := implementationIncompleteCounts(proposal)
 	actorUUID := uuid.MustParse(actorID)
 	now := s.now().UTC()
 	err = s.database.WithContext(ctx).Transaction(func(transaction *gorm.DB) error {
@@ -493,6 +820,7 @@ func (s *ImplementationService) Decide(ctx context.Context, proposalID, actorID 
 				"status": proposal.Status, "version": proposal.Version,
 				"content_ref": contentRef.ID, "content_hash": contentRef.ContentHash,
 				"accepted_count": accepted, "rejected_count": rejected,
+				"unimplemented_count": unimplementedCount, "blocking_diagnostic_count": blockingDiagnosticCount,
 			})
 		if result.Error != nil {
 			return result.Error
@@ -541,11 +869,27 @@ func (s *ImplementationService) Apply(ctx context.Context, proposalID, actorID s
 	if proposal.Version != input.Version || proposal.Status != "ready" {
 		return ArtifactRevision{}, ErrConflict
 	}
+	if err := requireGovernedImplementationReview(proposal); err != nil {
+		return ArtifactRevision{}, err
+	}
+	unimplementedCount, blockingDiagnosticCount := implementationIncompleteCounts(proposal)
 	if err := ensureConversationProposalCommandExecuted(s.database.WithContext(ctx), proposalModel, false); err != nil {
 		return ArtifactRevision{}, err
 	}
 	staleProposal := proposal
 	staleProposal.Operations = append([]FileOperation(nil), proposal.Operations...)
+	binding, err := exactApplicationBuildContractFromProposal(proposal, proposalModel)
+	if err != nil {
+		return ArtifactRevision{}, err
+	}
+	if _, err = s.requireApplicationBuildContract(
+		ctx, proposalModel.ProjectID.String(), proposal.BuildManifestID, actorID, binding,
+	); err != nil {
+		if errors.Is(err, ErrBlockingGate) || errors.Is(err, ErrConflict) || errors.Is(err, ErrProposalStale) {
+			return ArtifactRevision{}, s.persistProposalStale(ctx, staleProposal, proposalModel, actorID)
+		}
+		return ArtifactRevision{}, err
+	}
 	bundle, err := s.workbench.GetBundleForGeneration(ctx, proposal.BuildManifestID, actorID)
 	if err != nil {
 		if errors.Is(err, ErrBlockingGate) || errors.Is(err, ErrConflict) || errors.Is(err, ErrProposalStale) {
@@ -563,6 +907,12 @@ func (s *ImplementationService) Apply(ctx context.Context, proposalID, actorID s
 	if err != nil {
 		return ArtifactRevision{}, err
 	}
+	if proposal.CandidateSource != nil && len(accepted) != len(proposal.Operations) {
+		return ArtifactRevision{}, fmt.Errorf(
+			"%w: an exact Candidate implementation must be accepted in full",
+			ErrBlockingGate,
+		)
+	}
 	workspace, workspaceArtifact, baseRevision, err := s.loadWorkspace(ctx, proposalModel.ProjectID, proposal.BaseWorkspaceRevision)
 	if err != nil {
 		if errors.Is(err, ErrProposalStale) {
@@ -570,12 +920,24 @@ func (s *ImplementationService) Apply(ctx context.Context, proposalID, actorID s
 		}
 		return ArtifactRevision{}, err
 	}
+	if proposal.CandidateSource != nil && proposal.BaseWorkspaceRevision != nil {
+		baseTree, treeErr := candidateWorkspaceTree(workspace)
+		if treeErr != nil || baseTree.TreeHash != proposal.CandidateSource.BaseTreeHash {
+			return ArtifactRevision{}, fmt.Errorf("%w: Candidate implementation base tree", ErrConflict)
+		}
+	}
 	workspace, err = applyFileOperations(workspace, accepted)
 	if err != nil {
 		if errors.Is(err, ErrProposalStale) {
 			return ArtifactRevision{}, s.persistProposalStale(ctx, staleProposal, proposalModel, actorID)
 		}
 		return ArtifactRevision{}, err
+	}
+	if proposal.CandidateSource != nil {
+		resultTree, treeErr := candidateWorkspaceTree(workspace)
+		if treeErr != nil || resultTree.TreeHash != proposal.CandidateSource.TreeHash {
+			return ArtifactRevision{}, fmt.Errorf("%w: Candidate implementation result tree", ErrConflict)
+		}
 	}
 	now := s.now().UTC()
 	workspace["updatedAt"] = now.Format(time.RFC3339Nano)
@@ -737,6 +1099,7 @@ func (s *ImplementationService) Apply(ctx context.Context, proposalID, actorID s
 				"status": proposal.Status, "version": proposal.Version,
 				"content_ref": proposalContentRef.ID, "content_hash": proposalContentRef.ContentHash,
 				"applied_by": actorUUID, "applied_at": now,
+				"unimplemented_count": unimplementedCount, "blocking_diagnostic_count": blockingDiagnosticCount,
 			})
 		if result.Error != nil {
 			return result.Error
@@ -916,6 +1279,7 @@ func validateImplementationGenerationClaim(
 	expectedActiveProposalID *uuid.UUID,
 	expectedActiveProposalVersion uint64,
 	instructionHash string,
+	applicationBuildContract ApplicationBuildContractRef,
 	actorID uuid.UUID,
 	now time.Time,
 ) error {
@@ -932,6 +1296,8 @@ func validateImplementationGenerationClaim(
 		claim.ClaimExpiresAt == nil || claim.ClaimExpiresAt.Before(now) || claim.RequestKey != requestKey ||
 		claim.ReservedProposalID != proposal.ID || claim.ExecutionSource != string(executionSource) ||
 		claim.InstructionHash != instructionHash || claim.ActorID != actorID ||
+		claim.ApplicationBuildContractID == nil || *claim.ApplicationBuildContractID != uuid.MustParse(applicationBuildContract.ID) ||
+		stringValue(claim.ApplicationBuildContractHash) != applicationBuildContract.ContractHash ||
 		!optionalUUIDsEqual(claim.ConversationCommandID, conversationCommandID) ||
 		!optionalUUIDsEqual(claim.ExpectedActiveProposalID, expectedActiveProposalID) ||
 		optionalUint64Value(claim.ExpectedActiveProposalVersion) != expectedActiveProposalVersion {
@@ -989,6 +1355,21 @@ func lockFrozenManifestLeaf(
 }
 
 func (s *ImplementationService) load(ctx context.Context, proposalID string) (ImplementationProposal, storage.ImplementationProposalModel, error) {
+	proposal, model, err := s.loadEnvelope(ctx, proposalID)
+	if err != nil {
+		return ImplementationProposal{}, model, err
+	}
+	if err := s.validateCandidateImplementationSource(ctx, proposal, model); err != nil {
+		return ImplementationProposal{}, model, err
+	}
+	return proposal, model, nil
+}
+
+// loadEnvelope validates the immutable Proposal payload and all SQL
+// projections that existed when it was written. Candidate VerificationReceipt
+// authority is deliberately checked by load, except for the read/quarantine
+// compatibility path for pre-verification Candidate history.
+func (s *ImplementationService) loadEnvelope(ctx context.Context, proposalID string) (ImplementationProposal, storage.ImplementationProposalModel, error) {
 	id, err := uuid.Parse(proposalID)
 	if err != nil {
 		return ImplementationProposal{}, storage.ImplementationProposalModel{}, fmt.Errorf("%w: implementation proposal id", ErrInvalidInput)
@@ -1009,12 +1390,19 @@ func (s *ImplementationService) load(ctx context.Context, proposalID string) (Im
 		return ImplementationProposal{}, model, err
 	}
 	normalizeLegacyImplementationExecution(&proposal, model)
-	hash, err := implementationPayloadHash(proposal)
+	hash, err := storedImplementationPayloadHash(proposal, model)
 	if err != nil || hash != proposal.PayloadHash || hash != model.PayloadHash || proposal.Version != model.Version || proposal.Status != model.Status ||
 		proposal.ID != model.ID.String() || proposal.ProjectID != model.ProjectID.String() || proposal.BuildManifestID != model.BuildManifestID.String() ||
+		!optionalApplicationBuildContractMatchesModel(proposal.ApplicationBuildContract, model) ||
 		string(proposal.ExecutionSource) != model.ExecutionSource || !optionalStringMatchesUUID(proposal.ConversationCommandID, model.ConversationCommandID) ||
 		!optionalStringMatchesUUID(proposal.SupersedesProposalID, model.SupersedesProposalID) ||
 		proposal.InstructionHash != stringValue(model.InstructionHash) || proposal.AIProvider != stringValue(model.AIProvider) || proposal.AIModel != stringValue(model.AIModel) {
+		return ImplementationProposal{}, model, ErrConflict
+	}
+	unimplementedCount, blockingDiagnosticCount := implementationIncompleteCounts(proposal)
+	if (model.UnimplementedCount == nil) != (model.BlockingDiagnosticCount == nil) ||
+		(model.UnimplementedCount != nil &&
+			(*model.UnimplementedCount != unimplementedCount || *model.BlockingDiagnosticCount != blockingDiagnosticCount)) {
 		return ImplementationProposal{}, model, ErrConflict
 	}
 	return proposal, model, nil
@@ -1203,7 +1591,7 @@ func nullableUUIDString(value uuid.UUID) any {
 }
 
 func validateFileOperations(operations []FileOperation) error {
-	if len(operations) == 0 || len(operations) > 10_000 {
+	if len(operations) == 0 || len(operations) > 40_000 {
 		return fmt.Errorf("%w: implementation operations", ErrInvalidInput)
 	}
 	byID := map[string]FileOperation{}
@@ -1218,15 +1606,19 @@ func validateFileOperations(operations []FileOperation) error {
 		}
 		switch operation.Kind {
 		case "file.upsert":
-			if operation.Content == nil || len(*operation.Content) > 2<<20 {
+			if operation.Content == nil || len(*operation.Content) > 4<<20 {
 				return fmt.Errorf("%w: file content at operation %d", ErrInvalidInput, index)
 			}
+			if operation.Mode != "" && operation.Mode != "100644" && operation.Mode != "100755" {
+				return fmt.Errorf("%w: file mode at operation %d", ErrInvalidInput, index)
+			}
 		case "file.delete":
-			if operation.Content != nil {
+			if operation.Content != nil || operation.Mode != "" {
 				return fmt.Errorf("%w: delete operation content", ErrInvalidInput)
 			}
 		case "file.rename":
-			if err := validateWorkspacePath(operation.FromPath); err != nil || operation.FromPath == operation.Path {
+			if err := validateWorkspacePath(operation.FromPath); err != nil ||
+				operation.FromPath == operation.Path || operation.Mode != "" {
 				return fmt.Errorf("%w: rename paths", ErrInvalidInput)
 			}
 		default:
@@ -1347,9 +1739,17 @@ func applyFileOperations(workspace map[string]any, operations []FileOperation) (
 			if value, ok := existing["revision"].(float64); ok {
 				revision = int(value) + 1
 			}
+			mode := operation.Mode
+			if mode == "" {
+				mode = workspaceFileMode(existing)
+				if mode == "" {
+					mode = "100644"
+				}
+			}
 			files[operation.Path] = map[string]any{
 				"path": operation.Path, "content": dereferenceString(operation.Content),
-				"language": operation.Language, "revision": revision, "dirty": false,
+				"language": operation.Language, "mode": mode,
+				"revision": revision, "dirty": false,
 			}
 		case "file.delete":
 			existing := files[operation.Path]
@@ -1372,7 +1772,7 @@ func applyFileOperations(workspace map[string]any, operations []FileOperation) (
 		paths = append(paths, filePath)
 	}
 	sort.Strings(paths)
-	fileList := make([]map[string]any, 0, len(paths))
+	fileList := make([]any, 0, len(paths))
 	for _, filePath := range paths {
 		fileList = append(fileList, files[filePath])
 	}
@@ -1406,6 +1806,58 @@ func validateWorkspacePath(value string) error {
 }
 
 func implementationPayloadHash(proposal ImplementationProposal) (string, error) {
+	var candidateSource any
+	if proposal.CandidateSource != nil {
+		candidateSource = proposal.CandidateSource
+	}
+	return implementationPayloadHashWithCandidateSource(proposal, candidateSource)
+}
+
+func storedImplementationPayloadHash(
+	proposal ImplementationProposal,
+	model storage.ImplementationProposalModel,
+) (string, error) {
+	hash, err := implementationPayloadHash(proposal)
+	if err != nil || (hash == proposal.PayloadHash && hash == model.PayloadHash) {
+		return hash, err
+	}
+	if !historicalUnverifiedCandidateImplementation(model) || proposal.CandidateSource == nil {
+		return hash, nil
+	}
+	legacy := struct {
+		FreezeReceiptID      string                `json:"freezeReceiptId"`
+		RepositorySnapshotID string                `json:"repositorySnapshotId"`
+		SessionID            string                `json:"sessionId"`
+		CandidateID          string                `json:"candidateId"`
+		CandidateSnapshotID  string                `json:"candidateSnapshotId"`
+		CandidateVersion     uint64                `json:"candidateVersion"`
+		JournalSequence      uint64                `json:"journalSequence"`
+		SessionEpoch         uint64                `json:"sessionEpoch"`
+		WriterLeaseEpoch     uint64                `json:"writerLeaseEpoch"`
+		BaseTreeHash         string                `json:"baseTreeHash"`
+		TreeHash             string                `json:"treeHash"`
+		FullStackTemplate    ExactContentReference `json:"fullStackTemplate"`
+	}{
+		FreezeReceiptID:      proposal.CandidateSource.FreezeReceiptID,
+		RepositorySnapshotID: proposal.CandidateSource.RepositorySnapshotID,
+		SessionID:            proposal.CandidateSource.SessionID,
+		CandidateID:          proposal.CandidateSource.CandidateID,
+		CandidateSnapshotID:  proposal.CandidateSource.CandidateSnapshotID,
+		CandidateVersion:     proposal.CandidateSource.CandidateVersion,
+		JournalSequence:      proposal.CandidateSource.JournalSequence,
+		SessionEpoch:         proposal.CandidateSource.SessionEpoch,
+		WriterLeaseEpoch:     proposal.CandidateSource.WriterLeaseEpoch,
+		BaseTreeHash:         proposal.CandidateSource.BaseTreeHash,
+		TreeHash:             proposal.CandidateSource.TreeHash,
+		FullStackTemplate:    proposal.CandidateSource.FullStackTemplate,
+	}
+	return implementationPayloadHashWithCandidateSource(proposal, legacy)
+}
+
+func implementationPayloadHashWithCandidateSource(
+	proposal ImplementationProposal,
+	candidateSource any,
+) (string, error) {
 	type immutableOperation struct {
 		ID           string   `json:"id"`
 		Kind         string   `json:"kind"`
@@ -1413,6 +1865,7 @@ func implementationPayloadHash(proposal ImplementationProposal) (string, error) 
 		FromPath     string   `json:"fromPath,omitempty"`
 		Content      *string  `json:"content,omitempty"`
 		Language     string   `json:"language,omitempty"`
+		Mode         string   `json:"mode,omitempty"`
 		ExpectedHash string   `json:"expectedHash,omitempty"`
 		DependsOn    []string `json:"dependsOn,omitempty"`
 		Rationale    string   `json:"rationale,omitempty"`
@@ -1421,32 +1874,43 @@ func implementationPayloadHash(proposal ImplementationProposal) (string, error) 
 	operations := make([]immutableOperation, len(proposal.Operations))
 	for index, operation := range proposal.Operations {
 		operations[index] = immutableOperation{
-			operation.ID, operation.Kind, operation.Path, operation.FromPath, operation.Content,
-			operation.Language, operation.ExpectedHash, operation.DependsOn, operation.Rationale, operation.TraceSource,
+			ID: operation.ID, Kind: operation.Kind, Path: operation.Path,
+			FromPath: operation.FromPath, Content: operation.Content,
+			Language: operation.Language, Mode: operation.Mode,
+			ExpectedHash: operation.ExpectedHash, DependsOn: operation.DependsOn,
+			Rationale: operation.Rationale, TraceSource: operation.TraceSource,
 		}
 	}
 	payload := struct {
-		ID                    string               `json:"id"`
-		ProjectID             string               `json:"projectId"`
-		BuildManifestID       string               `json:"buildManifestId"`
-		BaseWorkspaceRevision *VersionRef          `json:"baseWorkspaceRevision,omitempty"`
-		Operations            []immutableOperation `json:"operations"`
-		Routes                []json.RawMessage    `json:"routes"`
-		APIs                  []json.RawMessage    `json:"apis"`
-		Migrations            []json.RawMessage    `json:"migrations"`
-		Tests                 []json.RawMessage    `json:"tests"`
-		Previews              []json.RawMessage    `json:"previews"`
-		TraceLinks            []json.RawMessage    `json:"traceLinks"`
-		Diagnostics           []ValidationFinding  `json:"diagnostics"`
-		Assumptions           []string             `json:"assumptions"`
-		UnimplementedItems    []string             `json:"unimplementedItems"`
-		CreatedBy             string               `json:"createdBy"`
-		CreatedAt             time.Time            `json:"createdAt"`
+		ID                       string                       `json:"id"`
+		ProjectID                string                       `json:"projectId"`
+		BuildManifestID          string                       `json:"buildManifestId"`
+		ApplicationBuildContract *ApplicationBuildContractRef `json:"applicationBuildContract,omitempty"`
+		BaseWorkspaceRevision    *VersionRef                  `json:"baseWorkspaceRevision,omitempty"`
+		CandidateSource          any                          `json:"candidateSource,omitempty"`
+		Operations               []immutableOperation         `json:"operations"`
+		Routes                   []json.RawMessage            `json:"routes"`
+		APIs                     []json.RawMessage            `json:"apis"`
+		Migrations               []json.RawMessage            `json:"migrations"`
+		Tests                    []json.RawMessage            `json:"tests"`
+		Previews                 []json.RawMessage            `json:"previews"`
+		TraceLinks               []json.RawMessage            `json:"traceLinks"`
+		Diagnostics              []ValidationFinding          `json:"diagnostics"`
+		Assumptions              []string                     `json:"assumptions"`
+		UnimplementedItems       []string                     `json:"unimplementedItems"`
+		CreatedBy                string                       `json:"createdBy"`
+		CreatedAt                time.Time                    `json:"createdAt"`
 	}{
-		proposal.ID, proposal.ProjectID, proposal.BuildManifestID, proposal.BaseWorkspaceRevision,
-		operations, proposal.Routes, proposal.APIs, proposal.Migrations, proposal.Tests,
-		proposal.Previews, proposal.TraceLinks, proposal.Diagnostics, proposal.Assumptions,
-		proposal.UnimplementedItems, proposal.CreatedBy, proposal.CreatedAt,
+		ID: proposal.ID, ProjectID: proposal.ProjectID,
+		BuildManifestID:          proposal.BuildManifestID,
+		ApplicationBuildContract: proposal.ApplicationBuildContract,
+		BaseWorkspaceRevision:    proposal.BaseWorkspaceRevision,
+		CandidateSource:          candidateSource,
+		Operations:               operations, Routes: proposal.Routes, APIs: proposal.APIs,
+		Migrations: proposal.Migrations, Tests: proposal.Tests, Previews: proposal.Previews,
+		TraceLinks: proposal.TraceLinks, Diagnostics: proposal.Diagnostics,
+		Assumptions: proposal.Assumptions, UnimplementedItems: proposal.UnimplementedItems,
+		CreatedBy: proposal.CreatedBy, CreatedAt: proposal.CreatedAt,
 	}
 	return domain.CanonicalHash(payload)
 }
@@ -1473,6 +1937,64 @@ func implementationStatus(operations []FileOperation) string {
 	default:
 		return "rejected"
 	}
+}
+
+func implementationIncompleteCounts(proposal ImplementationProposal) (int, int) {
+	unimplemented := len(proposal.UnimplementedItems)
+	blockingDiagnostics := 0
+	for _, finding := range proposal.Diagnostics {
+		if strings.EqualFold(strings.TrimSpace(finding.Severity), "blocker") {
+			blockingDiagnostics++
+		}
+	}
+	return unimplemented, blockingDiagnostics
+}
+
+func legacyAIImplementationSource(source ImplementationExecutionSource) bool {
+	switch source {
+	case ImplementationSourceManualGeneration,
+		ImplementationSourceWorkflowRunner,
+		ImplementationSourceConversationCommand:
+		return true
+	default:
+		return false
+	}
+}
+
+func historicalUnverifiedCandidateImplementation(model storage.ImplementationProposalModel) bool {
+	return model.ExecutionSource == string(ImplementationSourceCandidateFreeze) &&
+		model.CandidateVerificationBindingVersion == nil &&
+		model.CandidateVerificationReceiptID == nil &&
+		model.CandidateVerificationReceiptHash == nil
+}
+
+func quarantinableImplementationProposal(
+	proposal ImplementationProposal,
+	model storage.ImplementationProposalModel,
+) bool {
+	if legacyAIImplementationSource(proposal.ExecutionSource) ||
+		proposal.ExecutionSource == ImplementationSourceManualSubmission {
+		return true
+	}
+	return proposal.ExecutionSource == ImplementationSourceCandidateFreeze &&
+		historicalUnverifiedCandidateImplementation(model)
+}
+
+func requireGovernedImplementationReview(proposal ImplementationProposal) error {
+	if legacyAIImplementationSource(proposal.ExecutionSource) {
+		return fmt.Errorf(
+			"%w: AI implementation must be produced by an exact verified Candidate freeze",
+			ErrBlockingGate,
+		)
+	}
+	unimplemented, blockers := implementationIncompleteCounts(proposal)
+	if unimplemented != 0 || blockers != 0 {
+		return fmt.Errorf(
+			"%w: implementation has %d unimplemented item(s) and %d blocking diagnostic(s)",
+			ErrBlockingGate, unimplemented, blockers,
+		)
+	}
+	return nil
 }
 
 func implementationDecisionCounts(operations []FileOperation) (int, int) {

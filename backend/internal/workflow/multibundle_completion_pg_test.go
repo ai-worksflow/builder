@@ -15,6 +15,7 @@ import (
 	"github.com/worksflow/builder/backend/internal/core"
 	"github.com/worksflow/builder/backend/internal/domain"
 	storage "github.com/worksflow/builder/backend/internal/storage/postgres"
+	"github.com/worksflow/builder/backend/internal/testsupport"
 	"github.com/worksflow/builder/backend/migrations"
 	gormpostgres "gorm.io/driver/postgres"
 	"gorm.io/gorm"
@@ -104,16 +105,17 @@ func TestWorkbenchCompletionRejectsDerivedBundleFromAnotherWorkflowRunPostgres(t
 
 	proposalID := uuid.New()
 	appliedAt := now.Add(2 * time.Second)
+	completeCount := 0
 	proposal := storage.ImplementationProposalModel{
 		ID: proposalID, ProjectID: projectID, BuildManifestID: derivedID,
-		Status: "applied", Version: 2, ContentStore: "mongo", ContentRef: "foreign-proposal",
+		ExecutionSource: string(core.ImplementationSourceManualSubmission),
+		Status:          "applied", Version: 2, ContentStore: "mongo", ContentRef: "foreign-proposal",
 		ContentHash: completionTestHash("foreign-proposal-content"), PayloadHash: completionTestHash("foreign-proposal-payload"),
-		OperationCount: 1, AcceptedCount: 1, CreatedBy: userID, CreatedAt: now.Add(time.Second),
+		OperationCount: 1, UnimplementedCount: &completeCount, BlockingDiagnosticCount: &completeCount,
+		AcceptedCount: 1, CreatedBy: userID, CreatedAt: now.Add(time.Second),
 		AppliedBy: &userID, AppliedAt: &appliedAt,
 	}
-	if err := database.Create(&proposal).Error; err != nil {
-		t.Fatal(err)
-	}
+	testsupport.CreateBoundImplementationProposal(t, database, &proposal)
 
 	workspaceArtifactID := uuid.New()
 	workspaceRevisionID := uuid.New()
@@ -271,16 +273,18 @@ func TestWorkbenchCompletionAcceptsOrderedSameRunDerivedLineagePostgres(t *testi
 	producerManifests := []uuid.UUID{roots[0], derivedID}
 	for index, proposalID := range proposalIDs {
 		appliedAt := now.Add(time.Duration(3+index) * time.Second)
-		if err := database.Create(&storage.ImplementationProposalModel{
+		completeCount := 0
+		proposal := &storage.ImplementationProposalModel{
 			ID: proposalID, ProjectID: projectID, BuildManifestID: producerManifests[index],
-			Status: "applied", Version: 2, ContentStore: "mongo", ContentRef: "positive-proposal-" + proposalID.String(),
+			ExecutionSource: string(core.ImplementationSourceManualSubmission),
+			Status:          "applied", Version: 2, ContentStore: "mongo", ContentRef: "positive-proposal-" + proposalID.String(),
 			ContentHash:    completionTestHash("proposal-content-" + proposalID.String()),
 			PayloadHash:    completionTestHash("proposal-payload-" + proposalID.String()),
-			OperationCount: 1, AcceptedCount: 1, CreatedBy: userID,
+			OperationCount: 1, UnimplementedCount: &completeCount, BlockingDiagnosticCount: &completeCount,
+			AcceptedCount: 1, CreatedBy: userID,
 			CreatedAt: now.Add(time.Duration(index) * time.Second), AppliedBy: &userID, AppliedAt: &appliedAt,
-		}).Error; err != nil {
-			t.Fatal(err)
 		}
+		testsupport.CreateBoundImplementationProposal(t, database, proposal)
 	}
 	workspaceArtifactID := uuid.New()
 	if err := database.Create(&storage.ArtifactModel{
@@ -417,16 +421,18 @@ func TestQualitySelectsFinalWorkspaceProducerAcrossManifestGroupsPostgres(t *tes
 			t.Fatal(err)
 		}
 		appliedAt := now.Add(time.Duration(index+2) * time.Second)
-		if err := database.Create(&storage.ImplementationProposalModel{
+		completeCount := 0
+		proposal := &storage.ImplementationProposalModel{
 			ID: proposalIDs[index], ProjectID: projectID, BuildManifestID: rootIDs[index],
-			Status: "applied", Version: 2, ContentStore: "mongo", ContentRef: "quality-proposal-" + proposalIDs[index].String(),
+			ExecutionSource: string(core.ImplementationSourceManualSubmission),
+			Status:          "applied", Version: 2, ContentStore: "mongo", ContentRef: "quality-proposal-" + proposalIDs[index].String(),
 			ContentHash:    completionTestHash("quality-proposal-content-" + proposalIDs[index].String()),
 			PayloadHash:    completionTestHash("quality-proposal-payload-" + proposalIDs[index].String()),
-			OperationCount: 1, AcceptedCount: 1, CreatedBy: actorID, CreatedAt: now,
+			OperationCount: 1, UnimplementedCount: &completeCount, BlockingDiagnosticCount: &completeCount,
+			AcceptedCount: 1, CreatedBy: actorID, CreatedAt: now,
 			AppliedBy: &actorID, AppliedAt: &appliedAt,
-		}).Error; err != nil {
-			t.Fatal(err)
 		}
+		testsupport.CreateBoundImplementationProposal(t, database, proposal)
 	}
 
 	workspaceArtifactID := uuid.New()

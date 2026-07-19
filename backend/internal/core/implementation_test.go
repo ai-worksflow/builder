@@ -1,9 +1,11 @@
 package core
 
 import (
+	"encoding/json"
 	"testing"
 
 	"github.com/worksflow/builder/backend/internal/domain"
+	storage "github.com/worksflow/builder/backend/internal/storage/postgres"
 )
 
 func TestImplementationRevisionLineageSourcesFreezeEveryInput(t *testing.T) {
@@ -103,6 +105,119 @@ func TestImplementationProposalBaseRequiresExactWorkspaceRef(t *testing.T) {
 	}
 	if optionalVersionRefsEqual(exact, nil) || optionalVersionRefsEqual(nil, exact) {
 		t.Fatal("nil base is allowed only when there is no workspace ref")
+	}
+}
+
+func TestGovernedImplementationReviewRejectsLegacyAIAndIncompleteOutput(t *testing.T) {
+	t.Parallel()
+
+	for name, proposal := range map[string]ImplementationProposal{
+		"legacy direct model": {ExecutionSource: ImplementationSourceManualGeneration},
+		"workflow provider":   {ExecutionSource: ImplementationSourceWorkflowRunner},
+		"conversation model":  {ExecutionSource: ImplementationSourceConversationCommand},
+		"unimplemented item": {
+			ExecutionSource:    ImplementationSourceCandidateFreeze,
+			UnimplementedItems: []string{"Persistence is not implemented."},
+		},
+		"blocking diagnostic": {
+			ExecutionSource: ImplementationSourceCandidateFreeze,
+			Diagnostics: []ValidationFinding{{
+				Code: "missing_contract", Path: "$.apis", Message: "API contract is missing.", Severity: "blocker",
+			}},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			if err := requireGovernedImplementationReview(proposal); !errorsIs(err, ErrBlockingGate) {
+				t.Fatalf("review gate error = %v, want blocking gate", err)
+			}
+		})
+	}
+
+	if err := requireGovernedImplementationReview(ImplementationProposal{
+		ExecutionSource: ImplementationSourceCandidateFreeze,
+		Diagnostics:     []ValidationFinding{{Severity: "warning"}},
+	}); err != nil {
+		t.Fatalf("complete Candidate proposal was blocked: %v", err)
+	}
+}
+
+func TestStoredImplementationPayloadHashSupportsOnlyTerminalizablePreVerificationCandidateHistory(t *testing.T) {
+	t.Parallel()
+
+	proposal := ImplementationProposal{
+		ID: "historical-candidate", ProjectID: "project", BuildManifestID: "manifest",
+		ExecutionSource: ImplementationSourceCandidateFreeze,
+		CandidateSource: &CandidateImplementationSource{
+			FreezeReceiptID: "freeze", RepositorySnapshotID: "repository-snapshot",
+			SessionID: "session", CandidateID: "candidate", CandidateSnapshotID: "candidate-snapshot",
+			CandidateVersion: 2, JournalSequence: 3, SessionEpoch: 4, WriterLeaseEpoch: 5,
+			BaseTreeHash: "sha256:base", TreeHash: "sha256:tree",
+			FullStackTemplate: ExactContentReference{ID: "template", ContentHash: "sha256:template"},
+		},
+		Operations: []FileOperation{}, Routes: []json.RawMessage{}, APIs: []json.RawMessage{},
+		Migrations: []json.RawMessage{}, Tests: []json.RawMessage{}, Previews: []json.RawMessage{},
+		TraceLinks: []json.RawMessage{}, Diagnostics: []ValidationFinding{}, Assumptions: []string{},
+		UnimplementedItems: []string{}, CreatedBy: "owner",
+	}
+	legacyCandidateSource := struct {
+		FreezeReceiptID      string                `json:"freezeReceiptId"`
+		RepositorySnapshotID string                `json:"repositorySnapshotId"`
+		SessionID            string                `json:"sessionId"`
+		CandidateID          string                `json:"candidateId"`
+		CandidateSnapshotID  string                `json:"candidateSnapshotId"`
+		CandidateVersion     uint64                `json:"candidateVersion"`
+		JournalSequence      uint64                `json:"journalSequence"`
+		SessionEpoch         uint64                `json:"sessionEpoch"`
+		WriterLeaseEpoch     uint64                `json:"writerLeaseEpoch"`
+		BaseTreeHash         string                `json:"baseTreeHash"`
+		TreeHash             string                `json:"treeHash"`
+		FullStackTemplate    ExactContentReference `json:"fullStackTemplate"`
+	}{
+		FreezeReceiptID:      proposal.CandidateSource.FreezeReceiptID,
+		RepositorySnapshotID: proposal.CandidateSource.RepositorySnapshotID,
+		SessionID:            proposal.CandidateSource.SessionID,
+		CandidateID:          proposal.CandidateSource.CandidateID,
+		CandidateSnapshotID:  proposal.CandidateSource.CandidateSnapshotID,
+		CandidateVersion:     proposal.CandidateSource.CandidateVersion,
+		JournalSequence:      proposal.CandidateSource.JournalSequence,
+		SessionEpoch:         proposal.CandidateSource.SessionEpoch,
+		WriterLeaseEpoch:     proposal.CandidateSource.WriterLeaseEpoch,
+		BaseTreeHash:         proposal.CandidateSource.BaseTreeHash,
+		TreeHash:             proposal.CandidateSource.TreeHash,
+		FullStackTemplate:    proposal.CandidateSource.FullStackTemplate,
+	}
+	legacyHash, err := implementationPayloadHashWithCandidateSource(proposal, legacyCandidateSource)
+	if err != nil {
+		t.Fatal(err)
+	}
+	currentHash, err := implementationPayloadHash(proposal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if currentHash == legacyHash {
+		t.Fatal("pre-verification and verified Candidate payload shapes unexpectedly share a hash")
+	}
+	proposal.PayloadHash = legacyHash
+	model := storage.ImplementationProposalModel{
+		ExecutionSource: string(ImplementationSourceCandidateFreeze),
+		PayloadHash:     legacyHash,
+	}
+	storedHash, err := storedImplementationPayloadHash(proposal, model)
+	if err != nil || storedHash != legacyHash {
+		t.Fatalf("historical Candidate hash = %q, err=%v; want %q", storedHash, err, legacyHash)
+	}
+	if !historicalUnverifiedCandidateImplementation(model) || !quarantinableImplementationProposal(proposal, model) {
+		t.Fatal("pre-verification Candidate history was not classified for quarantine")
+	}
+
+	bindingVersion := candidateVerificationBindingContractVersion
+	model.CandidateVerificationBindingVersion = &bindingVersion
+	if historicalUnverifiedCandidateImplementation(model) || quarantinableImplementationProposal(proposal, model) {
+		t.Fatal("a partially populated Candidate verification binding entered the compatibility path")
+	}
+	if hash, err := storedImplementationPayloadHash(proposal, model); err != nil || hash == legacyHash {
+		t.Fatalf("non-historical Candidate accepted the legacy hash: hash=%q err=%v", hash, err)
 	}
 }
 

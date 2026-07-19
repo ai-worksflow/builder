@@ -45,6 +45,38 @@ func (p *generationProviderSpy) Generate(context.Context, ai.Request) (ai.Result
 	return ai.Result{}, nil
 }
 
+func testApplicationBuildContractRef() core.ApplicationBuildContractRef {
+	return core.ApplicationBuildContractRef{
+		ID: "66666666-6666-4666-8666-666666666666", ContractHash: strings.Repeat("a", 64),
+	}
+}
+
+type implementationBuildContractVerifierStub struct {
+	calls           int
+	projectID       string
+	buildManifestID string
+	actorID         string
+	selection       core.ApplicationBuildContractRef
+	verified        core.ApplicationBuildContractRef
+	err             error
+}
+
+func (v *implementationBuildContractVerifierStub) RequireReadyForImplementation(
+	_ context.Context,
+	projectID, buildManifestID, actorID string,
+	selection core.ApplicationBuildContractRef,
+) (core.ApplicationBuildContractRef, error) {
+	v.calls++
+	v.projectID, v.buildManifestID, v.actorID, v.selection = projectID, buildManifestID, actorID, selection
+	if v.err != nil {
+		return core.ApplicationBuildContractRef{}, v.err
+	}
+	if v.verified == (core.ApplicationBuildContractRef{}) {
+		return selection, nil
+	}
+	return v.verified, nil
+}
+
 type scriptedArtifactProvider struct {
 	requests []ai.Request
 	results  []ai.Result
@@ -99,15 +131,34 @@ func (w *recoveryPermissionWorkbench) GetBundleForGeneration(context.Context, st
 	return w.bundle, w.bundleErr
 }
 
-func TestImplementationGenerationRejectsCompletedManifestBeforeAI(t *testing.T) {
+func TestImplementationGenerationRequiresGovernedCandidateBeforeWorkbenchOrAI(t *testing.T) {
 	t.Parallel()
 
 	workbench := &blockedImplementationWorkbench{}
 	provider := &generationProviderSpy{}
 	service := &Service{workbench: workbench, provider: provider}
+	_, err := service.GenerateImplementation(context.Background(), ImplementationGenerationRequest{
+		BundleID: "bundle", ActorID: "actor", Model: "gpt-5",
+		Instruction: ImplementationInstruction{Objective: "build the application"},
+	})
+	if !errors.Is(err, ErrGovernedCandidateRequired) {
+		t.Fatalf("legacy implementation generation error = %v, want governed Candidate", err)
+	}
+	if workbench.calls != 0 || provider.calls != 0 {
+		t.Fatalf("legacy generation reached Workbench or AI: workbench=%d provider=%d", workbench.calls, provider.calls)
+	}
+}
+
+func TestImplementationGenerationRejectsCompletedManifestBeforeAI(t *testing.T) {
+	t.Parallel()
+
+	workbench := &blockedImplementationWorkbench{}
+	provider := &generationProviderSpy{}
+	service := &Service{workbench: workbench, provider: provider, allowUngovernedImplementationForTests: true}
 	if _, err := service.GenerateImplementation(context.Background(), ImplementationGenerationRequest{
 		BundleID: "consumed-bundle", ActorID: "actor", Model: "model",
-		Instruction: ImplementationInstruction{Objective: "instruction"},
+		Instruction:              ImplementationInstruction{Objective: "instruction"},
+		ApplicationBuildContract: testApplicationBuildContractRef(),
 	}); !errors.Is(err, core.ErrBlockingGate) {
 		t.Fatalf("expected completed manifest to block generation, got %v", err)
 	}
@@ -121,15 +172,62 @@ func TestImplementationGenerationRequiresCurrentWorkspaceBeforeAI(t *testing.T) 
 
 	workbench := &staleImplementationWorkbench{}
 	provider := &generationProviderSpy{}
-	service := &Service{workbench: workbench, provider: provider}
+	service := &Service{workbench: workbench, provider: provider, allowUngovernedImplementationForTests: true}
 	if _, err := service.GenerateImplementation(context.Background(), ImplementationGenerationRequest{
 		BundleID: "old-workspace-bundle", ActorID: "actor", Model: "model",
-		Instruction: ImplementationInstruction{Objective: "instruction"},
+		Instruction:              ImplementationInstruction{Objective: "instruction"},
+		ApplicationBuildContract: testApplicationBuildContractRef(),
 	}); !errors.Is(err, core.ErrProposalStale) {
 		t.Fatalf("expected stale workspace manifest to block generation, got %v", err)
 	}
 	if workbench.calls != 1 || provider.calls != 0 {
 		t.Fatalf("AI ran before exact workspace gate: workbench=%d provider=%d", workbench.calls, provider.calls)
+	}
+}
+
+func TestImplementationGenerationRequiresExactBuildContractBeforeWorkbench(t *testing.T) {
+	t.Parallel()
+
+	workbench := &blockedImplementationWorkbench{}
+	provider := &generationProviderSpy{}
+	service := &Service{workbench: workbench, provider: provider, allowUngovernedImplementationForTests: true}
+	_, err := service.GenerateImplementation(context.Background(), ImplementationGenerationRequest{
+		BundleID: "bundle", ActorID: "actor", Model: "gpt-5",
+		Instruction: ImplementationInstruction{Objective: "build"},
+	})
+	if !errors.Is(err, core.ErrInvalidInput) {
+		t.Fatalf("missing exact Build Contract error = %v, want invalid input", err)
+	}
+	if workbench.calls != 0 || provider.calls != 0 {
+		t.Fatalf("missing Build Contract reached Workbench or AI: workbench=%d provider=%d", workbench.calls, provider.calls)
+	}
+}
+
+func TestImplementationGenerationVerifiesBuildContractBeforeRecovery(t *testing.T) {
+	t.Parallel()
+
+	ref := testApplicationBuildContractRef()
+	gate := &implementationBuildContractVerifierStub{err: core.ErrBlockingGate}
+	workbench := &recoveryPermissionWorkbench{
+		bundle: core.WorkbenchBundle{ID: "active-bundle", ProjectID: "33333333-3333-4333-8333-333333333333"},
+		proposal: core.ImplementationProposal{
+			ID: "proposal-id", CreatedBy: "editor", Status: "open", Version: 1,
+			ExecutionSource:          core.ImplementationSourceManualGeneration,
+			ApplicationBuildContract: &ref,
+		},
+	}
+	provider := &generationProviderSpy{}
+	service := &Service{workbench: workbench, provider: provider, buildContracts: gate, allowUngovernedImplementationForTests: true}
+	_, err := service.GenerateImplementation(context.Background(), ImplementationGenerationRequest{
+		BundleID: "root-bundle", ActorID: "editor", Model: "gpt-5", ProposalID: "proposal-id",
+		Instruction:              ImplementationInstruction{Objective: "recover"},
+		ApplicationBuildContract: ref,
+	})
+	if !errors.Is(err, core.ErrBlockingGate) {
+		t.Fatalf("blocked Build Contract recovery error = %v, want blocking gate", err)
+	}
+	if gate.calls != 1 || gate.buildManifestID != workbench.bundle.ID || provider.calls != 0 {
+		t.Fatalf("recovery bypassed exact Build Contract gate: gate=%#v provider=%d", gate, provider.calls)
 	}
 }
 
@@ -146,10 +244,11 @@ func TestImplementationRecoveryRequiresEditPermissionBeforeReturningProposal(t *
 		InstructionHash: instructionHash, AIProvider: "provider", AIModel: "model",
 	}}
 	provider := &generationProviderSpy{}
-	service := &Service{workbench: workbench, provider: provider}
+	service := &Service{workbench: workbench, provider: provider, allowUngovernedImplementationForTests: true}
 	if _, err := service.GenerateImplementation(context.Background(), ImplementationGenerationRequest{
 		BundleID: "root-bundle", ActorID: "viewer", Model: "model", ProposalID: "proposal-id",
-		Instruction: ImplementationInstruction{Objective: "recover proposal"},
+		Instruction:              ImplementationInstruction{Objective: "recover proposal"},
+		ApplicationBuildContract: testApplicationBuildContractRef(),
 	}); !errors.Is(err, core.ErrForbidden) {
 		t.Fatalf("expected recovery to require edit permission, got %v", err)
 	}
@@ -173,14 +272,19 @@ func TestSecondConversationCommandCannotReplaceFirstCommandProposal(t *testing.T
 		},
 	}
 	provider := &generationProviderSpy{}
-	service := &Service{workbench: workbench, provider: provider}
+	service := &Service{
+		workbench: workbench, provider: provider,
+		buildContracts:                        &implementationBuildContractVerifierStub{},
+		allowUngovernedImplementationForTests: true,
+	}
 	if _, err := service.GenerateImplementation(context.Background(), ImplementationGenerationRequest{
 		BundleID: "root-bundle", ActorID: "second-actor", Model: "gpt-5",
 		Instruction:     ImplementationInstruction{Objective: "second reviewed command"},
 		ExecutionSource: core.ImplementationSourceConversationCommand,
 		RequestKey:      secondCommandID, ProposalID: secondCommandID, ConversationCommandID: &secondCommandID,
-		ExpectedRunID:        "55555555-5555-4555-8555-555555555555",
-		ExpectedRootBundleID: "44444444-4444-4444-8444-444444444444",
+		ExpectedRunID:            "55555555-5555-4555-8555-555555555555",
+		ExpectedRootBundleID:     "44444444-4444-4444-8444-444444444444",
+		ApplicationBuildContract: testApplicationBuildContractRef(),
 	}); !errors.Is(err, ErrActiveImplementationProposal) {
 		t.Fatalf("second command replaced or bypassed the first command proposal: %v", err)
 	}
@@ -209,16 +313,17 @@ func TestConversationImplementationGenerationRequiresExpectedTargetBeforeWorkben
 		t.Run(name, func(t *testing.T) {
 			workbench := &blockedImplementationWorkbench{}
 			provider := &generationProviderSpy{}
-			service := &Service{workbench: workbench, provider: provider}
+			service := &Service{workbench: workbench, provider: provider, allowUngovernedImplementationForTests: true}
 			_, err := service.GenerateImplementation(context.Background(), ImplementationGenerationRequest{
 				BundleID: "root-bundle", ActorID: "editor", Model: "gpt-5",
-				Instruction:           ImplementationInstruction{Objective: "reviewed command"},
-				ExecutionSource:       core.ImplementationSourceConversationCommand,
-				RequestKey:            commandID,
-				ProposalID:            commandID,
-				ConversationCommandID: &commandID,
-				ExpectedRunID:         target.runID,
-				ExpectedRootBundleID:  target.rootID,
+				Instruction:              ImplementationInstruction{Objective: "reviewed command"},
+				ExecutionSource:          core.ImplementationSourceConversationCommand,
+				RequestKey:               commandID,
+				ProposalID:               commandID,
+				ConversationCommandID:    &commandID,
+				ExpectedRunID:            target.runID,
+				ExpectedRootBundleID:     target.rootID,
+				ApplicationBuildContract: testApplicationBuildContractRef(),
 			})
 			if !errors.Is(err, core.ErrInvalidInput) {
 				t.Fatalf("generation error = %v, want invalid input", err)
@@ -246,9 +351,16 @@ func TestImplementationGenerationReplayIdentityIsExactAndCanonical(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	requested := currentImplementationGenerationReplayIdentity(instruction, instructionHash, "gpt-5")
+	buildContract := testApplicationBuildContractRef()
+	requested, err := currentImplementationGenerationReplayIdentity(instruction, instructionHash, "gpt-5", buildContract)
+	if err != nil {
+		t.Fatal(err)
+	}
 	existing := storage.ImplementationGenerationClaimModel{
-		Instruction:     json.RawMessage(`{ "objective": "Build the app", "constraints": ["keep tests"] }`),
+		Instruction: json.RawMessage(fmt.Sprintf(
+			`{"instruction":%s,"applicationBuildContract":{"contractHash":%q,"id":%q}}`,
+			instruction, buildContract.ContractHash, buildContract.ID,
+		)),
 		InstructionHash: instructionHash, RequestedModel: "gpt-5",
 		GenerationContractVersion: requested.GenerationContractVersion,
 		SystemPromptHash:          requested.SystemPromptHash, OutputSchemaHash: requested.OutputSchemaHash,
@@ -261,14 +373,28 @@ func TestImplementationGenerationReplayIdentityIsExactAndCanonical(t *testing.T)
 		t.Fatal("retry changed requested model without conflict")
 	}
 	existing.RequestedModel = "gpt-5"
-	existing.Instruction = json.RawMessage(`{"constraints":["changed"],"objective":"Build the app"}`)
+	existing.Instruction = json.RawMessage(fmt.Sprintf(
+		`{"applicationBuildContract":{"id":%q,"contractHash":%q},"instruction":{"constraints":["changed"],"objective":"Build the app"}}`,
+		buildContract.ID, buildContract.ContractHash,
+	))
 	if implementationGenerationReplayMatches(existing, requested) {
 		t.Fatal("retry changed canonical instruction without conflict")
 	}
-	existing.Instruction = instruction
+	existing.Instruction = append(json.RawMessage(nil), requested.Instruction...)
+	changedBuildContract := buildContract
+	changedBuildContract.ContractHash = strings.Repeat("b", 64)
+	changedReplay, err := currentImplementationGenerationReplayIdentity(instruction, instructionHash, "gpt-5", changedBuildContract)
+	if err != nil {
+		t.Fatal(err)
+	}
+	existing.Instruction = changedReplay.Instruction
+	if implementationGenerationReplayMatches(existing, requested) {
+		t.Fatal("retry changed the exact Application Build Contract without conflict")
+	}
+	existing.Instruction = append(json.RawMessage(nil), requested.Instruction...)
 	for name, mutate := range map[string]func(*storage.ImplementationGenerationClaimModel){
 		"generation contract": func(value *storage.ImplementationGenerationClaimModel) {
-			value.GenerationContractVersion = "implementation-proposal-generation/v2"
+			value.GenerationContractVersion = "implementation-proposal-generation/v3"
 		},
 		"system prompt": func(value *storage.ImplementationGenerationClaimModel) {
 			value.SystemPromptHash = generationSHA256([]byte("changed prompt"))
@@ -357,13 +483,15 @@ func TestImplementationAIRequestPreservesWorkflowManifestPairsAndReviewedScope(t
 			map[string]any{"ref": anchored, "purpose": "blueprint_selection_node", "content": map[string]any{"title": "Orders"}},
 		},
 	}
-	input, err := marshalImplementationInput(bundle, "Build reviewed app", nil, workflowInput, nil, nil)
+	buildContract := testApplicationBuildContractRef()
+	input, err := marshalImplementationInput(bundle, "Build reviewed app", buildContract, nil, workflowInput, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	request := ai.Request{Input: input}
 	var decoded struct {
-		ApplicationBuildManifest core.WorkbenchBundle `json:"applicationBuildManifest"`
+		ApplicationBuildManifest core.WorkbenchBundle             `json:"applicationBuildManifest"`
+		ApplicationBuildContract core.ApplicationBuildContractRef `json:"applicationBuildContract"`
 		WorkflowInput            struct {
 			InputManifest domain.InputManifest `json:"inputManifest"`
 			Sources       []struct {
@@ -375,6 +503,9 @@ func TestImplementationAIRequestPreservesWorkflowManifestPairsAndReviewedScope(t
 	}
 	if err := json.Unmarshal(request.Input, &decoded); err != nil {
 		t.Fatal(err)
+	}
+	if decoded.ApplicationBuildContract != buildContract {
+		t.Fatalf("AI request lost exact Application Build Contract identity: %#v", decoded.ApplicationBuildContract)
 	}
 	context := decoded.ApplicationBuildManifest.WorkflowContext
 	if context == nil || len(context.InputManifest.Sources) != 2 ||

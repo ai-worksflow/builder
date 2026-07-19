@@ -1,0 +1,85 @@
+{
+  "schemaVersion": "ai-runtime-contract/v2",
+  "applicationProfile": "reference-ai-conversation/v1",
+  "providerPolicy": {
+    "policyId": "reference-project-default",
+    "modelClass": "reasoning",
+    "fallbackAllowed": false,
+    "profilePinned": true
+  },
+  "providerPort": {
+    "portId": "generated-application-ai",
+    "protocol": "worksflow-generated-ai/v1",
+    "contractKind": "api_contract",
+    "requestSchemaRef": "#/components/schemas/ProviderGenerateRequest",
+    "eventSchemaRef": "#/components/schemas/ProviderEvent",
+    "streamingRequired": true,
+    "cancellationPropagation": true,
+    "usageRequired": true
+  },
+  "gateway": {
+    "plane": "generated-application",
+    "endpointEnvironmentVariable": "AI_GATEWAY_URL",
+    "capabilityEnvironmentVariable": "AI_GATEWAY_CAPABILITY_FILE",
+    "capabilityMode": "file",
+    "providerCredentials": "gateway-only",
+    "providerKeyExposure": "forbidden",
+    "tenantScoped": true,
+    "auditRequired": true
+  },
+  "conversation": {
+    "persistence": "required",
+    "tenantScoped": true,
+    "messageRoles": ["system", "user", "assistant", "tool"]
+  },
+  "run": {
+    "persistent": true,
+    "idempotencyRequired": true,
+    "statusValues": ["queued", "running", "completed", "failed", "cancelled"]
+  },
+  "streaming": {
+    "transport": "sse",
+    "eventTypes": ["run.queued", "run.started", "output.delta", "tool.call", "tool.result", "run.completed", "run.failed", "run.cancelled", "heartbeat"],
+    "eventSchemaRef": "run-event-schema.json",
+    "durable": true,
+    "resumeCursor": true,
+    "cursorField": "sequence",
+    "resumeHeader": "Last-Event-ID"
+  },
+  "cancellation": {
+    "supported": true,
+    "idempotent": true,
+    "terminalStatus": "cancelled"
+  },
+  "retry": {
+    "reasonRequired": true,
+    "maxAttempts": 3,
+    "createsNewAttempt": true,
+    "supersedeOnModelChange": true
+  },
+  "rateLimit": {
+    "scope": "tenant-actor",
+    "requests": 60,
+    "windowSeconds": 60,
+    "burst": 10,
+    "retryAfterRequired": true,
+    "failClosed": true
+  },
+  "limits": {
+    "maxInputBytes": 1048576,
+    "maxOutputBytes": 1048576,
+    "timeoutSeconds": 120
+  },
+  "retention": {
+    "messageDays": 30,
+    "runDays": 90,
+    "eventDays": 30,
+    "redactionRequired": true
+  },
+  "audit": {
+    "requiredFields": ["tenantId", "projectId", "actorId", "conversationId", "runId", "providerPolicyId", "requestId", "outcome", "usage", "errorCode"],
+    "promptContent": "redacted",
+    "responseContent": "redacted",
+    "retentionDays": 90
+  }
+}

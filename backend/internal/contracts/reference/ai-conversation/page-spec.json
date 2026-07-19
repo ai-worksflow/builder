@@ -1,0 +1,54 @@
+{
+  "blueprintPageNodeId": "page-conversations",
+  "title": "AI conversations",
+  "route": "/conversations",
+  "userGoal": "Create a durable conversation, send a prompt, observe model output, and recover or control the run.",
+  "acceptanceCriterionIds": [
+    "AC-AI-001",
+    "AC-AI-002",
+    "AC-AI-003",
+    "AC-AI-004",
+    "AC-AI-005",
+    "AC-AI-006",
+    "AC-AI-007",
+    "AC-AI-008",
+    "AC-AI-009",
+    "AC-AI-010",
+    "AC-AI-011",
+    "AC-AI-012",
+    "AC-AI-013",
+    "AC-AI-014",
+    "AC-AI-015"
+  ],
+  "requiredRoles": ["conversation-member"],
+  "states": [
+    {"id": "state-ready", "key": "ready", "title": "Ready", "required": true, "fixtureIds": []},
+    {"id": "state-loading", "key": "loading", "title": "Loading", "required": true, "fixtureIds": []},
+    {"id": "state-empty", "key": "empty", "title": "Empty", "required": true, "fixtureIds": []},
+    {"id": "state-error", "key": "error", "title": "Error", "required": true, "fixtureIds": []},
+    {"id": "state-streaming", "key": "streaming", "title": "Streaming", "required": true, "fixtureIds": []},
+    {"id": "state-cancelled", "key": "cancelled", "title": "Cancelled", "required": true, "fixtureIds": []}
+  ],
+  "dataBindings": [
+    {"id": "api-create-conversation", "name": "Create conversation", "source": "api", "operationId": "createConversation", "required": true},
+    {"id": "api-list-conversations", "name": "List conversations", "source": "api", "operationId": "listConversations", "required": true},
+    {"id": "api-get-conversation", "name": "Get conversation", "source": "api", "operationId": "getConversation", "required": true},
+    {"id": "api-list-messages", "name": "List messages", "source": "api", "operationId": "listMessages", "required": true},
+    {"id": "api-send-message", "name": "Send message", "source": "api", "operationId": "sendMessage", "required": true},
+    {"id": "api-list-runs", "name": "List runs", "source": "api", "operationId": "listRuns", "required": true},
+    {"id": "api-create-run", "name": "Create run", "source": "api", "operationId": "createRun", "required": true},
+    {"id": "api-get-run", "name": "Get run", "source": "api", "operationId": "getRun", "required": true},
+    {"id": "api-stream-run-events", "name": "Stream run events", "source": "api", "operationId": "streamRunEvents", "required": true},
+    {"id": "api-cancel-run", "name": "Cancel run", "source": "api", "operationId": "cancelRun", "required": true},
+    {"id": "api-retry-run", "name": "Retry run", "source": "api", "operationId": "retryRun", "required": true},
+    {"id": "data-conversations", "name": "Conversations", "source": "database", "entityId": "Conversation", "required": true},
+    {"id": "data-messages", "name": "Messages", "source": "database", "entityId": "Message", "required": true},
+    {"id": "data-runs", "name": "Runs", "source": "database", "entityId": "Run", "required": true},
+    {"id": "data-run-events", "name": "Run events", "source": "database", "entityId": "RunEvent", "required": true}
+  ],
+  "interactions": [
+    {"id": "interaction-send-message", "trigger": "submit", "outcome": "Create a message and start a run.", "acceptanceCriterionIds": ["AC-AI-003", "AC-AI-004"]},
+    {"id": "interaction-cancel-run", "trigger": "click", "outcome": "Cancel the active run and show the cancelled state.", "acceptanceCriterionIds": ["AC-AI-005"]},
+    {"id": "interaction-retry-run", "trigger": "submit", "outcome": "Create a traceable retry attempt.", "acceptanceCriterionIds": ["AC-AI-006"]}
+  ]
+}

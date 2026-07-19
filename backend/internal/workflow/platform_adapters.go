@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"regexp"
 	"sort"
@@ -116,7 +117,10 @@ func NewPlatformEngine(dependencies PlatformDependencies) (*Engine, error) {
 		return nil, err
 	}
 	engine.Runners = registry
-	engine.Capabilities = CurrentWorkflowExecutionProfileDescriptor().Capabilities
+	// Keep the mutable authoring factory independent from the immutable current
+	// execution profile snapshot. SealProductionExecutionProfiles fails closed if
+	// the factory grows before a separately versioned profile is introduced.
+	engine.Capabilities = PlatformWorkflowCapabilities(true, true)
 	if err := engine.SealProductionExecutionProfiles(); err != nil {
 		return nil, err
 	}
@@ -1056,7 +1060,8 @@ func workflowArtifactType(kind string) domain.ArtifactType {
 	switch kind {
 	case "project_brief", "product_requirements", "decision_record", "glossary_policy", "reference_source", "change_request", "requirement_baseline":
 		return domain.ArtifactDocument
-	case "blueprint", "page_spec", "api_contract", "data_contract", "permission_contract":
+	case "blueprint", "page_spec", "api_contract", "data_contract", "permission_contract",
+		"ai_runtime_contract", "deployment_contract", "verification_contract":
 		return domain.ArtifactBlueprint
 	case "prototype", "prototype_flow", "fixture_bundle", "design_system", "token_set", "component_registry":
 		return domain.ArtifactPrototype
@@ -2243,6 +2248,9 @@ func (r GenerationWorkbenchRunner) Run(ctx context.Context, execution Execution)
 			ExpectedRunID:   execution.Run.ID, ExpectedRootBundleID: rootBundleID,
 		})
 		if err != nil {
+			if errors.Is(err, generation.ErrGovernedCandidateRequired) {
+				return workbenchWaitInputResult(results, manifest.BundleIDs[rootIndex:]), nil
+			}
 			return WorkerResult{}, err
 		}
 		if generated.Proposal.Status == "applied" || generated.Proposal.Status == "partially_applied" {

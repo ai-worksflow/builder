@@ -21,6 +21,7 @@ import (
 	"github.com/worksflow/builder/backend/internal/generation"
 	"github.com/worksflow/builder/backend/internal/storage/content"
 	storage "github.com/worksflow/builder/backend/internal/storage/postgres"
+	"github.com/worksflow/builder/backend/internal/testsupport"
 	"github.com/worksflow/builder/backend/migrations"
 	gormpostgres "gorm.io/driver/postgres"
 	"gorm.io/gorm"
@@ -148,7 +149,39 @@ func (g *collaborationTestGenerator) GenerateArtifactProposal(
 		Value: json.RawMessage(`{"state":"generated"}`), Rationale: "PG collaboration fixture",
 	}
 	if manifest.JobType == downstreamDocumentJobType {
-		operation.Kind, operation.Path, operation.Value = domain.OperationReplace, "/summary", json.RawMessage(`"Generated downstream summary"`)
+		var constraints struct {
+			DownstreamDocument struct {
+				TargetKind string `json:"targetKind"`
+			} `json:"downstreamDocument"`
+		}
+		if err := json.Unmarshal(manifest.Constraints, &constraints); err != nil {
+			return generation.ArtifactGenerationResult{}, err
+		}
+		operation.Kind, operation.Path = domain.OperationReplace, ""
+		switch constraints.DownstreamDocument.TargetKind {
+		case "api_contract":
+			operation.Value = json.RawMessage(`{
+				"schemaVersion":"api-contract/v1","openapi":"3.1.0",
+				"info":{"title":"Generated API contract","version":"1.0.0","description":"Generated downstream summary"},
+				"paths":{"/health":{"get":{"operationId":"getHealth","responses":{"200":{"description":"Healthy"}}}}}
+			}`)
+		case "data_contract":
+			operation.Value = json.RawMessage(`{
+				"schemaVersion":"data-contract/v1",
+				"entities":[{"id":"Order","tableName":"orders","fields":[{"id":"id","name":"id","type":"uuid","nullable":false}],"primaryKey":["id"],"indexes":[],"tenantScope":{"mode":"global"}}],
+				"migrationPolicy":{"tool":"sql","directory":"migrations","applyCommandId":"migrate","rollbackPolicy":"required"}
+			}`)
+		case "permission_contract":
+			operation.Value = json.RawMessage(`{
+				"schemaVersion":"permission-contract/v1",
+				"identity":{"subjectClaim":"sub","authentication":"session"},
+				"tenant":{"mode":"project","claim":"project_id"},
+				"roles":[{"id":"Owner"}],
+				"policies":[{"id":"ManageOrders","roles":["Owner"],"resource":"orders","actions":["read","write"],"tenantScoped":true,"effect":"allow"}]
+			}`)
+		default:
+			operation.Path, operation.Value = "/summary", json.RawMessage(`"Generated downstream summary"`)
+		}
 	}
 	model := strings.TrimSpace(requestedModel)
 	if model == "" {
@@ -500,21 +533,50 @@ func TestDocumentSyncBackOnlyAcceptsAppliedCurrentImplementationFactsPostgres(t 
 	}
 	deploymentID, deploymentVersionID := uuid.New(), uuid.New()
 	if err := database.Exec(`INSERT INTO deployments (id,project_id,environment,provider,status,created_by) VALUES (?,?,?,?,?,?)`,
-		deploymentID, fixture.projectID, "preview", "test", "ready", fixture.ownerID).Error; err != nil {
-		t.Fatal(err)
-	}
-	if err := database.Exec(`INSERT INTO deployment_versions (id,deployment_id,number,action,workspace_artifact_id,workspace_revision_id,workspace_content_hash,entry_path,checksum,file_count,total_bytes,environment_ref,status,created_by) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		deploymentVersionID, deploymentID, 1, "publish", workspace.ArtifactID, workspace.RevisionID, workspace.ContentHash,
-		"/", collaborationHash("manual-deployment"), 1, 1, "default", "ready", fixture.ownerID).Error; err != nil {
-		t.Fatal(err)
-	}
-	if err := database.Table("deployments").Where("id = ?", deploymentID).Update("active_version_id", deploymentVersionID).Error; err != nil {
+		deploymentID, fixture.projectID, "preview", "test", "deploying", fixture.ownerID).Error; err != nil {
 		t.Fatal(err)
 	}
 	manualDeploymentRequest := request
 	manualDeploymentRequest.Provenance = ProvenanceRef{Kind: ProvenanceDeployment, ID: deploymentID.String()}
 	if _, err := fixture.service.CreateSyncBackProposal(ctx, fixture.projectID.String(), fixture.ownerID.String(), manualDeploymentRequest); !errors.Is(err, core.ErrProposalStale) {
-		t.Fatalf("deployment without consumed build producer error = %v", err)
+		t.Fatalf("deployment without an active immutable version error = %v", err)
+	}
+	release := seedCollaborationReleaseAuthority(t, fixture, buildID, workspace)
+	if err := database.Exec(`
+INSERT INTO deployment_versions (
+  id, deployment_id, number, action,
+  workspace_artifact_id, workspace_revision_id, workspace_content_hash,
+  build_manifest_id, quality_run_id,
+  build_artifact_id, build_content_ref, build_content_hash, build_hash,
+  build_entry_path, build_file_count, build_total_bytes,
+  entry_path, checksum, file_count, total_bytes, environment_ref, status, created_by,
+  canonical_receipt_id, canonical_receipt_hash, release_bundle_id, release_bundle_hash
+) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+`, deploymentVersionID, deploymentID, 1, "publish",
+		workspace.ArtifactID, workspace.RevisionID, workspace.ContentHash,
+		buildID, release.qualityRunID,
+		release.buildArtifactID, release.buildContentRef, release.buildContentHash, release.buildHash,
+		"index.html", 1, 1024,
+		"/", collaborationHash("canonical-deployment"), 1, 1024, "default", "deploying", fixture.ownerID,
+		release.receiptID, release.receiptHash, release.bundleID, release.bundleHash,
+	).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Table("deployment_versions").Where("id = ?", deploymentVersionID).
+		Update("status", "ready").Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Table("deployments").Where("id = ?", deploymentID).Updates(map[string]any{
+		"active_version_id": deploymentVersionID,
+		"status":            "ready",
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	deploymentGenerated, err := fixture.service.CreateSyncBackProposal(
+		ctx, fixture.projectID.String(), fixture.ownerID.String(), manualDeploymentRequest,
+	)
+	if err != nil || deploymentGenerated.WorkspaceSource == nil || *deploymentGenerated.WorkspaceSource != workspace {
+		t.Fatalf("canonical deployment sync-back = %+v, err=%v", deploymentGenerated, err)
 	}
 	generated, err := fixture.service.CreateSyncBackProposal(ctx, fixture.projectID.String(), fixture.ownerID.String(), request)
 	if err != nil {
@@ -549,7 +611,7 @@ func TestDocumentSyncBackOnlyAcceptsAppliedCurrentImplementationFactsPostgres(t 
 	if err := database.Model(&storage.OutboxEventModel{}).Where("event_type = ?", "document.sync_back_proposed").Count(&outboxCount).Error; err != nil {
 		t.Fatal(err)
 	}
-	if auditCount != 3 || outboxCount != 3 {
+	if auditCount != 4 || outboxCount != 4 {
 		t.Fatalf("sync-back audit/outbox counts = %d/%d", auditCount, outboxCount)
 	}
 }
@@ -680,19 +742,388 @@ func seedImplementationFactFixture(t *testing.T, fixture collaborationPostgresFi
 	}
 	implementationPayload := json.RawMessage(`{"operations":[{"kind":"upsert","path":"app/orders.tsx"}],"tests":["orders.e2e"]}`)
 	implementationContent := fixture.contents.addFinalized(fixture.projectID.String(), "implementation_proposal", implementationID.String(), implementationPayload)
-	if err := fixture.database.Create(&storage.ImplementationProposalModel{
+	completionCount := 0
+	proposal := &storage.ImplementationProposalModel{
 		ID: implementationID, ProjectID: fixture.projectID, BuildManifestID: buildID, Status: "open", Version: 1,
 		ContentStore: "mongo", ContentRef: implementationContent.ID, ContentHash: implementationContent.ContentHash,
 		PayloadHash: collaborationHash("implementation:" + implementationID.String()), OperationCount: 1,
+		UnimplementedCount: &completionCount, BlockingDiagnosticCount: &completionCount,
 		CreatedBy: fixture.ownerID, CreatedAt: now,
-	}).Error; err != nil {
-		t.Fatal(err)
 	}
+	testsupport.CreateBoundImplementationProposal(t, fixture.database, proposal)
 	workspace := seedApprovedCollaborationArtifact(
 		t, fixture.database, fixture.contents, fixture.projectID, fixture.ownerID, "workspace", "WORKSPACE-MAIN",
 		"Application workspace", json.RawMessage(`{"files":{"app/orders.tsx":{"content":"implemented"}}}`), &implementationID,
 	)
 	return buildID, implementationID, workspace
+}
+
+type collaborationReleaseAuthority struct {
+	receiptID        uuid.UUID
+	receiptHash      string
+	bundleID         uuid.UUID
+	bundleHash       string
+	qualityRunID     uuid.UUID
+	buildArtifactID  uuid.UUID
+	buildContentRef  string
+	buildContentHash string
+	buildHash        string
+}
+
+func seedCollaborationReleaseAuthority(
+	t *testing.T,
+	fixture collaborationPostgresFixture,
+	buildID uuid.UUID,
+	workspace core.VersionRef,
+) collaborationReleaseAuthority {
+	t.Helper()
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	type exactBuildLineage struct {
+		ManifestHash          string
+		BuildContractID       uuid.UUID
+		BuildContractHash     string
+		FullStackTemplateID   uuid.UUID
+		FullStackTemplateHash string
+	}
+	var lineage exactBuildLineage
+	if err := fixture.database.Table("implementation_proposals AS proposal").
+		Select(`manifest.manifest_hash, proposal.application_build_contract_id AS build_contract_id,
+contract.contract_hash AS build_contract_hash, contract.full_stack_template_id, contract.full_stack_template_hash`).
+		Joins("JOIN application_build_manifests AS manifest ON manifest.id = proposal.build_manifest_id").
+		Joins("JOIN application_build_contracts AS contract ON contract.id = proposal.application_build_contract_id").
+		Where("proposal.build_manifest_id = ? AND proposal.project_id = ?", buildID, fixture.projectID).
+		Take(&lineage).Error; err != nil {
+		t.Fatalf("load exact build lineage for canonical release: %v", err)
+	}
+
+	profileID := "collaboration-canonical-v1"
+	profileHash := collaborationHash("collaboration-canonical-profile")
+	profileDocument, err := json.Marshal(map[string]any{
+		"schemaVersion":          "verification-profile/v1",
+		"id":                     profileID,
+		"version":                1,
+		"profileHash":            profileHash,
+		"supportedTemplateRoles": []string{"web", "api"},
+		"verifierImages": []map[string]any{{
+			"role":  "node",
+			"image": "registry.example/quality-node@" + collaborationHash("collaboration-quality-image"),
+		}},
+		"builtInChecks": []any{},
+		"limits":        map[string]any{},
+		"networkPolicy": map[string]any{},
+		"state":         "active",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.database.Exec(`
+INSERT INTO verification_profile_versions (
+  profile_id, version, schema_version, document, content_hash, created_by
+) VALUES (?, 1, 'verification-profile/v1', ?::jsonb, ?, ?)
+`, profileID, string(profileDocument), profileHash, fixture.ownerID).Error; err != nil {
+		t.Fatalf("insert canonical collaboration VerificationProfile: %v", err)
+	}
+	if err := fixture.database.Exec(`
+INSERT INTO verification_profile_policies (
+  profile_id, profile_version, profile_hash, state, policy_version, reason, updated_by
+) VALUES (?, 1, ?, 'active', 1, 'canonical collaboration release fixture', ?)
+`, profileID, profileHash, fixture.ownerID).Error; err != nil {
+		t.Fatalf("activate canonical collaboration VerificationProfile: %v", err)
+	}
+
+	templateReleases, err := json.Marshal([]map[string]any{
+		{"role": "api", "id": uuid.NewString(), "contentHash": collaborationHash("collaboration-api-template")},
+		{"role": "web", "id": uuid.NewString(), "contentHash": collaborationHash("collaboration-web-template")},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	obligations := json.RawMessage(`[{"id":"OBL-COLLABORATION","level":"must","status":"ready","oracleIds":["oracle-collaboration"]}]`)
+	checksJSON := json.RawMessage(`[
+  "oracle-collaboration",
+  "release-artifacts",
+  "release-container-policy",
+  "release-sbom",
+  "release-vulnerability"
+]`)
+	planID := uuid.New()
+	planHash := collaborationHash("collaboration-canonical-plan:" + workspace.RevisionID)
+	runtimePolicyHash := collaborationHash("collaboration-runtime-policy")
+	// ReadyApplicationBuildContract creates the compact BuildContract fixture used by
+	// this test package without child projections. Seed only the frozen Plan row with
+	// trigger replication disabled; the Run, Attempt, Receipt, Bundle,
+	// QualityRun and DeploymentVersion below all pass their production gates.
+	if err := fixture.database.Transaction(func(transaction *gorm.DB) error {
+		if err := transaction.Exec("SET LOCAL session_replication_role = replica").Error; err != nil {
+			return err
+		}
+		if err := transaction.Exec(`
+INSERT INTO canonical_verification_plans (
+  id, schema_version, scope, project_id,
+  workspace_artifact_id, workspace_revision_id, workspace_content_hash,
+  build_manifest_id, build_manifest_hash, build_contract_id, build_contract_hash,
+  full_stack_template_id, full_stack_template_hash,
+  verification_profile_id, verification_profile_version, verification_profile_hash,
+  template_releases, obligations, check_ids, required_check_ids,
+  check_count, obligation_count, runtime_policy_hash,
+  content_store, content_ref, content_hash, plan_hash, created_by
+) VALUES (
+  ?, 'canonical-verification-plan/v1', 'canonical', ?,
+  ?, ?, ?, ?, ?, ?, ?, ?, ?,
+  ?, 1, ?, ?::jsonb, ?::jsonb, ?::jsonb, ?::jsonb,
+  5, 1, ?, 'blob', ?, ?, ?, ?
+)
+`, planID, fixture.projectID,
+			workspace.ArtifactID, workspace.RevisionID, workspace.ContentHash,
+			buildID, lineage.ManifestHash, lineage.BuildContractID, lineage.BuildContractHash,
+			lineage.FullStackTemplateID, lineage.FullStackTemplateHash,
+			profileID, profileHash, string(templateReleases), string(obligations), string(checksJSON), string(checksJSON),
+			runtimePolicyHash, "blob://collaboration-canonical-plans/"+planID.String(), planHash, planHash,
+			fixture.ownerID,
+		).Error; err != nil {
+			return err
+		}
+		return transaction.Exec("SET LOCAL session_replication_role = origin").Error
+	}); err != nil {
+		t.Fatalf("insert exact canonical collaboration VerificationPlan: %v", err)
+	}
+
+	runID := uuid.New()
+	if err := fixture.database.Exec(`
+INSERT INTO canonical_verification_runs (
+  id, schema_version, project_id, plan_id, plan_hash,
+  request_key, request_hash, reason, state, version, fence_epoch,
+  created_by, updated_by
+) VALUES (
+  ?, 'canonical-verification-run/v1', ?, ?, ?,
+  ?, ?, 'canonical collaboration release', 'queued', 1, 0,
+  ?, ?
+)
+`, runID, fixture.projectID, planID, planHash,
+		"collaboration-canonical-"+runID.String(), collaborationHash("collaboration-run:"+runID.String()),
+		fixture.ownerID, fixture.ownerID,
+	).Error; err != nil {
+		t.Fatalf("queue canonical collaboration VerificationRun: %v", err)
+	}
+	workerID := "collaboration-canonical-worker"
+	leaseUntil := now.Add(15 * time.Minute)
+	attemptID := uuid.New()
+	// Claim authority is committed only with its exact Attempt generation and
+	// durable cleanup obligation, matching the production worker transaction.
+	if err := fixture.database.Transaction(func(transaction *gorm.DB) error {
+		if err := transaction.Exec(`
+UPDATE canonical_verification_runs
+SET state = 'claimed', version = 2, fence_epoch = 1,
+    lease_worker_id = ?, lease_epoch = 1, lease_expires_at = ?,
+    started_at = ?, updated_by = ?
+WHERE id = ?
+`, workerID, leaseUntil, now, fixture.ownerID, runID).Error; err != nil {
+			return err
+		}
+		if err := transaction.Exec(`
+INSERT INTO canonical_verification_attempts (
+  id, schema_version, run_id, project_id, plan_id, plan_hash,
+  ordinal, state, version, fence_epoch, created_by, updated_by
+) VALUES (
+  ?, 'canonical-verification-attempt/v1', ?, ?, ?, ?,
+  1, 'queued', 1, 0, ?, ?
+)
+`, attemptID, runID, fixture.projectID, planID, planHash, fixture.ownerID, fixture.ownerID).Error; err != nil {
+			return err
+		}
+		if err := transaction.Exec(`
+UPDATE canonical_verification_attempts
+SET state = 'claimed', version = 2, fence_epoch = 1,
+    lease_worker_id = ?, lease_epoch = 1, lease_expires_at = ?,
+    started_at = ?, updated_by = ?
+WHERE id = ?
+`, workerID, leaseUntil, now, fixture.ownerID, attemptID).Error; err != nil {
+			return err
+		}
+		return transaction.Exec(`
+INSERT INTO verification_execution_cleanups (
+  scope, project_id, run_id, attempt_id, attempt_fence_epoch,
+  state, created_by, updated_by
+) VALUES ('canonical', ?, ?, ?, 1, 'registered', ?, ?)
+`, fixture.projectID, runID, attemptID, fixture.ownerID, fixture.ownerID).Error
+	}); err != nil {
+		t.Fatalf("claim canonical collaboration verification execution: %v", err)
+	}
+	for index, state := range []string{"materializing", "preparing", "running", "collecting"} {
+		if err := fixture.database.Exec(
+			"UPDATE canonical_verification_attempts SET state = ?, version = ?, updated_by = ? WHERE id = ?",
+			state, index+3, fixture.ownerID, attemptID,
+		).Error; err != nil {
+			t.Fatalf("advance canonical collaboration VerificationAttempt to %s: %v", state, err)
+		}
+	}
+	if err := fixture.database.Exec(`
+UPDATE verification_execution_cleanups
+SET state = 'completed', version = 2,
+    completed_at = statement_timestamp(), updated_by = ?
+WHERE scope = 'canonical' AND attempt_id = ? AND attempt_fence_epoch = 1
+`, fixture.ownerID, attemptID).Error; err != nil {
+		t.Fatalf("complete canonical collaboration verification cleanup: %v", err)
+	}
+	if err := fixture.database.Exec(`
+UPDATE canonical_verification_attempts
+SET state = 'passed', version = 7,
+    lease_worker_id = NULL, lease_epoch = NULL, lease_expires_at = NULL,
+    finished_at = ?, updated_by = ?
+WHERE id = ?
+`, now, fixture.ownerID, attemptID).Error; err != nil {
+		t.Fatalf("pass canonical collaboration VerificationAttempt: %v", err)
+	}
+	for index, state := range []string{"materializing", "preparing", "running", "collecting"} {
+		if err := fixture.database.Exec(
+			"UPDATE canonical_verification_runs SET state = ?, version = ?, updated_by = ? WHERE id = ?",
+			state, index+3, fixture.ownerID, runID,
+		).Error; err != nil {
+			t.Fatalf("advance canonical collaboration VerificationRun to %s: %v", state, err)
+		}
+	}
+	if err := fixture.database.Exec(`
+UPDATE canonical_verification_runs
+SET state = 'passed', version = 7,
+    lease_worker_id = NULL, lease_epoch = NULL, lease_expires_at = NULL,
+    finished_at = ?, updated_by = ?
+WHERE id = ?
+`, now, fixture.ownerID, runID).Error; err != nil {
+		t.Fatalf("pass canonical collaboration VerificationRun: %v", err)
+	}
+
+	buildHash := collaborationHash("collaboration-web-static:" + workspace.RevisionID)
+	releaseArtifacts, err := json.Marshal([]map[string]any{
+		{
+			"id": "application-image", "kind": "oci-image", "store": "oci",
+			"ref":         "registry.example/collaboration@" + collaborationHash("collaboration-image"),
+			"contentHash": collaborationHash("collaboration-image"),
+			"mediaType":   "application/vnd.oci.image.manifest.v1+json", "byteSize": 4096,
+		},
+		{
+			"id": "web-static", "kind": "web-static", "store": "content",
+			"ref": "content://collaboration-web-static", "contentHash": buildHash,
+			"mediaType": "application/vnd.worksflow.static-tree", "byteSize": 1024,
+		},
+		collaborationReleaseMetadataArtifact("health-contract", "health-readiness-contract", "application/schema+json"),
+		collaborationReleaseMetadataArtifact("migration", "migration", "application/vnd.worksflow.migration"),
+		collaborationReleaseMetadataArtifact("provenance", "provenance", "application/vnd.in-toto+json"),
+		collaborationReleaseMetadataArtifact("runtime-config", "runtime-config-schema", "application/schema+json"),
+		collaborationReleaseMetadataArtifact("sbom", "sbom", "application/spdx+json"),
+		collaborationReleaseMetadataArtifact("signature", "signature", "application/vnd.dev.cosign.simplesigning.v1+json"),
+		collaborationReleaseMetadataArtifact("vulnerability", "vulnerability-report", "application/vnd.worksflow.vulnerability+json"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	receiptID := uuid.New()
+	receiptHash := collaborationHash("collaboration-canonical-receipt:" + workspace.RevisionID)
+	if err := fixture.database.Transaction(func(transaction *gorm.DB) error {
+		if err := transaction.Exec(`
+INSERT INTO canonical_verification_receipts (
+  id, schema_version, scope, run_id, project_id, plan_id, plan_hash,
+  workspace_artifact_id, workspace_revision_id, workspace_content_hash,
+  build_manifest_id, build_manifest_hash, build_contract_id, build_contract_hash,
+  full_stack_template_id, full_stack_template_hash,
+  verification_profile_id, verification_profile_version, verification_profile_hash,
+  attempt_ids, release_artifacts, check_count, coverage_count,
+  must_count, must_passed_count, blocker_count, warning_count, decision,
+  content_store, content_ref, content_hash, payload_hash, created_by
+) VALUES (
+  ?, 'canonical-verification-receipt/v1', 'canonical', ?, ?, ?, ?,
+  ?, ?, ?, ?, ?, ?, ?, ?, ?,
+  ?, 1, ?, ?::jsonb, ?::jsonb, 5, 1,
+  1, 1, 0, 0, 'passed', 'blob', ?, ?, ?, ?
+)
+`, receiptID, runID, fixture.projectID, planID, planHash,
+			workspace.ArtifactID, workspace.RevisionID, workspace.ContentHash,
+			buildID, lineage.ManifestHash, lineage.BuildContractID, lineage.BuildContractHash,
+			lineage.FullStackTemplateID, lineage.FullStackTemplateHash,
+			profileID, profileHash, `["`+attemptID.String()+`"]`, string(releaseArtifacts),
+			"blob://collaboration-canonical-receipts/"+receiptID.String(), collaborationHash("collaboration-receipt-content"),
+			receiptHash, fixture.ownerID,
+		).Error; err != nil {
+			return err
+		}
+		checks := []struct {
+			id   string
+			kind string
+		}{
+			{id: "oracle-collaboration", kind: "test"},
+			{id: "release-artifacts", kind: "release-manifest"},
+			{id: "release-container-policy", kind: "container-policy"},
+			{id: "release-sbom", kind: "sbom"},
+			{id: "release-vulnerability", kind: "vulnerability"},
+		}
+		for ordinal, check := range checks {
+			if err := transaction.Exec(`
+INSERT INTO canonical_verification_checks (
+  receipt_id, ordinal, check_id, kind, required, status, attempt_id, truncated
+) VALUES (?, ?, ?, ?, true, 'passed', ?, false)
+`, receiptID, ordinal, check.id, check.kind, attemptID).Error; err != nil {
+				return err
+			}
+		}
+		return transaction.Exec(`
+INSERT INTO canonical_verification_obligation_coverage (
+  receipt_id, ordinal, obligation_id, level, check_ids, status
+) VALUES (?, 0, 'OBL-COLLABORATION', 'must', ?::jsonb, 'passed')
+`, receiptID, string(checksJSON)).Error
+	}); err != nil {
+		t.Fatalf("insert exact passed canonical collaboration VerificationReceipt: %v", err)
+	}
+
+	bundleID := uuid.New()
+	bundleHash := collaborationHash("collaboration-release-bundle:" + workspace.RevisionID)
+	if err := fixture.database.Exec(`
+INSERT INTO release_bundles (
+  id, schema_version, project_id, workspace_artifact_id, workspace_revision_id,
+  workspace_content_hash, canonical_receipt_id, canonical_receipt_hash,
+  release_artifacts, content_store, content_ref, content_hash, bundle_hash, created_by
+) VALUES (
+  ?, 'release-bundle/v1', ?, ?, ?, ?, ?, ?, ?::jsonb,
+  'blob', ?, ?, ?, ?
+)
+`, bundleID, fixture.projectID, workspace.ArtifactID, workspace.RevisionID, workspace.ContentHash,
+		receiptID, receiptHash, string(releaseArtifacts),
+		"blob://collaboration-release-bundles/"+bundleID.String(), collaborationHash("collaboration-bundle-content"),
+		bundleHash, fixture.ownerID,
+	).Error; err != nil {
+		t.Fatalf("insert exact collaboration ReleaseBundle: %v", err)
+	}
+
+	qualityRunID, buildArtifactID := uuid.New(), uuid.New()
+	buildContentRef := "content://collaboration-web-static/" + buildArtifactID.String()
+	buildContentHash := collaborationHash("collaboration-web-static-content:" + buildArtifactID.String())
+	if err := fixture.database.Exec(`
+INSERT INTO quality_runs (
+  id, project_id, workspace_artifact_id, workspace_revision_id, workspace_content_hash,
+  status, score, runner_version, sandbox_kind, version, created_by, started_at, completed_at,
+  build_artifact_id, build_content_ref, build_content_hash, build_hash,
+  build_entry_path, build_file_count, build_total_bytes
+) VALUES (
+  ?, ?, ?, ?, ?, 'passed', 100, 'collaboration-canonical/v1', 'test', 1, ?, ?, ?,
+  ?, ?, ?, ?, 'index.html', 1, 1024
+)
+`, qualityRunID, fixture.projectID, workspace.ArtifactID, workspace.RevisionID, workspace.ContentHash,
+		fixture.ownerID, now, now, buildArtifactID, buildContentRef, buildContentHash, buildHash,
+	).Error; err != nil {
+		t.Fatalf("insert exact collaboration QualityRun build artifact: %v", err)
+	}
+
+	return collaborationReleaseAuthority{
+		receiptID: receiptID, receiptHash: receiptHash,
+		bundleID: bundleID, bundleHash: bundleHash,
+		qualityRunID: qualityRunID, buildArtifactID: buildArtifactID,
+		buildContentRef: buildContentRef, buildContentHash: buildContentHash, buildHash: buildHash,
+	}
+}
+
+func collaborationReleaseMetadataArtifact(id, kind, mediaType string) map[string]any {
+	return map[string]any{
+		"id": id, "kind": kind, "store": "content", "ref": "content://collaboration-" + id,
+		"contentHash": collaborationHash("collaboration-" + id), "mediaType": mediaType, "byteSize": 512,
+	}
 }
 
 func graphHasNode(graph DocumentGraph, entityType, entityID string) bool {
@@ -714,6 +1145,16 @@ func bindingSetHasRole(bindings DocumentMemberBindingSet, userID string, role Do
 }
 
 func canonicalGeneratedDocumentContent(payload json.RawMessage, expectedKind string) bool {
+	if expectedKind == "apiContract" {
+		var contract struct {
+			SchemaVersion string                     `json:"schemaVersion"`
+			OpenAPI       string                     `json:"openapi"`
+			Info          map[string]any             `json:"info"`
+			Paths         map[string]json.RawMessage `json:"paths"`
+		}
+		return json.Unmarshal(payload, &contract) == nil && contract.SchemaVersion == "api-contract/v1" &&
+			contract.OpenAPI == "3.1.0" && contract.Info != nil && len(contract.Paths) > 0
+	}
 	var value struct {
 		Kind               string `json:"kind"`
 		Blocks             []any  `json:"blocks"`

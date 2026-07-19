@@ -18,7 +18,7 @@ func ValidateDefinitionForExecutionProfile(definition domain.WorkflowDefinition,
 		return &domain.DomainError{Kind: domain.ErrValidation, Field: "workflow.executionProfile", Message: err.Error()}
 	}
 	switch profile {
-	case CurrentWorkflowExecutionProfileRef():
+	case WorkflowExecutionProfileV2Ref():
 		return validateDefinitionV2(definition)
 	case WorkflowExecutionProfileV1Ref():
 		return validateDefinitionV1(definition)
@@ -79,18 +79,17 @@ func validateDefinitionV1(definition domain.WorkflowDefinition) error {
 	return descriptor.Capabilities.ValidateDefinition(definition)
 }
 
-// validateDefinitionV2 is the current authoring validator. It intentionally
-// has its own entry point even while its acceptance rules match v1, so future
-// changes cannot reinterpret definitions persisted under either exact ref.
+// validateDefinitionV2 is frozen by workflow-engine/v2. Current authoring
+// aliases this entry point until a separately versioned profile exists.
 func validateDefinitionV2(definition domain.WorkflowDefinition) error {
 	if err := definition.Validate(); err != nil {
 		return err
 	}
-	profile := CurrentWorkflowExecutionProfileRef()
+	profile := WorkflowExecutionProfileV2Ref()
 	if definition.ExecutionProfile != profile {
 		return &domain.DomainError{Kind: domain.ErrValidation, Field: "workflow.executionProfile", Message: "definition content does not embed the exact selected profile"}
 	}
-	descriptor := CurrentWorkflowExecutionProfileDescriptor()
+	descriptor := WorkflowExecutionProfileV2Descriptor()
 	if err := validateDefinitionAnalysisLimitsV1(definition, descriptor.Capabilities.AnalysisLimits); err != nil {
 		return err
 	}

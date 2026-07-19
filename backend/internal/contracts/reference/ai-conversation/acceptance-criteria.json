@@ -1,0 +1,81 @@
+{
+  "schemaVersion": "reference-acceptance-criteria/v1",
+  "applicationId": "reference-ai-conversation-v1",
+  "criteria": [
+    {
+      "id": "AC-AI-001",
+      "requirementIds": ["REQ-CONVERSATION-PERSISTENCE"],
+      "statement": "An authenticated project member can create a conversation and list it in the same project."
+    },
+    {
+      "id": "AC-AI-002",
+      "requirementIds": ["REQ-CONVERSATION-PERSISTENCE"],
+      "statement": "Conversation and message history remains readable after the API process and browser session are restarted."
+    },
+    {
+      "id": "AC-AI-003",
+      "requirementIds": ["REQ-IDEMPOTENCY"],
+      "statement": "Replaying a message or run creation request with the same project-scoped idempotency key returns the original resource without duplicate model execution."
+    },
+    {
+      "id": "AC-AI-004",
+      "requirementIds": ["REQ-TYPED-STREAM"],
+      "statement": "A run emits schema-valid, monotonically sequenced SSE events and resumes after Last-Event-ID without replay gaps or reordering."
+    },
+    {
+      "id": "AC-AI-005",
+      "requirementIds": ["REQ-CANCEL"],
+      "statement": "Cancelling a queued or running run is idempotent, stops further model output, and persists the cancelled terminal status."
+    },
+    {
+      "id": "AC-AI-006",
+      "requirementIds": ["REQ-RETRY"],
+      "statement": "Retry requires a non-empty reason, creates a traceable new attempt, and never exceeds the configured maximum attempt count."
+    },
+    {
+      "id": "AC-AI-007",
+      "requirementIds": ["REQ-TENANT-AUTH"],
+      "statement": "Two independently authenticated principals cannot read, stream, cancel, retry, or infer resources belonging to another project."
+    },
+    {
+      "id": "AC-AI-008",
+      "requirementIds": ["REQ-TENANT-AUTH"],
+      "statement": "Every conversation, message, run, and event operation requires an authenticated project member role and is audited with actor and project identity."
+    },
+    {
+      "id": "AC-AI-009",
+      "requirementIds": ["REQ-OPERABILITY"],
+      "statement": "Web liveness and API readiness endpoints report healthy only when their required runtime dependencies are available."
+    },
+    {
+      "id": "AC-AI-010",
+      "requirementIds": ["REQ-OPERABILITY"],
+      "statement": "Database migrations complete successfully before application traffic is enabled and are safe to re-run."
+    },
+    {
+      "id": "AC-AI-011",
+      "requirementIds": ["REQ-GATEWAY-GOVERNANCE"],
+      "statement": "Model execution uses the declared AI gateway policy and obtains credentials only from runtime secret injection; provider secrets never reach the browser or workspace."
+    },
+    {
+      "id": "AC-AI-012",
+      "requirementIds": ["REQ-GATEWAY-GOVERNANCE"],
+      "statement": "Per-project and per-actor rate limits reject excess requests with a machine-readable error and Retry-After guidance."
+    },
+    {
+      "id": "AC-AI-013",
+      "requirementIds": ["REQ-GATEWAY-GOVERNANCE"],
+      "statement": "A run that exceeds its configured timeout becomes failed exactly once, records a stable error code, and emits a terminal run.failed event."
+    },
+    {
+      "id": "AC-AI-014",
+      "requirementIds": ["REQ-RETENTION"],
+      "statement": "Message and run retention jobs use the declared windows and redact secret-bearing diagnostic fields before persistence or export."
+    },
+    {
+      "id": "AC-AI-015",
+      "requirementIds": ["REQ-RECOVERY"],
+      "statement": "After an API or stream connection failure, the client reconnects from the last durable cursor and the run reaches one durable terminal state."
+    }
+  ]
+}

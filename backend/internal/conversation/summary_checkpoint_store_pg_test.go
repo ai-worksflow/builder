@@ -39,6 +39,12 @@ func TestGORMStoreSummaryCheckpointPrefixReviewChainAndConcurrentSiblingApproval
 	}).Error; err != nil {
 		t.Fatal(err)
 	}
+	if err := database.Create(&storage.ProjectMemberModel{
+		ProjectID: projectID, UserID: creatorID, Role: string(core.RoleOwner),
+		JoinedAt: now, UpdatedAt: now,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
 
 	conversation, err := store.CreateConversation(ctx, projectID, creatorID, "Checkpoint chain")
 	if err != nil {

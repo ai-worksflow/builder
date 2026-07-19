@@ -1,0 +1,198 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://worksflow.dev/schemas/ai-runtime-contract-v2.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "applicationProfile",
+    "providerPolicy",
+    "providerPort",
+    "gateway",
+    "conversation",
+    "run",
+    "streaming",
+    "cancellation",
+    "retry",
+    "rateLimit",
+    "limits",
+    "retention",
+    "audit"
+  ],
+  "properties": {
+    "schemaVersion": {"const": "ai-runtime-contract/v2"},
+    "applicationProfile": {"type": "string", "pattern": "^[a-z][a-z0-9._/-]{0,119}$"},
+    "providerPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["policyId", "modelClass", "fallbackAllowed", "profilePinned"],
+      "properties": {
+        "policyId": {"type": "string", "minLength": 1, "maxLength": 120},
+        "modelClass": {"type": "string", "minLength": 1, "maxLength": 120},
+        "fallbackAllowed": {"type": "boolean"},
+        "profilePinned": {"const": true}
+      }
+    },
+    "providerPort": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["portId", "protocol", "contractKind", "requestSchemaRef", "eventSchemaRef", "streamingRequired", "cancellationPropagation", "usageRequired"],
+      "properties": {
+        "portId": {"type": "string", "pattern": "^[a-z][a-z0-9._-]{0,79}$"},
+        "protocol": {"const": "worksflow-generated-ai/v1"},
+        "contractKind": {"const": "api_contract"},
+        "requestSchemaRef": {"type": "string", "pattern": "^#/components/schemas/[A-Za-z][A-Za-z0-9._-]{0,127}$"},
+        "eventSchemaRef": {"type": "string", "pattern": "^#/components/schemas/[A-Za-z][A-Za-z0-9._-]{0,127}$"},
+        "streamingRequired": {"const": true},
+        "cancellationPropagation": {"const": true},
+        "usageRequired": {"const": true}
+      }
+    },
+    "gateway": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["plane", "endpointEnvironmentVariable", "capabilityEnvironmentVariable", "capabilityMode", "providerCredentials", "providerKeyExposure", "tenantScoped", "auditRequired"],
+      "properties": {
+        "plane": {"const": "generated-application"},
+        "endpointEnvironmentVariable": {"type": "string", "pattern": "^[A-Z][A-Z0-9_]{0,126}$"},
+        "capabilityEnvironmentVariable": {"type": "string", "pattern": "^[A-Z][A-Z0-9_]{0,126}$"},
+        "capabilityMode": {"const": "file"},
+        "providerCredentials": {"const": "gateway-only"},
+        "providerKeyExposure": {"const": "forbidden"},
+        "tenantScoped": {"const": true},
+        "auditRequired": {"const": true}
+      }
+    },
+    "conversation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["persistence", "tenantScoped", "messageRoles"],
+      "properties": {
+        "persistence": {"const": "required"},
+        "tenantScoped": {"const": true},
+        "messageRoles": {
+          "type": "array",
+          "minItems": 2,
+          "items": {"enum": ["system", "user", "assistant", "tool"]},
+          "uniqueItems": true
+        }
+      }
+    },
+    "run": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["persistent", "idempotencyRequired", "statusValues"],
+      "properties": {
+        "persistent": {"const": true},
+        "idempotencyRequired": {"const": true},
+        "statusValues": {
+          "type": "array",
+          "minItems": 5,
+          "items": {"enum": ["queued", "running", "completed", "failed", "cancelled"]},
+          "uniqueItems": true
+        }
+      }
+    },
+    "streaming": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["transport", "eventTypes", "eventSchemaRef", "durable", "resumeCursor", "cursorField", "resumeHeader"],
+      "properties": {
+        "transport": {"const": "sse"},
+        "eventTypes": {
+          "type": "array",
+          "minItems": 5,
+          "items": {"type": "string", "pattern": "^[a-z][a-z0-9_.-]{0,79}$"},
+          "uniqueItems": true
+        },
+        "eventSchemaRef": {"type": "string", "pattern": "^[A-Za-z0-9._-][A-Za-z0-9._/-]*\\.json$", "maxLength": 300},
+        "durable": {"const": true},
+        "resumeCursor": {"const": true},
+        "cursorField": {"const": "sequence"},
+        "resumeHeader": {"const": "Last-Event-ID"}
+      }
+    },
+    "cancellation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["supported", "idempotent", "terminalStatus"],
+      "properties": {
+        "supported": {"const": true},
+        "idempotent": {"const": true},
+        "terminalStatus": {"const": "cancelled"}
+      }
+    },
+    "retry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["reasonRequired", "maxAttempts", "createsNewAttempt", "supersedeOnModelChange"],
+      "properties": {
+        "reasonRequired": {"const": true},
+        "maxAttempts": {"type": "integer", "minimum": 1, "maximum": 20},
+        "createsNewAttempt": {"const": true},
+        "supersedeOnModelChange": {"const": true}
+      }
+    },
+    "rateLimit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["scope", "requests", "windowSeconds", "burst", "retryAfterRequired", "failClosed"],
+      "properties": {
+        "scope": {"const": "tenant-actor"},
+        "requests": {"type": "integer", "minimum": 1, "maximum": 100000},
+        "windowSeconds": {"type": "integer", "minimum": 1, "maximum": 3600},
+        "burst": {"type": "integer", "minimum": 1, "maximum": 100000},
+        "retryAfterRequired": {"const": true},
+        "failClosed": {"const": true}
+      }
+    },
+    "limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["maxInputBytes", "maxOutputBytes", "timeoutSeconds"],
+      "properties": {
+        "maxInputBytes": {"type": "integer", "minimum": 1},
+        "maxOutputBytes": {"type": "integer", "minimum": 1},
+        "timeoutSeconds": {"type": "integer", "minimum": 1, "maximum": 3600}
+      }
+    },
+    "retention": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["messageDays", "runDays", "eventDays", "redactionRequired"],
+      "properties": {
+        "messageDays": {"type": "integer", "minimum": 1, "maximum": 3650},
+        "runDays": {"type": "integer", "minimum": 1, "maximum": 3650},
+        "eventDays": {"type": "integer", "minimum": 1, "maximum": 3650},
+        "redactionRequired": {"const": true}
+      }
+    },
+    "audit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["requiredFields", "promptContent", "responseContent", "retentionDays"],
+      "properties": {
+        "requiredFields": {
+          "type": "array",
+          "minItems": 9,
+          "items": {"enum": ["tenantId", "projectId", "actorId", "conversationId", "runId", "providerPolicyId", "requestId", "outcome", "usage", "errorCode"]},
+          "uniqueItems": true,
+          "allOf": [
+            {"contains": {"const": "tenantId"}},
+            {"contains": {"const": "actorId"}},
+            {"contains": {"const": "projectId"}},
+            {"contains": {"const": "conversationId"}},
+            {"contains": {"const": "runId"}},
+            {"contains": {"const": "providerPolicyId"}},
+            {"contains": {"const": "requestId"}},
+            {"contains": {"const": "outcome"}},
+            {"contains": {"const": "usage"}}
+          ]
+        },
+        "promptContent": {"const": "redacted"},
+        "responseContent": {"const": "redacted"},
+        "retentionDays": {"type": "integer", "minimum": 1, "maximum": 3650}
+      }
+    }
+  }
+}

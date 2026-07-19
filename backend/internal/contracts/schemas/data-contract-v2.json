@@ -1,0 +1,132 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://worksflow.dev/schemas/data-contract-v2.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "entities", "migrationPolicy"],
+  "properties": {
+    "schemaVersion": {"const": "data-contract/v2"},
+    "entities": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/entity"}
+    },
+    "migrationPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tool", "directory", "applyCommandId", "rollbackPolicy"],
+      "properties": {
+        "tool": {"type": "string", "minLength": 1, "maxLength": 80},
+        "directory": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9._-][A-Za-z0-9._/-]*$",
+          "maxLength": 300
+        },
+        "applyCommandId": {"type": "string", "pattern": "^[a-z][a-z0-9._-]{0,79}$"},
+        "rollbackPolicy": {"enum": ["forward-only", "required"]}
+      }
+    }
+  },
+  "$defs": {
+    "identifier": {"type": "string", "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$"},
+    "field": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "name", "type", "nullable"],
+      "properties": {
+        "id": {"$ref": "#/$defs/identifier"},
+        "name": {"type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]{0,62}$"},
+        "type": {
+          "enum": ["uuid", "string", "text", "integer", "number", "boolean", "date", "timestamp", "json", "bytes"]
+        },
+        "nullable": {"type": "boolean"},
+        "generated": {"type": "boolean"},
+        "default": {},
+        "references": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["entityId", "fieldId", "onDelete"],
+          "properties": {
+            "entityId": {"$ref": "#/$defs/identifier"},
+            "fieldId": {"$ref": "#/$defs/identifier"},
+            "onDelete": {"enum": ["restrict", "cascade", "set-null"]}
+          }
+        }
+      }
+    },
+    "index": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "fieldIds", "unique"],
+      "properties": {
+        "id": {"$ref": "#/$defs/identifier"},
+        "fieldIds": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"$ref": "#/$defs/identifier"},
+          "uniqueItems": true
+        },
+        "unique": {"type": "boolean"}
+      }
+    },
+    "foreignKey": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "fieldIds", "targetEntityId", "targetFieldIds", "onDelete"],
+      "properties": {
+        "id": {"$ref": "#/$defs/identifier"},
+        "fieldIds": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"$ref": "#/$defs/identifier"},
+          "uniqueItems": true
+        },
+        "targetEntityId": {"$ref": "#/$defs/identifier"},
+        "targetFieldIds": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"$ref": "#/$defs/identifier"},
+          "uniqueItems": true
+        },
+        "onDelete": {"enum": ["restrict", "cascade", "set-null"]}
+      }
+    },
+    "entity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "tableName", "fields", "primaryKey", "indexes", "foreignKeys", "tenantScope"],
+      "properties": {
+        "id": {"$ref": "#/$defs/identifier"},
+        "tableName": {"type": "string", "pattern": "^[a-z][a-z0-9_]{0,62}$"},
+        "fields": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"$ref": "#/$defs/field"}
+        },
+        "primaryKey": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"$ref": "#/$defs/identifier"},
+          "uniqueItems": true
+        },
+        "indexes": {"type": "array", "items": {"$ref": "#/$defs/index"}},
+        "foreignKeys": {"type": "array", "items": {"$ref": "#/$defs/foreignKey"}},
+        "tenantScope": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["mode"],
+          "properties": {
+            "mode": {"enum": ["global", "project", "user"]},
+            "fieldId": {"$ref": "#/$defs/identifier"}
+          },
+          "allOf": [
+            {
+              "if": {"properties": {"mode": {"enum": ["project", "user"]}}},
+              "then": {"required": ["fieldId"]}
+            }
+          ]
+        }
+      }
+    }
+  }
+}

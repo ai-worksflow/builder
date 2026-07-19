@@ -24,10 +24,10 @@ import (
 )
 
 type multiBundleMemoryContentStore struct {
-	mu          sync.Mutex
-	sequence    uint64
-	items       map[string]content.StoredContent
-	finalizeErr error
+	mu            sync.Mutex
+	sequence      uint64
+	items         map[string]content.StoredContent
+	finalizeCalls int
 }
 
 func newMultiBundleMemoryContentStore() *multiBundleMemoryContentStore {
@@ -57,9 +57,7 @@ func (s *multiBundleMemoryContentStore) PutPending(
 func (s *multiBundleMemoryContentStore) Finalize(_ context.Context, contentID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.finalizeErr != nil {
-		return s.finalizeErr
-	}
+	s.finalizeCalls++
 	stored, exists := s.items[contentID]
 	if !exists {
 		return content.ErrContentNotFound
@@ -71,7 +69,7 @@ func (s *multiBundleMemoryContentStore) Finalize(_ context.Context, contentID st
 	return nil
 }
 
-func TestGeneratedProposalRecoversAfterFinalizeFailurePostgres(t *testing.T) {
+func TestLegacyGeneratedProposalIsRejectedByGovernedGatePostgres(t *testing.T) {
 	database, cleanup := multiBundlePostgresDatabase(t)
 	defer cleanup()
 	fixture := seedMultiBundlePostgresFixture(t, database)
@@ -83,9 +81,12 @@ func TestGeneratedProposalRecoversAfterFinalizeFailurePostgres(t *testing.T) {
 	contractHash := "sha256:" + strings.Repeat("b", 64)
 	rootID := uuid.MustParse(fixture.rootA.RootBuildManifestID)
 	leafID := uuid.MustParse(fixture.rootA.ID)
+	buildContract := multiBundleBuildContractRef(fixture.rootA.ID)
 	if err := database.Create(&storage.ImplementationGenerationClaimModel{
 		ID: uuid.New(), BuildManifestID: leafID, ProjectID: fixture.projectID, RootManifestID: rootID,
-		RequestKey: requestKey, ReservedProposalID: proposalID,
+		ApplicationBuildContractID:   nonNilUUIDPointer(uuid.MustParse(buildContract.ID)),
+		ApplicationBuildContractHash: nonEmptyStringPointer(buildContract.ContractHash),
+		RequestKey:                   requestKey, ReservedProposalID: proposalID,
 		ExecutionSource: string(ImplementationSourceManualGeneration), Instruction: instruction, InstructionHash: instructionHash,
 		RequestedModel: "test-model", GenerationContractVersion: "test-contract/v1",
 		SystemPromptHash: contractHash, OutputSchemaHash: contractHash,
@@ -94,38 +95,57 @@ func TestGeneratedProposalRecoversAfterFinalizeFailurePostgres(t *testing.T) {
 	}).Error; err != nil {
 		t.Fatal(err)
 	}
-	fixture.contents.finalizeErr = errors.New("simulated finalize outage")
 	fileContent := "export const recovered = true\n"
 	_, err := fixture.implementation.CreateGenerated(ctx, fixture.projectID.String(), fixture.ownerID.String(), CreateImplementationProposalInput{
-		BuildManifestID: fixture.rootA.ID,
-		Operations:      []FileOperation{{ID: "recover-finalize", Kind: "file.upsert", Path: "src/recovered.ts", Content: &fileContent}},
+		BuildManifestID: fixture.rootA.ID, ApplicationBuildContract: buildContract,
+		Operations: []FileOperation{{ID: "recover-finalize", Kind: "file.upsert", Path: "src/recovered.ts", Content: &fileContent}},
 	}, GeneratedImplementationIdentity{
 		ProposalID: proposalID.String(), RequestKey: requestKey.String(),
 		ExecutionSource: ImplementationSourceManualGeneration, InstructionHash: instructionHash,
 		AIProvider: "test-provider", AIModel: "test-model", ClaimToken: token.String(),
+		ApplicationBuildContract: buildContract,
 	})
-	if !errors.Is(err, ErrContentNotReady) {
-		t.Fatalf("finalize failure error = %v, want ErrContentNotReady", err)
+	if err == nil || !strings.Contains(err.Error(), "legacy AI ImplementationProposal creation is disabled") {
+		t.Fatalf("legacy generated Proposal error = %v, want governed database rejection", err)
 	}
 	var claim storage.ImplementationGenerationClaimModel
 	if err := database.Where("request_key = ?", requestKey).Take(&claim).Error; err != nil {
 		t.Fatal(err)
 	}
-	if claim.Status != "completed" || claim.CompletedProposalID == nil || *claim.CompletedProposalID != proposalID {
-		t.Fatalf("SQL checkpoint was not recoverable after finalize failure: %+v", claim)
+	if claim.Status != "processing" || claim.CompletedProposalID != nil || claim.ClaimToken == nil || *claim.ClaimToken != token {
+		t.Fatalf("governed rejection mutated the generation claim: %+v", claim)
 	}
 	if err := database.Model(&storage.ImplementationGenerationClaimModel{}).Where("id = ?", claim.ID).
 		Update("instruction", json.RawMessage(`{"constraints":["tampered"],"objective":"recover after finalize failure"}`)).Error; err == nil {
 		t.Fatal("durable generation instruction snapshot was mutable")
 	}
-	fixture.contents.finalizeErr = nil
-	recovered, err := fixture.implementation.Get(ctx, proposalID.String(), fixture.ownerID.String())
-	if err != nil || recovered.ID != proposalID.String() {
-		t.Fatalf("pending referenced proposal could not be recovered: proposal=%+v err=%v", recovered, err)
+	var proposalCount int64
+	if err := database.Model(&storage.ImplementationProposalModel{}).Where("id = ?", proposalID).Count(&proposalCount).Error; err != nil {
+		t.Fatal(err)
+	}
+	if proposalCount != 0 {
+		t.Fatalf("governed rejection persisted %d legacy generated Proposals", proposalCount)
+	}
+	fixture.contents.mu.Lock()
+	abortedProposalContent := 0
+	for _, stored := range fixture.contents.items {
+		if stored.AggregateType != "implementation_proposal" || stored.AggregateID != proposalID.String() {
+			continue
+		}
+		if stored.State != content.StateAborted {
+			fixture.contents.mu.Unlock()
+			t.Fatalf("governed rejection left Proposal content in state %q", stored.State)
+		}
+		abortedProposalContent++
+	}
+	finalizeCalls := fixture.contents.finalizeCalls
+	fixture.contents.mu.Unlock()
+	if abortedProposalContent != 1 || finalizeCalls != 0 {
+		t.Fatalf("gate was not first and cleanup-exact: aborted=%d finalizeCalls=%d", abortedProposalContent, finalizeCalls)
 	}
 	lineage, err := fixture.workbench.GetLineageState(ctx, fixture.rootA.ID, fixture.ownerID.String())
-	if err != nil || lineage.CurrentProposal == nil || lineage.CurrentProposal.ID != proposalID.String() {
-		t.Fatalf("Workbench lineage could not recover the committed pending content: state=%+v err=%v", lineage, err)
+	if err != nil || lineage.CurrentProposal != nil {
+		t.Fatalf("governed rejection polluted Workbench lineage: state=%+v err=%v", lineage, err)
 	}
 }
 
@@ -243,6 +263,25 @@ type multiBundlePostgresFixture struct {
 	otherRoot      WorkbenchBundle
 }
 
+type multiBundleBuildContractVerifier struct{}
+
+func (multiBundleBuildContractVerifier) RequireReadyForImplementation(
+	_ context.Context,
+	_, buildManifestID, _ string,
+	selection ApplicationBuildContractRef,
+) (ApplicationBuildContractRef, error) {
+	expected := multiBundleBuildContractRef(buildManifestID)
+	if !sameApplicationBuildContractRef(selection, expected) {
+		return ApplicationBuildContractRef{}, ErrBlockingGate
+	}
+	return expected, nil
+}
+
+func multiBundleBuildContractRef(buildManifestID string) ApplicationBuildContractRef {
+	id := uuid.NewSHA1(uuid.NameSpaceOID, []byte("multi-bundle-contract:"+buildManifestID))
+	return ApplicationBuildContractRef{ID: id.String(), ContractHash: hashText("contract:" + buildManifestID)}
+}
+
 func TestMultiBundleSequentialRebasePostgres(t *testing.T) {
 	database, cleanup := multiBundlePostgresDatabase(t)
 	defer cleanup()
@@ -288,7 +327,7 @@ func TestMultiBundleSequentialRebasePostgres(t *testing.T) {
 	lateContent := packageA
 	if _, err := fixture.implementation.Create(
 		ctx, fixture.projectID.String(), fixture.ownerID.String(), CreateImplementationProposalInput{
-			BuildManifestID: fixture.rootA.ID,
+			BuildManifestID: fixture.rootA.ID, ApplicationBuildContract: multiBundleBuildContractRef(fixture.rootA.ID),
 			Operations: []FileOperation{{
 				ID: "consumed-root-regeneration", Kind: "file.upsert", Path: "package.json",
 				Content: &lateContent, Language: "json", ExpectedHash: hashText(packageA),
@@ -381,6 +420,9 @@ func TestMultiBundleSequentialRebasePostgres(t *testing.T) {
 	if rebasedCount != 1 {
 		t.Fatalf("duplicate rebase persisted %d W1 bundles, want 1", rebasedCount)
 	}
+	seedMultiBundleBuildContracts(
+		t, fixture.database, fixture.ownerID, fixture.projectID, []WorkbenchBundle{rebasedB},
+	)
 
 	proposalBRebased := createReadyMultiBundleProposal(
 		t, fixture.implementation, fixture.projectID, fixture.ownerID, rebasedB.ID,
@@ -779,7 +821,7 @@ func createReadyMultiBundleProposal(
 	proposal, err := service.Create(
 		context.Background(), projectID.String(), actorID.String(),
 		CreateImplementationProposalInput{
-			BuildManifestID: bundleID,
+			BuildManifestID: bundleID, ApplicationBuildContract: multiBundleBuildContractRef(bundleID),
 			Operations: []FileOperation{{
 				ID: operationID, Kind: "file.upsert", Path: "package.json", Content: &newContent,
 				Language: "json", ExpectedHash: expectedHash,
@@ -825,7 +867,7 @@ func seedMultiBundlePostgresFixture(t *testing.T, database *gorm.DB) multiBundle
 	if err != nil {
 		t.Fatal(err)
 	}
-	implementation, err := NewImplementationService(database, contents, access)
+	implementation, err := NewImplementationService(database, contents, access, multiBundleBuildContractVerifier{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -861,12 +903,86 @@ func seedMultiBundlePostgresFixture(t *testing.T, database *gorm.DB) multiBundle
 		t, database, contents, otherProjectID, otherOwnerID, now, otherWorkspace,
 		VersionRef{}, VersionRef{}, VersionRef{}, VersionRef{},
 	)
+	seedMultiBundleBuildContracts(t, database, ownerID, projectID, []WorkbenchBundle{rootA, rootB})
+	seedMultiBundleBuildContracts(t, database, otherOwnerID, otherProjectID, []WorkbenchBundle{otherRoot})
 
 	return multiBundlePostgresFixture{
 		database: database, contents: contents, workbench: workbench, implementation: implementation,
 		projectID: projectID, otherProjectID: otherProjectID, ownerID: ownerID, viewerID: viewerID,
 		otherOwnerID: otherOwnerID, workspaceW0: workspaceW0, otherWorkspace: otherWorkspace,
 		rootA: rootA, rootB: rootB, otherRoot: otherRoot,
+	}
+}
+
+func seedMultiBundleBuildContracts(
+	t *testing.T,
+	database *gorm.DB,
+	ownerID, projectID uuid.UUID,
+	bundles []WorkbenchBundle,
+) {
+	t.Helper()
+	if len(bundles) == 0 {
+		return
+	}
+	stackID := uuid.NewSHA1(uuid.NameSpaceOID, []byte("multi-bundle-stack:"+projectID.String()))
+	stackHash := hashText("stack:" + projectID.String())
+	templateID := "test-stack-" + strings.ReplaceAll(projectID.String()[:8], "-", "")
+	createdAt := time.Now().UTC().Add(-30 * time.Minute).Truncate(time.Microsecond)
+	document, err := json.Marshal(map[string]any{
+		"id": stackID.String(), "schemaVersion": "full-stack-template/v1",
+		"templateId": templateID, "version": "1.0.0",
+		"components": []any{map[string]any{"role": "api"}, map[string]any{"role": "web"}},
+		"layout":     map[string]any{}, "contentHash": stackHash,
+		"createdBy": ownerID.String(), "createdAt": createdAt.Format(time.RFC3339Nano),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Exec(`ALTER TABLE full_stack_template_releases DISABLE TRIGGER USER`).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Exec(`ALTER TABLE application_build_contracts DISABLE TRIGGER USER`).Error; err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := database.Exec(`ALTER TABLE application_build_contracts ENABLE TRIGGER USER`).Error; err != nil {
+			t.Fatal(err)
+		}
+		if err := database.Exec(`ALTER TABLE full_stack_template_releases ENABLE TRIGGER USER`).Error; err != nil {
+			t.Fatal(err)
+		}
+	}()
+	if err := database.Exec(`
+INSERT INTO full_stack_template_releases (
+  id, schema_version, template_id, release_version, document,
+  content_hash, created_by, created_at
+) VALUES (?, 'full-stack-template/v1', ?, '1.0.0', ?::jsonb, ?, ?, ?)
+ON CONFLICT (id) DO NOTHING
+`, stackID, templateID, string(document), stackHash, ownerID, createdAt).Error; err != nil {
+		t.Fatal(err)
+	}
+	for _, bundle := range bundles {
+		contract := multiBundleBuildContractRef(bundle.ID)
+		if err := database.Exec(`
+INSERT INTO application_build_contracts (
+  id, project_id, build_manifest_id, build_manifest_hash,
+  full_stack_template_id, full_stack_template_hash,
+  schema_version, compiler_version, compiler_hash,
+  content_store, content_ref, content_hash, contract_hash,
+  status, must_count, must_ready_count, obligation_count,
+  source_count, template_release_count, blocking_count, conflict_count,
+  version, created_by, created_at
+) VALUES (
+  ?, ?, ?, ?, ?, ?,
+  'application-build-contract/v2', 'test-compiler/v1', ?,
+  'mongo', ?, ?, ?,
+  'ready', 1, 1, 1, 0, 0, 0, 0, 1, ?, ?
+)
+`, uuid.MustParse(contract.ID), projectID, uuid.MustParse(bundle.ID), bundle.ManifestHash,
+			stackID, stackHash, hashText("compiler"), "test-contract-"+bundle.ID,
+			hashText("content:"+bundle.ID), contract.ContractHash, ownerID, createdAt).Error; err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 
@@ -1010,7 +1126,8 @@ func assertMultiBundleWorkspaceFile(t *testing.T, payload json.RawMessage, fileP
 	}
 	for _, file := range objectSlice(workspace["files"]) {
 		if firstString(file, "path") == filePath {
-			if got := firstString(file, "content"); got != want {
+			got, ok := file["content"].(string)
+			if !ok || got != want {
 				t.Fatalf("workspace file %s = %q, want %q", filePath, got, want)
 			}
 			return

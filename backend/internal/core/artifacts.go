@@ -24,7 +24,8 @@ var validArtifactKinds = map[string]struct{}{
 	"requirement_baseline": {}, "blueprint": {}, "page_spec": {}, "prototype": {},
 	"prototype_flow": {}, "fixture_bundle": {}, "design_system": {}, "token_set": {},
 	"component_registry": {}, "api_contract": {}, "data_contract": {},
-	"permission_contract": {}, "workspace": {}, "test_report": {}, "quality_report": {},
+	"permission_contract": {}, "ai_runtime_contract": {}, "deployment_contract": {},
+	"verification_contract": {}, "workspace": {}, "test_report": {}, "quality_report": {},
 }
 
 var systemManagedArtifactKinds = map[string]struct{}{
@@ -1862,12 +1863,16 @@ func revisionFromModel(
 	payload json.RawMessage,
 	sources []ArtifactSource,
 ) ArtifactRevision {
+	proposalID := model.ProposalID
+	if proposalID == nil {
+		proposalID = model.ImplementationProposalID
+	}
 	return ArtifactRevision{
 		ID: model.ID.String(), ArtifactID: model.ArtifactID.String(), RevisionNumber: model.RevisionNumber,
 		ParentRevisionID: uuidStringPointer(model.ParentRevisionID), SchemaVersion: model.SchemaVersion,
 		SourceVersions: sources, Content: payload, ContentHash: model.ContentHash, WorkflowStatus: model.WorkflowStatus,
 		ChangeSource: model.ChangeSource, ChangeSummary: model.ChangeSummary,
-		SourceManifestID: uuidStringPointer(model.SourceManifestID), ProposalID: uuidStringPointer(model.ProposalID),
+		SourceManifestID: uuidStringPointer(model.SourceManifestID), ProposalID: uuidStringPointer(proposalID),
 		CreatedBy: model.CreatedBy.String(), CreatedAt: model.CreatedAt, ApprovedAt: model.ApprovedAt,
 	}
 }

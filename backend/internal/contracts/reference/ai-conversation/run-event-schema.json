@@ -1,0 +1,97 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://worksflow.dev/reference/ai-conversation/run-event-v1.json",
+  "title": "Reference AI Conversation RunEvent",
+  "oneOf": [
+    {"$ref": "#/$defs/runQueued"},
+    {"$ref": "#/$defs/runStarted"},
+    {"$ref": "#/$defs/outputDelta"},
+    {"$ref": "#/$defs/toolCall"},
+    {"$ref": "#/$defs/toolResult"},
+    {"$ref": "#/$defs/runCompleted"},
+    {"$ref": "#/$defs/runFailed"},
+    {"$ref": "#/$defs/runCancelled"},
+    {"$ref": "#/$defs/heartbeat"}
+  ],
+  "$defs": {
+    "common": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schemaVersion", "eventId", "projectId", "conversationId", "runId", "sequence", "type", "createdAt", "data"],
+      "properties": {
+        "schemaVersion": {"const": "run-event/v1"},
+        "eventId": {"type": "string", "format": "uuid"},
+        "projectId": {"type": "string", "format": "uuid"},
+        "conversationId": {"type": "string", "format": "uuid"},
+        "runId": {"type": "string", "format": "uuid"},
+        "sequence": {"type": "integer", "minimum": 1},
+        "type": {"enum": ["run.queued", "run.started", "output.delta", "tool.call", "tool.result", "run.completed", "run.failed", "run.cancelled", "heartbeat"]},
+        "createdAt": {"type": "string", "format": "date-time"},
+        "data": {"type": "object"}
+      }
+    },
+    "usage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["inputTokens", "outputTokens"],
+      "properties": {
+        "inputTokens": {"type": "integer", "minimum": 0},
+        "outputTokens": {"type": "integer", "minimum": 0}
+      }
+    },
+    "runQueued": {
+      "allOf": [
+        {"$ref": "#/$defs/common"},
+        {"properties": {"type": {"const": "run.queued"}, "data": {"type": "object", "additionalProperties": false, "required": ["queuePosition"], "properties": {"queuePosition": {"type": "integer", "minimum": 0}}}}}
+      ]
+    },
+    "runStarted": {
+      "allOf": [
+        {"$ref": "#/$defs/common"},
+        {"properties": {"type": {"const": "run.started"}, "data": {"type": "object", "additionalProperties": false, "required": ["modelProfileId"], "properties": {"modelProfileId": {"type": "string", "minLength": 1}}}}}
+      ]
+    },
+    "outputDelta": {
+      "allOf": [
+        {"$ref": "#/$defs/common"},
+        {"properties": {"type": {"const": "output.delta"}, "data": {"type": "object", "additionalProperties": false, "required": ["text"], "properties": {"text": {"type": "string", "minLength": 1}}}}}
+      ]
+    },
+    "toolCall": {
+      "allOf": [
+        {"$ref": "#/$defs/common"},
+        {"properties": {"type": {"const": "tool.call"}, "data": {"type": "object", "additionalProperties": false, "required": ["callId", "name", "arguments"], "properties": {"callId": {"type": "string", "minLength": 1}, "name": {"type": "string", "minLength": 1}, "arguments": {"type": "object"}}}}}
+      ]
+    },
+    "toolResult": {
+      "allOf": [
+        {"$ref": "#/$defs/common"},
+        {"properties": {"type": {"const": "tool.result"}, "data": {"type": "object", "additionalProperties": false, "required": ["callId", "output"], "properties": {"callId": {"type": "string", "minLength": 1}, "output": {}}}}}
+      ]
+    },
+    "runCompleted": {
+      "allOf": [
+        {"$ref": "#/$defs/common"},
+        {"properties": {"type": {"const": "run.completed"}, "data": {"type": "object", "additionalProperties": false, "required": ["finishReason", "usage"], "properties": {"finishReason": {"type": "string", "minLength": 1}, "usage": {"$ref": "#/$defs/usage"}}}}}
+      ]
+    },
+    "runFailed": {
+      "allOf": [
+        {"$ref": "#/$defs/common"},
+        {"properties": {"type": {"const": "run.failed"}, "data": {"type": "object", "additionalProperties": false, "required": ["errorCode", "errorMessage", "retryable"], "properties": {"errorCode": {"type": "string", "minLength": 1}, "errorMessage": {"type": "string", "minLength": 1}, "retryable": {"type": "boolean"}}}}}
+      ]
+    },
+    "runCancelled": {
+      "allOf": [
+        {"$ref": "#/$defs/common"},
+        {"properties": {"type": {"const": "run.cancelled"}, "data": {"type": "object", "additionalProperties": false, "required": ["reason"], "properties": {"reason": {"type": "string", "minLength": 1}}}}}
+      ]
+    },
+    "heartbeat": {
+      "allOf": [
+        {"$ref": "#/$defs/common"},
+        {"properties": {"type": {"const": "heartbeat"}, "data": {"type": "object", "additionalProperties": false, "required": ["cursor"], "properties": {"cursor": {"type": "integer", "minimum": 1}}}}}
+      ]
+    }
+  }
+}
