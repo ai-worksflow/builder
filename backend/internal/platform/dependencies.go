@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"time"
 
 	"github.com/nats-io/nats.go"
@@ -64,16 +65,20 @@ func Connect(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Depe
 }
 
 func (d *Dependencies) connectPostgres(ctx context.Context, cfg config.PostgresConfig) error {
-	database, err := gorm.Open(postgres.Open(cfg.DSN), &gorm.Config{
+	dsn, err := postgresDSNWithSchema(cfg.DSN, cfg.Schema)
+	if err != nil {
+		return errors.New("prepare PostgreSQL connection configuration")
+	}
+	database, err := gorm.Open(postgres.Open(dsn), &gorm.Config{
 		DisableAutomaticPing: true,
 		Logger:               gormlogger.Default.LogMode(gormlogger.Silent),
 	})
 	if err != nil {
-		return err
+		return errors.New("open PostgreSQL driver configuration")
 	}
 	sqlDB, err := database.DB()
 	if err != nil {
-		return err
+		return errors.New("obtain PostgreSQL connection pool")
 	}
 	sqlDB.SetMaxOpenConns(cfg.MaxOpenConns)
 	sqlDB.SetMaxIdleConns(cfg.MaxIdleConns)
@@ -81,18 +86,30 @@ func (d *Dependencies) connectPostgres(ctx context.Context, cfg config.PostgresC
 	sqlDB.SetConnMaxIdleTime(cfg.ConnMaxIdleTime)
 	if err := sqlDB.PingContext(ctx); err != nil {
 		_ = sqlDB.Close()
-		return err
+		return errors.New("PostgreSQL readiness probe failed")
 	}
 	d.Postgres = database
 	d.PostgresSQL = sqlDB
 	return nil
 }
 
+func postgresDSNWithSchema(rawDSN, schema string) (string, error) {
+	parsed, err := url.Parse(rawDSN)
+	if err != nil {
+		return "", err
+	}
+	query := parsed.Query()
+	query.Set("search_path", schema)
+	parsed.RawQuery = query.Encode()
+	return parsed.String(), nil
+}
+
 func (d *Dependencies) connectRedis(ctx context.Context, cfg config.RedisConfig) error {
 	redisOptions := &redis.Options{
-		Addr:     cfg.Address,
-		Password: cfg.Password,
-		DB:       cfg.DB,
+		Addr:                  cfg.Address,
+		Password:              cfg.Password,
+		DB:                    cfg.DB,
+		ContextTimeoutEnabled: true,
 	}
 	if cfg.UseTLS {
 		redisOptions.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS12}

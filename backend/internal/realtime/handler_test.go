@@ -185,6 +185,23 @@ func TestHandlerRejectsUnexpectedOrigin(t *testing.T) {
 	}
 }
 
+func TestHandlerAllowsDynamicSameOriginWithoutStaticPublicHost(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	hub := NewHub(1)
+	go hub.Run(ctx)
+	handler := NewHandler(hub, AnonymousAuthenticator{}, AllowAllSubscriptions{}, testLogger(), testWebSocketConfig())
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	connection := dialTestSocket(t, server.URL, server.URL)
+	defer connection.Close()
+	writeSocketJSON(t, connection, map[string]interface{}{"type": "auth", "requestId": "same-origin"})
+	if message := readSocketJSON(t, connection); message["type"] != "auth.ack" {
+		t.Fatalf("same-origin auth response = %#v", message)
+	}
+}
+
 func TestHandlerReturnsProblemForNonUpgradeRequest(t *testing.T) {
 	handler := NewHandler(NewHub(1), RejectAuthenticator{}, AllowAllSubscriptions{}, testLogger(), testWebSocketConfig())
 	response := httptest.NewRecorder()

@@ -15,6 +15,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 	"github.com/worksflow/builder/backend/internal/config"
+	"github.com/worksflow/builder/backend/internal/httpapi/requestorigin"
 )
 
 type Handler struct {
@@ -394,6 +395,9 @@ func validateSubscription(subscription SubscriptionRequest) error {
 func (h *Handler) originAllowed(request *http.Request) bool {
 	origin := strings.TrimSpace(request.Header.Get("Origin"))
 	if origin == "" {
+		return true
+	}
+	if requestorigin.Same(request, origin) {
 		return true
 	}
 	parsed, err := url.Parse(origin)

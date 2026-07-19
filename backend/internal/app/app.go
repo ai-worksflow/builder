@@ -11,10 +11,12 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/nats-io/nats.go"
+	"github.com/worksflow/builder/backend/internal/agent"
 	"github.com/worksflow/builder/backend/internal/ai"
 	"github.com/worksflow/builder/backend/internal/auth"
 	documentcollaboration "github.com/worksflow/builder/backend/internal/collaboration"
 	"github.com/worksflow/builder/backend/internal/config"
+	"github.com/worksflow/builder/backend/internal/constructor"
 	"github.com/worksflow/builder/backend/internal/conversation"
 	"github.com/worksflow/builder/backend/internal/core"
 	"github.com/worksflow/builder/backend/internal/dataruntime"
@@ -28,14 +30,20 @@ import (
 	worksmiddleware "github.com/worksflow/builder/backend/internal/httpapi/middleware"
 	"github.com/worksflow/builder/backend/internal/httpapi/transport"
 	"github.com/worksflow/builder/backend/internal/logging"
+	"github.com/worksflow/builder/backend/internal/lsp"
 	"github.com/worksflow/builder/backend/internal/platform"
 	"github.com/worksflow/builder/backend/internal/realtime"
+	"github.com/worksflow/builder/backend/internal/release"
+	"github.com/worksflow/builder/backend/internal/repository"
+	"github.com/worksflow/builder/backend/internal/sandbox"
 	"github.com/worksflow/builder/backend/internal/storage/content"
+	"github.com/worksflow/builder/backend/internal/templates"
+	"github.com/worksflow/builder/backend/internal/verification"
 	workflowruntime "github.com/worksflow/builder/backend/internal/workflow"
 	"github.com/worksflow/builder/backend/migrations"
 )
 
-func Run(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
+func Run(ctx context.Context, cfg config.Config, logger *slog.Logger) (runErr error) {
 	dependencies, err := platform.Connect(ctx, cfg, logger)
 	if err != nil {
 		return err
@@ -44,11 +52,15 @@ func Run(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 
 	startupCtx, cancelStartup := context.WithTimeout(ctx, cfg.Startup.Timeout)
 	defer cancelStartup()
-	if cfg.Startup.Migrate {
-		if err := migrations.Up(startupCtx, dependencies.PostgresSQL); err != nil {
-			return fmt.Errorf("apply database migrations: %w", err)
-		}
-		logger.Info("database migrations are current")
+	if err := migrations.VerifyCurrent(startupCtx, dependencies.PostgresSQL); err != nil {
+		return fmt.Errorf("verify PostgreSQL schema migration head: %w", err)
+	}
+	if err := platform.VerifyPostgresAPIRolePosture(
+		startupCtx,
+		dependencies.PostgresSQL,
+		cfg.Environment,
+	); err != nil {
+		return fmt.Errorf("verify PostgreSQL API role posture: %w", err)
 	}
 	upgradedMinimumLoops, err := workflowruntime.UpgradeExistingMinimumLoops(
 		startupCtx,
@@ -78,6 +90,14 @@ func Run(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 			return fmt.Errorf("ensure MongoDB indexes: %w", err)
 		}
 		logger.Info("MongoDB indexes are current")
+	}
+	verificationStore, err := verification.NewPostgresStore(dependencies.Postgres, contentStore)
+	if err != nil {
+		return fmt.Errorf("create verification store: %w", err)
+	}
+	releaseStore, err := release.NewStore(dependencies.Postgres, contentStore, verificationStore)
+	if err != nil {
+		return fmt.Errorf("create ReleaseBundle store: %w", err)
 	}
 	if cfg.Startup.EnsureNATSStream {
 		if err := events.EnsureEventStream(startupCtx, dependencies.JetStream); err != nil {
@@ -177,8 +197,9 @@ func Run(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 	deliveryServices, err := delivery.NewPlatformServices(delivery.PlatformDependencies{
 		Database: dependencies.Postgres, Contents: contentStore, Access: accessControl,
 		Sandbox: qualitySandbox, QualityRoot: cfg.Delivery.QualityTempRoot, Provider: publishProvider,
-		Environments:  delivery.DataRuntimeEnvironmentResolver{Source: dataService},
-		PublicRuntime: publicDataService,
+		Environments:   delivery.DataRuntimeEnvironmentResolver{Source: dataService},
+		PublicRuntime:  publicDataService,
+		ReleaseBundles: releaseStore,
 	})
 	if err != nil {
 		return fmt.Errorf("create delivery services: %w", err)
@@ -246,9 +267,877 @@ func Run(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 	if err != nil {
 		return fmt.Errorf("create workbench service: %w", err)
 	}
-	implementationService, err := core.NewImplementationService(dependencies.Postgres, contentStore, accessControl)
+	templateRegistry, err := templates.NewRegistry(dependencies.Postgres)
+	if err != nil {
+		return fmt.Errorf("create template registry: %w", err)
+	}
+	templateRegistryHandler, err := transport.NewTemplateRegistryHandler(transport.TemplateRegistryDependencies{Registry: templateRegistry})
+	if err != nil {
+		return fmt.Errorf("create template registry transport: %w", err)
+	}
+	templateResolver, err := constructor.NewTemplateRegistryResolver(templateRegistry)
+	if err != nil {
+		return fmt.Errorf("create constructor template resolver: %w", err)
+	}
+	constructorService, err := constructor.NewService(
+		dependencies.Postgres, contentStore, accessControl, workbenchService, templateResolver,
+	)
+	if err != nil {
+		return fmt.Errorf("create constructor service: %w", err)
+	}
+	constructorHandler, err := transport.NewConstructorHandler(transport.ConstructorDependencies{
+		Service: constructorService, MaxJSONBodyBytes: cfg.HTTP.MaxJSONBodyBytes,
+	})
+	if err != nil {
+		return fmt.Errorf("create constructor transport: %w", err)
+	}
+	implementationService, err := core.NewImplementationService(
+		dependencies.Postgres, contentStore, accessControl, constructorService,
+	)
 	if err != nil {
 		return fmt.Errorf("create implementation service: %w", err)
+	}
+	treeStore, err := repository.NewTreeStore(contentStore)
+	if err != nil {
+		return fmt.Errorf("create repository tree store: %w", err)
+	}
+	fileStore, err := repository.NewFileStore(contentStore)
+	if err != nil {
+		return fmt.Errorf("create repository file store: %w", err)
+	}
+	fileCatalog, err := repository.NewGORMFileBlobCatalog(dependencies.Postgres)
+	if err != nil {
+		return fmt.Errorf("create repository file catalog: %w", err)
+	}
+	fileBlobs, err := repository.NewFileBlobService(fileCatalog, fileStore, time.Now)
+	if err != nil {
+		return fmt.Errorf("create repository file service: %w", err)
+	}
+	literalIndexStore, err := repository.NewGORMExactTreeLiteralIndexStore(dependencies.Postgres)
+	if err != nil {
+		return fmt.Errorf("create repository exact-tree literal index store: %w", err)
+	}
+	searchAdmission, err := repository.NewRedisExactTreeSearchAdmission(
+		dependencies.Redis,
+		repositorySearchAdmissionOptions(cfg.Repository.SearchAdmission),
+	)
+	if err != nil {
+		return fmt.Errorf("create repository exact-tree search admission: %w", err)
+	}
+	literalIndex, err := repository.NewAdmittedExactTreeLiteralIndexService(
+		literalIndexStore,
+		fileBlobs,
+		repository.ExactTreeLiteralIndexAdmissionConfig{
+			ProjectQuota: repository.ExactTreeLiteralIndexProjectQuota{
+				MaxTrees:        cfg.Repository.SearchIndex.MaxTrees,
+				MaxSourceBytes:  cfg.Repository.SearchIndex.MaxSourceBytes,
+				MaxActiveBuilds: cfg.Repository.SearchIndex.MaxActiveBuilds,
+			},
+			FirstBuilderAdmission: searchAdmission,
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("create repository exact-tree literal index service: %w", err)
+	}
+	templateSources, err := repository.NewGitTemplateSourceMaterializer(repository.GitTemplateSourceOptions{
+		GitBinary: cfg.TemplateSource.GitBinary, CacheRoot: cfg.TemplateSource.CacheRoot,
+		AllowedHosts: cfg.TemplateSource.AllowedHosts, FetchTimeout: cfg.TemplateSource.FetchTimeout,
+	})
+	if err != nil {
+		return fmt.Errorf("create exact TemplateRelease source materializer: %w", err)
+	}
+	candidateStore, err := repository.NewGORMCandidateStore(dependencies.Postgres, treeStore)
+	if err != nil {
+		return fmt.Errorf("create repository Candidate store: %w", err)
+	}
+	candidateBootstrap, err := repository.NewCandidateBootstrapService(
+		dependencies.Postgres, contentStore, fileBlobs, treeStore, candidateStore,
+		sandboxAccessAdapter{access: accessControl},
+		repositoryBuildContractGate{constructor: constructorService}, time.Now,
+		repository.WithTemplateSourceMaterializer(templateSources),
+		repository.WithCandidateSearchLiteralIndex(literalIndex),
+		repository.WithExactTreeSearchAdmission(searchAdmission),
+	)
+	if err != nil {
+		return fmt.Errorf("create repository Candidate bootstrap service: %w", err)
+	}
+	candidateControls, err := repository.NewCandidateControlStore(dependencies.Postgres, candidateStore)
+	if err != nil {
+		return fmt.Errorf("create repository Candidate control store: %w", err)
+	}
+	pathPolicies, err := repository.NewRegistryPathPolicyResolver(templateRegistry)
+	if err != nil {
+		return fmt.Errorf("create repository path policy resolver: %w", err)
+	}
+	sandboxAccess := sandboxAccessAdapter{access: accessControl}
+	mutations, err := repository.NewMutationService(
+		candidateStore, treeStore, fileBlobs, pathPolicies, sandboxAccess, time.Now,
+	)
+	if err != nil {
+		return fmt.Errorf("create repository mutation service: %w", err)
+	}
+	rebaseStore, err := repository.NewCandidateRebaseStore(dependencies.Postgres, candidateStore)
+	if err != nil {
+		return fmt.Errorf("create repository Candidate rebase store: %w", err)
+	}
+	rebases, err := repository.NewCandidateRebaseService(
+		candidateBootstrap, rebaseStore, candidateControls, candidateStore,
+		mutations, fileBlobs, sandboxAccess, time.Now,
+	)
+	if err != nil {
+		return fmt.Errorf("create repository Candidate rebase service: %w", err)
+	}
+	repositoryHandler, err := transport.NewRepositoryHandler(transport.RepositoryDependencies{
+		Service: candidateBootstrap, Rebases: rebases, MaxJSONBodyBytes: cfg.HTTP.MaxJSONBodyBytes,
+	})
+	if err != nil {
+		return fmt.Errorf("create repository Candidate transport: %w", err)
+	}
+	sandboxStore, err := sandbox.NewStore(dependencies.Postgres)
+	if err != nil {
+		return fmt.Errorf("create SandboxSession store: %w", err)
+	}
+	var workspaceMaterializer *sandbox.WorkspaceMaterializer
+	var workspaceSynchronizers []sandbox.WorkspaceMutationSynchronizer
+	if cfg.Sandbox.Enabled {
+		workspaceMaterializer, err = sandbox.NewWorkspaceMaterializer(cfg.Sandbox.WorkspaceRoot, fileBlobs)
+		if err != nil {
+			return fmt.Errorf("create sandbox workspace materializer: %w", err)
+		}
+		workspaceSynchronizers = append(workspaceSynchronizers, workspaceMaterializer)
+	}
+	sandboxFacade, err := sandbox.NewFacade(
+		sandboxStore, candidateControls, mutations, fileBlobs, sandboxAccess, workspaceSynchronizers...,
+	)
+	if err != nil {
+		return fmt.Errorf("create sandbox façade: %w", err)
+	}
+	candidateFreeze, err := sandbox.NewCandidateFreezeService(
+		sandboxStore, candidateControls, implementationService, fileBlobs, sandboxAccess,
+	)
+	if err != nil {
+		return fmt.Errorf("create Candidate freeze-to-Proposal service: %w", err)
+	}
+	connectionTicketStore, err := sandbox.NewRedisConnectionTicketStore(
+		dependencies.Redis, cfg.Sandbox.RedisPrefix+"connection-ticket:", time.Now,
+	)
+	if err != nil {
+		return fmt.Errorf("create sandbox connection ticket store: %w", err)
+	}
+	connectionTickets, err := sandbox.NewConnectionTicketService(
+		connectionTicketStore, sandboxStore, sandboxAccess, cfg.Sandbox.ConnectionTicketTTL, time.Now,
+	)
+	if err != nil {
+		return fmt.Errorf("create sandbox connection ticket service: %w", err)
+	}
+	sandboxStreamEvents, err := sandbox.NewRedisStreamEventStore(
+		dependencies.Redis, cfg.Sandbox.RedisPrefix+"stream:",
+		cfg.Sandbox.StreamMaxEvents, cfg.Sandbox.StreamRetention, time.Now,
+	)
+	if err != nil {
+		return fmt.Errorf("create sandbox stream event store: %w", err)
+	}
+	var sandboxProvisioning *sandbox.ProvisioningService
+	var sandboxControl *sandbox.ControlService
+	var sandboxProcesses *sandbox.ProcessService
+	var sandboxTerminals *sandbox.TerminalService
+	var sandboxPorts *sandbox.PortService
+	var sandboxDeadlineWorker *sandbox.DeadlineWorkerService
+	var interactiveRuntime *sandbox.ContainerRuntime
+	if cfg.Sandbox.Enabled {
+		sessionConfiguration, resolverErr := sandbox.NewTemplateSessionConfigurationResolver(templateRegistry)
+		if resolverErr != nil {
+			return fmt.Errorf("create sandbox template configuration resolver: %w", resolverErr)
+		}
+		interactiveRuntime, err = sandbox.NewContainerRuntime(sandbox.ContainerRuntimeConfig{
+			RuntimeBinary: cfg.Sandbox.RuntimeBinary, DaemonHost: cfg.Sandbox.DaemonHost,
+			WorkspaceRoot: cfg.Sandbox.WorkspaceRoot, RunnerImage: cfg.Sandbox.RunnerImage,
+			GatewayNetwork:     cfg.Sandbox.GatewayNetwork,
+			GatewayBindAddress: cfg.Sandbox.GatewayBindAddress,
+			StartupTimeout:     cfg.Sandbox.StartupTimeout, CommandTimeout: cfg.Sandbox.CommandTimeout,
+			OutputLimit: cfg.Sandbox.RuntimeOutputMax,
+		})
+		if err != nil {
+			return fmt.Errorf("create interactive sandbox runtime: %w", err)
+		}
+		defer func() {
+			if closeErr := interactiveRuntime.Close(); closeErr != nil {
+				logger.Warn("close interactive sandbox runtime client", "error", closeErr)
+			}
+		}()
+		runtimeReadinessCtx, cancelRuntimeReadiness := context.WithTimeout(ctx, cfg.Sandbox.CommandTimeout)
+		err = interactiveRuntime.Readiness(runtimeReadinessCtx)
+		cancelRuntimeReadiness()
+		if err != nil {
+			return fmt.Errorf("verify interactive sandbox runtime: %w", err)
+		}
+		processStore, processStoreErr := sandbox.NewPostgresProcessStore(dependencies.Postgres)
+		if processStoreErr != nil {
+			return fmt.Errorf("create sandbox process store: %w", processStoreErr)
+		}
+		sandboxProcesses, err = sandbox.NewProcessService(
+			sandboxStore, candidateControls, sessionConfiguration, workspaceMaterializer,
+			interactiveRuntime, processStore, sandboxAccess, sandboxStreamEvents,
+			int64(cfg.Sandbox.RuntimeOutputMax),
+		)
+		if err != nil {
+			return fmt.Errorf("create sandbox process service: %w", err)
+		}
+		terminalStore, terminalStoreErr := sandbox.NewPostgresTerminalStore(dependencies.Postgres)
+		if terminalStoreErr != nil {
+			return fmt.Errorf("create sandbox terminal store: %w", terminalStoreErr)
+		}
+		sandboxTerminals, err = sandbox.NewTerminalService(
+			sandboxStore, candidateControls, workspaceMaterializer, interactiveRuntime,
+			terminalStore, sandboxAccess, sandboxStreamEvents, int64(cfg.Sandbox.RuntimeOutputMax),
+		)
+		if err != nil {
+			return fmt.Errorf("create sandbox terminal service: %w", err)
+		}
+		previewGrantStore, previewStoreErr := sandbox.NewRedisPreviewGrantStore(
+			dependencies.Redis, cfg.Sandbox.RedisPrefix+"preview-grant:", time.Now,
+		)
+		if previewStoreErr != nil {
+			return fmt.Errorf("create sandbox preview grant store: %w", previewStoreErr)
+		}
+		sandboxPorts, err = sandbox.NewPortService(
+			sandboxStore, candidateControls, workspaceMaterializer, interactiveRuntime,
+			sandboxAccess, previewGrantStore, cfg.Sandbox.PreviewPublicOrigin,
+			cfg.Sandbox.PreviewDialHost, cfg.Sandbox.PreviewTicketTTL, cfg.Sandbox.PreviewProbeTimeout,
+		)
+		if err != nil {
+			return fmt.Errorf("create sandbox port service: %w", err)
+		}
+		defer func() {
+			if closeErr := sandboxTerminals.Close(); closeErr != nil {
+				logger.Warn("close interactive sandbox terminals", "error", closeErr)
+			}
+		}()
+		lifecycle, lifecycleErr := sandbox.NewLifecycleService(
+			sandboxStore, workspaceMaterializer, interactiveRuntime, sandboxStreamEvents,
+		)
+		if lifecycleErr != nil {
+			return fmt.Errorf("create sandbox lifecycle service: %w", lifecycleErr)
+		}
+		resourceFencer, fencerErr := sandbox.NewRuntimeEpochFencerGroup(sandboxProcesses, sandboxTerminals)
+		if fencerErr != nil {
+			return fmt.Errorf("create sandbox runtime resource fencer: %w", fencerErr)
+		}
+		sandboxControl, err = sandbox.NewControlService(
+			sandboxStore, candidateControls, workspaceMaterializer, interactiveRuntime,
+			sandboxAccess, sandboxStreamEvents, resourceFencer,
+		)
+		if err != nil {
+			return fmt.Errorf("create sandbox lifecycle control service: %w", err)
+		}
+		lifecycleWorkerID := cfg.Sandbox.LifecycleWorkerID
+		if lifecycleWorkerID == "" {
+			lifecycleWorkerID = cfg.ServiceName + "-sandbox-lifecycle-" + uuid.NewString()
+		}
+		deadlineWorker, workerErr := sandbox.NewDeadlineWorker(
+			sandboxStore, sandboxStore, candidateControls, sandboxControl,
+			sandbox.DeadlineWorkerConfig{
+				WorkerID: lifecycleWorkerID, LeaseDuration: cfg.Sandbox.LifecycleLease,
+				RetryDelay: cfg.Sandbox.LifecycleRetry,
+			},
+		)
+		if workerErr != nil {
+			return fmt.Errorf("create sandbox lifecycle deadline worker: %w", workerErr)
+		}
+		sandboxDeadlineWorker, workerErr = sandbox.NewDeadlineWorkerService(
+			deadlineWorker, cfg.Sandbox.LifecyclePoll, logger,
+		)
+		if workerErr != nil {
+			return fmt.Errorf("create sandbox lifecycle deadline worker service: %w", workerErr)
+		}
+		runnerDigest := sandboxRunnerDigest(cfg.Sandbox.RunnerImage)
+		sandboxProvisioning, err = sandbox.NewProvisioningService(
+			sandboxStore, candidateControls, sessionConfiguration, sandboxAccess,
+			sandbox.ProvisioningPolicy{
+				RunnerImageDigest: runnerDigest,
+				Quota: sandbox.Quota{
+					CPUMillis: cfg.Sandbox.CPUMillis, MemoryBytes: cfg.Sandbox.MemoryBytes,
+					WorkspaceBytes: cfg.Sandbox.WorkspaceBytes, PIDLimit: cfg.Sandbox.PIDLimit,
+					PreviewPortLimit: cfg.Sandbox.PreviewPortLimit,
+				},
+				TTL: sandbox.TTLPolicy{
+					IdleHibernateAfter: cfg.Sandbox.IdleHibernateAfter, MaxRuntime: cfg.Sandbox.MaxRuntime,
+				},
+			},
+			time.Now,
+			lifecycle,
+		)
+		if err != nil {
+			return fmt.Errorf("create sandbox provisioning service: %w", err)
+		}
+	} else {
+		logger.Warn("interactive sandbox provisioning is disabled")
+	}
+	sandboxPlatform, err := sandbox.NewPlatformServiceWithOptions(
+		sandboxFacade, sandboxProvisioning,
+		sandbox.PlatformServiceOptions{
+			Tickets: connectionTickets, Control: sandboxControl, Process: sandboxProcesses,
+			Terminal: sandboxTerminals, Port: sandboxPorts, Freeze: candidateFreeze,
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("create sandbox platform service: %w", err)
+	}
+	sandboxStreamHandler, err := transport.NewSandboxStreamHandler(transport.SandboxStreamDependencies{
+		Tickets: connectionTickets, Events: sandboxStreamEvents, Terminals: sandboxTerminals,
+		Activity: sandboxStore,
+		Logger:   logger, Config: cfg.WebSocket,
+	})
+	if err != nil {
+		return fmt.Errorf("create sandbox stream transport: %w", err)
+	}
+	sandboxHandler, err := transport.NewSandboxHandler(transport.SandboxDependencies{
+		Service: sandboxPlatform, MaxJSONBodyBytes: cfg.HTTP.MaxJSONBodyBytes,
+	})
+	if err != nil {
+		return fmt.Errorf("create sandbox transport: %w", err)
+	}
+	var lspTicketHandler *transport.LSPTicketHandler
+	var lspWebSocket http.Handler
+	var languageServerRuntime *lsp.ContainerRuntime
+	if cfg.LSP.Enabled {
+		profileSource, profileErr := lsp.NewRegistryProfileSource(templateRegistry)
+		if profileErr != nil {
+			return fmt.Errorf("create LSP approved profile source: %w", profileErr)
+		}
+		authority, authorityErr := lsp.NewAuthoritySource(
+			sandboxStore, candidateControls, profileSource, time.Now,
+		)
+		if authorityErr != nil {
+			return fmt.Errorf("create LSP Sandbox/Repository authority: %w", authorityErr)
+		}
+		grantStore, grantStoreErr := lsp.NewRedisTicketGrantStore(
+			dependencies.Redis, cfg.LSP.RedisPrefix+"ticket:", time.Now,
+		)
+		if grantStoreErr != nil {
+			return fmt.Errorf("create LSP one-time ticket store: %w", grantStoreErr)
+		}
+		ticketService, ticketErr := lsp.NewTicketService(
+			grantStore, authority, sandboxAccess, cfg.LSP.TicketTTL, time.Now,
+		)
+		if ticketErr != nil {
+			return fmt.Errorf("create LSP ticket service: %w", ticketErr)
+		}
+		rateLimiter, rateErr := lsp.NewRedisTicketRateLimiter(
+			dependencies.Redis,
+			lsp.RedisTicketRateLimiterOptions{
+				Prefix: cfg.LSP.RedisPrefix + "rate:", RefillPerSecond: cfg.LSP.RefillPerSecond,
+				Burst: cfg.LSP.Burst,
+			},
+		)
+		if rateErr != nil {
+			return fmt.Errorf("create LSP Redis admission limiter: %w", rateErr)
+		}
+		auditSink, auditErr := lsp.NewPostgresTicketAuditSink(dependencies.Postgres)
+		if auditErr != nil {
+			return fmt.Errorf("create LSP durable security audit sink: %w", auditErr)
+		}
+		securedTickets, securedTicketErr := lsp.NewSecuredTicketService(
+			ticketService, rateLimiter, auditSink, time.Now,
+		)
+		if securedTicketErr != nil {
+			return fmt.Errorf("create secured LSP ticket service: %w", securedTicketErr)
+		}
+		lspTicketHandler, err = transport.NewLSPTicketHandler(transport.LSPTicketDependencies{
+			Tickets: securedTickets, Projects: sandboxPlatform, MaxJSONBodyBytes: cfg.HTTP.MaxJSONBodyBytes,
+		})
+		if err != nil {
+			return fmt.Errorf("create LSP ticket transport: %w", err)
+		}
+
+		serviceRoots, serviceRootErr := lsp.NewRegistryRuntimeServiceRootSource(templateRegistry)
+		if serviceRootErr != nil {
+			return fmt.Errorf("create LSP exact TemplateService root source: %w", serviceRootErr)
+		}
+		lspSnapshots, snapshotErr := lsp.NewRuntimeWorkspaceSnapshotMaterializer(
+			cfg.Sandbox.WorkspaceRoot, fileBlobs,
+		)
+		if snapshotErr != nil {
+			return fmt.Errorf("create LSP immutable workspace snapshot materializer: %w", snapshotErr)
+		}
+		bindingSource, bindingErr := lsp.NewRuntimeBindingSource(
+			authority, sandboxStore, candidateControls, lspSnapshots,
+			fileBlobs, serviceRoots, time.Now,
+		)
+		if bindingErr != nil {
+			return fmt.Errorf("create LSP exact runtime binding source: %w", bindingErr)
+		}
+		languageServerRuntime, err = lsp.NewContainerRuntime(lsp.ContainerRuntimeConfig{
+			RuntimeBinary: cfg.LSP.RuntimeBinary, DaemonHost: cfg.LSP.DaemonHost,
+			CommandTimeout: cfg.LSP.CommandTimeout, CLIOutputBytes: cfg.LSP.CLIOutputMax,
+		})
+		if err != nil {
+			return fmt.Errorf("create LSP container runtime: %w", err)
+		}
+		defer func(runtime *lsp.ContainerRuntime) {
+			if closeErr := runtime.Close(); closeErr != nil {
+				runErr = errors.Join(runErr, fmt.Errorf("close LSP container runtime: %w", closeErr))
+			}
+		}(languageServerRuntime)
+		lspReadinessCtx, cancelLSPReadiness := context.WithTimeout(startupCtx, cfg.LSP.CommandTimeout)
+		readinessErr := languageServerRuntime.Readiness(lspReadinessCtx)
+		cancelLSPReadiness()
+		if readinessErr != nil {
+			return fmt.Errorf("verify LSP container daemon: %w", readinessErr)
+		}
+		requestLimiter, requestLimiterErr := lsp.NewRedisGatewayRequestRateLimiter(
+			dependencies.Redis, cfg.LSP.RedisPrefix+"request-rate:",
+		)
+		if requestLimiterErr != nil {
+			return fmt.Errorf("create LSP Gateway request limiter: %w", requestLimiterErr)
+		}
+		gatewayAudit, gatewayAuditErr := lsp.NewPostgresGatewayAuditSink(dependencies.Postgres)
+		if gatewayAuditErr != nil {
+			return fmt.Errorf("create LSP Gateway durable audit sink: %w", gatewayAuditErr)
+		}
+		editorLeases, editorLeasesErr := lsp.NewRedisGatewayEditorLeaseStore(
+			dependencies.Redis, cfg.LSP.RedisPrefix+"editor-lease:",
+		)
+		if editorLeasesErr != nil {
+			return fmt.Errorf("create LSP Gateway editor lease store: %w", editorLeasesErr)
+		}
+		gatewaySecurity, gatewaySecurityErr := lsp.NewGatewaySecurity(
+			requestLimiter, gatewayAudit, editorLeases,
+		)
+		if gatewaySecurityErr != nil {
+			return fmt.Errorf("create LSP Gateway security boundary: %w", gatewaySecurityErr)
+		}
+		gateway, gatewayErr := lsp.NewGateway(
+			bindingSource, languageServerRuntime, bindingSource, gatewaySecurity,
+		)
+		if gatewayErr != nil {
+			return fmt.Errorf("create bound LSP gateway: %w", gatewayErr)
+		}
+		webSocketGateway, webSocketGatewayErr := transport.NewWebSocketLSPGateway(gateway, cfg.LSP.WriteWait)
+		if webSocketGatewayErr != nil {
+			return fmt.Errorf("create LSP WebSocket gateway adapter: %w", webSocketGatewayErr)
+		}
+		lspWebSocket, err = transport.NewLSPWebSocketHandler(transport.LSPWebSocketDependencies{
+			Tickets: securedTickets, Gateway: webSocketGateway,
+			Config: transport.LSPWebSocketConfig{
+				AllowedOrigins: cfg.LSP.AllowedOrigins, TrustedProxies: cfg.HTTP.TrustedProxies,
+				RequireTLS: cfg.LSP.RequireTLS, BindTimeout: cfg.LSP.BindTimeout, WriteWait: cfg.LSP.WriteWait,
+			},
+		})
+		if err != nil {
+			return fmt.Errorf("create LSP WebSocket transport: %w", err)
+		}
+		logger.Info("server-owned LSP gateway enabled")
+	}
+	verificationPlanning, err := verification.NewPostgresCandidatePlanSource(dependencies.Postgres, contentStore)
+	if err != nil {
+		return fmt.Errorf("create Candidate verification planning source: %w", err)
+	}
+	verificationControl, err := verification.NewControlService(
+		verificationStore, verificationPlanning, sandboxAccess,
+	)
+	if err != nil {
+		return fmt.Errorf("create Candidate verification control service: %w", err)
+	}
+	canonicalVerificationPlanning, err := verification.NewPostgresCanonicalPlanSource(dependencies.Postgres, contentStore)
+	if err != nil {
+		return fmt.Errorf("create Canonical verification planning source: %w", err)
+	}
+	canonicalVerificationControl, err := verification.NewCanonicalControlService(
+		verificationStore, canonicalVerificationPlanning, sandboxAccess,
+	)
+	if err != nil {
+		return fmt.Errorf("create Canonical verification control service: %w", err)
+	}
+	releaseService, err := release.NewService(releaseStore, sandboxAccess)
+	if err != nil {
+		return fmt.Errorf("create ReleaseBundle service: %w", err)
+	}
+	releaseDeliveryReadService, err := release.NewDeliveryService(releaseStore, accessControl)
+	if err != nil {
+		return fmt.Errorf("create release delivery read service: %w", err)
+	}
+	var releaseDeliveryMutationService *release.DeliveryService
+	var releaseDeliveryWorker *release.ReconciledDeliveryWorkerService
+	var releaseDeliveryProvider *release.HTTPDeliveryOperationProvider
+	var reconciledReleaseStore *release.ReconciledDeliveryStore
+	if cfg.Delivery.ReleaseWorkerEnabled {
+		controllerIdentity := release.DeliveryControllerIdentity{
+			SchemaVersion: release.DeliveryControllerIdentitySchemaVersion,
+			ID:            cfg.Delivery.ReleaseControllerID, Version: cfg.Delivery.ReleaseControllerVersion,
+			Protocol:       cfg.Delivery.ReleaseControllerProtocol,
+			TrustKeyDigest: cfg.Delivery.ReleaseControllerTrustKeyDigest,
+		}
+		releaseDeliveryProvider, err = release.NewHTTPDeliveryOperationProvider(release.HTTPDeliveryOperationProviderConfig{
+			BaseURL: cfg.Delivery.ReleaseControllerURL, BearerToken: cfg.Delivery.ReleaseControllerToken,
+			RequestTimeout: cfg.Delivery.ReleaseRequestTimeout, MaxResponseBytes: cfg.Delivery.ReleaseResponseMax,
+			ExpectedIdentity: controllerIdentity,
+		}, nil)
+		if err != nil {
+			return fmt.Errorf("create reconciled release delivery provider: %w", err)
+		}
+		reconciledStore, storeErr := release.NewReconciledDeliveryStore(releaseStore, controllerIdentity)
+		if storeErr != nil {
+			return fmt.Errorf("create reconciled release delivery store: %w", storeErr)
+		}
+		reconciledReleaseStore = reconciledStore
+		// Do not start a worker (or expose delivery mutations) until both the
+		// durable schema/active-operation authority and the remote pinned
+		// identity are proven. In particular, an authority rotation must drain
+		// operations under the old configuration instead of first claiming them
+		// with the new worker and leaving their leases to churn forever.
+		releaseReadinessCtx, cancelReleaseReadiness := context.WithTimeout(ctx, cfg.Dependencies.ReadinessTimeout)
+		if err := reconciledStore.Readiness(releaseReadinessCtx); err != nil {
+			cancelReleaseReadiness()
+			return fmt.Errorf("verify reconciled release delivery store before worker startup: %w", err)
+		}
+		if err := releaseDeliveryProvider.Readiness(releaseReadinessCtx); err != nil {
+			cancelReleaseReadiness()
+			return fmt.Errorf("verify release delivery controller before worker startup: %w", err)
+		}
+		cancelReleaseReadiness()
+		releaseDeliveryMutationService, err = release.NewDeliveryService(reconciledStore, accessControl)
+		if err != nil {
+			return fmt.Errorf("create release delivery control service: %w", err)
+		}
+		// Use the authority-aware store for reads too while execution is
+		// enabled, without coupling read route registration to the worker.
+		releaseDeliveryReadService = releaseDeliveryMutationService
+		workerID := cfg.Delivery.ReleaseWorkerID
+		if workerID == "" {
+			workerID = cfg.ServiceName + "-release-delivery-" + uuid.NewString()
+		}
+		releaseWorker, workerErr := release.NewReconciledDeliveryWorker(
+			reconciledStore, releaseDeliveryProvider, workerID,
+			cfg.Delivery.ReleaseLeaseDuration, cfg.Delivery.ReleaseReconcileDelay,
+		)
+		if workerErr != nil {
+			return fmt.Errorf("create release delivery worker: %w", workerErr)
+		}
+		releaseDeliveryWorker, workerErr = release.NewReconciledDeliveryWorkerService(
+			releaseWorker, cfg.Delivery.ReleasePollInterval,
+		)
+		if workerErr != nil {
+			return fmt.Errorf("create release delivery worker service: %w", workerErr)
+		}
+		releaseDeliveryWorker.SetErrorHandler(func(workerErr error) {
+			logger.Error("release delivery operation will be retried or requires reconciliation", "error", workerErr)
+		})
+	}
+	releaseHandler, err := transport.NewReleaseHandler(transport.ReleaseDependencies{
+		Service: releaseService, DeliveryRead: releaseDeliveryReadService,
+		DeliveryMutation: releaseDeliveryMutationService, MaxJSONBodyBytes: cfg.HTTP.MaxJSONBodyBytes,
+	})
+	if err != nil {
+		return fmt.Errorf("create ReleaseBundle transport: %w", err)
+	}
+	verificationHandler, err := transport.NewVerificationHandler(transport.VerificationDependencies{
+		Service: verificationControl, Canonical: canonicalVerificationControl, Sessions: sandboxPlatform,
+		MaxJSONBodyBytes: cfg.HTTP.MaxJSONBodyBytes,
+	})
+	if err != nil {
+		return fmt.Errorf("create Candidate verification transport: %w", err)
+	}
+	var verificationWorker *verification.CandidateWorkerService
+	var canonicalVerificationWorker *verification.CanonicalWorkerService
+	if cfg.Verification.WorkerEnabled {
+		verificationExecutor, executorErr := verification.NewDockerCandidateExecutor(
+			verification.DockerCandidateExecutorConfig{
+				RuntimeBinary: cfg.Verification.RuntimeBinary, DaemonHost: cfg.Verification.DaemonHost,
+				WorkspaceRoot: cfg.Verification.WorkspaceRoot, Memory: cfg.Verification.Memory,
+				CPUs: cfg.Verification.CPUs, PIDs: cfg.Verification.PIDs,
+				OutputLimit: cfg.Verification.OutputMax, TempBytes: cfg.Verification.TempBytes,
+				User: "10001:10001",
+			},
+			contentStore,
+			nil,
+		)
+		if executorErr != nil {
+			return fmt.Errorf("create Candidate verification executor: %w", executorErr)
+		}
+		verificationMaterializer, materializerErr := verification.NewCandidateWorkspaceMaterializer(
+			dependencies.Postgres, treeStore, fileBlobs, cfg.Verification.WorkspaceRoot,
+			verificationExecutor,
+		)
+		if materializerErr != nil {
+			return fmt.Errorf("create Candidate verification materializer: %w", materializerErr)
+		}
+		workerID := cfg.Verification.WorkerID
+		if workerID == "" {
+			workerID = cfg.ServiceName + "-verification-" + uuid.NewString()
+		}
+		candidateWorker, workerErr := verification.NewCandidateWorker(
+			verificationStore, verificationMaterializer, verificationExecutor,
+			verification.CandidateWorkerConfig{
+				ActorID: verification.VerificationWorkerActorID, WorkerID: workerID,
+				LeaseDuration:     cfg.Verification.LeaseDuration,
+				HeartbeatInterval: cfg.Verification.Heartbeat,
+			},
+			nil,
+			nil,
+		)
+		if workerErr != nil {
+			return fmt.Errorf("create Candidate verification worker: %w", workerErr)
+		}
+		verificationWorker, workerErr = verification.NewCandidateWorkerService(
+			candidateWorker, cfg.Verification.PollInterval, logger,
+		)
+		if workerErr != nil {
+			return fmt.Errorf("create Candidate verification worker service: %w", workerErr)
+		}
+		canonicalWorkspaceSource, sourceErr := verification.NewPostgresCanonicalWorkspaceSource(
+			dependencies.Postgres, contentStore,
+		)
+		if sourceErr != nil {
+			return fmt.Errorf("create Canonical verification workspace source: %w", sourceErr)
+		}
+		canonicalMaterializer, materializerErr := verification.NewCanonicalWorkspaceMaterializer(
+			canonicalWorkspaceSource, cfg.Verification.WorkspaceRoot, verificationExecutor,
+		)
+		if materializerErr != nil {
+			return fmt.Errorf("create Canonical verification materializer: %w", materializerErr)
+		}
+		canonicalArtifacts, collectorErr := verification.NewContentCanonicalArtifactCollector(contentStore)
+		if collectorErr != nil {
+			return fmt.Errorf("create Canonical release artifact collector: %w", collectorErr)
+		}
+		canonicalWorker, canonicalWorkerErr := verification.NewCanonicalWorker(
+			verificationStore, canonicalMaterializer, verificationExecutor, canonicalArtifacts,
+			verification.CandidateWorkerConfig{
+				ActorID: verification.VerificationWorkerActorID, WorkerID: workerID,
+				LeaseDuration:     cfg.Verification.LeaseDuration,
+				HeartbeatInterval: cfg.Verification.Heartbeat,
+			},
+			nil,
+			nil,
+		)
+		if canonicalWorkerErr != nil {
+			return fmt.Errorf("create Canonical verification worker: %w", canonicalWorkerErr)
+		}
+		canonicalVerificationWorker, canonicalWorkerErr = verification.NewCanonicalWorkerService(
+			canonicalWorker, cfg.Verification.PollInterval, logger,
+		)
+		if canonicalWorkerErr != nil {
+			return fmt.Errorf("create Canonical verification worker service: %w", canonicalWorkerErr)
+		}
+	}
+	var agentHandler *transport.AgentHandler
+	var agentStreamRelay *agent.StreamRelay
+	var agentExecutionWorker *agent.ExecutionWorker
+	var agentModelGateway http.Handler
+	if cfg.Agent.Enabled {
+		_, qualifiedSchemaHash, schemaErr := agent.QualifiedOutputSchema()
+		if schemaErr != nil {
+			return fmt.Errorf("qualify Agent output schema: %w", schemaErr)
+		}
+		if cfg.Agent.OutputSchemaHash != qualifiedSchemaHash {
+			return fmt.Errorf(
+				"qualify Agent output schema: configured hash %q does not match embedded hash %q",
+				cfg.Agent.OutputSchemaHash, qualifiedSchemaHash,
+			)
+		}
+		_, qualifiedPromptHash := agent.QualifiedPromptTemplate()
+		if cfg.Agent.PromptHash != qualifiedPromptHash {
+			return fmt.Errorf(
+				"qualify Agent prompt template: configured hash %q does not match embedded hash %q",
+				cfg.Agent.PromptHash, qualifiedPromptHash,
+			)
+		}
+		agentStore, storeErr := agent.NewPostgresStore(dependencies.Postgres)
+		if storeErr != nil {
+			return fmt.Errorf("create Agent control store: %w", storeErr)
+		}
+		agentEvidence, evidenceErr := agent.NewEvidenceStore(contentStore)
+		if evidenceErr != nil {
+			return fmt.Errorf("create Agent immutable evidence store: %w", evidenceErr)
+		}
+		agentReview, reviewErr := agent.NewReviewService(agentStore, agentEvidence, sandboxAccess)
+		if reviewErr != nil {
+			return fmt.Errorf("create Agent evidence review service: %w", reviewErr)
+		}
+		agentTreeResolver, treeErr := agent.NewPostgresCandidateTreeResolver(dependencies.Postgres, treeStore)
+		if treeErr != nil {
+			return fmt.Errorf("create Agent exact Candidate tree resolver: %w", treeErr)
+		}
+		agentPatchFiles, patchFilesErr := agent.NewPatchFileReviewService(
+			agentReview, agentStore, agentTreeResolver, fileBlobs,
+		)
+		if patchFilesErr != nil {
+			return fmt.Errorf("create Agent patch file review service: %w", patchFilesErr)
+		}
+		agentMerge, mergeErr := agent.NewPatchMergeService(
+			agentStore, agentReview, agentTreeResolver, sandboxFacade,
+			agentStore, sandboxAccess, time.Now,
+		)
+		if mergeErr != nil {
+			return fmt.Errorf("create Agent patch merge service: %w", mergeErr)
+		}
+		agentUndo, undoErr := agent.NewPatchUndoService(
+			agentStore, treeStore, sandboxFacade, agentStore, sandboxAccess, time.Now,
+		)
+		if undoErr != nil {
+			return fmt.Errorf("create Agent patch undo service: %w", undoErr)
+		}
+		agentHistory, historyErr := agent.NewPatchHistoryService(agentStore, agentStore, sandboxAccess)
+		if historyErr != nil {
+			return fmt.Errorf("create Agent patch history service: %w", historyErr)
+		}
+		planningSource, sourceErr := agent.NewPostgresPlanningSource(
+			dependencies.Postgres,
+			contentStore,
+			candidateStore,
+			fileBlobs,
+			pathPolicies,
+			agent.PostgresPlanningSourceConfig{
+				OutputSchemaHash: cfg.Agent.OutputSchemaHash,
+				AllowedTools:     cfg.Agent.AllowedTools,
+				Budgets: agent.TaskBudgets{
+					WallTimeSeconds: int64(cfg.Agent.WallTime / time.Second),
+					MaxInputTokens:  cfg.Agent.MaxInputTokens,
+					MaxOutputTokens: cfg.Agent.MaxOutputTokens,
+					MaxCommands:     cfg.Agent.MaxCommands,
+					MaxLogBytes:     cfg.Agent.MaxLogBytes,
+					MaxPatchBytes:   cfg.Agent.MaxPatchBytes,
+				},
+				MaxContextFiles: cfg.Agent.MaxContextFiles,
+			},
+		)
+		if sourceErr != nil {
+			return fmt.Errorf("create Agent authoritative PlanningSource: %w", sourceErr)
+		}
+		planner, plannerErr := agent.NewDeterministicPlanner(planningSource, time.Now)
+		if plannerErr != nil {
+			return fmt.Errorf("create Agent deterministic planner: %w", plannerErr)
+		}
+		executorProfiles, profileErr := agent.NewStaticExecutorProfiles(map[string]agent.ExecutorIdentity{
+			cfg.Agent.ProfileID: {
+				Adapter: cfg.Agent.Adapter, Provider: cfg.Agent.Provider, Model: cfg.Agent.Model,
+				RunnerImageDigest: sandboxRunnerDigest(cfg.Agent.RunnerImage),
+				ModelPolicyHash:   cfg.Agent.ModelPolicyHash,
+				ParametersHash:    cfg.Agent.ParametersHash,
+				PromptHash:        cfg.Agent.PromptHash,
+				OutputSchemaHash:  cfg.Agent.OutputSchemaHash,
+				ToolchainHash:     cfg.Agent.ToolchainHash,
+			},
+		})
+		if profileErr != nil {
+			return fmt.Errorf("create Agent executor profile: %w", profileErr)
+		}
+		agentControl, controlErr := agent.NewControlService(
+			agentStore, planner, executorProfiles, sandboxAccess, time.Now,
+		)
+		if controlErr != nil {
+			return fmt.Errorf("create Agent control service: %w", controlErr)
+		}
+		agentHandler, err = transport.NewAgentHandler(transport.AgentDependencies{
+			Service: agentControl, Review: agentReview, PatchFiles: agentPatchFiles,
+			Merge: agentMerge, Undo: agentUndo,
+			History:          agentHistory,
+			Sessions:         sandboxPlatform,
+			MaxJSONBodyBytes: cfg.HTTP.MaxJSONBodyBytes,
+		})
+		if err != nil {
+			return fmt.Errorf("create Agent transport: %w", err)
+		}
+		agentStreamRelay, err = agent.NewStreamRelay(
+			dependencies.Postgres,
+			sandboxStreamEvents,
+			agent.StreamRelayConfig{
+				BatchSize: cfg.Outbox.BatchSize, PollInterval: cfg.Outbox.PollInterval,
+				ClaimTTL: cfg.Outbox.ClaimTTL, MaxAttempts: cfg.Outbox.MaxAttempts,
+				PublishTimeout: cfg.Outbox.PublishWait,
+			},
+			logger,
+		)
+		if err != nil {
+			return fmt.Errorf("create Agent stream relay: %w", err)
+		}
+		if cfg.Agent.WorkerEnabled {
+			templateContext, contextErr := agent.NewPostgresTemplateContextReader(dependencies.Postgres)
+			if contextErr != nil {
+				return fmt.Errorf("create Agent Template context reader: %w", contextErr)
+			}
+			contextMaterializer, contextErr := agent.NewContextMaterializer(contentStore, fileBlobs, templateContext)
+			if contextErr != nil {
+				return fmt.Errorf("create Agent context materializer: %w", contextErr)
+			}
+			worktrees, worktreeErr := agent.NewWorktreeManager(cfg.Agent.WorktreeRoot, fileBlobs)
+			if worktreeErr != nil {
+				return fmt.Errorf("create Agent isolated worktree manager: %w", worktreeErr)
+			}
+			capabilities, capabilityErr := agent.NewRedisModelCapabilityAuthority(
+				dependencies.Redis,
+				cfg.Agent.GatewayRedisPrefix,
+				cfg.Agent.GatewayBaseURL,
+			)
+			if capabilityErr != nil {
+				return fmt.Errorf("create Agent model capability authority: %w", capabilityErr)
+			}
+			modelGateway, gatewayErr := agent.NewModelGateway(agent.ModelGatewayConfig{
+				UpstreamResponsesURL: cfg.AI.BaseURL,
+				UpstreamAPIKey:       cfg.AI.APIKey,
+				Organization:         cfg.AI.Organization,
+				UpstreamProject:      cfg.AI.Project,
+				MaxInputBytes:        cfg.AI.MaxInputBytes,
+				MaxOutputBytes:       cfg.AI.MaxOutputBytes,
+				RequestTimeout:       cfg.Agent.WallTime + 30*time.Second,
+			}, capabilities, nil, logger)
+			if gatewayErr != nil {
+				return fmt.Errorf("create Agent Model Gateway: %w", gatewayErr)
+			}
+			runner, runnerErr := agent.NewDockerCodexRunner(agent.DockerCodexRunnerConfig{
+				RuntimeBinary: cfg.Agent.RuntimeBinary,
+				DaemonHost:    cfg.Agent.DaemonHost,
+				RunnerImage:   cfg.Agent.RunnerImage,
+				Network:       cfg.Agent.RunnerNetwork,
+				Memory:        cfg.Agent.RunnerMemory,
+				CPUs:          cfg.Agent.RunnerCPUs,
+				PIDs:          cfg.Agent.RunnerPIDs,
+				OutputLimit:   cfg.Agent.RunnerOutputMax,
+				User:          "10001:10001",
+			}, capabilities, agent.OSContainerCommandExecutor{OutputLimit: cfg.Agent.RunnerOutputMax})
+			if runnerErr != nil {
+				return fmt.Errorf("create digest-pinned Codex Runner: %w", runnerErr)
+			}
+			workerLifecycle, workerErr := agent.NewWorkerService(agentStore, sandboxAccess)
+			if workerErr != nil {
+				return fmt.Errorf("create Agent worker lifecycle: %w", workerErr)
+			}
+			workerID := cfg.Agent.WorkerID
+			if workerID == "" {
+				workerID = cfg.ServiceName + "-agent-" + uuid.NewString()
+			}
+			agentExecutionWorker, workerErr = agent.NewExecutionWorker(
+				agentStore,
+				workerLifecycle,
+				agentTreeResolver,
+				worktrees,
+				contextMaterializer,
+				runner,
+				agentEvidence,
+				fileBlobs,
+				agent.ExecutionWorkerConfig{
+					WorkerID:      workerID,
+					ClaimBatch:    cfg.Agent.ClaimBatch,
+					PollInterval:  cfg.Agent.PollInterval,
+					LeaseDuration: cfg.Agent.LeaseDuration,
+					Heartbeat:     cfg.Agent.Heartbeat,
+				},
+				logger,
+			)
+			if workerErr != nil {
+				return fmt.Errorf("create Agent execution worker: %w", workerErr)
+			}
+			agentModelGateway = modelGateway
+		}
+		logger.Info(
+			"Agent control plane enabled",
+			"profile_id", cfg.Agent.ProfileID,
+			"runner_digest", sandboxRunnerDigest(cfg.Agent.RunnerImage),
+			"worker_enabled", cfg.Agent.WorkerEnabled,
+		)
+	} else {
+		logger.Warn("Agent control plane is disabled")
 	}
 	activityService, err := core.NewActivityService(dependencies.Postgres, dependencies.Redis, accessControl, 45*time.Second)
 	if err != nil {
@@ -264,6 +1153,7 @@ func Run(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 	}
 	generationService, err := generation.NewService(
 		dependencies.Postgres, contentStore, aiProvider, proposalService, workbenchService, implementationService,
+		constructorService,
 		generation.ServiceConfig{ClaimLease: cfg.AI.Timeout + 5*time.Minute},
 	)
 	if err != nil {
@@ -338,6 +1228,9 @@ func Run(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 	if idempotencyRequestLimit < designimport.MaxRequestBytes {
 		idempotencyRequestLimit = designimport.MaxRequestBytes
 	}
+	if idempotencyRequestLimit < repository.MaxFileBytes {
+		idempotencyRequestLimit = repository.MaxFileBytes
+	}
 	idempotency, err := worksmiddleware.NewIdempotencyRepository(dependencies.Postgres, worksmiddleware.IdempotencyConfig{
 		TTL: cfg.Idempotency.TTL, LockTTL: cfg.Idempotency.LockTTL,
 		MaxRequestBytes: idempotencyRequestLimit, MaxResponseBytes: cfg.Idempotency.MaxResponseBytes,
@@ -382,6 +1275,63 @@ func Run(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 		go func() {
 			defer runtimeWorkers.Done()
 			runWorkflowWorker(runtimeCtx, worker, cfg.Workflow.PollInterval, logger)
+		}()
+	}
+	if agentStreamRelay != nil {
+		runtimeWorkers.Add(1)
+		go func() {
+			defer runtimeWorkers.Done()
+			agentStreamRelay.Run(runtimeCtx)
+		}()
+	}
+	if sandboxDeadlineWorker != nil {
+		runtimeWorkers.Add(1)
+		go func() {
+			defer runtimeWorkers.Done()
+			if workerErr := sandboxDeadlineWorker.Run(runtimeCtx); workerErr != nil &&
+				!errors.Is(workerErr, context.Canceled) {
+				logger.Error("SandboxSession lifecycle deadline worker stopped", "error", workerErr)
+			}
+		}()
+	}
+	if agentExecutionWorker != nil {
+		runtimeWorkers.Add(1)
+		go func() {
+			defer runtimeWorkers.Done()
+			if workerErr := agentExecutionWorker.Run(runtimeCtx); workerErr != nil &&
+				!errors.Is(workerErr, context.Canceled) {
+				logger.Error("Agent execution worker stopped", "error", workerErr)
+			}
+		}()
+	}
+	if verificationWorker != nil {
+		runtimeWorkers.Add(1)
+		go func() {
+			defer runtimeWorkers.Done()
+			if workerErr := verificationWorker.Run(runtimeCtx); workerErr != nil &&
+				!errors.Is(workerErr, context.Canceled) {
+				logger.Error("Candidate verification worker stopped", "error", workerErr)
+			}
+		}()
+	}
+	if canonicalVerificationWorker != nil {
+		runtimeWorkers.Add(1)
+		go func() {
+			defer runtimeWorkers.Done()
+			if workerErr := canonicalVerificationWorker.Run(runtimeCtx); workerErr != nil &&
+				!errors.Is(workerErr, context.Canceled) {
+				logger.Error("Canonical verification worker stopped", "error", workerErr)
+			}
+		}()
+	}
+	if releaseDeliveryWorker != nil {
+		runtimeWorkers.Add(1)
+		go func() {
+			defer runtimeWorkers.Done()
+			if workerErr := releaseDeliveryWorker.Run(runtimeCtx); workerErr != nil &&
+				!errors.Is(workerErr, context.Canceled) {
+				logger.Error("release delivery worker stopped", "error", workerErr)
+			}
 		}()
 	}
 
@@ -434,27 +1384,76 @@ func Run(ctx context.Context, cfg config.Config, logger *slog.Logger) error {
 	}
 	readinessChecks[qualitySandboxCheck] = qualitySandbox.Readiness
 	readinessChecks["publish_storage"] = publishProvider.Readiness
+	if releaseDeliveryProvider != nil {
+		readinessChecks["release_delivery_controller"] = func(ctx context.Context) error {
+			if err := reconciledReleaseStore.Readiness(ctx); err != nil {
+				return err
+			}
+			return releaseDeliveryProvider.Readiness(ctx)
+		}
+	}
 	readinessChecks["nats_event_stream"] = func(checkCtx context.Context) error {
 		_, checkErr := dependencies.JetStream.StreamInfo(events.DefaultStreamName, nats.Context(checkCtx))
 		return checkErr
 	}
 	readinessChecks["realtime_fanout"] = fanoutSupervisor.Readiness
 	readinessChecks["workflow_execution_profiles"] = workflowEngine.Readiness
+	if interactiveRuntime != nil {
+		readinessChecks["interactive_sandbox_runtime"] = interactiveRuntime.Readiness
+	}
+	if languageServerRuntime != nil {
+		readinessChecks["language_server_runtime"] = func(checkCtx context.Context) error {
+			return languageServerRuntime.Readiness(checkCtx)
+		}
+	}
+	if sandboxDeadlineWorker != nil {
+		readinessChecks["sandbox_lifecycle_deadline_worker"] = sandboxDeadlineWorker.Readiness
+	}
+	if agentStreamRelay != nil {
+		readinessChecks["agent_stream_relay"] = agentStreamRelay.Readiness
+	}
+	if agentExecutionWorker != nil {
+		readinessChecks["agent_execution_worker"] = agentExecutionWorker.Readiness
+	}
+	if verificationWorker != nil {
+		readinessChecks["candidate_verification_worker"] = verificationWorker.Readiness
+	}
+	if canonicalVerificationWorker != nil {
+		readinessChecks["canonical_verification_worker"] = canonicalVerificationWorker.Readiness
+	}
 	readiness := health.NewReadiness(cfg.Dependencies.ReadinessTimeout, readinessChecks)
 	router, err := httpapi.NewRouter(cfg, logger, httpapi.RouterOptions{
-		Readiness: readiness, WebSocket: websocketHandler,
-		Transport: apiTransport, Authentication: authService, Idempotency: idempotency,
+		Readiness: readiness, WebSocket: websocketHandler, SandboxWebSocket: sandboxStreamHandler,
+		ModelGateway: agentModelGateway,
+		Transport:    apiTransport, Authentication: authService, Idempotency: idempotency,
 		Workflow: workflowHandler, Conversation: conversationHandler, GitHub: githubHandler, Data: dataHandler,
 		PublicData: publicDataHandler, Delivery: deliveryHandler, DesignImports: designImportHandler,
+		Constructor: constructorHandler, TemplateRegistry: templateRegistryHandler,
+		Repository: repositoryHandler, Sandbox: sandboxHandler,
+		LSPTickets: lspTicketHandler, LSPWebSocket: lspWebSocket,
+		Verification: verificationHandler, Agent: agentHandler,
+		Release: releaseHandler,
 	})
 	if err != nil {
 		stopRuntime()
 		return fmt.Errorf("create HTTP router: %w", err)
 	}
 
+	var serverHandler http.Handler = router
+	if sandboxPorts != nil {
+		previewHandler, previewErr := transport.NewSandboxPreviewHandler(
+			router, sandboxPorts, cfg.Sandbox.PreviewPublicOrigin, cfg.CORS.AllowedOrigins,
+			[]string{cfg.Security.Session.CookieName, cfg.Security.CSRF.CookieName}, logger,
+		)
+		if previewErr != nil {
+			stopRuntime()
+			return fmt.Errorf("create sandbox preview transport: %w", previewErr)
+		}
+		serverHandler = previewHandler
+	}
 	server := &http.Server{
 		Addr:              cfg.HTTP.Address(),
-		Handler:           router,
+		Handler:           serverHandler,
 		ReadTimeout:       cfg.HTTP.ReadTimeout,
 		ReadHeaderTimeout: cfg.HTTP.ReadHeaderTimeout,
 		WriteTimeout:      cfg.HTTP.WriteTimeout,
@@ -514,6 +1513,30 @@ func runWorkflowWorker(ctx context.Context, worker workflowruntime.Worker, pollI
 			return
 		case <-ticker.C:
 		}
+	}
+}
+
+func repositorySearchAdmissionOptions(
+	configured config.RepositorySearchAdmissionConfig,
+) repository.RedisExactTreeSearchAdmissionOptions {
+	bucket := func(value config.RepositorySearchRateBucketConfig) repository.ExactTreeSearchAdmissionBucketLimits {
+		return repository.ExactTreeSearchAdmissionBucketLimits{
+			RefillTokens:   value.RefillTokens,
+			RefillInterval: value.RefillInterval,
+			Burst:          value.Burst,
+		}
+	}
+	return repository.RedisExactTreeSearchAdmissionOptions{
+		Prefix:  configured.RedisPrefix,
+		Timeout: configured.Timeout,
+		Query: repository.ExactTreeSearchAdmissionOperationLimits{
+			Project: bucket(configured.QueryProject),
+			Actor:   bucket(configured.QueryActor),
+		},
+		FirstBuilder: repository.ExactTreeSearchAdmissionOperationLimits{
+			Project: bucket(configured.BuildProject),
+			Actor:   bucket(configured.BuildActor),
+		},
 	}
 }
 
