@@ -1,0 +1,38 @@
+{
+  "schemaVersion": "worksflow-post-run-verification-contract/v1",
+  "suiteId": "production-postgresql-identity-external",
+  "executionKind": "post-run-verifier",
+  "status": "planned",
+  "controls": [
+    {
+      "id": "dedicated-schema-dml",
+      "requiredArtifactIds": [
+        "dedicated-schema-and-dml-receipt"
+      ]
+    },
+    {
+      "id": "distinct-login-dsn",
+      "requiredArtifactIds": [
+        "four-distinct-login-dsn-posture"
+      ]
+    },
+    {
+      "id": "gc-scheduler-recovery",
+      "requiredArtifactIds": [
+        "gc-scheduler-same-run-recovery-receipt"
+      ]
+    },
+    {
+      "id": "nologin-group-roles",
+      "requiredArtifactIds": [
+        "five-stable-nologin-role-posture"
+      ]
+    },
+    {
+      "id": "secret-injection",
+      "requiredArtifactIds": [
+        "secret-injection-receipt"
+      ]
+    }
+  ]
+}

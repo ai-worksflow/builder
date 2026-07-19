@@ -1,0 +1,56 @@
+{
+  "schemaVersion": "worksflow-post-run-verification-contract/v1",
+  "suiteId": "qualification-artifact-hygiene",
+  "executionKind": "post-run-verifier",
+  "status": "implemented-internal",
+  "controls": [
+    {
+      "id": "artifact-exact-file-closure",
+      "implementation": "backend/internal/qualificationreceipt/verifier.go",
+      "requiredArtifactIds": [
+        "immutable-signed-qualification-receipt"
+      ]
+    },
+    {
+      "id": "credential-set-issuance-revocation",
+      "implementation": "backend/internal/qualificationreceipt/verifier.go",
+      "requiredArtifactIds": [
+        "credential-set-issuance-receipt",
+        "credential-set-revocation-receipt"
+      ]
+    },
+    {
+      "id": "kms-encryption-and-plaintext-disposition",
+      "implementation": "backend/internal/qualificationreceipt/encryption.go",
+      "requiredArtifactIds": [
+        "browser-video",
+        "credential-safe-trace",
+        "kms-encryption-attestation"
+      ]
+    },
+    {
+      "id": "playwright-inventory-exactness",
+      "implementation": "backend/internal/qualificationreceipt/verifier.go",
+      "requiredArtifactIds": [
+        "zero-mock-zero-skip-playwright-json"
+      ]
+    },
+    {
+      "id": "signed-receipt-and-root-authority",
+      "implementation": "backend/internal/qualificationreceipt/authority.go",
+      "requiredArtifactIds": [
+        "golden-authority-document",
+        "golden-fixture-document"
+      ]
+    },
+    {
+      "id": "golden-fault-authority-ledger-receipt-closure",
+      "implementation": "backend/internal/qualificationreceipt/fault_evidence.go",
+      "expectedFaultOperationCount": 13,
+      "expectedFaultOperationSetDigest": "sha256:50add6d13b4b28587f5ceab1385d85e457cc35489a031ac9d2f3ff217bd1fa9d",
+      "requiredArtifactIds": [
+        "golden-fault-ledger-attestation"
+      ]
+    }
+  ]
+}

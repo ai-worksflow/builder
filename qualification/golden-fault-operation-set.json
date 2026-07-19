@@ -1,0 +1,1 @@
+{"operations":["agent-runner-crash","agent-runner-timeout","agent-security-canary","controller-conflict","controller-maintenance","controller-not-found","controller-timeout","lsp-resource-pressure","lsp-runtime-crash","lsp-runtime-drift","reference-gateway-outage","reference-process-restart","sandbox-dependency-crash"],"schemaVersion":"worksflow-golden-fault-operation-set/v1"}

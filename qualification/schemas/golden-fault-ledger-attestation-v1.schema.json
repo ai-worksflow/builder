@@ -1,0 +1,67 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://worksflow.dev/schemas/golden-fault-ledger-attestation-v1.json",
+  "title": "Worksflow Golden fault ledger attestation predicate v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["entries", "fixtureId", "issuedAt", "runId", "schemaVersion", "status"],
+  "properties": {
+    "entries": {
+      "type": "array",
+      "minItems": 13,
+      "maxItems": 13,
+      "items": {"$ref": "#/$defs/entry"}
+    },
+    "fixtureId": {"$ref": "#/$defs/uuidV4"},
+    "issuedAt": {"$ref": "#/$defs/time"},
+    "runId": {"$ref": "#/$defs/uuidV4"},
+    "schemaVersion": {"const": "worksflow-golden-fault-ledger-attestation/v1"},
+    "status": {"const": "terminal"}
+  },
+  "$defs": {
+    "digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "time": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\\.[0-9]{3}Z$"},
+    "uuidV4": {"type": "string", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"},
+    "entry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "authorityDigest", "authorityId", "completedAt", "envelopeDigest", "operationKind", "outcome",
+        "payloadDigest", "receiptArtifactId", "receiptDigest", "reservationDigest", "reservedAt",
+        "resultDigest", "resultId", "state"
+      ],
+      "properties": {
+        "authorityDigest": {"$ref": "#/$defs/digest"},
+        "authorityId": {"$ref": "#/$defs/uuidV4"},
+        "completedAt": {"$ref": "#/$defs/time"},
+        "envelopeDigest": {"$ref": "#/$defs/digest"},
+        "operationKind": {
+          "enum": [
+            "agent-runner-crash",
+            "agent-runner-timeout",
+            "agent-security-canary",
+            "controller-conflict",
+            "controller-maintenance",
+            "controller-not-found",
+            "controller-timeout",
+            "lsp-resource-pressure",
+            "lsp-runtime-crash",
+            "lsp-runtime-drift",
+            "reference-gateway-outage",
+            "reference-process-restart",
+            "sandbox-dependency-crash"
+          ]
+        },
+        "outcome": {"enum": ["applied", "refused"]},
+        "payloadDigest": {"$ref": "#/$defs/digest"},
+        "receiptArtifactId": {"$ref": "#/$defs/uuidV4"},
+        "receiptDigest": {"$ref": "#/$defs/digest"},
+        "reservationDigest": {"$ref": "#/$defs/digest"},
+        "reservedAt": {"$ref": "#/$defs/time"},
+        "resultDigest": {"$ref": "#/$defs/digest"},
+        "resultId": {"$ref": "#/$defs/uuidV4"},
+        "state": {"const": "terminal"}
+      }
+    }
+  }
+}

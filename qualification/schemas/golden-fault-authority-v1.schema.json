@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://worksflow.dev/schemas/golden-fault-authority-v1.json",
+  "title": "Worksflow Golden fault authority predicate v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "authorityId",
+    "expectedFenceDigest",
+    "expiresAt",
+    "fixtureId",
+    "issuedAt",
+    "maxUses",
+    "operationKind",
+    "resourceSelector",
+    "runId",
+    "schemaVersion"
+  ],
+  "properties": {
+    "authorityId": {"$ref": "#/$defs/uuidV4"},
+    "expectedFenceDigest": {"$ref": "#/$defs/digest"},
+    "expiresAt": {"$ref": "#/$defs/time"},
+    "fixtureId": {"$ref": "#/$defs/uuidV4"},
+    "issuedAt": {"$ref": "#/$defs/time"},
+    "maxUses": {"const": 1},
+    "operationKind": {
+      "enum": [
+        "agent-runner-crash",
+        "agent-runner-timeout",
+        "agent-security-canary",
+        "controller-conflict",
+        "controller-maintenance",
+        "controller-not-found",
+        "controller-timeout",
+        "lsp-resource-pressure",
+        "lsp-runtime-crash",
+        "lsp-runtime-drift",
+        "reference-gateway-outage",
+        "reference-process-restart",
+        "sandbox-dependency-crash"
+      ]
+    },
+    "resourceSelector": {
+      "enum": ["agent.patch-policy", "agent.runner", "lsp.runtime", "reference.gateway", "reference.process", "release.controller", "sandbox.dependency"]
+    },
+    "runId": {"$ref": "#/$defs/uuidV4"},
+    "schemaVersion": {"const": "worksflow-golden-fault-authority/v1"}
+  },
+  "$defs": {
+    "digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "uuidV4": {"type": "string", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"},
+    "time": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\\.[0-9]{3}Z$"}
+  }
+}

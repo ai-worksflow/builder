@@ -23,8 +23,10 @@ From the repository root:
 docker compose up --build
 ```
 
-Compose starts PostgreSQL, Redis, MongoDB, NATS with JetStream, a dedicated
-Docker-in-Docker quality sandbox, its configured Node and Go images, and the API.
+Compose starts PostgreSQL, runs the one-shot `migrate` service to completion,
+then starts Redis, MongoDB, NATS with JetStream, a dedicated Docker-in-Docker
+quality sandbox, its configured Node and Go images, and the API. The API will
+not start until the migration service succeeds.
 The default development tags are mutable and therefore not reproducible.
 The credentials in `docker-compose.yml` are development-only values. The
 frontend is run separately from `frontend/`.
@@ -50,12 +52,24 @@ published versions, and sandbox state.
 
 Start PostgreSQL, Redis, MongoDB and NATS, and make a Docker daemon plus the
 configured sandbox images available. Copy `backend/.env.example` to an ignored
-environment file, load it in the shell, then run:
+environment file and load it in the shell. Apply migrations with the dedicated
+migration credential before starting the API:
 
 ```sh
 cd backend
+WORKSFLOW_MIGRATION_POSTGRES_DSN="$MIGRATION_OWNER_DSN" \
+WORKSFLOW_MIGRATION_POSTGRES_SCHEMA="${POSTGRES_SCHEMA:-public}" \
+  go run ./cmd/migrate
 make run
 ```
+
+In a shared environment, `WORKSFLOW_MIGRATION_POSTGRES_DSN` and `POSTGRES_DSN`
+must not identify the same login. The migration process receives DDL/definer
+authority; the API process receives only its application DML and approved
+function privileges. `POSTGRES_SCHEMA` is the API's sole schema selector; do
+not put `search_path`, `role`, identity overrides, service files, or passwords
+in the `POSTGRES_DSN` query. Do not export the migration DSN into the API
+container.
 
 Configuration is environment-driven and validated before services are opened.
 Invalid ports, durations, connection limits, URLs, weak shared-environment
@@ -80,22 +94,38 @@ Important startup settings:
   `DELIVERY_PUBLISH_BASE_URL`, such as `http://localhost:8080/published`, when
   published applications need the public data runtime because the provider
   derives an exact browser Origin from it.
-- `STARTUP_MIGRATE`, `STARTUP_ENSURE_MONGO_INDEXES`, and
-  `STARTUP_ENSURE_NATS_STREAM` default on in development/test and off in
-  production. Production must provision the same resources separately or opt
-  in explicitly.
+- `STARTUP_MIGRATE` is retired and its presence is a configuration error in
+  every environment. Use `cmd/migrate` with
+  `WORKSFLOW_MIGRATION_POSTGRES_DSN`; the API never applies PostgreSQL DDL.
+- `STARTUP_ENSURE_MONGO_INDEXES` and `STARTUP_ENSURE_NATS_STREAM` control the
+  remaining non-PostgreSQL startup provisioning. Shared deployments should
+  provision those resources deliberately.
 
 ## Startup and persistence lifecycle
 
-The process establishes PostgreSQL, Redis, MongoDB and NATS connections first,
-then applies the enabled startup provisioning under `STARTUP_TIMEOUT`. It
-constructs the domain services only after provisioning succeeds. The NATS
-event stream must already exist when automatic stream creation is disabled.
+The API establishes PostgreSQL, Redis, MongoDB and NATS connections first,
+verifies the PostgreSQL application-role posture in staging/production, then
+applies only enabled non-PostgreSQL startup provisioning under
+`STARTUP_TIMEOUT`. It constructs domain services only after those checks
+succeed. The NATS event stream must already exist when automatic stream
+creation is disabled.
 
-PostgreSQL migrations are embedded in the API binary. The migrator holds a
-PostgreSQL advisory lock, applies each version in its own transaction, and
-records its SHA-256 checksum in `schema_migrations`. Changing an already
-applied migration is a startup error; add a new migration instead.
+PostgreSQL migrations are embedded in the standalone `migrate` binary, not
+executed by the API. The migrator requires an explicit canonical
+`WORKSFLOW_MIGRATION_POSTGRES_DSN`, uses a bounded
+`WORKSFLOW_MIGRATION_TIMEOUT`, holds a PostgreSQL advisory lock on one dedicated
+connection, applies each version in its own transaction, and records its
+SHA-256 checksum in `schema_migrations`. Changing an already applied migration
+is an error; add a new migration instead. Production and staging must run this
+one-shot process before starting or rolling API instances.
+
+The API does not treat a successful ping as schema compatibility. Before
+constructing services it reads `schema_migrations` with the application
+credential and verifies the exact ordered set of embedded versions and
+checksums. A missing version, an unknown newer version or checksum drift fails
+startup. This is intentionally strict: run the matching one-shot migrator
+before the corresponding API rollout, and do not expect an older binary to
+continue after a newer schema head has been installed.
 
 The current migration chain is:
 
@@ -119,6 +149,399 @@ The current migration chain is:
 | `000016_workflow_execution_profiles` | immutable execution-profile pins on definition versions and runs, with a rolling-deploy-compatible legacy profile |
 | `000017_application_build_manifest_slice_identity` | exact durable DeliverySlice pins for current workflow Bundle roots and every derived lineage row |
 | `000018_conversation_summary_checkpoints` | independently reviewed immutable prefix summaries, forward-only checkpoint heads, exact conversation/provider-input receipts, and fail-closed proposal/command provenance |
+| `000019`–`000022` | project governance mode, artifact-health backfill, Template admission and exact Application BuildContract authority |
+| `000023`–`000030` | Repository Candidate/checkpoint authority, Sandbox sessions/processes/terminals, immutable FileBlobs/bootstrap and successor Candidate rebase |
+| `000031`–`000038` | Agent task/stream/evidence, exact Merge/Undo and Candidate freeze/Projection/BuildContract guards |
+| `000039`–`000042` | Candidate Verification control plane, immutable Receipt, freeze gate and worker lease/fence authority |
+| `000043`–`000046` | Canonical quality/verification, complete ReleaseBundle publish gate and Preview/Production/rollback control plane |
+| `000047`–`000055` | Sandbox deadlines and Candidate write/abandon reconciliation, verification truncation/cleanup gates, legacy proposal closure, fresh Sandbox baseline and Template artifact authority receipts |
+| `000056`–`000061` | durable Release Controller Operation reconciliation, exact-Bundle Preview single-flight, GET-only operator Case, legacy/v3 writer mutex, nested authority recheck and commit-time Run↔Operation binding |
+| `000062_repository_exact_tree_literal_index` | immutable project + exact-tree manifest/member/content-hash text-blob index |
+| `000063_repository_exact_tree_literal_index_build_claims` | durable expiring single-builder claim before any FileBlob resolve |
+| `000064_repository_exact_tree_literal_index_project_quota` | atomic project tree/source-byte/active-build reservation and quota |
+| `000065_repository_exact_tree_literal_index_project_gin` | project UUID + body trigram composite GIN tenant fence |
+| `000066_repository_exact_tree_literal_index_gc` | bounded exact-CAS retention/GC, immutable capabilities/receipts/tombstones and migration/application/operator privilege split |
+| `000067_repository_snapshot_receipts` | append-only exact RepositorySnapshot completion receipts |
+| `000068_golden_fault_consume_ledger` | append-only one-shot Golden fault reservation/result CAS ledger and dedicated operator ACL |
+| `000069_model_governance_activation_store`–`000070_model_governance_signed_genesis` | append-only Model Governance activation/revocation state and signed genesis authority |
+| `000071_qualification_promotion_consume` | append-only exact VerifiedPromotion consumption plus a pending immutable-revision handoff; it does not submit a workflow node |
+| `000072_credential_set_event_store` | owner-only, non-secret CredentialSet event/operation/head store with exact append CAS and guarded projection |
+| `000073_qualification_evidence_event_store` | owner-only Qualification Evidence event/operation/head store with globally reserved identities, exact append CAS, guarded projection and trusted database time |
+| `000074_qualification_plan_authority` | owner-only immutable Qualification Plan authority/identity reservations, exact canonical material freeze/resolve and the Evidence reservation authority guard |
+
+### Production PostgreSQL identities and schema
+
+Production and staging need the original three stable group roles before
+migration `000066`, the fourth Golden fault group before `000068`, and the
+fifth qualification-promotion group before `000071`. New installations should
+provision all five up front:
+
+```sql
+-- Run through the platform's privileged PostgreSQL provisioning channel.
+CREATE ROLE worksflow_migration_owner NOLOGIN NOSUPERUSER NOCREATEDB
+  NOCREATEROLE NOREPLICATION NOBYPASSRLS;
+CREATE ROLE worksflow_application NOLOGIN NOSUPERUSER NOCREATEDB
+  NOCREATEROLE NOREPLICATION NOBYPASSRLS;
+CREATE ROLE worksflow_repository_index_gc_operator NOLOGIN NOSUPERUSER
+  NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
+CREATE ROLE worksflow_golden_fault_operator NOLOGIN NOSUPERUSER
+  NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
+CREATE ROLE worksflow_qualification_promotion_operator NOLOGIN NOSUPERUSER
+  NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
+
+-- The secret/IAM provisioner must create these five real low-privilege
+-- LOGIN identities first; this SQL does not create or set their credentials.
+GRANT worksflow_migration_owner TO worksflow_migrator_login;
+GRANT worksflow_application TO worksflow_api_login;
+GRANT worksflow_repository_index_gc_operator TO worksflow_gc_login;
+GRANT worksflow_golden_fault_operator TO worksflow_golden_fault_login;
+GRANT worksflow_qualification_promotion_operator
+  TO worksflow_qualification_promotion_login;
+
+REVOKE CREATE ON DATABASE worksflow FROM PUBLIC;
+CREATE SCHEMA worksflow AUTHORIZATION worksflow_migration_owner;
+REVOKE ALL ON SCHEMA worksflow FROM PUBLIC;
+```
+
+Use deployment-specific LOGIN names where required, but preserve the five exact
+group-role names because migration/readiness contracts use them. Do not grant
+one group to another, and do not make a LOGIN a member of more than its one
+group. None of the five LOGINs may own the database, inherit its owner, create
+objects in the database/schema, or reach superuser, `BYPASSRLS`, role/database
+creation or replication authority. The migrator's membership is used only by
+the one-shot migration process; the API and operator must never receive it.
+No membership into one of the five stable groups may use `ADMIN OPTION`, and
+the stable groups must not themselves be members of any other role. Before
+`000066`, convert or revoke every explicit column-level ACL in the trusted
+schema through a reviewed provisioning change; table-level grants are the only
+supported application DML contract.
+The migration owner and migrator identities must be dedicated to this database
+boundary: `000066` changes their global default routine ACL so future functions
+do not silently regain PostgreSQL's default `PUBLIC EXECUTE`.
+
+Migration `000066` starts with a no-mutation preflight. Any partial or unsafe
+stable-role set, outgoing stable-role membership, incoming `ADMIN OPTION`, or
+explicit trusted-schema column ACL aborts before schema ACL, DDL, ownership or
+default-privilege changes. The all-absent role posture is supported only for
+isolated local development and installs no stable-role grants. If that local
+posture was applied first, creating the roles afterward is not enough: the
+checksum/version is already immutable and the conditional blocks will not run
+again. Add a reviewed follow-up migration that installs the same ownership and
+grants. Never edit the applied SQL, delete its `schema_migrations` row or grant
+broad table privileges as a repair.
+
+`000066` installs the exact-tree index/GC privilege boundary and normalizes
+trusted-schema ownership: the schema and all of its tables and sequences are
+owned by the exact `worksflow_migration_owner` `NOLOGIN` role, as are all 23
+controlled routines (the original 22 external/trigger boundaries plus the
+Sandbox checkpoint dependency helper). Platform provisioning must separately
+grant the application group the complete, reviewed DML needed by all other API
+tables/sequences, provision the dedicated database, and inject every
+role-specific process DSN as a runtime secret. Do not put DSNs in the
+repository, Compose defaults, image
+layers, command arguments or logs. The development Compose stack intentionally
+reuses one owner credential and the `public` schema; that convenience is
+neither a production role test nor a qualification result.
+Shared Compose deployments must set `APP_ENV=staging` or `APP_ENV=production`;
+the Compose value is interpolated and the development default intentionally
+skips role posture only for local use. Injecting a production DSN while leaving
+`APP_ENV=development` is not a valid deployment.
+
+Migration `000068` uses conditional grants, so
+`worksflow_golden_fault_operator` must exist before it runs. If the migration
+was already recorded without that role, creating the role alone does not replay
+the grants. Use the exact owner/invoker preflight and narrow repair GRANT shown
+in `docs/golden-qualification-control-plane.md` section 5.1; if either table or
+either trigger function is not owned by `worksflow_migration_owner`, create a
+reviewed follow-up migration instead of altering the immutable migration row.
+After `000068`, the production owner boundary contains 12 protected boundary
+tables, 28 indexes and 25 controlled routines; the two new trigger functions
+are owner-only `SECURITY INVOKER`, so the exact `SECURITY DEFINER` count remains
+19. The API/application role has no privilege on either fault table. The
+dedicated fault operator has only non-grantable `SELECT, INSERT` on those two
+append-only tables plus schema `USAGE`.
+
+Migration `000071` also uses conditional grants, so
+`worksflow_qualification_promotion_operator` must exist before it runs. Through
+`000071` (before later migrations), the exhaustive production posture baseline
+is five stable `NOLOGIN` groups, 17 protected/owned boundary tables, 42 owned
+indexes, 33 owned routines, 11 owner-only internal routines, and 24
+`SECURITY DEFINER` routines. The qualification-promotion operator receives
+only non-grantable schema `USAGE`, non-grantable `SELECT` on its two append-only
+tables, and non-grantable `EXECUTE` on the single canonical consume routine.
+The application and other operators receive no access. A successful consume
+atomically appends a ledger row and a `pending` handoff; that handoff is not an
+immutable revision and is not proof that a workflow node was submitted.
+
+After migration `000072`, the current exhaustive production posture is 21
+owned boundary tables, 52 owned indexes, 37 owned routines, and exactly 25
+`SECURITY DEFINER` routines; the protected-table ACL catalog has 22 entries
+because it also includes read-only `schema_migrations`. The four CredentialSet
+tables are owned by `worksflow_migration_owner` and allow no non-owner table or
+column ACL. Their four routines are owner-only with exact signatures and
+catalog contracts: immutable/strict/parallel-safe SQL
+`credential_set_sha256(bytea)` with no per-function configuration; volatile
+PL/pgSQL reject and head-guard trigger functions with respectively
+`pg_catalog` and `pg_catalog, <schema>` search paths; and the sole new
+`SECURITY DEFINER`, `append_credential_set_event(...)`, pinned to
+`pg_catalog, <schema>, pg_temp`. The events and operations ledgers each have
+exactly one statement-level `BEFORE UPDATE OR DELETE OR TRUNCATE` reject
+trigger; heads has exactly one statement-level
+`BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE` guard; the private projection
+authorization table has no user trigger. Any extra CredentialSet table,
+overload, trigger or non-owner ACL blocks startup posture.
+
+After migration `000073`, the real PostgreSQL catalog baseline is 25 owned
+boundary tables, 59 owned indexes, 41 owned routines, 15 owner-only internal
+routines and exactly 26 `SECURITY DEFINER` routines; the protected-table ACL
+catalog has 26 entries because it also includes read-only
+`schema_migrations`. Qualification Evidence adds four owner-only tables and
+four owner-only exact-signature routines without adding a sixth stable role or
+posture connection. Its SQL SHA-256 helper is immutable, strict,
+parallel-safe and pinned to `pg_catalog`; its PL/pgSQL reject and head-guard
+trigger functions are volatile, parallel-unsafe `SECURITY INVOKER` routines
+with exact fixed paths; and its append routine is the sole new
+`SECURITY DEFINER`, pinned to `pg_catalog, <schema>, pg_temp`. The events and
+operations ledgers have the exact statement-level immutable triggers, heads
+has the exact guarded-projection trigger, and the transaction-local projection
+authorization table has none. Any extra Qualification Evidence table, routine,
+overload, trigger, non-owner ACL, owner drift or function-catalog drift blocks
+startup posture. This owner-only persistence boundary is not a production
+operator or permission for the API/application role to orchestrate evidence.
+
+After migration `000074`, the real migrated baseline is 28 protected tables,
+27 owned boundary tables, 67 owned indexes, 46 owned routines, 20 owner-only
+internal routines and exactly 27 `SECURITY DEFINER` routines. Qualification
+Plan adds exactly two migration-owner-only tables, eight valid/ready indexes,
+five owner-only exact-signature routines and three enabled user triggers. The
+SHA-256 SQL helper and immutable-mutation reject function use `pg_catalog`;
+the invoker resolve and Evidence guard use `pg_catalog, <schema>`; and the sole
+new definer, freeze, uses `pg_catalog, <schema>, pg_temp`. Freeze returns the
+authority table composite while resolve returns the same set type as a stable
+SQL invoker. Neither application nor any operator receives table or routine
+privileges, and no sixth role or fifth posture DSN is introduced. Because the
+new guard is named `guard_qualification_evidence_plan_authority` and is attached
+to `qualification_evidence_events`, the exhaustive named Evidence inventory is
+now five functions and four triggers even though migration `000073`'s own exact
+contract remains four functions and three triggers. Owner, ACL, index state,
+trigger enablement, result type, search path, security-mode or extra named
+routine drift blocks production startup.
+
+The index-specific boundary is exact:
+
+- `PUBLIC` has no trusted-schema table, sequence or routine privilege. Existing
+  predecessor `SECURITY INVOKER` routines are explicitly re-granted to the
+  application group so old API operations keep working; its executable
+  `SECURITY DEFINER` set is exactly ten Candidate/claim mutation functions.
+- The application group has only the documented direct DML on the four index
+  tables and read-only `schema_migrations`. It has no GC-private table access
+  or Golden fault, CredentialSet, Qualification Evidence, or Qualification
+  Plan ledger access and cannot execute a GC or internal trigger/guard
+  function.
+- The operator group has no direct privilege on the index, Candidate or six
+  GC-private tables. It can execute only the four GC plan/execute/inspect/
+  readiness functions.
+- The Golden fault operator is a different group with only schema `USAGE` and
+  non-grantable `SELECT, INSERT` on the two append-only Golden fault tables. It
+  cannot be reachable from the API/application group.
+- The trusted schema has no explicit column ACL. API and operator startup also
+  reject any `ADMIN OPTION` held by the session or a reachable role, so neither
+  process can delegate its stable group authority.
+- All fourteen exposed functions are `SECURITY DEFINER`, owned by the exact
+  `worksflow_migration_owner` role, pinned to the exact trusted search path
+  `pg_catalog, <schema>, pg_temp`, and revoked from `PUBLIC`.
+- The exact-signature `sandbox_checkpoint_is_exact` dependency is separately
+  constrained to SQL/STABLE `SECURITY INVOKER`, a scalar Boolean result, the
+  same fixed path, and non-grantable `EXECUTE` for only migration-owner and
+  application. After `000068`, the ten internal trigger/guard routines are
+  owner-only; the
+  migration removes every historical non-owner grantee from both sets.
+- The API startup
+  posture also rejects a different `session_user`/`current_user`, schema or
+  database creation, object ownership, unexpected inherited or `SET ROLE`
+  authority, broad table/function grants and a non-exact function result
+  contract.
+
+The migration ledger preserves the historical up checksum and records a
+separate SHA-256 for every canonical down file. On upgrade, the migrator may
+establish a missing down checksum only for an exact, ordered, up-checksum-
+matching legacy prefix; it rejects unknown versions, gaps and existing down
+drift before applying a new migration. The API's `VerifyCurrent` path is
+read-only: an old ledger without `down_checksum`, a `NULL` digest, an orphaned
+pair or any digest mismatch blocks startup until the migrator is run. The
+first trusted upgrade necessarily establishes the baseline for old down files
+because no historical down digest existed before this feature.
+
+Apply the schema with only the migrator identity, then start the API with its
+own schema and DSN:
+
+```sh
+# Values are injected by the deployment secret manager.
+export WORKSFLOW_MIGRATION_POSTGRES_DSN
+export POSTGRES_DSN
+
+WORKSFLOW_MIGRATION_POSTGRES_SCHEMA=worksflow go run ./cmd/migrate
+POSTGRES_SCHEMA=worksflow make run
+```
+
+The migrator, API and role-specific operators each accept a canonical
+PostgreSQL URL and a separate canonical lowercase unquoted schema selector.
+Identity-changing DSN
+query parameters such as `role`, `options`/`search_path`, service files and
+password overrides are rejected; schema selection is injected programmatically.
+
+### Standalone production PostgreSQL posture check
+
+`cmd/production-postgres-posture` is an independent, read-only posture checker
+for four concurrently held connections inspected within one bounded check
+window: the application LOGIN, the one-shot migrator LOGIN, a separate
+qualification/auditor LOGIN, and the dedicated qualification-promotion LOGIN.
+Each connection's catalog query takes its own PostgreSQL snapshot; the result
+is not an atomic cross-identity snapshot. The auditor is not an operator. It
+must have only database
+connectivity and catalog visibility: no membership or `SET ROLE` path to
+`worksflow_application`, `worksflow_migration_owner`,
+`worksflow_repository_index_gc_operator`,
+`worksflow_golden_fault_operator`, or
+`worksflow_qualification_promotion_operator`; no trusted-schema `USAGE`,
+data/column/sequence privilege, function execution, or object ownership. The
+promotion LOGIN reaches only `worksflow_qualification_promotion_operator`, has
+schema `USAGE` without `CREATE`, effective `SELECT` on exactly
+`qualification_promotion_consumptions` and
+`qualification_promotion_handoffs`, and `EXECUTE` on exactly the canonical
+`consume_verified_qualification_promotion(...)` routine. It has no direct
+LOGIN ACL, column-only grant, sequence access, ownership, or other routine or
+relation privilege.
+These four audited LOGINs are distinct from the five stable `NOLOGIN` group
+roles; application and migrator each reach exactly their one intended group,
+the promotion identity reaches exactly its operator group, and the auditor
+reaches none of the five.
+
+Each DSN is loaded from a different absolute credential file. Credential files
+must be single-link, non-symlinked, owned by the checker process, and mode
+`0400` or `0600`. The four URLs must name different LOGINs and different
+passwords while targeting the same host, port, database, schema and TLS trust
+anchor. Production URLs must use `sslmode=verify-full`, one common absolute
+`sslrootcert`, and `target_session_attrs=read-write`; client certificate/key
+parameters and all identity/session overrides are rejected. The CA file must
+be a bounded parseable PEM certificate in a root- or process-owned directory
+chain with no symlink, hardlink, or group/world-writable component. The catalog
+query also confirms that each live session uses TLS and is neither a recovery
+server nor read-only.
+
+```sh
+export WORKSFLOW_PRODUCTION_POSTGRES_APP_DSN_FILE=/run/worksflow-secrets/posture-app.dsn
+export WORKSFLOW_PRODUCTION_POSTGRES_MIGRATOR_DSN_FILE=/run/worksflow-secrets/posture-migrator.dsn
+export WORKSFLOW_PRODUCTION_POSTGRES_QUALIFICATION_DSN_FILE=/run/worksflow-secrets/posture-auditor.dsn
+export WORKSFLOW_PRODUCTION_POSTGRES_PROMOTION_DSN_FILE=/run/worksflow-secrets/posture-promotion.dsn
+export WORKSFLOW_PRODUCTION_POSTGRES_SCHEMA=worksflow
+export WORKSFLOW_PRODUCTION_POSTGRES_POSTURE_TIMEOUT=30s
+
+go run ./cmd/production-postgres-posture > posture-result.json
+```
+
+The checker dynamically closes over every trusted-schema table, partition,
+sequence, view, index, column ACL and routine, so new migration/governance
+objects do not disappear behind the older exact-tree static counts. It reuses
+the API's exhaustive production posture and additionally requires migrator
+authority to come only through `worksflow_migration_owner`; the auditor must
+remain entirely outside the trusted data plane; and the promotion identity's
+effective table, column, sequence, function and ownership closure must match
+its exact consume-only boundary. It never prints DSNs, secret
+values, credential paths, endpoints, or driver errors. Exit `0` means this
+standalone posture passed; `2` is invalid configuration/trust material, `3` is
+an unsafe privilege posture, and `4` is an operational/inconclusive check.
+
+The JSON always declares
+`evidenceClass=standalone-point-in-time-posture-check` for compatibility and
+excludes
+`external-qualification-receipt`, `gc-scheduler-qualification`, and
+`promotion-authority`. A successful check is therefore not the planned
+production PostgreSQL qualification artifact, is not an atomic global
+snapshot, does not test the GC scheduler's same-run recovery, and is not
+consumed by Qualification Receipt or promotion. External composition must
+still obtain a maintenance-window or equivalent target-environment Receipt.
+
+### Exact-tree index retention operator
+
+Migration `000066` adds append-only run, capability, receipt and tombstone
+facts plus two private short-lived authorization tables. The latter bind the
+exact transaction ID, backend PID, tenant, tree, capability and blob; they are
+removed before the successful transaction returns and never become reusable
+capabilities. Planning ranks all ready publications before applying protection
+filters. Execution takes the exact tree lock and project-quota lock, rechecks
+the whole manifest publication under CAS, and returns exactly one immutable
+`deleted`, `protected`, `stale` or `expired` receipt.
+
+Every Candidate `current_tree_hash` protects its tree regardless of Candidate
+status, and a live build claim also protects its tree. A blob is deleted only
+after the target members/manifest are removed and no remaining tree in that
+project references the content hash. Tombstones bind the deleted publication
+and one-shot capability, so rebuilding the same tree produces a distinct
+publication instead of colliding with old deletion evidence.
+
+The policy defaults and hard limits are:
+
+| Input | Default | Database/CLI boundary |
+|---|---:|---:|
+| retention | 30 days (`720h`) | at least 7 days (`168h`) |
+| keep per project | 8 | at least 8 |
+| batch size | 25 | 1–100 |
+| capability TTL | 10 minutes | greater than zero, at most 15 minutes |
+
+Run the dedicated binary with a distinct low-privilege operator `LOGIN`. The
+run ID is a scheduler-supplied, canonical non-zero UUID and must remain stable
+across a crash or ambiguous result:
+
+```sh
+# Inject this environment value from the secret manager; it has no default.
+export WORKSFLOW_REPOSITORY_INDEX_GC_POSTGRES_DSN
+
+RUN_ID=8f0f3d35-4c4d-4b2f-b91d-e5d4d0f45847
+go run ./cmd/repository-index-gc \
+  -postgres-schema worksflow \
+  -run-id "$RUN_ID" \
+  -retention 720h \
+  -keep-per-project 8 \
+  -batch-size 25 \
+  -capability-ttl 10m \
+  -timeout 5m
+
+# Ambiguous response or process crash: repeat the exact command and RUN_ID.
+```
+
+The same operation is available through the opt-in Compose maintenance
+profile; it deliberately has no usable DSN, schema or run-ID default:
+
+```sh
+export WORKSFLOW_REPOSITORY_INDEX_GC_POSTGRES_DSN
+export WORKSFLOW_REPOSITORY_INDEX_GC_POSTGRES_SCHEMA=worksflow
+export WORKSFLOW_REPOSITORY_INDEX_GC_RUN_ID=8f0f3d35-4c4d-4b2f-b91d-e5d4d0f45847
+docker compose --profile maintenance run --rm repository-index-gc
+```
+
+Never create a replacement run while the first run has an unknown outcome.
+The same ID with changed policy is rejected; same-ID execution replays the
+existing capability/receipt identities. After the original run is fully
+inspected and terminal, a later scheduled batch receives a new run ID. A
+`protected`, `stale` or `expired` outcome is terminal evidence, not permission
+to bypass the guard with manual `DELETE`.
+
+Rollback is intentionally stricter than “no deletion happened.” It first takes
+an `ACCESS EXCLUSIVE` fence over all six GC control/audit/authorization tables,
+then refuses rollback if any run, capability, receipt, tombstone or transient
+authorization row exists. This prevents a concurrent execute from committing
+between a clean count and destructive DDL and prevents append-only non-deletion
+receipts from being discarded.
+
+Focused real-PostgreSQL canaries cover migration `000066`, the staging/
+production API role posture, and the real low-privilege operator LOGIN with
+interrupted same-run recovery. The
+operator test also rejects superuser `SET ROLE`, unexpected Candidate definer
+access and function owner/result/search-path tampering. These results prove
+repository-internal contracts only. Production role creation, full application
+DML, dedicated schema ownership and secret injection remain external
+deployment responsibilities and require their own evidence.
 
 Migration `000012` makes each workflow root unique within
 `(project, workflow run, manifest group, root ordinal)`. `manifest_group_key` is

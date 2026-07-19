@@ -1,0 +1,51 @@
+{
+  "schemaVersion": "worksflow-post-run-verification-contract/v1",
+  "suiteId": "model-profile-governance",
+  "executionKind": "post-run-verifier",
+  "status": "planned",
+  "controls": [
+    {
+      "id": "activation-decision",
+      "requiredArtifactIds": [
+        "activation-decision-record",
+        "model-governance-receipt",
+        "activation-registry-record"
+      ]
+    },
+    {
+      "id": "approved-profile",
+      "requiredArtifactIds": [
+        "approved-model-profile",
+        "model-governance-trust-policy"
+      ]
+    },
+    {
+      "id": "frozen-corpus-conformance",
+      "requiredArtifactIds": [
+        "frozen-model-conformance-corpus",
+        "conformance-corpus-result"
+      ]
+    },
+    {
+      "id": "provider-route-runner-source",
+      "requiredArtifactIds": [
+        "provider-route-authority",
+        "immutable-runner-source-binding"
+      ]
+    },
+    {
+      "id": "shadow-baseline-comparison",
+      "requiredArtifactIds": [
+        "shadow-comparison-receipt"
+      ]
+    },
+    {
+      "id": "signed-genesis-bootstrap",
+      "requiredArtifactIds": [
+        "signed-model-governance-genesis-decision",
+        "model-governance-genesis-receipt",
+        "initial-model-governance-revocation-authority"
+      ]
+    }
+  ]
+}

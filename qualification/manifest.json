@@ -1,0 +1,667 @@
+{
+  "schemaVersion": "worksflow-qualification-manifest/v1",
+  "subject": "worksflow-project-level-ai-constructor",
+  "sourceDocuments": [
+    "docs/ai-constructor-architecture.md",
+    "docs/full-stack-quality-profile.md",
+    "docs/golden-qualification-control-plane.md"
+  ],
+  "qualificationSupportPaths": [
+    "README.md",
+    "backend/Dockerfile",
+    "backend/cmd/production-postgres-posture/main.go",
+    "backend/cmd/production-postgres-posture/main_pg_test.go",
+    "backend/cmd/production-postgres-posture/main_test.go",
+    "backend/cmd/qualification-receipt/main.go",
+    "backend/cmd/qualification-receipt/main_test.go",
+    "backend/go.mod",
+    "backend/go.sum",
+    "backend/internal/contracts/reference/ai-conversation/acceptance-criteria.json",
+    "backend/internal/credentialset/canonical.go",
+    "backend/internal/credentialset/domain.go",
+    "backend/internal/credentialset/memory_store.go",
+    "backend/internal/credentialset/memory_store_test.go",
+    "backend/internal/credentialset/postgres.go",
+    "backend/internal/credentialset/postgres_pg_test.go",
+    "backend/internal/credentialset/service.go",
+    "backend/internal/credentialset/service_test.go",
+    "backend/internal/credentialset/validation.go",
+    "backend/internal/goldenfault/domain.go",
+    "backend/internal/goldenfault/evidence.go",
+    "backend/internal/goldenfault/postgres.go",
+    "backend/internal/goldenfault/postgres_pg_test.go",
+    "backend/internal/goldenfault/service.go",
+    "backend/internal/goldenfault/service_test.go",
+    "backend/internal/goldenfault/strict_json.go",
+    "backend/internal/goldenfault/verifier.go",
+    "backend/internal/goldenfault/verifier_test.go",
+    "backend/internal/modelgovernance/activation.go",
+    "backend/internal/modelgovernance/activation_test.go",
+    "backend/internal/modelgovernance/authority_domain.go",
+    "backend/internal/modelgovernance/authority_parser.go",
+    "backend/internal/modelgovernance/authority_test.go",
+    "backend/internal/modelgovernance/authority_trust.go",
+    "backend/internal/modelgovernance/authority_verifier.go",
+    "backend/internal/modelgovernance/canonical.go",
+    "backend/internal/modelgovernance/doc.go",
+    "backend/internal/modelgovernance/domain.go",
+    "backend/internal/modelgovernance/frozen_corpus_test.go",
+    "backend/internal/modelgovernance/genesis.go",
+    "backend/internal/modelgovernance/genesis_authority.go",
+    "backend/internal/modelgovernance/genesis_test.go",
+    "backend/internal/modelgovernance/memory.go",
+    "backend/internal/modelgovernance/model_profile_test.go",
+    "backend/internal/modelgovernance/postgres.go",
+    "backend/internal/modelgovernance/postgres_pg_test.go",
+    "backend/internal/modelgovernance/postgres_test.go",
+    "backend/internal/modelgovernance/validation.go",
+    "backend/internal/platform/postgres_role_posture.go",
+    "backend/internal/platform/postgres_role_posture_test.go",
+    "backend/internal/productionpostgres/checker.go",
+    "backend/internal/productionpostgres/checker_pg_test.go",
+    "backend/internal/productionpostgres/checker_test.go",
+    "backend/internal/productionpostgres/credentials.go",
+    "backend/internal/productionpostgres/credentials_test.go",
+    "backend/internal/productionpostgres/domain.go",
+    "backend/internal/qualificationevidence/domain.go",
+    "backend/internal/qualificationevidence/memory.go",
+    "backend/internal/qualificationevidence/memory_test.go",
+    "backend/internal/qualificationevidence/postgres.go",
+    "backend/internal/qualificationevidence/postgres_pg_test.go",
+    "backend/internal/qualificationevidence/service.go",
+    "backend/internal/qualificationevidence/service_test.go",
+    "backend/internal/qualificationevidence/strict.go",
+    "backend/internal/qualificationplanauthority/canonical.go",
+    "backend/internal/qualificationplanauthority/domain.go",
+    "backend/internal/qualificationplanauthority/memory.go",
+    "backend/internal/qualificationplanauthority/postgres.go",
+    "backend/internal/qualificationplanauthority/postgres_pg_test.go",
+    "backend/internal/qualificationplanauthority/service.go",
+    "backend/internal/qualificationplanauthority/service_test.go",
+    "backend/internal/qualificationpromotion/domain.go",
+    "backend/internal/qualificationpromotion/memory.go",
+    "backend/internal/qualificationpromotion/postgres.go",
+    "backend/internal/qualificationpromotion/postgres_pg_test.go",
+    "backend/internal/qualificationpromotion/service.go",
+    "backend/internal/qualificationpromotion/service_test.go",
+    "backend/internal/qualificationpromotion/strict.go",
+    "backend/internal/qualificationreceipt/artifacts.go",
+    "backend/internal/qualificationreceipt/authority.go",
+    "backend/internal/qualificationreceipt/authority_test.go",
+    "backend/internal/qualificationreceipt/domain.go",
+    "backend/internal/qualificationreceipt/encryption.go",
+    "backend/internal/qualificationreceipt/fault_evidence.go",
+    "backend/internal/qualificationreceipt/golden.go",
+    "backend/internal/qualificationreceipt/plan.go",
+    "backend/internal/qualificationreceipt/plan_test.go",
+    "backend/internal/qualificationreceipt/repository.go",
+    "backend/internal/qualificationreceipt/repository_test.go",
+    "backend/internal/qualificationreceipt/shape.go",
+    "backend/internal/qualificationreceipt/strict_json.go",
+    "backend/internal/qualificationreceipt/testdata/plan-vector/contracts/reference-acceptance-criteria.json",
+    "backend/internal/qualificationreceipt/testdata/plan-vector/docs/architecture.md",
+    "backend/internal/qualificationreceipt/testdata/plan-vector/frontend/playwright.golden.config.ts",
+    "backend/internal/qualificationreceipt/testdata/plan-vector/frontend/scripts/check-golden-environment.mjs",
+    "backend/internal/qualificationreceipt/testdata/plan-vector/frontend/tests/golden-reference.spec.ts",
+    "backend/internal/qualificationreceipt/testdata/plan-vector/frontend/tests/qualification-fixture.ts",
+    "backend/internal/qualificationreceipt/testdata/plan-vector/qualification/artifact-hygiene.json",
+    "backend/internal/qualificationreceipt/testdata/plan-vector/qualification/manifest.json",
+    "backend/internal/qualificationreceipt/testdata/plan-vector/qualification/test-inventory.json",
+    "backend/internal/qualificationreceipt/trust.go",
+    "backend/internal/qualificationreceipt/trust_test.go",
+    "backend/internal/qualificationreceipt/verifier.go",
+    "backend/internal/qualificationreceipt/verifier_test.go",
+    "backend/internal/qualificationreceiptv3/canonical.go",
+    "backend/internal/qualificationreceiptv3/canonical_test.go",
+    "backend/internal/qualificationreceiptv3/control_domain.go",
+    "backend/internal/qualificationreceiptv3/control_memory.go",
+    "backend/internal/qualificationreceiptv3/control_service.go",
+    "backend/internal/qualificationreceiptv3/control_service_test.go",
+    "backend/internal/qualificationreceiptv3/domain.go",
+    "backend/internal/qualificationreceiptv3/test_helpers_test.go",
+    "backend/internal/qualificationreceiptv3/verifier.go",
+    "backend/internal/qualificationreceiptv3/verifier_test.go",
+    "backend/internal/templateauthority/dsse.go",
+    "backend/internal/templateauthority/dsse_test.go",
+    "backend/migrations/000068_golden_fault_consume_ledger.down.sql",
+    "backend/migrations/000068_golden_fault_consume_ledger.up.sql",
+    "backend/migrations/000069_model_governance_activation_store.down.sql",
+    "backend/migrations/000069_model_governance_activation_store.up.sql",
+    "backend/migrations/000070_model_governance_signed_genesis.down.sql",
+    "backend/migrations/000070_model_governance_signed_genesis.up.sql",
+    "backend/migrations/000071_qualification_promotion_consume.down.sql",
+    "backend/migrations/000071_qualification_promotion_consume.up.sql",
+    "backend/migrations/000072_credential_set_event_store.down.sql",
+    "backend/migrations/000072_credential_set_event_store.up.sql",
+    "backend/migrations/000073_qualification_evidence_event_store.down.sql",
+    "backend/migrations/000073_qualification_evidence_event_store.up.sql",
+    "backend/migrations/000074_qualification_plan_authority.down.sql",
+    "backend/migrations/000074_qualification_plan_authority.up.sql",
+    "backend/migrations/credential_set_event_store_test.go",
+    "backend/migrations/golden_fault_consume_ledger_pg_test.go",
+    "backend/migrations/golden_fault_consume_ledger_test.go",
+    "backend/migrations/model_governance_activation_store_test.go",
+    "backend/migrations/model_governance_signed_genesis_test.go",
+    "backend/migrations/qualification_evidence_event_store_test.go",
+    "backend/migrations/qualification_plan_authority_test.go",
+    "backend/migrations/qualification_promotion_consume_test.go",
+    "docs/backend-development.md",
+    "docs/model-governance-authority.md",
+    "docs/platform-architecture.md",
+    "docs/qualification-evidence-orchestrator.md",
+    "docs/qualification-plan-authority.md",
+    "docs/qualification-promotion-operator.md",
+    "docs/qualification-receipt-v3.md",
+    "frontend/package.json",
+    "frontend/playwright.golden.config.ts",
+    "frontend/pnpm-lock.yaml",
+    "frontend/scripts/check-golden-environment.mjs",
+    "frontend/scripts/check-qualification-manifest.mjs",
+    "frontend/scripts/golden-authority.mjs",
+    "frontend/scripts/qualification-core.mjs",
+    "frontend/scripts/qualification-inventory.mjs",
+    "frontend/scripts/normalize-playwright-qualification.mjs",
+    "frontend/scripts/qualification-not-implemented.mjs",
+    "frontend/scripts/qualification-plan.mjs",
+    "frontend/scripts/qualification-source-policy.mjs",
+    "frontend/tests/qualification-policy.test.ts",
+    "frontend/tests/qualification-runtime.ts",
+    "frontend/tests/golden-agent.spec.ts",
+    "frontend/tests/golden-authority.test.ts",
+    "frontend/tests/golden-lsp.spec.ts",
+    "frontend/tests/golden-qualification-support.ts",
+    "frontend/tests/golden-reference.spec.ts",
+    "frontend/tests/golden-release.spec.ts",
+    "frontend/tests/golden-sandbox.spec.ts",
+    "qualification/artifact-hygiene.json",
+    "qualification/golden-fault-operation-set.json",
+    "qualification/README.md",
+    "qualification/schemas/golden-fault-authority-v1.schema.json",
+    "qualification/schemas/golden-fault-consume-receipt-v1.schema.json",
+    "qualification/schemas/golden-fault-ledger-attestation-v1.schema.json",
+    "qualification/model-profile-conformance.json",
+    "qualification/production-postgresql-posture.json",
+    "qualification/test-inventory.json"
+  ],
+  "policy": {
+    "stageExitRequiresExternalQualification": true,
+    "allowSkippedTests": false,
+    "allowMocks": false,
+    "allowMutableRuntimeImages": false,
+    "credentialBearingArtifacts": "restricted-encrypted-until-revocation",
+    "passingInternalSuitesAreStageExitEvidence": false
+  },
+  "suites": [
+    {
+      "id": "constructor-and-template-internal",
+      "mode": "internal-regression",
+      "executionKind": "internal-test",
+      "status": "implemented-internal",
+      "coverage": "internal-complete",
+      "requirementIds": [
+        "AIC-E2E-001",
+        "AIC-E2E-002",
+        "AIC-E2E-012",
+        "AIC-E2E-013",
+        "AIC-FAIL-001",
+        "AIC-FAIL-002",
+        "AIC-FAIL-003",
+        "AIC-FAIL-004",
+        "AIC-FAIL-006",
+        "AIC-FAIL-014",
+        "AIC-FAIL-015",
+        "AIC-FAIL-017",
+        "AIC-FAIL-018"
+      ],
+      "commands": [
+        "go test ./internal/contracts/... ./internal/core ./internal/constructor ./internal/templates ./internal/templateauthority -count=1",
+        "pnpm test:unit"
+      ],
+      "testPaths": [
+        "backend/internal/contracts",
+        "backend/internal/contracts/reference",
+        "backend/internal/core",
+        "backend/internal/constructor",
+        "backend/internal/templates",
+        "backend/internal/templateauthority",
+        "frontend/tests/constructor-platform-client.test.ts",
+        "frontend/tests/platform-flow.test.ts"
+      ],
+      "requiredArtifacts": [
+        "go-test-json",
+        "reference-ai-conversation-bundle-validation-log",
+        "reference-build-contract-deterministic-hash",
+        "frontend-unit-log",
+        "real-postgresql-canary-log"
+      ],
+      "limitations": [
+        "Does not approve the audited upstream TemplateRelease.",
+        "Reference compilation uses explicit test-only Template authorities and is not a Template admission receipt.",
+        "Does not replace an external Golden browser run."
+      ]
+    },
+    {
+      "id": "verification-internal",
+      "mode": "internal-regression",
+      "executionKind": "internal-test",
+      "status": "implemented-internal",
+      "coverage": "internal-complete",
+      "requirementIds": [
+        "AIC-E2E-011",
+        "FQP-E2E-001",
+        "FQP-E2E-002",
+        "FQP-E2E-003",
+        "FQP-E2E-005",
+        "FQP-E2E-006",
+        "FQP-E2E-007",
+        "FQP-E2E-008"
+      ],
+      "commands": [
+        "go test ./internal/verification ./internal/core ./migrations -count=1",
+        "go test -race ./internal/verification -count=1"
+      ],
+      "testPaths": [
+        "backend/internal/verification",
+        "backend/internal/core",
+        "backend/migrations"
+      ],
+      "requiredArtifacts": [
+        "go-test-json",
+        "go-race-log",
+        "real-postgresql-verification-receipt-canary"
+      ],
+      "limitations": [
+        "Internal receipts are not an approved Golden multi-service qualification."
+      ]
+    },
+    {
+      "id": "repository-internal",
+      "mode": "internal-regression",
+      "executionKind": "internal-test",
+      "status": "implemented-internal",
+      "coverage": "internal-complete",
+      "requirementIds": [
+        "AIC-E2E-023",
+        "AIC-E2E-024",
+        "AIC-FAIL-029",
+        "AIC-FAIL-030",
+        "AIC-FAIL-031",
+        "FQP-E2E-012",
+        "FQP-E2E-013"
+      ],
+      "commands": [
+        "go test ./internal/repository ./internal/sandbox ./migrations -count=1",
+        "pnpm test:unit"
+      ],
+      "testPaths": [
+        "backend/internal/repository",
+        "backend/internal/sandbox",
+        "backend/migrations",
+        "frontend/tests/candidate-search-ui.test.ts",
+        "frontend/tests/repository-candidate-head.test.ts",
+        "frontend/tests/sandbox-platform-client.test.ts"
+      ],
+      "requiredArtifacts": [
+        "go-test-json",
+        "frontend-unit-log",
+        "real-postgresql-redis-repository-canary"
+      ],
+      "limitations": [
+        "Does not qualify production PostgreSQL roles, secrets or the GC scheduler."
+      ]
+    },
+    {
+      "id": "lsp-internal",
+      "mode": "internal-regression",
+      "executionKind": "internal-test",
+      "status": "implemented-internal",
+      "coverage": "internal-complete",
+      "requirementIds": [
+        "AIC-FAIL-032",
+        "AIC-FAIL-033",
+        "AIC-FAIL-034",
+        "AIC-FAIL-035",
+        "LSP-QA-001",
+        "LSP-QA-002",
+        "LSP-QA-003",
+        "LSP-QA-004",
+        "LSP-QA-005",
+        "LSP-QA-006",
+        "LSP-QA-007",
+        "LSP-QA-008",
+        "LSP-QA-009",
+        "LSP-QA-010",
+        "LSP-QA-011",
+        "LSP-QA-012",
+        "LSP-QA-013",
+        "LSP-QA-014",
+        "LSP-QA-015"
+      ],
+      "commands": [
+        "go test ./internal/lsp ./internal/httpapi/transport -count=1",
+        "pnpm test:unit"
+      ],
+      "testPaths": [
+        "backend/internal/lsp",
+        "backend/internal/httpapi/transport/lsp_test.go",
+        "backend/internal/httpapi/transport/lsp_gateway_test.go",
+        "frontend/tests/lsp-platform-client.test.ts",
+        "frontend/tests/lsp-session.test.ts",
+        "frontend/tests/lsp-monaco.test.ts",
+        "frontend/tests/lsp-monaco-providers.test.ts"
+      ],
+      "requiredArtifacts": [
+        "go-test-json",
+        "frontend-unit-log",
+        "real-postgresql-redis-lsp-canary"
+      ],
+      "limitations": [
+        "Uses protocol/runtime fixtures and cannot satisfy LSP-QA-016."
+      ]
+    },
+    {
+      "id": "runtime-supply-chain-internal",
+      "mode": "internal-regression",
+      "executionKind": "internal-test",
+      "status": "implemented-internal",
+      "coverage": "internal-complete",
+      "requirementIds": [
+        "FQP-E2E-015"
+      ],
+      "commands": [
+        "make runtime-image-contract-check",
+        "docker compose build api frontend agent-model-host-relay",
+        "make runtime-images"
+      ],
+      "testPaths": [
+        "sandbox-runner/validate-runner-build-args.sh",
+        "sandbox-runner/Dockerfile",
+        "agent-runner/Dockerfile",
+        "backend/Dockerfile",
+        "frontend/Dockerfile",
+        "deploy/check-compose-contracts.sh"
+      ],
+      "requiredArtifacts": [
+        "build-contract-self-test-log",
+        "positive-image-build-log",
+        "mutable-and-sri-negative-build-log",
+        "non-root-version-smoke",
+        "sandbox-pty-preview-canary"
+      ],
+      "limitations": [
+        "Local image builds are not Registry approval, SBOM, signature or provenance evidence."
+      ]
+    },
+    {
+      "id": "sandbox-golden-external",
+      "mode": "external-qualification",
+      "executionKind": "playwright",
+      "qualificationGroup": "golden",
+      "status": "not-qualified",
+      "coverage": "external-complete",
+      "requirementIds": [
+        "AIC-E2E-003",
+        "AIC-E2E-004",
+        "AIC-E2E-005",
+        "AIC-E2E-006",
+        "AIC-E2E-007"
+      ],
+      "qualificationCommand": "pnpm --dir frontend qualification:golden",
+      "testPaths": [
+        "frontend/tests/golden-sandbox.spec.ts"
+      ],
+      "requiredArtifacts": [
+        "approved-template-release-receipt",
+        "repository-snapshot-receipt",
+        "sandbox-session-event-log",
+        "process-port-health-log",
+        "browser-video",
+        "credential-safe-trace",
+        "zero-skip-playwright-json"
+      ],
+      "blockers": [
+        "The 4-case executable source closure has not run against an approved Golden TemplateRelease and exact full-stack endpoint.",
+        "The target still lacks external Sandbox fault-adapter, credential, trace-encryption, and immutable Receipt evidence."
+      ]
+    },
+    {
+      "id": "agent-golden-external",
+      "mode": "external-qualification",
+      "executionKind": "playwright",
+      "qualificationGroup": "golden",
+      "status": "not-qualified",
+      "coverage": "external-complete",
+      "requirementIds": [
+        "AIC-E2E-008",
+        "AIC-E2E-009",
+        "AIC-FAIL-005",
+        "AIC-FAIL-007",
+        "AIC-FAIL-008",
+        "AIC-FAIL-009",
+        "AIC-FAIL-010",
+        "AIC-FAIL-011"
+      ],
+      "qualificationCommand": "pnpm --dir frontend qualification:golden",
+      "testPaths": [
+        "frontend/tests/golden-agent.spec.ts"
+      ],
+      "requiredArtifacts": [
+        "registry-approved-agent-runner-attestation",
+        "live-provider-profile-receipt",
+        "attempt-event-stream",
+        "patch-validation-receipt",
+        "merge-undo-receipts",
+        "security-isolation-findings",
+        "browser-video",
+        "credential-safe-trace"
+      ],
+      "blockers": [
+        "The 4-case executable source closure has not run with credential-backed live Provider qualification.",
+        "No target run has proved the fixture-approved Agent Runner or one-shot Agent fault adapters.",
+        "No encrypted capture, immutable qualification Receipt, or downstream consumption evidence exists."
+      ]
+    },
+    {
+      "id": "reference-ai-golden-external",
+      "mode": "external-qualification",
+      "executionKind": "playwright",
+      "qualificationGroup": "golden",
+      "status": "not-qualified",
+      "coverage": "external-complete",
+      "requirementIds": [
+        "AIC-E2E-010",
+        "FQP-E2E-004"
+      ],
+      "qualificationCommand": "pnpm --dir frontend qualification:golden",
+      "testPaths": [
+        "frontend/tests/golden-reference.spec.ts"
+      ],
+      "criterionSource": {
+        "path": "backend/internal/contracts/reference/ai-conversation/acceptance-criteria.json",
+        "schemaVersion": "reference-acceptance-criteria/v1",
+        "applicationId": "reference-ai-conversation-v1"
+      },
+      "requiredArtifacts": [
+        "reference-application-contract-bundle",
+        "typed-ai-stream-log",
+        "persistence-restart-receipt",
+        "two-principal-auth-tenant-matrix",
+        "service-image-and-command-log",
+        "browser-video",
+        "credential-safe-trace"
+      ],
+      "blockers": [
+        "The 6-case executable source closure has not run against the exact generated Reference application and its independently authenticated A/B principals.",
+        "No target run has produced real process-restart, gateway-outage, rate-limit, retention, audit, encrypted capture, or immutable Receipt evidence."
+      ]
+    },
+    {
+      "id": "release-golden-external",
+      "mode": "external-qualification",
+      "executionKind": "playwright",
+      "qualificationGroup": "golden",
+      "status": "not-qualified",
+      "coverage": "external-complete",
+      "requirementIds": [
+        "AIC-E2E-014",
+        "AIC-E2E-015",
+        "AIC-E2E-016",
+        "AIC-E2E-017",
+        "AIC-E2E-018",
+        "AIC-E2E-019",
+        "AIC-E2E-020",
+        "AIC-E2E-021",
+        "AIC-E2E-022",
+        "AIC-FAIL-012",
+        "AIC-FAIL-013",
+        "AIC-FAIL-019",
+        "AIC-FAIL-020",
+        "AIC-FAIL-021",
+        "AIC-FAIL-022",
+        "AIC-FAIL-023",
+        "AIC-FAIL-024",
+        "AIC-FAIL-025",
+        "AIC-FAIL-026",
+        "AIC-FAIL-027",
+        "AIC-FAIL-028",
+        "FQP-E2E-009",
+        "FQP-E2E-010",
+        "FQP-E2E-011"
+      ],
+      "qualificationCommand": "pnpm --dir frontend qualification:golden",
+      "testPaths": [
+        "frontend/tests/golden-release.spec.ts"
+      ],
+      "requiredArtifacts": [
+        "signed-release-bundle",
+        "controller-identity-and-trust-receipt",
+        "controller-fault-injection-log",
+        "preview-receipt-v2",
+        "production-receipt-v2",
+        "deployment-and-rollback-revisions",
+        "same-digest-promotion-proof"
+      ],
+      "blockers": [
+        "The 5-case executable source closure has not run against a qualified Release Controller, Registry/KMS, Secret Broker, or target cluster.",
+        "No target run has produced one-shot Controller fault receipts, same-digest deployment evidence, encrypted capture, or immutable qualification Receipt."
+      ]
+    },
+    {
+      "id": "lsp-golden-external",
+      "mode": "external-qualification",
+      "executionKind": "playwright",
+      "qualificationGroup": "golden",
+      "status": "not-qualified",
+      "coverage": "external-complete",
+      "requirementIds": [
+        "AIC-E2E-025",
+        "AIC-FAIL-036",
+        "FQP-E2E-014",
+        "LSP-QA-016"
+      ],
+      "qualificationCommand": "pnpm --dir frontend qualification:golden",
+      "testPaths": [
+        "frontend/tests/golden-lsp.spec.ts"
+      ],
+      "requiredArtifacts": [
+        "approved-language-server-profile",
+        "server-image-and-capability-hash",
+        "real-ingress-wss-fault-matrix",
+        "browser-video",
+        "credential-safe-trace",
+        "resource-and-security-results",
+        "zero-skip-playwright-json"
+      ],
+      "blockers": [
+        "The 3-case executable source closure has not run with the fixture-approved language-server profile, image, real WSS ingress, and credential.",
+        "No target run has produced one-shot LSP fault receipts, resource/audit evidence, encrypted capture, or immutable qualification Receipt."
+      ]
+    },
+    {
+      "id": "qualification-artifact-hygiene",
+      "mode": "external-qualification",
+      "executionKind": "post-run-verifier",
+      "qualificationGroup": "golden",
+      "status": "not-qualified",
+      "coverage": "planned",
+      "requirementIds": [
+        "FQP-E2E-016"
+      ],
+      "qualificationCommand": "pnpm --dir frontend qualification:golden",
+      "verificationContractPath": "qualification/artifact-hygiene.json",
+      "requiredArtifacts": [
+        "acceptance-test-artifact-coverage-receipt",
+        "zero-mock-zero-skip-playwright-json",
+        "credential-set-issuance-receipt",
+        "credential-set-revocation-receipt",
+        "golden-authority-document",
+        "golden-fault-ledger-attestation",
+        "golden-fixture-document",
+        "credential-safe-trace",
+        "browser-video",
+        "immutable-signed-qualification-receipt"
+      ],
+      "blockers": [
+        "The atomic CredentialSet service and durable PostgreSQL event/CAS store are implemented internally, but no dedicated production operator/login/DSN, real atomic Secret Broker, issuer/revoker, KMS/HSM signer, crash-before-call not-invoked recovery contract, or one-time delivery claim/ack ledger exists; no external issuance/revocation or credential-safe encrypted-trace evidence has been produced.",
+        "The exact qualification-evidence lifecycle and owner-only durable PostgreSQL event/CAS Store implement request/digest closure, database-authoritative chronology, global operation reservations, Inspect-only recovery, and the 512-artifact bound internally; there is no immutable-plan resolver, dedicated production operator/login/DSN, post-issuance abort-and-exact-revoke path, or real capture/encryption/KMS/index/sign/seal/verification adapter.",
+        "No real fault adapters or external fault-operator/fault-ledger-attestor orchestration has produced the authority, consume-receipt, and run-ledger artifacts.",
+        "The internal immutable Receipt verifier exists, but no external runner/approver has signed and sealed a qualifying evidence snapshot."
+      ]
+    },
+    {
+      "id": "model-profile-governance",
+      "mode": "governance-qualification",
+      "executionKind": "post-run-verifier",
+      "qualificationGroup": "model-profile",
+      "status": "not-qualified",
+      "coverage": "partial",
+      "requirementIds": [
+        "AIC-FAIL-016"
+      ],
+      "verificationContractPath": "qualification/model-profile-conformance.json",
+      "requiredArtifacts": [
+        "approved-model-profile",
+        "frozen-model-conformance-corpus",
+        "conformance-corpus-result",
+        "shadow-comparison-receipt",
+        "provider-route-authority",
+        "model-governance-trust-policy",
+        "immutable-runner-source-binding",
+        "signed-model-governance-genesis-decision",
+        "model-governance-genesis-receipt",
+        "initial-model-governance-revocation-authority",
+        "activation-decision-record",
+        "model-governance-receipt",
+        "activation-registry-record"
+      ],
+      "blockers": [
+        "The strict verifier, durable PostgreSQL append-only CAS ActivationStore, signed Genesis bootstrap, receipt-bound signer-policy history, and cumulative revocation epoch fence are implemented internally, but the independent production operator, provisioned trust/revocation authorities, common authority epoch/data-plane consume fence, and authority wiring do not exist.",
+        "No production authority has signed a Genesis decision/receipt or provisioned its exact initial revocation/trust anchor for a target workload.",
+        "No approved model, frozen-corpus run, live shadow comparison, provider-route authority, immutable runner evidence or production ModelGovernanceReceipt has been produced."
+      ]
+    },
+    {
+      "id": "production-postgresql-identity-external",
+      "mode": "external-qualification",
+      "executionKind": "post-run-verifier",
+      "qualificationGroup": "postgresql",
+      "status": "not-qualified",
+      "coverage": "planned",
+      "requirementIds": [
+        "AIC-FAIL-037"
+      ],
+      "qualificationCommand": "pnpm --dir frontend qualification:postgresql",
+      "verificationContractPath": "qualification/production-postgresql-posture.json",
+      "requiredArtifacts": [
+        "five-stable-nologin-role-posture",
+        "four-distinct-login-dsn-posture",
+        "dedicated-schema-and-dml-receipt",
+        "secret-injection-receipt",
+        "gc-scheduler-same-run-recovery-receipt"
+      ],
+      "blockers": [
+        "The standalone bounded-window checker is implemented internally; its four connections use separate catalog snapshots, and target production credentials/execution, secret-injection evidence, GC scheduler same-run recovery, maintenance-window evidence, and external composition remain absent."
+      ]
+    }
+  ]
+}

@@ -26,6 +26,7 @@ services:
       context: ./frontend
       dockerfile: Dockerfile
       args:
+        NODE_IMAGE: ${FRONTEND_NODE_IMAGE:-node@sha256:16e22a550f3863206a3f701448c45f7912c6896a62de43add43bb9c86130c3e2}
         NEXT_PUBLIC_PLATFORM_API_URL: ${NEXT_PUBLIC_PLATFORM_API_URL:-/api/platform}
         NEXT_PUBLIC_PLATFORM_WS_URL: ${NEXT_PUBLIC_PLATFORM_WS_URL:-/api/platform/v1/ws}
     environment:
@@ -57,6 +58,62 @@ services:
       timeout: 3s
       retries: 20
     restart: unless-stopped
+
+  migrate:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      args:
+        GO_IMAGE: ${BACKEND_GO_IMAGE:-golang@sha256:1a478681b671001b7f029f94b5016aed984a23ad99c707f6a0ab6563860ae2f3}
+        RUNTIME_IMAGE: ${BACKEND_RUNTIME_IMAGE:-alpine@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc}
+    entrypoint: ["/usr/local/bin/migrate"]
+    environment:
+      # Local Compose intentionally reuses the development DSN. Production
+      # must inject separate migration-owner credentials into this process.
+      WORKSFLOW_MIGRATION_POSTGRES_DSN: ${WORKSFLOW_MIGRATION_POSTGRES_DSN:-postgres://worksflow:worksflow@postgres:5432/worksflow?sslmode=disable}
+      WORKSFLOW_MIGRATION_POSTGRES_SCHEMA: ${WORKSFLOW_MIGRATION_POSTGRES_SCHEMA:-public}
+      WORKSFLOW_MIGRATION_TIMEOUT: ${WORKSFLOW_MIGRATION_TIMEOUT:-30m}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    init: true
+    restart: "no"
+
+  repository-index-gc:
+    profiles: ["maintenance"]
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      args:
+        GO_IMAGE: ${BACKEND_GO_IMAGE:-golang@sha256:1a478681b671001b7f029f94b5016aed984a23ad99c707f6a0ab6563860ae2f3}
+        RUNTIME_IMAGE: ${BACKEND_RUNTIME_IMAGE:-alpine@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc}
+    entrypoint: ["/usr/local/bin/repository-index-gc"]
+    command:
+      - -postgres-schema
+      - ${WORKSFLOW_REPOSITORY_INDEX_GC_POSTGRES_SCHEMA:-}
+      - -run-id
+      - ${WORKSFLOW_REPOSITORY_INDEX_GC_RUN_ID:-}
+      - -retention
+      - ${WORKSFLOW_REPOSITORY_INDEX_GC_RETENTION:-720h}
+      - -keep-per-project
+      - ${WORKSFLOW_REPOSITORY_INDEX_GC_KEEP_PER_PROJECT:-8}
+      - -batch-size
+      - ${WORKSFLOW_REPOSITORY_INDEX_GC_BATCH_SIZE:-25}
+      - -capability-ttl
+      - ${WORKSFLOW_REPOSITORY_INDEX_GC_CAPABILITY_TTL:-10m}
+      - -timeout
+      - ${WORKSFLOW_REPOSITORY_INDEX_GC_TIMEOUT:-5m}
+    environment:
+      # Intentionally has no usable default. This must identify one distinct
+      # LOGIN that inherits only worksflow_repository_index_gc_operator.
+      WORKSFLOW_REPOSITORY_INDEX_GC_POSTGRES_DSN: ${WORKSFLOW_REPOSITORY_INDEX_GC_POSTGRES_DSN:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    init: true
+    restart: "no"
 
   redis:
     image: redis:7.4-alpine
@@ -99,17 +156,24 @@ services:
 
   storage-init:
     image: alpine:3.20
-    command: ["sh", "-c", "chown -R 10001:10001 /var/lib/worksflow/quality /var/lib/worksflow/published"]
+    command: ["sh", "-c", "chown -R 10001:10001 /var/lib/worksflow/quality /var/lib/worksflow/verification /var/lib/worksflow/published /var/lib/worksflow/sandboxes /var/lib/worksflow/agent-worktrees /var/lib/worksflow/template-sources"]
     network_mode: none
     volumes:
       - quality-workspaces:/var/lib/worksflow/quality
+      - verification-workspaces:/var/lib/worksflow/verification
       - published-data:/var/lib/worksflow/published
+      - sandbox-workspaces:/var/lib/worksflow/sandboxes
+      - agent-worktrees:/var/lib/worksflow/agent-worktrees
+      - template-source-cache:/var/lib/worksflow/template-sources
     restart: "no"
 
   sandbox:
     image: docker:27-dind
     privileged: true
-    command: ["--host=tcp://0.0.0.0:2375", "--host=unix:///var/run/docker.sock"]
+    command:
+      - "--host=tcp://0.0.0.0:2375"
+      - "--host=unix:///var/run/worksflow-sandbox/docker.sock"
+      - "--group=10001"
     environment:
       DOCKER_TLS_CERTDIR: ""
     expose:
@@ -117,6 +181,10 @@ services:
     volumes:
       - sandbox-data:/var/lib/docker
       - quality-workspaces:/var/lib/worksflow/quality
+      - verification-workspaces:/var/lib/worksflow/verification
+      - sandbox-workspaces:/var/lib/worksflow/sandboxes
+      - agent-worktrees:/var/lib/worksflow/agent-worktrees
+      - sandbox-runtime:/var/run/worksflow-sandbox
     networks:
       - sandbox-net
     healthcheck:
@@ -126,20 +194,62 @@ services:
       retries: 20
     restart: unless-stopped
 
+  # This path-confined HTTP relay shares the DinD network namespace. The inner
+  # relay can reach it through host-gateway, while the isolated Agent Runner
+  # remains attached only to its dedicated internal Docker network.
+  agent-model-host-relay:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      args:
+        GO_IMAGE: ${BACKEND_GO_IMAGE:-golang@sha256:1a478681b671001b7f029f94b5016aed984a23ad99c707f6a0ab6563860ae2f3}
+        RUNTIME_IMAGE: ${BACKEND_RUNTIME_IMAGE:-alpine@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc}
+    entrypoint: ["/usr/local/bin/agent-model-relay"]
+    environment:
+      WORKSFLOW_MODEL_RELAY_LISTEN_ADDRESS: 0.0.0.0:18080
+      WORKSFLOW_MODEL_RELAY_TARGET_ORIGIN: http://api:8080
+      WORKSFLOW_MODEL_RELAY_REQUEST_TIMEOUT: ${AGENT_MODEL_RELAY_REQUEST_TIMEOUT:-8h1m}
+    network_mode: service:sandbox
+    depends_on:
+      sandbox:
+        condition: service_healthy
+    read_only: true
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,size=16777216,uid=10001,gid=10001,mode=0700
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/agent-model-relay", "healthcheck"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 2s
+    init: true
+    restart: unless-stopped
+
   sandbox-images:
     image: docker:27-cli
     environment:
       DOCKER_HOST: tcp://sandbox:2375
       NODE_IMAGE: ${DELIVERY_SANDBOX_NODE_IMAGE:-node:22-alpine}
       GO_IMAGE: ${DELIVERY_SANDBOX_GO_IMAGE:-golang:1.22-alpine}
+      SANDBOX_ENABLED: ${SANDBOX_ENABLED:-false}
+      SANDBOX_RUNNER_IMAGE: ${SANDBOX_RUNNER_IMAGE:-}
+      LSP_ENABLED: ${LSP_ENABLED:-false}
+      LSP_PRELOAD_IMAGES: ${LSP_PRELOAD_IMAGES:-}
+      AGENT_ENABLED: ${AGENT_ENABLED:-false}
+      AGENT_RUNNER_IMAGE: ${AGENT_RUNNER_IMAGE:-}
+      AGENT_RUNNER_NETWORK: ${AGENT_RUNNER_NETWORK:-worksflow-agent-model}
+      AGENT_MODEL_RELAY_REQUEST_TIMEOUT: ${AGENT_MODEL_RELAY_REQUEST_TIMEOUT:-8h1m}
+    volumes:
+      - ./deploy/prepare-sandbox-runtime.sh:/usr/local/share/worksflow/prepare-sandbox-runtime.sh:ro
     command:
       - /bin/sh
-      - -ec
-      - |
-        docker pull "$$NODE_IMAGE"
-        docker pull "$$GO_IMAGE"
+      - /usr/local/share/worksflow/prepare-sandbox-runtime.sh
     depends_on:
       sandbox:
+        condition: service_healthy
+      agent-model-host-relay:
         condition: service_healthy
     networks:
       - sandbox-net
@@ -149,20 +259,26 @@ services:
     build:
       context: ./backend
       dockerfile: Dockerfile
+      args:
+        GO_IMAGE: ${BACKEND_GO_IMAGE:-golang@sha256:1a478681b671001b7f029f94b5016aed984a23ad99c707f6a0ab6563860ae2f3}
+        RUNTIME_IMAGE: ${BACKEND_RUNTIME_IMAGE:-alpine@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc}
     environment:
-      APP_ENV: development
+      APP_ENV: ${APP_ENV:-development}
       SERVICE_NAME: worksflow-api
       LOG_LEVEL: info
       LOG_FORMAT: json
       HTTP_HOST: 0.0.0.0
       HTTP_PORT: 8080
-      STARTUP_MIGRATE: "true"
+      HTTP_WRITE_TIMEOUT: ${HTTP_WRITE_TIMEOUT:-5m}
       STARTUP_ENSURE_MONGO_INDEXES: "true"
       STARTUP_ENSURE_NATS_STREAM: "true"
       OUTBOX_ENABLED: "true"
       CORS_ALLOWED_ORIGINS: ${PLATFORM_ALLOWED_ORIGINS:-http://localhost:${NGINX_PORT:-10000},http://127.0.0.1:${NGINX_PORT:-10000}}
       CORS_ALLOW_CREDENTIALS: "true"
-      POSTGRES_DSN: postgres://worksflow:worksflow@postgres:5432/worksflow?sslmode=disable
+      # Local defaults use the development owner. Shared deployments must
+      # inject a distinct low-privilege application LOGIN and trusted schema.
+      POSTGRES_DSN: ${POSTGRES_DSN:-postgres://worksflow:worksflow@postgres:5432/worksflow?sslmode=disable}
+      POSTGRES_SCHEMA: ${POSTGRES_SCHEMA:-public}
       REDIS_ADDRESS: redis:6379
       MONGO_URI: mongodb://root:worksflow@mongo:27017/?authSource=admin
       MONGO_DATABASE: worksflow
@@ -188,6 +304,102 @@ services:
       DELIVERY_QUALITY_TEMP_ROOT: /var/lib/worksflow/quality
       DELIVERY_PUBLISH_ROOT: /var/lib/worksflow/published
       DELIVERY_PUBLISH_BASE_URL: ${DELIVERY_PUBLISH_BASE_URL:-http://localhost:${NGINX_PORT:-10000}/published}
+      # Release delivery remains disabled unless the operator supplies the
+      # complete, controller-qualified v3 identity below. Keep every value in
+      # Compose so the documented opt-in command actually reaches the API.
+      RELEASE_DELIVERY_WORKER_ENABLED: ${RELEASE_DELIVERY_WORKER_ENABLED:-false}
+      RELEASE_DELIVERY_WORKER_ID: ${RELEASE_DELIVERY_WORKER_ID:-}
+      RELEASE_DELIVERY_CONTROLLER_URL: ${RELEASE_DELIVERY_CONTROLLER_URL:-}
+      RELEASE_DELIVERY_CONTROLLER_TOKEN: ${RELEASE_DELIVERY_CONTROLLER_TOKEN:-}
+      RELEASE_DELIVERY_CONTROLLER_ID: ${RELEASE_DELIVERY_CONTROLLER_ID:-}
+      RELEASE_DELIVERY_CONTROLLER_VERSION: ${RELEASE_DELIVERY_CONTROLLER_VERSION:-}
+      RELEASE_DELIVERY_CONTROLLER_PROTOCOL: ${RELEASE_DELIVERY_CONTROLLER_PROTOCOL:-worksflow.release-delivery/v3}
+      RELEASE_DELIVERY_CONTROLLER_TRUST_KEY_DIGEST: ${RELEASE_DELIVERY_CONTROLLER_TRUST_KEY_DIGEST:-}
+      RELEASE_DELIVERY_LEASE_DURATION: ${RELEASE_DELIVERY_LEASE_DURATION:-5m}
+      RELEASE_DELIVERY_POLL_INTERVAL: ${RELEASE_DELIVERY_POLL_INTERVAL:-1s}
+      RELEASE_DELIVERY_RECONCILE_DELAY: ${RELEASE_DELIVERY_RECONCILE_DELAY:-5s}
+      RELEASE_DELIVERY_REQUEST_TIMEOUT: ${RELEASE_DELIVERY_REQUEST_TIMEOUT:-2m}
+      RELEASE_DELIVERY_RESPONSE_MAX_BYTES: ${RELEASE_DELIVERY_RESPONSE_MAX_BYTES:-1048576}
+      TEMPLATE_SOURCE_GIT_BINARY: git
+      TEMPLATE_SOURCE_CACHE_ROOT: /var/lib/worksflow/template-sources
+      TEMPLATE_SOURCE_ALLOWED_HOSTS: ${TEMPLATE_SOURCE_ALLOWED_HOSTS:-github.com}
+      TEMPLATE_SOURCE_FETCH_TIMEOUT: ${TEMPLATE_SOURCE_FETCH_TIMEOUT:-2m}
+      SANDBOX_ENABLED: ${SANDBOX_ENABLED:-false}
+      SANDBOX_RUNNER_IMAGE: ${SANDBOX_RUNNER_IMAGE:-}
+      SANDBOX_RUNTIME: docker
+      SANDBOX_DAEMON_HOST: tcp://sandbox:2375
+      SANDBOX_WORKSPACE_ROOT: /var/lib/worksflow/sandboxes
+      SANDBOX_GATEWAY_NETWORK: bridge
+      # The nested DinD daemon publishes only onto the private sandbox-net;
+      # the API is the sole application service on that network that dials it.
+      SANDBOX_GATEWAY_BIND_ADDRESS: 0.0.0.0
+      SANDBOX_PREVIEW_DIAL_HOST: sandbox
+      SANDBOX_PREVIEW_PUBLIC_ORIGIN: ${SANDBOX_PREVIEW_PUBLIC_ORIGIN:-http://preview.localhost:${NGINX_PORT:-10000}}
+      SANDBOX_PREVIEW_TICKET_TTL: ${SANDBOX_PREVIEW_TICKET_TTL:-15m}
+      # LSP uses the shared local daemon socket. Its runtime boundary rejects
+      # remote TCP daemons, shell/PATH lookup, pulls, and mutable image tags.
+      LSP_ENABLED: ${LSP_ENABLED:-false}
+      LSP_RUNTIME_BINARY: /usr/bin/docker
+      LSP_DAEMON_HOST: unix:///var/run/worksflow-sandbox/docker.sock
+      LSP_ALLOWED_ORIGINS: ${PLATFORM_ALLOWED_ORIGINS:-http://localhost:${NGINX_PORT:-10000},http://127.0.0.1:${NGINX_PORT:-10000}}
+      LSP_REQUIRE_TLS: "false"
+      LSP_TICKET_TTL: ${LSP_TICKET_TTL:-20s}
+      LSP_BIND_TIMEOUT: ${LSP_BIND_TIMEOUT:-5s}
+      LSP_WRITE_WAIT: ${LSP_WRITE_WAIT:-2s}
+      LSP_COMMAND_TIMEOUT: ${LSP_COMMAND_TIMEOUT:-30s}
+      LSP_CLI_OUTPUT_MAX_BYTES: ${LSP_CLI_OUTPUT_MAX_BYTES:-1048576}
+      LSP_REDIS_PREFIX: ${LSP_REDIS_PREFIX:-worksflow:sandbox:lsp:}
+      VERIFICATION_WORKER_ENABLED: ${VERIFICATION_WORKER_ENABLED:-true}
+      VERIFICATION_RUNTIME: docker
+      VERIFICATION_DAEMON_HOST: tcp://sandbox:2375
+      VERIFICATION_WORKSPACE_ROOT: /var/lib/worksflow/verification
+      VERIFICATION_MEMORY: ${VERIFICATION_MEMORY:-1g}
+      VERIFICATION_CPUS: ${VERIFICATION_CPUS:-1.0}
+      VERIFICATION_PIDS: ${VERIFICATION_PIDS:-256}
+      VERIFICATION_OUTPUT_MAX_BYTES: ${VERIFICATION_OUTPUT_MAX_BYTES:-1048576}
+      VERIFICATION_TEMP_BYTES: ${VERIFICATION_TEMP_BYTES:-536870912}
+      VERIFICATION_POLL_INTERVAL: ${VERIFICATION_POLL_INTERVAL:-1s}
+      VERIFICATION_LEASE_DURATION: ${VERIFICATION_LEASE_DURATION:-2m}
+      VERIFICATION_HEARTBEAT: ${VERIFICATION_HEARTBEAT:-30s}
+      # Agent execution is opt-in and fails startup unless every immutable
+      # identity hash, digest-pinned Runner and provider secret is present.
+      # Its Runner can reach only the two-hop path-confined Model Relay.
+      AGENT_ENABLED: ${AGENT_ENABLED:-false}
+      AGENT_WORKER_ENABLED: ${AGENT_WORKER_ENABLED:-false}
+      AGENT_WORKER_ID: ${AGENT_WORKER_ID:-}
+      AGENT_EXECUTOR_PROFILE_ID: ${AGENT_EXECUTOR_PROFILE_ID:-codex-default}
+      AGENT_EXECUTOR_ADAPTER: ${AGENT_EXECUTOR_ADAPTER:-codex-cli}
+      AGENT_EXECUTOR_PROVIDER: ${AGENT_EXECUTOR_PROVIDER:-openai}
+      AGENT_EXECUTOR_MODEL: ${AGENT_EXECUTOR_MODEL:-gpt-5}
+      AGENT_RUNNER_IMAGE: ${AGENT_RUNNER_IMAGE:-}
+      AGENT_RUNTIME: docker
+      AGENT_DAEMON_HOST: tcp://sandbox:2375
+      AGENT_WORKTREE_ROOT: /var/lib/worksflow/agent-worktrees
+      AGENT_RUNNER_NETWORK: ${AGENT_RUNNER_NETWORK:-worksflow-agent-model}
+      AGENT_RUNNER_MEMORY: ${AGENT_RUNNER_MEMORY:-4g}
+      AGENT_RUNNER_CPUS: ${AGENT_RUNNER_CPUS:-2.0}
+      AGENT_RUNNER_PIDS: ${AGENT_RUNNER_PIDS:-256}
+      AGENT_RUNNER_OUTPUT_MAX_BYTES: ${AGENT_RUNNER_OUTPUT_MAX_BYTES:-8388608}
+      AGENT_MODEL_GATEWAY_BASE_URL: http://worksflow-agent-model-relay:18080/internal/agent-model/v1
+      AGENT_MODEL_GATEWAY_REDIS_PREFIX: ${AGENT_MODEL_GATEWAY_REDIS_PREFIX:-worksflow:agent:model:}
+      AGENT_MODEL_POLICY_HASH: ${AGENT_MODEL_POLICY_HASH:-}
+      AGENT_PARAMETERS_HASH: ${AGENT_PARAMETERS_HASH:-}
+      AGENT_PROMPT_HASH: ${AGENT_PROMPT_HASH:-}
+      AGENT_OUTPUT_SCHEMA_HASH: ${AGENT_OUTPUT_SCHEMA_HASH:-}
+      AGENT_TOOLCHAIN_HASH: ${AGENT_TOOLCHAIN_HASH:-}
+      AGENT_ALLOWED_TOOLS: ${AGENT_ALLOWED_TOOLS:-file.read,file.write,file.search,shell.exec,diagnostic.read}
+      AGENT_WALL_TIME: ${AGENT_WALL_TIME:-4m}
+      AGENT_MAX_INPUT_TOKENS: ${AGENT_MAX_INPUT_TOKENS:-200000}
+      AGENT_MAX_OUTPUT_TOKENS: ${AGENT_MAX_OUTPUT_TOKENS:-50000}
+      AGENT_MAX_COMMANDS: ${AGENT_MAX_COMMANDS:-200}
+      AGENT_MAX_LOG_BYTES: ${AGENT_MAX_LOG_BYTES:-8388608}
+      AGENT_MAX_PATCH_BYTES: ${AGENT_MAX_PATCH_BYTES:-16777216}
+      AGENT_MAX_CONTEXT_FILES: ${AGENT_MAX_CONTEXT_FILES:-256}
+      AGENT_CLAIM_BATCH: ${AGENT_CLAIM_BATCH:-10}
+      AGENT_POLL_INTERVAL: ${AGENT_POLL_INTERVAL:-1s}
+      AGENT_LEASE_DURATION: ${AGENT_LEASE_DURATION:-2m}
+      AGENT_HEARTBEAT: ${AGENT_HEARTBEAT:-30s}
+      AI_PROVIDER: openai
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
       OPENAI_RESPONSES_URL: ${OPENAI_RESPONSES_URL:-}
@@ -201,13 +413,20 @@ services:
       OPENAI_PROJECT: ${OPENAI_PROJECT:-}
     volumes:
       - quality-workspaces:/var/lib/worksflow/quality
+      - verification-workspaces:/var/lib/worksflow/verification
       - published-data:/var/lib/worksflow/published
+      - sandbox-workspaces:/var/lib/worksflow/sandboxes
+      - agent-worktrees:/var/lib/worksflow/agent-worktrees
+      - sandbox-runtime:/var/run/worksflow-sandbox
+      - template-source-cache:/var/lib/worksflow/template-sources
     networks:
       - default
       - sandbox-net
     depends_on:
       postgres:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
       redis:
         condition: service_healthy
       mongo:
@@ -218,6 +437,8 @@ services:
         condition: service_completed_successfully
       sandbox-images:
         condition: service_completed_successfully
+      agent-model-host-relay:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:8080/health/ready"]
       interval: 10s
@@ -233,8 +454,13 @@ volumes:
   mongo-data:
   nats-data:
   sandbox-data:
+  sandbox-runtime:
   quality-workspaces:
+  verification-workspaces:
+  sandbox-workspaces:
+  agent-worktrees:
   published-data:
+  template-source-cache:
 
 networks:
   sandbox-net:

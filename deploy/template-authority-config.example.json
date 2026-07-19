@@ -1,0 +1,74 @@
+{
+  "schemaVersion": "template-artifact-authority-config/v1",
+  "authority": {
+    "id": "worksflow-template-authority",
+    "version": "2026.07",
+    "verifierImageDigest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    "predicateType": "https://worksflow.example/schemas/template-artifact-admission/v1",
+    "expectedPolicyHash": "",
+    "expectedTrustRootDigest": ""
+  },
+  "source": {
+    "gitBinary": "git",
+    "cacheRoot": "/var/lib/worksflow/template-sources",
+    "allowedHosts": [
+      "github.com"
+    ],
+    "fetchTimeout": "2m0s"
+  },
+  "registry": {
+    "origins": [
+      {
+        "host": "registry.example.com",
+        "authorizationEnv": "WORKSFLOW_TEMPLATE_REGISTRY_AUTHORIZATION",
+        "redirectHosts": []
+      }
+    ],
+    "repositories": [
+      {
+        "host": "registry.example.com",
+        "repository": "worksflow/templates"
+      }
+    ],
+    "maxManifestBytes": 4194304,
+    "maxBlobBytes": 268435456,
+    "maxTotalBytes": 1073741824,
+    "maxBlobs": 128,
+    "maxRedirects": 4,
+    "timeout": "2m0s"
+  },
+  "dsse": {
+    "keys": [
+      {
+        "keyId": "ci-2026-01",
+        "algorithm": "ed25519",
+        "identity": "template-ci@example.com",
+        "publicKeyFile": "/run/worksflow/trust/ci-2026-01.pem"
+      }
+    ],
+    "allowedPayloadTypes": [
+      "application/vnd.in-toto+json"
+    ],
+    "allowedPredicateTypes": [
+      "https://worksflow.example/schemas/template-artifact-admission/v1"
+    ],
+    "minSignatures": 1
+  },
+  "transparency": {
+    "logs": [
+      {
+        "id": "template-log-2026",
+        "keys": [
+          {
+            "keyId": "log-2026-01",
+            "algorithm": "ed25519",
+            "identity": "template-log@example.com",
+            "publicKeyFile": "/run/worksflow/trust/log-2026-01.pem"
+          }
+        ]
+      }
+    ],
+    "maxEntryAge": "168h0m0s",
+    "maxFutureSkew": "5m0s"
+  }
+}

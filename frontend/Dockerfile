@@ -1,11 +1,15 @@
-FROM node:22-alpine AS dependencies
+ARG NODE_IMAGE
+
+FROM ${NODE_IMAGE} AS dependencies
+ARG NODE_IMAGE
 
 WORKDIR /app
+RUN printf '%s\n' "${NODE_IMAGE}" | grep -Eq '^[^[:space:]@]+@sha256:[0-9a-f]{64}$'
 RUN corepack enable && corepack prepare pnpm@11.8.0 --activate
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
 RUN pnpm install --frozen-lockfile
 
-FROM node:22-alpine AS build
+FROM ${NODE_IMAGE} AS build
 
 WORKDIR /app
 RUN corepack enable && corepack prepare pnpm@11.8.0 --activate
@@ -19,7 +23,7 @@ ENV NEXT_PUBLIC_PLATFORM_WS_URL=$NEXT_PUBLIC_PLATFORM_WS_URL
 
 RUN pnpm build
 
-FROM node:22-alpine AS runtime
+FROM ${NODE_IMAGE} AS runtime
 
 ENV NODE_ENV=production
 ENV HOSTNAME=0.0.0.0

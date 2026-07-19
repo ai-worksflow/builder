@@ -1,0 +1,60 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://worksflow.dev/schemas/golden-fault-consume-receipt-v1.json",
+  "title": "Worksflow Golden fault consume receipt v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "adapterInvocationId", "adapterResultDigest", "authorityId", "completedAt", "envelopeDigest",
+    "expectedFenceDigest", "fixtureId", "observedFenceDigest", "observedHeadDigest", "operationKind",
+    "outcome", "payloadDigest", "predicateDigest", "reservedAt", "resolutionDigest", "resolvedFenceDigest",
+    "resolvedHeadDigest", "resolvedResourceId", "resourceSelector", "resultId", "runId", "schemaVersion"
+  ],
+  "properties": {
+    "adapterInvocationId": {"$ref": "#/$defs/uuidV4"},
+    "adapterResultDigest": {"$ref": "#/$defs/digest"},
+    "authorityId": {"$ref": "#/$defs/uuidV4"},
+    "completedAt": {"$ref": "#/$defs/time"},
+    "envelopeDigest": {"$ref": "#/$defs/digest"},
+    "expectedFenceDigest": {"$ref": "#/$defs/digest"},
+    "fixtureId": {"$ref": "#/$defs/uuidV4"},
+    "observedFenceDigest": {"$ref": "#/$defs/digest"},
+    "observedHeadDigest": {"$ref": "#/$defs/digest"},
+    "operationKind": {
+      "enum": [
+        "agent-runner-crash",
+        "agent-runner-timeout",
+        "agent-security-canary",
+        "controller-conflict",
+        "controller-maintenance",
+        "controller-not-found",
+        "controller-timeout",
+        "lsp-resource-pressure",
+        "lsp-runtime-crash",
+        "lsp-runtime-drift",
+        "reference-gateway-outage",
+        "reference-process-restart",
+        "sandbox-dependency-crash"
+      ]
+    },
+    "outcome": {"enum": ["applied", "refused"]},
+    "payloadDigest": {"$ref": "#/$defs/digest"},
+    "predicateDigest": {"$ref": "#/$defs/digest"},
+    "reservedAt": {"$ref": "#/$defs/time"},
+    "resolutionDigest": {"$ref": "#/$defs/digest"},
+    "resolvedFenceDigest": {"$ref": "#/$defs/digest"},
+    "resolvedHeadDigest": {"$ref": "#/$defs/digest"},
+    "resolvedResourceId": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,511}$"},
+    "resourceSelector": {
+      "enum": ["agent.patch-policy", "agent.runner", "lsp.runtime", "reference.gateway", "reference.process", "release.controller", "sandbox.dependency"]
+    },
+    "resultId": {"$ref": "#/$defs/uuidV4"},
+    "runId": {"$ref": "#/$defs/uuidV4"},
+    "schemaVersion": {"const": "worksflow-golden-fault-consume-receipt/v1"}
+  },
+  "$defs": {
+    "digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "uuidV4": {"type": "string", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"},
+    "time": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\\.[0-9]{3}Z$"}
+  }
+}
