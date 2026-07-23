@@ -867,6 +867,22 @@ export interface ApplyProposalInputDto {
   readonly expectedDraftContentHash?: ContentHash
 }
 
+export interface AdvanceProposalInputDto {
+  readonly acceptedOperationIds: readonly EntityId[]
+  readonly reviewerIds: readonly EntityId[]
+  readonly reviewSummary: string
+  readonly approveReview?: boolean
+  readonly soloReviewConfirmed?: boolean
+}
+
+export interface AdvanceProposalResultDto {
+  readonly stage: 'review_requested' | 'approved'
+  readonly proposal: ProposalDto
+  readonly draft?: ArtifactDraftDto<JsonValue>
+  readonly revision: ArtifactRevisionDto<JsonValue>
+  readonly review: ReviewDto
+}
+
 export interface ProposalDraftSnapshotDto {
   readonly expectedDraftId: EntityId
   readonly expectedDraftEtag: string

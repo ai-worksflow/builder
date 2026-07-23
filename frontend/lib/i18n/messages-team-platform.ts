@@ -301,6 +301,9 @@ const definitions = {
   'teamPlatform.blueprint.workflowStartFailed': ['无法启动选择工作流。', 'Unable to start the selection workflow.'],
 
   'teamPlatform.pageSpec.applySelected': ['决定每项操作并应用所选更改', 'Decide every operation and apply selected changes'],
+  'teamPlatform.pageSpec.applySelectedAdvanced': ['高级：仅应用手动选择项', 'Advanced: apply only the manual selection'],
+  'teamPlatform.pageSpec.reviewAndContinue': ['确认这些更改并自动继续', 'Confirm these changes and continue automatically'],
+  'teamPlatform.pageSpec.advancingProposal': ['正在应用、创建修订并处理审核…', 'Applying, creating the revision, and processing review…'],
   'teamPlatform.pageSpec.applyingProposal': ['正在应用提案…', 'Applying proposal…'],
   'teamPlatform.pageSpec.applyWorkflowProposalFirst': ['请先在“提案”页签审核并应用工作流绑定的精确提案。', 'Review and apply the exact workflow-linked proposal in the Proposal tab first.'],
   'teamPlatform.pageSpec.askAi': ['请求 AI 生成页面规范提案', 'Ask AI for a PageSpec proposal'],

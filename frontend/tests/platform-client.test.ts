@@ -139,6 +139,46 @@ test('domain clients encode identifiers and add idempotency keys to create reque
   assert.equal(capturedUrl, 'https://platform.example.test/v1/projects/project%2Fa')
 })
 
+test('proposal automation sends one idempotent intent without client-owned concurrency fields', async () => {
+  let capturedUrl = ''
+  let capturedInit: RequestInit | undefined
+  const http = new HttpClient({
+    baseUrl: 'https://platform.example.test',
+    requestIdFactory: () => 'automation-request',
+    fetch: (async (input, init) => {
+      capturedUrl = input.toString()
+      capturedInit = init
+      return json({
+        stage: 'review_requested',
+        proposal: { id: 'proposal/a' },
+        revision: { id: 'revision-1' },
+        review: { id: 'review-1' },
+      })
+    }) as FetchLike,
+  })
+  const clients = createPlatformDomainClients(http)
+
+  await clients.proposals.advance('proposal/a', {
+    acceptedOperationIds: ['operation-1'],
+    reviewerIds: ['reviewer-1'],
+    reviewSummary: 'Reviewed exact changes',
+  }, { idempotencyKey: 'automation-1' })
+
+  assert.equal(
+    capturedUrl,
+    'https://platform.example.test/v1/output-proposals/proposal%2Fa/advance',
+  )
+  assert.equal(capturedInit?.method, 'POST')
+  const headers = new Headers(capturedInit?.headers)
+  assert.equal(headers.get('idempotency-key'), 'automation-1')
+  assert.equal(headers.has('if-match'), false)
+  assert.equal(capturedInit?.body, JSON.stringify({
+    acceptedOperationIds: ['operation-1'],
+    reviewerIds: ['reviewer-1'],
+    reviewSummary: 'Reviewed exact changes',
+  }))
+})
+
 test('dependency commands pin exact immutable refs without display-only revision numbers', async () => {
   let capturedUrl = ''
   let capturedBody: unknown

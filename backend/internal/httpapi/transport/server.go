@@ -5,6 +5,7 @@ import (
 	"log/slog"
 
 	"github.com/worksflow/builder/backend/internal/auth"
+	"github.com/worksflow/builder/backend/internal/automation"
 	documentcollaboration "github.com/worksflow/builder/backend/internal/collaboration"
 	"github.com/worksflow/builder/backend/internal/config"
 	"github.com/worksflow/builder/backend/internal/core"
@@ -104,6 +105,10 @@ type ProposalService interface {
 	Apply(context.Context, string, string, core.ApplyProposalInput) (core.ArtifactDraft, error)
 }
 
+type ProposalAutomationService interface {
+	AdvanceProposal(context.Context, string, string, automation.AdvanceProposalInput) (automation.AdvanceProposalResult, error)
+}
+
 type WorkbenchService interface {
 	CreateBundle(context.Context, string, string, core.CreateWorkbenchBundleInput) (core.WorkbenchBundle, error)
 	GetBundle(context.Context, string, string) (core.WorkbenchBundle, error)
@@ -152,6 +157,7 @@ type Services struct {
 	Baselines      BaselineService
 	Impacts        ImpactService
 	Proposals      ProposalService
+	Automation     ProposalAutomationService
 	Workbench      WorkbenchService
 	Implementation ImplementationService
 	Activity       ActivityService

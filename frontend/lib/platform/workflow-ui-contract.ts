@@ -110,6 +110,19 @@ export function resolveWorkflowProposalReference(
   return inferredProposalId || explicitProposalId
 }
 
+export function workflowReviewNodeAfterEdit(
+  run: WorkflowRunDto | null | undefined,
+  editNode: Pick<WorkflowNodeRunDto, 'definitionNodeId' | 'sliceId'>,
+) {
+  if (!run || !editNode.definitionNodeId.endsWith('-edit')) return undefined
+  const reviewDefinitionNodeId = `${editNode.definitionNodeId.slice(0, -'-edit'.length)}-review`
+  const matches = run.nodes.filter((node) =>
+    node.definitionNodeId === reviewDefinitionNodeId
+      && (node.sliceId ?? '') === (editNode.sliceId ?? ''),
+  )
+  return matches.length === 1 ? matches[0] : undefined
+}
+
 export function workflowEditorTargetForArtifact(
   definition: WorkflowDefinitionDto | null | undefined,
   run: WorkflowRunDto | null,

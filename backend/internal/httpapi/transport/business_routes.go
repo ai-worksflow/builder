@@ -118,6 +118,8 @@ func (s *Server) RegisterBusinessRoutes(group *gin.RouterGroup, persistence ...g
 	conditionalCommand(http.MethodPost, "/proposals/:proposalId/decisions", s.DecideOutputProposal)
 	conditionalCommand(http.MethodPost, "/output-proposals/:proposalId/apply", s.ApplyOutputProposal)
 	conditionalCommand(http.MethodPost, "/proposals/:proposalId/apply", s.ApplyOutputProposal)
+	command(http.MethodPost, "/output-proposals/:proposalId/advance", s.AdvanceOutputProposal)
+	command(http.MethodPost, "/proposals/:proposalId/advance", s.AdvanceOutputProposal)
 
 	command(http.MethodPost, "/projects/:projectId/workbench-bundles", s.CreateWorkbenchBundle)
 	command(http.MethodPost, "/projects/:projectId/build-manifests", s.CreateWorkbenchBundle)

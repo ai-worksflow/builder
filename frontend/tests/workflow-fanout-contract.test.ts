@@ -4,7 +4,9 @@ import {
   parseEditableDefinition,
   resolveWorkflowProposalReference,
   starterWorkflowDefinition,
+  workflowReviewNodeAfterEdit,
 } from '../lib/platform/workflow-ui-contract'
+import type { WorkflowRunDto } from '../lib/platform/flow-contract'
 
 const starter = starterWorkflowDefinition()
 assert.equal(starter.schemaVersion, '4')
@@ -79,5 +81,15 @@ assert.equal(
   resolveWorkflowProposalReference('run-1', '', 'active-proposal'),
   'active-proposal',
 )
+const reviewNode = workflowReviewNodeAfterEdit({
+  nodes: [
+    { key: 'review-a', definitionNodeId: 'page-spec-review', sliceId: 'slice-a' },
+    { key: 'review-b', definitionNodeId: 'page-spec-review', sliceId: 'slice-b' },
+  ],
+} as unknown as WorkflowRunDto, {
+  definitionNodeId: 'page-spec-edit',
+  sliceId: 'slice-b',
+})
+assert.equal(reviewNode?.key, 'review-b')
 
 console.log('✓ workflow fan-out uses exact resolvers and atomically creates unique reciprocal merge pairs')

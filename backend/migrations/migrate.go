@@ -112,6 +112,20 @@ var acceptedMigrationChecksumRotations = map[string][]migrationChecksumRotation{
 			replayCurrentUpInTx: true,
 		},
 	},
+	"000088_sandbox_absolute_ttl_transition_boundary": {{
+		version:      "000088_sandbox_absolute_ttl_transition_boundary",
+		fromChecksum: "a28b8007381c1da3e83e38c738ff834863794ee816c93e2eae470754b0d16075",
+		toChecksum:   "34e7e14fd199a7088fd4605338b5cd2d8ddb4990b623eb931d62cac0c0aa3138",
+		fromDown:     "e39e0ef664eb5f987f7ab30ba9ec6fc757df00603a69fa90e7aec741660bc294",
+		toDown:       "54a87d283c7f3a26b9944d3ae40236af1acb884632a851a1b9fe09cea01d7294",
+	}},
+	"000089_sandbox_absolute_ttl_checkpoint_guard": {{
+		version:      "000089_sandbox_absolute_ttl_checkpoint_guard",
+		fromChecksum: "f24a481d320b8bcf2223acbdf073013836f08f69691782b3db2b3c35396385eb",
+		toChecksum:   "33791c3e858a64eb3a433a1d3e7f699de97f5cebb14b95af073edad165b156d0",
+		fromDown:     "4659f3a80cc7d44e3b0d870b72cd2bef3dcabdc8cd40a2ff00cc5584ff5c7a8d",
+		toDown:       "0692bc6c5f16298f515ce01b0439d78cc2e00c9ee5c00050bb65e41ec2a04030",
+	}},
 }
 
 // This is the only accepted migration-version relocation. An earlier build

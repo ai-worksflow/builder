@@ -15,6 +15,7 @@ import (
 	"github.com/worksflow/builder/backend/internal/agent"
 	"github.com/worksflow/builder/backend/internal/ai"
 	"github.com/worksflow/builder/backend/internal/auth"
+	"github.com/worksflow/builder/backend/internal/automation"
 	documentcollaboration "github.com/worksflow/builder/backend/internal/collaboration"
 	"github.com/worksflow/builder/backend/internal/config"
 	"github.com/worksflow/builder/backend/internal/constructor"
@@ -1374,11 +1375,16 @@ func Run(ctx context.Context, cfg config.Config, logger *slog.Logger) (runErr er
 	if err != nil {
 		return fmt.Errorf("create conversation control-plane transport: %w", err)
 	}
+	proposalAutomation, err := automation.NewService(proposalService, artifactService, reviewService)
+	if err != nil {
+		return fmt.Errorf("create proposal automation service: %w", err)
+	}
 	apiTransport := transport.NewServer(transport.Services{
 		Auth: authService, Projects: projectService, Members: memberService, Access: accessControl,
 		Artifacts: artifactService, Traces: traceService, Reviews: reviewService, Comments: commentService,
 		Baselines: baselineService, Impacts: impactService, Proposals: proposalService,
-		Workbench: workbenchService, Implementation: implementationService, Activity: activityService,
+		Automation: proposalAutomation,
+		Workbench:  workbenchService, Implementation: implementationService, Activity: activityService,
 		Generation: generationService, Collaboration: documentCollaborationService,
 	}, cfg, logger)
 	idempotencyRequestLimit := cfg.HTTP.MaxJSONBodyBytes

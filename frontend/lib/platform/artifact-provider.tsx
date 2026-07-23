@@ -40,6 +40,8 @@ import {
 } from './artifact-workspace'
 import { normalizeBlueprintContent } from './blueprint-content'
 import type {
+  AdvanceProposalInputDto,
+  AdvanceProposalResultDto,
   ArtifactRevisionDto,
   ArtifactDraftDto,
   BlueprintContentDto,
@@ -178,6 +180,10 @@ interface ArtifactWorkspaceContextState extends ArtifactWorkspaceSnapshot {
     acceptedOperationIds: readonly string[],
     discardDraftSnapshot?: ProposalDraftSnapshotDto,
   ) => Promise<ArtifactDraftDto<JsonValue>>
+  readonly advanceProposal: (
+    proposalId: string,
+    input: AdvanceProposalInputDto,
+  ) => Promise<AdvanceProposalResultDto>
   readonly decideProposalOperation: (
     proposal: Pick<ProposalDto, 'id' | 'version'>,
     operationId: string,
@@ -676,6 +682,11 @@ export function ArtifactWorkspaceProvider({ children }: { children: ReactNode })
       updateSnapshotProposalApply(result.appliedProposal, result.data, mutationScope)
       await revalidateRef.current()
       return result.data
+    },
+    advanceProposal: async (proposalId, input) => {
+      const result = await gateway.advanceProposal(proposalId, input)
+      await revalidateRef.current()
+      return result
     },
     decideProposalOperation: async (proposal, operationId, decision, reason) => {
       const result = await gateway.decideProposalOperation(

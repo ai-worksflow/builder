@@ -72,7 +72,7 @@ func (s *Service) AdvanceProposal(
 	if s == nil || ctx == nil || strings.TrimSpace(proposalID) == "" || strings.TrimSpace(actorID) == "" {
 		return AdvanceProposalResult{}, fmt.Errorf("%w: proposal automation identity", core.ErrInvalidInput)
 	}
-	accepted, err := exactIDSet("accepted operation", input.AcceptedOperationIDs, true)
+	accepted, err := exactIDSet("accepted operation", input.AcceptedOperationIDs, false)
 	if err != nil {
 		return AdvanceProposalResult{}, err
 	}
@@ -191,7 +191,6 @@ func (s *Service) decidePending(
 			reason = ""
 			finalAccepted++
 		}
-		current, _ = refreshOperation(current, operation.ID)
 		updated, err := s.proposals.Decide(ctx, current.ID, actorID, core.DecideProposalInput{
 			OperationID: operation.ID,
 			Decision:    decision,
@@ -336,18 +335,6 @@ func sortedKeys(values map[string]bool) []string {
 	}
 	sort.Strings(result)
 	return result
-}
-
-func refreshOperation(
-	proposal domain.OutputProposal,
-	operationID string,
-) (domain.OutputProposal, domain.ProposalOperation) {
-	for _, operation := range proposal.Operations {
-		if operation.ID == operationID {
-			return proposal, operation
-		}
-	}
-	return proposal, domain.ProposalOperation{}
 }
 
 func proposalRevision(revision *core.ArtifactRevision, proposalID string) *core.ArtifactRevision {

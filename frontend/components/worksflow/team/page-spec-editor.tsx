@@ -12,6 +12,7 @@ import { usePlatformFlow } from '@/lib/platform/flow-provider'
 import {
   resolveWorkflowProposalReference,
   workflowEditorTargetForArtifact,
+  workflowReviewNodeAfterEdit,
 } from '@/lib/platform/workflow-ui-contract'
 import { useWorksflow } from '@/lib/worksflow/store'
 import {
@@ -180,6 +181,11 @@ export function PageSpecEditor({
     && review.target.revisionId === latestVersion?.revisionId,
   )
   const currentUserId = collaboration.session.signedIn ? collaboration.session.user.id : null
+  const automationReviewer = reviewCandidatesForGovernance(
+    collaboration.members,
+    currentUserId,
+    collaboration.project?.governanceMode ?? 'team',
+  )[0]
   const clientIssues = content ? pageSpecReviewIssues(content) : []
   const draftMatchesLatest = Boolean(
     latestVersion
@@ -382,6 +388,71 @@ export function PageSpecEditor({
       setSaveState('idle')
       setTab('versions')
       await loadDetails()
+    } catch (cause) {
+      setError(errorMessage(cause, t('teamPlatform.pageSpec.operationFailed')))
+    } finally {
+      setProposalBusyId('')
+    }
+  }
+
+  async function advanceProposal(proposal: ProposalDto) {
+    if (
+      proposalBusyId
+      || dirty
+      || saveState === 'saving'
+      || saveState === 'conflict'
+      || !automationReviewer
+      || (workflowContextRequested && (!workflowProposalId || proposal.id !== workflowProposalId))
+      || (workflowContextRequested && !linkedProposalBaseMatchesDraft)
+    ) return
+    const selected = selectedOperations[proposal.id] ?? []
+    const acceptedOperationIds = proposal.operations
+      .filter((operation) =>
+        operation.decision === 'accepted'
+          || operation.decision === 'applied'
+          || (selected.length > 0
+            ? selected.includes(operation.id)
+            : operation.decision === 'pending'),
+      )
+      .map((operation) => operation.id)
+    const solo = collaboration.project?.governanceMode === 'solo'
+    setProposalBusyId(proposal.id)
+    setError(null)
+    try {
+      const result = await workspace.advanceProposal(proposal.id, {
+        acceptedOperationIds,
+        reviewerIds: [automationReviewer.user.id],
+        reviewSummary,
+        approveReview: solo,
+        soloReviewConfirmed: solo,
+      })
+      setConfirmedAppliedProposalId(proposal.id)
+      setCreatedWorkflowRevisionId(result.revision.id)
+      setSaveState('saved')
+      await Promise.all([workspace.refresh(), collaboration.refresh(), loadDetails()])
+      if (result.stage !== 'approved' || !workflowReference.runId) {
+        setTab('review')
+        return
+      }
+      const editNode = flow.run?.id === workflowReference.runId
+        ? flow.run.nodes.find((node) => node.key === workflowReference.nodeKey)
+        : undefined
+      if (!editNode?.allowedActions?.includes('submit_input')) {
+        setSurface('workbench')
+        return
+      }
+      const submitted = await flow.submitNodeRevision(editNode, {
+        artifactId: result.revision.artifactId,
+        revisionId: result.revision.id,
+        contentHash: result.revision.contentHash,
+      })
+      if (!submitted) return
+      const updatedRun = await flow.loadRun(workflowReference.runId)
+      const reviewNode = workflowReviewNodeAfterEdit(updatedRun, editNode)
+      if (reviewNode?.allowedActions?.includes('approve_review')) {
+        await flow.resolveReview(reviewNode, 'approve', reviewSummary, solo)
+      }
+      setSurface('workbench')
     } catch (cause) {
       setError(errorMessage(cause, t('teamPlatform.pageSpec.operationFailed')))
     } finally {
@@ -595,6 +666,7 @@ export function PageSpecEditor({
               outputSchemaVersion: 'page-spec.patch.v1',
             }).catch((cause) => setError(errorMessage(cause, t('teamPlatform.pageSpec.operationFailed'))))}
             onApply={(proposal) => void applyProposal(proposal)}
+            onAdvance={(proposal) => void advanceProposal(proposal)}
           />
         )}
         {tab === 'trace' && (
@@ -732,7 +804,7 @@ function InteractionsEditor({ interactions, readOnly, onChange }: { interactions
   )
 }
 
-function ProposalEditor({ proposals, selected, onSelected, instruction, onInstruction, canEdit, canCreate, linkedProposalId, proposalBusyId, applyBlocked, onCreate, onApply }: { proposals: readonly ProposalDto[]; selected: Record<string, string[]>; onSelected: (next: Record<string, string[]>) => void; instruction: string; onInstruction: (value: string) => void; canEdit: boolean; canCreate: boolean; linkedProposalId: string; proposalBusyId: string; applyBlocked: boolean; onCreate: () => void; onApply: (proposal: ProposalDto) => void }) {
+function ProposalEditor({ proposals, selected, onSelected, instruction, onInstruction, canEdit, canCreate, linkedProposalId, proposalBusyId, applyBlocked, onCreate, onApply, onAdvance }: { proposals: readonly ProposalDto[]; selected: Record<string, string[]>; onSelected: (next: Record<string, string[]>) => void; instruction: string; onInstruction: (value: string) => void; canEdit: boolean; canCreate: boolean; linkedProposalId: string; proposalBusyId: string; applyBlocked: boolean; onCreate: () => void; onApply: (proposal: ProposalDto) => void; onAdvance: (proposal: ProposalDto) => void }) {
   const { t } = useI18n()
   return (
     <div className="mx-auto max-w-4xl space-y-3">
@@ -764,7 +836,8 @@ function ProposalEditor({ proposals, selected, onSelected, instruction, onInstru
                 </label>
               ))}
             </div>
-            <button type="button" onClick={() => onApply(proposal)} disabled={!canEdit || !isLinked || applyBlocked || Boolean(proposalBusyId) || !hasAccepted || !['open', 'reviewing', 'ready'].includes(proposal.status)} className="mt-2 rounded bg-primary px-2.5 py-1.5 text-[9px] font-semibold text-primary-foreground disabled:opacity-40">{proposalBusyId === proposal.id ? t('teamPlatform.pageSpec.applyingProposal') : t('teamPlatform.pageSpec.applySelected')}</button>
+            <button type="button" onClick={() => onAdvance(proposal)} disabled={!canEdit || !isLinked || applyBlocked || Boolean(proposalBusyId) || !['open', 'reviewing', 'ready'].includes(proposal.status)} className="mt-2 w-full rounded bg-primary px-2.5 py-2 text-[9px] font-semibold text-primary-foreground disabled:opacity-40">{proposalBusyId === proposal.id ? t('teamPlatform.pageSpec.advancingProposal') : t('teamPlatform.pageSpec.reviewAndContinue')}</button>
+            <button type="button" aria-label={t('teamPlatform.pageSpec.applySelected')} onClick={() => onApply(proposal)} disabled={!canEdit || !isLinked || applyBlocked || Boolean(proposalBusyId) || !hasAccepted || !['open', 'reviewing', 'ready'].includes(proposal.status)} className="mt-1.5 rounded border border-border px-2.5 py-1.5 text-[8px] text-muted-foreground disabled:opacity-40">{t('teamPlatform.pageSpec.applySelectedAdvanced')}</button>
             {linkedProposalId && !isLinked && <p className="mt-1 text-[8px] text-faint-foreground">{t('teamPlatform.pageSpec.notWorkflowProposal')}</p>}
           </article>
         )

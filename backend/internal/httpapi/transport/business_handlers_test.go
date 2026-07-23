@@ -13,6 +13,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/worksflow/builder/backend/internal/ai"
+	"github.com/worksflow/builder/backend/internal/automation"
 	"github.com/worksflow/builder/backend/internal/core"
 	"github.com/worksflow/builder/backend/internal/domain"
 	"github.com/worksflow/builder/backend/internal/generation"
@@ -40,6 +41,7 @@ func TestBusinessRouteRegistrationCoversCoreResources(t *testing.T) {
 		"POST /v1/projects/:projectId/blueprint-selections/compile",
 		"POST /v1/output-proposals/:proposalId/decisions",
 		"POST /v1/output-proposals/:proposalId/apply",
+		"POST /v1/output-proposals/:proposalId/advance",
 		"POST /v1/projects/:projectId/workbench-bundles",
 		"POST /v1/implementation-proposals/:implementationProposalId/quarantine",
 		"POST /v1/implementation-proposals/:implementationProposalId/apply",
@@ -51,6 +53,36 @@ func TestBusinessRouteRegistrationCoversCoreResources(t *testing.T) {
 		if !routes[expected] {
 			t.Errorf("missing route %s", expected)
 		}
+	}
+}
+
+func TestProposalAutomationReceivesOnlyStableUserIntent(t *testing.T) {
+	service := &fakeProposalAutomationService{result: automation.AdvanceProposalResult{
+		Stage: "review_requested",
+		Proposal: domain.OutputProposal{
+			ID: "proposal-1",
+		},
+		Revision: core.ArtifactRevision{ID: "revision-1"},
+		Review:   core.ReviewRequest{ID: "review-1"},
+	}}
+	router := newBusinessRouter(t, transport.Services{Automation: service})
+	headers := authenticatedHeaders(true)
+	headers.Set("Idempotency-Key", "proposal-automation-1")
+	headers.Set("Content-Type", "application/json")
+	response := performRequest(
+		router,
+		http.MethodPost,
+		"/v1/output-proposals/proposal-1/advance",
+		[]byte(`{"acceptedOperationIds":["operation-1"],"reviewerIds":["reviewer-1"],"reviewSummary":"Reviewed exact changes"}`),
+		headers,
+	)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+	}
+	if service.calls != 1 || service.proposalID != "proposal-1" || service.actorID != testUserID ||
+		len(service.input.AcceptedOperationIDs) != 1 || service.input.AcceptedOperationIDs[0] != "operation-1" ||
+		len(service.input.ReviewerIDs) != 1 || service.input.ReviewerIDs[0] != "reviewer-1" {
+		t.Fatalf("automation input = %#v", service)
 	}
 }
 
@@ -670,6 +702,26 @@ type fakeArtifactService struct {
 	reviewGateArtifactID string
 	reviewGateActorID    string
 	updateInputs         []core.UpdateDraftInput
+}
+
+type fakeProposalAutomationService struct {
+	result     automation.AdvanceProposalResult
+	input      automation.AdvanceProposalInput
+	proposalID string
+	actorID    string
+	calls      int
+}
+
+func (fake *fakeProposalAutomationService) AdvanceProposal(
+	_ context.Context,
+	proposalID, actorID string,
+	input automation.AdvanceProposalInput,
+) (automation.AdvanceProposalResult, error) {
+	fake.calls++
+	fake.proposalID = proposalID
+	fake.actorID = actorID
+	fake.input = input
+	return fake.result, nil
 }
 
 func (f *fakeArtifactService) Create(_ context.Context, projectID, actor string, input core.CreateArtifactInput) (core.VersionedArtifact, error) {

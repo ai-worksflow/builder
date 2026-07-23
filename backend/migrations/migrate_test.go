@@ -310,6 +310,44 @@ func TestForwardEquivalencePortabilityChecksumRotationIsExact(t *testing.T) {
 	}
 }
 
+func TestSandboxAbsoluteTTLWhitespaceChecksumRotationsAreExact(t *testing.T) {
+	for _, version := range []string{
+		"000088_sandbox_absolute_ttl_transition_boundary",
+		"000089_sandbox_absolute_ttl_checkpoint_guard",
+	} {
+		t.Run(version, func(t *testing.T) {
+			rotations := acceptedMigrationChecksumRotations[version]
+			if len(rotations) != 1 {
+				t.Fatalf("accepted Sandbox absolute TTL rotations = %d, want exact historical formatting lineage", len(rotations))
+			}
+			rotation := rotations[0]
+			expected := []Applied{{
+				Version: rotation.version, Checksum: rotation.toChecksum,
+				DownChecksum: rotation.toDown, DownChecksumValid: true,
+			}}
+			applied := []Applied{{
+				Version: rotation.version, Checksum: rotation.fromChecksum,
+				DownChecksum: rotation.fromDown, DownChecksumValid: true,
+			}}
+			planned, err := plannedMigrationChecksumRotations(expected, applied)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(planned) != 1 || planned[0] != rotation {
+				t.Fatalf("planned rotations = %#v", planned)
+			}
+			if planned[0].replayCurrentUpInTx {
+				t.Fatal("format-only checksum rotation unexpectedly replays physical DDL")
+			}
+			applied[0].Checksum = "unreviewed-sandbox-drift"
+			if _, err := plannedMigrationChecksumRotations(expected, applied); err == nil ||
+				!strings.Contains(err.Error(), "checksum differs") {
+				t.Fatalf("unreviewed Sandbox checksum drift error = %v", err)
+			}
+		})
+	}
+}
+
 func TestCandidateSandboxMigrationRelocationIsExactAndCrashRecoverable(t *testing.T) {
 	expected, err := expectedVersions()
 	if err != nil {

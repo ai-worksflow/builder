@@ -44,6 +44,8 @@ import {
 } from 'lucide-react'
 import { useCollaboration } from '@/lib/collaboration/provider'
 import { useArtifactWorkspace } from '@/lib/platform/artifact-provider'
+import { usePlatformFlow } from '@/lib/platform/flow-provider'
+import { workflowReviewNodeAfterEdit } from '@/lib/platform/workflow-ui-contract'
 import {
   ArtifactWorkspaceConflictError,
   reviewGateReadyForRequest,
@@ -143,6 +145,7 @@ const LAYER_ICONS: Record<PrototypeLayerKind, typeof Frame> = {
 
 export function PrototypeStudio() {
   const workspace = useArtifactWorkspace()
+  const flow = usePlatformFlow()
   const collaboration = useCollaboration()
   const { setSurface } = useWorksflow()
   const { formatNumber, t } = useI18n()
@@ -192,6 +195,13 @@ export function PrototypeStudio() {
   const canEdit = collaboration.session.signedIn && collaboration.can('edit')
   const effectiveCanEdit = canEdit && !editorMutationBusy
   const canReview = collaboration.session.signedIn && collaboration.can('publish')
+  const currentUserId = collaboration.session.signedIn ? collaboration.session.user.id : null
+  const automationReviewer = reviewCandidatesForGovernance(
+    collaboration.members,
+    currentUserId,
+    collaboration.project?.governanceMode ?? 'team',
+  )[0]
+  const workflowReference = platformWorkflowReference()
 
   function beginEditorMutation(kind: EditorMutationKind, artifactId: string) {
     if (editorMutationRef.current) return null
@@ -775,6 +785,77 @@ export function PrototypeStudio() {
     }
   }
 
+  async function advancePrototypeProposal(proposal: ProposalDto) {
+    if (!canEdit || editorMutationRef.current || proposalDraftStateBlocked(saveStateRef.current)) return
+    if (!automationReviewer) {
+      setError(t('prototypePlatform.error.addReviewer'))
+      return
+    }
+    const artifactId = activeResource?.artifact.id ?? ''
+    if (!artifactId || proposal.artifactId !== artifactId) return
+    if (
+      activeResource?.draft
+      && activeResource.draft.contentHash !== proposal.baseRevision.contentHash
+    ) {
+      setError(t('prototypePlatform.error.finishDraftBeforeApply'))
+      return
+    }
+    const lock = beginEditorMutation('revisionReview', artifactId)
+    if (!lock) return
+    setProposalBusyId(proposal.id)
+    setError(null)
+    const solo = collaboration.project?.governanceMode === 'solo'
+    try {
+      const result = await workspace.advanceProposal(proposal.id, {
+        acceptedOperationIds: proposal.operations
+          .filter((operation) => operation.decision !== 'rejected')
+          .map((operation) => operation.id),
+        reviewerIds: [automationReviewer.user.id],
+        reviewSummary: t('prototypePlatform.review.requestSummary'),
+        approveReview: solo,
+        soloReviewConfirmed: solo,
+      })
+      await Promise.all([workspace.refresh(), collaboration.refresh()])
+      if (!editorMutationOwnsActiveArtifact(lock)) return
+      setSaveState('saved')
+      const refreshedDetails = await workspace.loadDetails<PrototypeContentDto>(artifactId)
+      if (!editorMutationOwnsActiveArtifact(lock)) return
+      setDetails(refreshedDetails)
+      if (result.stage !== 'approved' || !workflowReference.runId) return
+      const editNode = flow.run?.id === workflowReference.runId
+        ? flow.run.nodes.find((node) => node.key === workflowReference.nodeKey)
+        : undefined
+      if (!editNode?.allowedActions?.includes('submit_input')) {
+        setSurface('workbench')
+        return
+      }
+      const submitted = await flow.submitNodeRevision(editNode, {
+        artifactId: result.revision.artifactId,
+        revisionId: result.revision.id,
+        contentHash: result.revision.contentHash,
+      })
+      if (!submitted) return
+      const updatedRun = await flow.loadRun(workflowReference.runId)
+      const reviewNode = workflowReviewNodeAfterEdit(updatedRun, editNode)
+      if (reviewNode?.allowedActions?.includes('approve_review')) {
+        await flow.resolveReview(
+          reviewNode,
+          'approve',
+          t('prototypePlatform.review.requestSummary'),
+          solo,
+        )
+      }
+      setSurface('workbench')
+    } catch (cause) {
+      if (editorMutationOwnsActiveArtifact(lock)) {
+        setError(message(cause, t('prototypePlatform.error.serviceRequestFailed')))
+      }
+    } finally {
+      if (editorMutationTokenCurrent(lock)) setProposalBusyId('')
+      endEditorMutation(lock)
+    }
+  }
+
   async function createRevisionAndRequestReview() {
     if (!activeResource || !canEdit) return
     if (editorMutationRef.current) {
@@ -1129,7 +1210,7 @@ export function PrototypeStudio() {
               {panel === 'properties' && <PropertiesPanel layer={selectedLayer} rootLayerId={frame?.rootLayerId} canEdit={effectiveCanEdit} onUpdate={updateLayer} onLayout={updateLayerLayout} onStyle={updateLayerStyle} onDuplicate={duplicateLayer} onDelete={deleteLayer} />}
               {panel === 'variants' && <VariantsPanel content={content} selectedStateId={state?.id} selectedBreakpointId={breakpoint?.id} canEdit={effectiveCanEdit} stateStructureLocked={!content.exploratory} onChange={updateContent} onSelectState={setSelectedStateId} onSelectBreakpoint={setSelectedBreakpointId} onError={setError} />}
               {panel === 'data' && <DataPanel content={content} />}
-              {panel === 'trace' && <TracePanel resource={activeResource} content={content} details={details} proposals={proposals} review={review} clientIssues={clientIssues} canEdit={effectiveCanEdit} canReview={canReview} proposalBusyId={proposalBusyId} proposalActionsBlocked={proposalActionsBlocked} onDecide={(proposal, operation, decision) => void decideProposalOperation(proposal, operation, decision)} onDecideAll={(proposal, decision) => void decideAllProposalOperations(proposal, decision)} onApply={(proposal) => void applyPrototypeProposal(proposal)} onRefresh={() => void workspace.refresh()} />}
+              {panel === 'trace' && <TracePanel resource={activeResource} content={content} details={details} proposals={proposals} review={review} clientIssues={clientIssues} canEdit={effectiveCanEdit} canReview={canReview} proposalBusyId={proposalBusyId} proposalActionsBlocked={proposalActionsBlocked} onDecide={(proposal, operation, decision) => void decideProposalOperation(proposal, operation, decision)} onDecideAll={(proposal, decision) => void decideAllProposalOperations(proposal, decision)} onApply={(proposal) => void applyPrototypeProposal(proposal)} onAdvance={(proposal) => void advancePrototypeProposal(proposal)} onRefresh={() => void workspace.refresh()} />}
             </div>
           </aside>
         </>
@@ -1316,7 +1397,7 @@ function DataPanel({ content }: { content: PrototypeContentDto }) {
   </div>
 }
 
-function TracePanel({ resource, content, details, proposals, review, clientIssues, canEdit, canReview, proposalBusyId, proposalActionsBlocked, onDecide, onDecideAll, onApply, onRefresh }: { resource: VersionedArtifactDto<PrototypeContentDto>; content: PrototypeContentDto; details: Awaited<ReturnType<ReturnType<typeof useArtifactWorkspace>['loadDetails']>> | null; proposals: ReturnType<typeof useArtifactWorkspace>['proposals']; review?: ReturnType<typeof useCollaboration>['reviews'][number]; clientIssues: readonly string[]; canEdit: boolean; canReview: boolean; proposalBusyId: string; proposalActionsBlocked: boolean; onDecide: (proposal: ProposalDto, operation: ProposalOperationDto, decision: 'accepted' | 'rejected') => void; onDecideAll: (proposal: ProposalDto, decision: 'accepted' | 'rejected') => void; onApply: (proposal: ProposalDto) => void; onRefresh: () => void }) {
+function TracePanel({ resource, content, details, proposals, review, clientIssues, canEdit, canReview, proposalBusyId, proposalActionsBlocked, onDecide, onDecideAll, onApply, onAdvance, onRefresh }: { resource: VersionedArtifactDto<PrototypeContentDto>; content: PrototypeContentDto; details: Awaited<ReturnType<ReturnType<typeof useArtifactWorkspace>['loadDetails']>> | null; proposals: ReturnType<typeof useArtifactWorkspace>['proposals']; review?: ReturnType<typeof useCollaboration>['reviews'][number]; clientIssues: readonly string[]; canEdit: boolean; canReview: boolean; proposalBusyId: string; proposalActionsBlocked: boolean; onDecide: (proposal: ProposalDto, operation: ProposalOperationDto, decision: 'accepted' | 'rejected') => void; onDecideAll: (proposal: ProposalDto, decision: 'accepted' | 'rejected') => void; onApply: (proposal: ProposalDto) => void; onAdvance: (proposal: ProposalDto) => void; onRefresh: () => void }) {
   const { formatNumber, t } = useI18n()
   return <div className="space-y-4">
     <section><div className="flex items-center justify-between"><PanelLabel>{t('prototypePlatform.exactSource')}</PanelLabel><button type="button" onClick={onRefresh} className="rounded p-1 text-faint-foreground hover:text-foreground" aria-label={t('prototypePlatform.refreshTrace')}><RefreshCw className="size-3" /></button></div><div className="mt-2 rounded border border-border bg-background p-2 font-mono text-[8px] leading-relaxed text-faint-foreground">PageSpec<br />{content.pageSpecRevision.artifactId}<br />{content.pageSpecRevision.revisionId}<br />{content.pageSpecRevision.contentHash}</div></section>
@@ -1338,6 +1419,10 @@ function TracePanel({ resource, content, details, proposals, review, clientIssue
                 <span className="rounded bg-primary/10 px-1 py-0.5 text-[8px] text-primary-bright">{proposalStatusLabel(proposal.status, t)}</span>
               </div>
               <p className="mt-1 text-[8px] text-faint-foreground">{t('prototypePlatform.manifestBase', { manifest: proposal.manifest.id, hash: proposal.baseRevision.contentHash.slice(0, 12) })}</p>
+              <button type="button" onClick={() => onAdvance(proposal)} disabled={!canEdit || busy || proposalActionsBlocked || !['open', 'reviewing', 'ready'].includes(proposal.status)} className="mt-2 inline-flex h-8 w-full items-center justify-center gap-1 rounded bg-primary text-[8px] font-semibold text-primary-foreground disabled:opacity-35">
+                {busy ? <LoaderCircle className="size-3 animate-spin" /> : <PackageCheck className="size-3" />}
+                {t('prototypePlatform.reviewAndContinue')}
+              </button>
               <div className="mt-2 space-y-1.5">
                 {proposal.operations.map((operation) => (
                   <div key={operation.id} className="rounded border border-border/70 bg-panel p-2">
@@ -1618,3 +1703,11 @@ function prototypeIssueLabel(issue: string, t: Translate, formatNumber: FormatNu
 
 function message(cause: unknown, fallback: string) { return cause instanceof Error ? cause.message : fallback }
 function artifactReference() { if (typeof window === 'undefined') return ''; return new URLSearchParams(window.location.search).get('artifactId') ?? '' }
+function platformWorkflowReference() {
+  if (typeof window === 'undefined') return { runId: '', nodeKey: '' }
+  const query = new URLSearchParams(window.location.search)
+  return {
+    runId: query.get('runId') ?? '',
+    nodeKey: query.get('nodeKey') ?? '',
+  }
+}

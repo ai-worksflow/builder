@@ -1,5 +1,7 @@
 import type {
   AddProjectMemberInputDto,
+  AdvanceProposalInputDto,
+  AdvanceProposalResultDto,
   ApplyProposalInputDto,
   ArtifactGenerationResultDto,
   AuditEventDto,
@@ -803,6 +805,18 @@ export class ProposalsClient extends DomainClient {
   ) {
     return this.http.post<ArtifactDraftDto<JsonValue>, ApplyProposalInputDto>(
       `/v1/output-proposals/${segment(proposalId)}/apply`,
+      input,
+      mutationOptions(options, true),
+    )
+  }
+
+  advance(
+    proposalId: string,
+    input: AdvanceProposalInputDto,
+    options?: ClientMutationOptions,
+  ) {
+    return this.http.post<AdvanceProposalResultDto, AdvanceProposalInputDto>(
+      `/v1/output-proposals/${segment(proposalId)}/advance`,
       input,
       mutationOptions(options, true),
     )

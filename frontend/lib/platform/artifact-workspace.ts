@@ -1,6 +1,8 @@
 import type { CollaborationPlatformClient } from '../collaboration/platform-adapter'
 import type {
   ArtifactDependencyDto,
+  AdvanceProposalInputDto,
+  AdvanceProposalResultDto,
   ArtifactDraftDto,
   ArtifactReviewGateDto,
   ArtifactRevisionDto,
@@ -939,6 +941,21 @@ export class ArtifactWorkspaceGateway {
       version: current.version + 1,
     }
     return { ...applied, appliedProposal }
+  }
+
+  async advanceProposal(
+    proposalId: string,
+    input: AdvanceProposalInputDto,
+  ): Promise<AdvanceProposalResultDto> {
+    const result = await this.client.proposals.advance(
+      proposalId,
+      input,
+      { idempotencyKey: true },
+    )
+    return {
+      ...result.data,
+      proposal: normalizeProposal(result.data.proposal),
+    }
   }
 
   async decideProposalOperation(

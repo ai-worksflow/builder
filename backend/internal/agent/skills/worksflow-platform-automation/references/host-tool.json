@@ -1,0 +1,57 @@
+{
+  "name": "worksflow_advance_output_proposal",
+  "description": "Advance one exact user-reviewed Worksflow output proposal through deterministic operation decisions, Apply, immutable revision creation, and canonical review. Call only after the user confirms the accepted operation IDs and review intent.",
+  "inputSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "proposalId": {
+        "type": "string",
+        "minLength": 1,
+        "description": "The exact output proposal selected from authoritative platform state."
+      },
+      "acceptedOperationIds": {
+        "type": "array",
+        "minItems": 1,
+        "uniqueItems": true,
+        "items": {
+          "type": "string",
+          "minLength": 1
+        },
+        "description": "The complete operation selection explicitly confirmed by the user."
+      },
+      "reviewerIds": {
+        "type": "array",
+        "minItems": 1,
+        "uniqueItems": true,
+        "items": {
+          "type": "string",
+          "minLength": 1
+        },
+        "description": "Eligible reviewer identities selected from current project membership."
+      },
+      "reviewSummary": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 4096,
+        "description": "The user's reason for the exact review decision."
+      },
+      "approveReview": {
+        "type": "boolean",
+        "default": false,
+        "description": "True only when the current user intentionally records approval now."
+      },
+      "soloReviewConfirmed": {
+        "type": "boolean",
+        "default": false,
+        "description": "True only after an explicit Solo Owner self-review confirmation."
+      }
+    },
+    "required": [
+      "proposalId",
+      "acceptedOperationIds",
+      "reviewerIds",
+      "reviewSummary"
+    ]
+  }
+}
