@@ -49,10 +49,31 @@ type User struct {
 	HTMLURL   string `json:"htmlUrl"`
 }
 type ConnectionStatus struct {
-	Connected bool       `json:"connected"`
-	Source    string     `json:"source,omitempty"`
-	User      *User      `json:"user,omitempty"`
-	ExpiresAt *time.Time `json:"expiresAt,omitempty"`
+	Connected    bool       `json:"connected"`
+	Source       string     `json:"source,omitempty"`
+	Organization string     `json:"organization,omitempty"`
+	User         *User      `json:"user,omitempty"`
+	ExpiresAt    *time.Time `json:"expiresAt,omitempty"`
+}
+type CreateRepositoryInput struct {
+	Owner         string          `json:"owner,omitempty"`
+	Name          string          `json:"name"`
+	Description   string          `json:"description,omitempty"`
+	Private       bool            `json:"private"`
+	Files         []WorkspaceFile `json:"files"`
+	CommitMessage string          `json:"commitMessage"`
+	Confirm       bool            `json:"confirm"`
+}
+type RepositoryCreateOptions struct {
+	Owner       string
+	Name        string
+	Description string
+	Private     bool
+}
+type CreateRepositoryResult struct {
+	Repository Repository `json:"repository"`
+	CommitSHA  string     `json:"commitSha"`
+	CommitURL  string     `json:"commitUrl"`
 }
 type RepositoryPermissions struct {
 	Pull  bool `json:"pull"`

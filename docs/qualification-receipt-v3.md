@@ -1,10 +1,11 @@
 # Snapshot-first Qualification Receipt v3
 
 Status: strict internal canonical-payload, keyful-verification, and
-request/observation/completion control contract with a concurrency-safe memory
-reference Store. No PostgreSQL signing operator, production snapshot builder,
-real signer, external run, promotion approval, immutable revision, or workflow
-submission is claimed.
+request/observation/completion control contract with both a concurrency-safe
+memory reference Store and an owner-only durable PostgreSQL Store/expected
+resolver. No production Receipt operator/login/DSN, production snapshot
+builder, real signer, external run, promotion approval, immutable revision, or
+workflow submission is claimed.
 
 `backend/internal/qualificationreceiptv3` defines the next qualification
 Receipt without reinterpreting the repository's existing wire v2. Existing
@@ -102,15 +103,27 @@ Receipt issue time. None of these fields proves that an external signer call
 was recorded before invocation.
 
 The package now defines a separate append-only request/observation/completion
-control contract and a concurrency-safe memory reference Store. Production
-signing still needs its owner-only PostgreSQL implementation. That Store must
-atomically persist both role-separated signer requests before either network
-call, assign trusted database time, retain exact request/payload/PAE bytes and
-hashes, and reconcile commit-unknown outcomes by exact inspection. After a
-started record exists, recovery may use only authenticated `Inspect`. An
-ordinary not-found response is not proof of `not-invoked`; safe resumption
-requires the exact signed claim/acknowledgement closure implemented by the
-control contract.
+control contract, a concurrency-safe memory reference Store, and the owner-only
+PostgreSQL implementation installed by migration `000075`. The PostgreSQL
+Store atomically persists both role-separated signer requests before either
+network call, assigns trusted database time, retains exact
+request/payload/PAE bytes and hashes, and reconciles commit-unknown outcomes by
+exact inspection. Its `ExpectedResolver` reconstructs expected Receipt bytes
+only from the two exact frozen signer rows. Real PostgreSQL 16 tests cover
+concurrent starts/appends, retry generations, lost commit acknowledgements,
+completion, restart recovery, and exact replay. Completion re-locks the current
+Evidence head and last event, then binds their version, identity, raw hash,
+closure digest and artifact-index digest to all four frozen requests; a later
+but otherwise valid `artifact-indexed` head is rejected. After a started record exists,
+recovery may use only authenticated `Inspect`. An ordinary not-found response
+is not proof of `not-invoked`; safe resumption requires the exact signed
+claim/acknowledgement closure implemented by the control contract.
+
+This durable boundary remains owner-only: migration `000075` creates no
+Receipt runtime role, LOGIN, DSN, grant, network operator, or signer. A
+production composition must introduce and qualify those identities without
+giving the application/API role direct access to the ledgers or writer
+routines.
 
 An authority-signed `observedAt` is evidence supplied by that authority, not
 the ledger clock. Every durable observation also needs a Store-assigned UTC
@@ -152,7 +165,7 @@ review/upstream-revision state. It may then create only a pending immutable-
 revision handoff. Creation of that revision and exact node submission remain a
 separate workflow transaction.
 
-Until the durable Store, real adapters, target run, independent verification,
-single-use consumption, and workflow handoff all exist and produce external
-evidence, qualification remains blocked and the manifest must continue to
-report zero externally qualified suites.
+Until the production operator and real adapters, target run, independent
+external verification, single-use Promotion v2 consumption, and workflow
+handoff all exist and produce external evidence, qualification remains blocked
+and the manifest must continue to report zero externally qualified suites.

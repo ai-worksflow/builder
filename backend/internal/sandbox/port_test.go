@@ -116,6 +116,87 @@ func TestPortServiceListsOnlyExactRuntimePortsAndIssuesCapabilityHost(t *testing
 	}
 }
 
+func TestPortServiceListSynchronizesReadyCandidateProjection(t *testing.T) {
+	service, sessions, runtime, _, view := portServiceFixture(t)
+	if _, err := service.List(context.Background(), view.ProjectID, view.ID, testActorID); err != nil {
+		t.Fatal(err)
+	}
+	next, _, err := sessions.candidates.record.Candidate.AcquireLease(
+		view.Candidate.Version, testActorID, 5*time.Minute, view.UpdatedAt.Add(100*time.Millisecond),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessions.candidates.record.Candidate = next
+
+	listed, err := service.List(context.Background(), view.ProjectID, view.ID, testActorID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if listed.Session.Candidate.Version != next.Version || listed.Session.Version != view.Version+1 ||
+		runtime.inspectSpec.SessionEpoch != view.SessionEpoch {
+		t.Fatalf("port list did not synchronize Candidate projection: session=%#v inspect=%#v", listed.Session, runtime.inspectSpec)
+	}
+	if len(listed.Ports) != 2 {
+		t.Fatalf("ports = %#v", listed.Ports)
+	}
+}
+
+func TestPortServiceIssueSynchronizesReadyCandidateProjection(t *testing.T) {
+	service, sessions, runtime, _, view := portServiceFixture(t)
+	next, _, err := sessions.candidates.record.Candidate.AcquireLease(
+		view.Candidate.Version, testActorID, 5*time.Minute, view.UpdatedAt.Add(100*time.Millisecond),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessions.candidates.record.Candidate = next
+
+	link, err := service.Issue(context.Background(), IssuePreviewInput{
+		ProjectID: view.ProjectID, SessionID: view.ID, PortName: "web-http", ActorID: testActorID,
+		ExpectedSessionVersion: view.Version, ExpectedSessionEpoch: view.SessionEpoch,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sessions.session.Snapshot().Candidate.Version != next.Version ||
+		sessions.session.Snapshot().Version != view.Version+1 ||
+		runtime.inspectSpec.SessionEpoch != view.SessionEpoch || link.Port.State != PortListening {
+		t.Fatalf("preview issue did not synchronize Candidate projection: session=%#v spec=%#v link=%#v",
+			sessions.session.Snapshot(), runtime.inspectSpec, link)
+	}
+}
+
+func TestPortServiceListDegradesStaleWorkspaceToUnavailablePorts(t *testing.T) {
+	service, _, runtime, _, view := portServiceFixture(t)
+	if _, err := service.List(context.Background(), view.ProjectID, view.ID, testActorID); err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate a content projection that fell behind the authoritative
+	// Candidate. The old runtime must not be exposed, while observational
+	// polling remains successful.
+	mount := service.workspaces.mount(view.ID)
+	projection, err := loadWorkspaceProjection(mount)
+	if err != nil {
+		t.Fatal(err)
+	}
+	projection.TreeHash = "sha256:" + strings.Repeat("a", 64)
+	if err := replaceWorkspaceProjection(mount, projection); err != nil {
+		t.Fatal(err)
+	}
+	runtime.inspectSpec = RuntimeSpec{}
+
+	listed, err := service.List(context.Background(), view.ProjectID, view.ID, testActorID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(listed.Ports) != 2 || listed.Ports[0].State != PortUnavailable ||
+		listed.Ports[1].State != PortUnavailable || runtime.inspectSpec.SessionID != "" {
+		t.Fatalf("stale workspace port projection = %#v inspect=%#v", listed, runtime.inspectSpec)
+	}
+}
+
 func TestPortServiceRefusesUndeclaredUnreadyAndRawTCPPreview(t *testing.T) {
 	service, sessions, runtime, _, view := portServiceFixture(t)
 	service.probe = func(context.Context, string, int, string, time.Duration) bool { return false }

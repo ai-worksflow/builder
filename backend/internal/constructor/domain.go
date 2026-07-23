@@ -143,15 +143,19 @@ type TemplateRuntimeEnvironmentVariable struct {
 // exact FullStackTemplate ref; a service adapter must load every source and
 // release fact from canonical storage before invoking Compiler.Compile.
 type CompileInput struct {
-	ProjectID           string
-	DeliverySliceID     string
-	BuildManifest       BuildManifestRef
-	BaseWorkspace       *WorkspaceRevisionRef
-	Sources             []PinnedBuildSource
-	FullStackTemplate   FullStackTemplateRef
-	TemplateReleaseRefs []TemplateReleaseRef
-	TemplateRuntime     *TemplateRuntimeFacts
-	ForbiddenClaims     []string
+	ProjectID       string
+	DeliverySliceID string
+	// DeliverySlicePageNodeID is the exact Blueprint anchor carried by the
+	// Workbench bundle. DeliverySliceID is an orchestration UUID and must not be
+	// confused with the semantic Blueprint page identity.
+	DeliverySlicePageNodeID string
+	BuildManifest           BuildManifestRef
+	BaseWorkspace           *WorkspaceRevisionRef
+	Sources                 []PinnedBuildSource
+	FullStackTemplate       FullStackTemplateRef
+	TemplateReleaseRefs     []TemplateReleaseRef
+	TemplateRuntime         *TemplateRuntimeFacts
+	ForbiddenClaims         []string
 }
 
 type RouteConstraint struct {

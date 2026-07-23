@@ -84,7 +84,24 @@ func (materializer *WorkspaceMaterializer) Materialize(
 	}
 	if _, err := os.Lstat(finalRoot); err == nil {
 		if err := validateExistingWorkspace(mount, projection, candidate.CurrentTree); err != nil {
-			return WorkspaceMount{}, err
+			// Candidate lease operations advance the Candidate version without
+			// changing the journal or tree. Refresh only that fence after proving
+			// the persisted workspace still matches the exact authoritative tree.
+			// Content drift remains a hard conflict.
+			actual, loadErr := loadWorkspaceProjection(mount)
+			if loadErr != nil || actual.SchemaVersion != projection.SchemaVersion ||
+				actual.ProjectID != projection.ProjectID || actual.SessionID != projection.SessionID ||
+				actual.SessionEpoch != projection.SessionEpoch || actual.CandidateID != projection.CandidateID ||
+				actual.CandidateJournalSequence != projection.CandidateJournalSequence ||
+				actual.TreeHash != projection.TreeHash || actual.CandidateVersion > projection.CandidateVersion {
+				return WorkspaceMount{}, err
+			}
+			if verifyErr := verifyWorkspaceTree(ctx, mount.Workspace, candidate.CurrentTree); verifyErr != nil {
+				return WorkspaceMount{}, verifyErr
+			}
+			if replaceErr := replaceWorkspaceProjection(mount, projection); replaceErr != nil {
+				return WorkspaceMount{}, replaceErr
+			}
 		}
 		return mount, nil
 	} else if !errors.Is(err, os.ErrNotExist) {
@@ -300,7 +317,7 @@ func validateExistingWorkspace(
 	defer file.Close()
 	actual, err := decodeWorkspaceProjection(file)
 	if err != nil || !sameWorkspaceProjection(actual, expected) ||
-		actual.CandidateVersion > expected.CandidateVersion {
+		actual.CandidateVersion != expected.CandidateVersion {
 		return ErrWorkspaceConflict
 	}
 	return verifyWorkspaceTree(context.Background(), mount.Workspace, tree)
@@ -339,6 +356,12 @@ func verifyWorkspaceTree(ctx context.Context, root string, tree repository.TreeM
 			return ErrWorkspaceConflict
 		}
 		if entry.IsDir() {
+			if runtimeWorkspaceDirectory(relative, expectedDirectories) {
+				return filepath.SkipDir
+			}
+			if relative == ".worksflow" {
+				return nil
+			}
 			if !expectedDirectories[relative] {
 				return ErrWorkspaceConflict
 			}
@@ -380,6 +403,27 @@ func verifyWorkspaceTree(ctx context.Context, root string, tree repository.TreeM
 		return ErrWorkspaceConflict
 	}
 	return nil
+}
+
+// runtimeWorkspaceDirectory separates reproducible source authority from
+// ephemeral dependency and build products. A directory with the same name is
+// never ignored when it is part of the authoritative Candidate tree.
+func runtimeWorkspaceDirectory(relative string, expectedDirectories map[string]bool) bool {
+	if relative == "." || expectedDirectories[relative] {
+		return false
+	}
+	if relative == ".worksflow/dependencies" {
+		return true
+	}
+	if relative == ".worksflow" {
+		return false
+	}
+	switch filepath.Base(filepath.FromSlash(relative)) {
+	case "node_modules", ".next", "dist", "build", "out", "bin", ".cache", "coverage":
+		return true
+	default:
+		return false
+	}
 }
 
 func decodeWorkspaceProjection(reader io.Reader) (workspaceProjection, error) {

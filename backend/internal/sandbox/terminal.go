@@ -333,11 +333,35 @@ func (service *TerminalService) List(
 	if err != nil {
 		return TerminalList{}, err
 	}
-	terminals, err := service.terminals.List(ctx, projectID, sessionID, limit)
+	// The endpoint is a projection of the current SandboxSession epoch. Older
+	// terminal records remain durable audit history, but exposing them here
+	// widens the response beyond the returned Session identity and makes a
+	// client reconnect fail closed after session rotation.
+	terminals, err := service.terminals.List(ctx, projectID, sessionID, 100)
 	if err != nil {
 		return TerminalList{}, err
 	}
-	return TerminalList{Session: session.Snapshot(), Terminals: terminals}, nil
+	view := session.Snapshot()
+	return TerminalList{
+		Session: view, Terminals: currentSessionTerminals(terminals, view.SessionEpoch, limit),
+	}, nil
+}
+
+func currentSessionTerminals(values []TerminalView, sessionEpoch uint64, limit int) []TerminalView {
+	if limit == 0 {
+		limit = defaultTerminalListLimit
+	}
+	result := make([]TerminalView, 0, min(limit, len(values)))
+	for _, value := range values {
+		if value.SessionEpoch != sessionEpoch {
+			continue
+		}
+		result = append(result, value)
+		if len(result) == limit {
+			break
+		}
+	}
+	return result
 }
 
 func (service *TerminalService) AttachTerminal(ctx context.Context, input TerminalStreamControl) error {

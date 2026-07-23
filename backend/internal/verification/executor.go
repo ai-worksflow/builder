@@ -34,6 +34,7 @@ var (
 	verificationServiceIDPattern       = regexp.MustCompile(`^[a-z][a-z0-9-]{0,30}$`)
 	verificationDaemonTCPPattern       = regexp.MustCompile(`^tcp://(?:[A-Za-z0-9.-]+|\[[0-9A-Fa-f:]+\]):[0-9]{1,5}$`)
 	verificationPythonHashPattern      = regexp.MustCompile(`--hash=sha256:[0-9a-fA-F]{64}(?:\s|\\|$)`)
+	verificationGoSumHashPattern       = regexp.MustCompile(`^h1:[A-Za-z0-9+/]{43}=$`)
 	verificationSecretPatterns         = []*regexp.Regexp{
 		regexp.MustCompile(`(?i)(authorization\s*:\s*bearer\s+)[^\s]+`),
 		regexp.MustCompile(`(?i)((?:password|api[_-]?key|access[_-]?token|secret)\s*[=:]\s*)[^\s]+`),
@@ -483,7 +484,7 @@ func (executor *DockerCandidateExecutor) prepareDependencyCache(
 	resolver candidateDependencyResolverPolicy,
 ) (candidatePreparedDependency, error) {
 	if !stableIDPattern.MatchString(dependency.ID) || !stableIDPattern.MatchString(dependency.ServiceID) ||
-		(dependency.Ecosystem != "node" && dependency.Ecosystem != "python") ||
+		(dependency.Ecosystem != "go" && dependency.Ecosystem != "node" && dependency.Ecosystem != "python") ||
 		!imagePattern.MatchString(dependency.ToolchainImageDigest) || !exactSHA256(dependency.CacheKey) ||
 		len(dependency.Lockfiles) != 1 || !equalStrings(expectedDependencyResolverArgv(dependency), dependency.ResolverArgv) {
 		return candidatePreparedDependency{}, fmt.Errorf("%w: invalid immutable dependency request", ErrCandidateExecution)
@@ -550,6 +551,9 @@ func (executor *DockerCandidateExecutor) prepareDependencyCache(
 			!validHashLockedPythonRequirements(value) {
 			return candidatePreparedDependency{}, fmt.Errorf("%w: Python dependency lock is not hash-locked", ErrCandidateExecution)
 		}
+		if dependency.Ecosystem == "go" && name == "go.sum" && !validHashLockedGoSum(value) {
+			return candidatePreparedDependency{}, fmt.Errorf("%w: Go dependency lock is not checksum-pinned", ErrCandidateExecution)
+		}
 		if err := os.WriteFile(filepath.Join(staging, name), value, 0o600); err != nil {
 			return candidatePreparedDependency{}, fmt.Errorf("%w: stage resolver input: %v", ErrCandidateExecution, err)
 		}
@@ -568,8 +572,14 @@ func (executor *DockerCandidateExecutor) prepareDependencyCache(
 			"--env", "npm_config_ignore_scripts=true", "--env", "npm_config_audit=false",
 			"--env", "npm_config_fund=false", "--env", "npm_config_update_notifier=false",
 		)
-	} else {
+	} else if dependency.Ecosystem == "python" {
 		args = append(args, "--env", "PIP_DISABLE_PIP_VERSION_CHECK=1", "--env", "PIP_NO_INPUT=1")
+	} else {
+		args = append(args,
+			"--env", "GOMODCACHE=/resolver/gomodcache", "--env", "GOCACHE=/tmp/go-build",
+			"--env", "GOPROXY="+dependency.Lockfiles[0].Registry, "--env", "GOSUMDB=sum.golang.org",
+			"--env", "GONOSUMDB=", "--env", "GOPRIVATE=",
+		)
 	}
 	args = append(args, dependency.ToolchainImageDigest)
 	args = append(args, dependency.ResolverArgv...)
@@ -605,6 +615,8 @@ func validateDependencyOutput(root string, dependency PlanDependency) error {
 	target := filepath.Join(root, "node_modules")
 	if dependency.Ecosystem == "python" {
 		target = filepath.Join(root, "site-packages")
+	} else if dependency.Ecosystem == "go" {
+		target = filepath.Join(root, "gomodcache")
 	}
 	info, err := os.Lstat(target)
 	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
@@ -695,6 +707,27 @@ func validHashLockedPythonRequirements(value []byte) bool {
 		currentRequirement, currentHash, seenRequirement = true, verificationPythonHashPattern.MatchString(line), true
 	}
 	return seenRequirement && currentRequirement && currentHash
+}
+
+func validHashLockedGoSum(value []byte) bool {
+	text := string(value)
+	if text == "" || strings.ContainsRune(text, '\x00') {
+		return false
+	}
+	seen := false
+	for _, raw := range strings.Split(text, "\n") {
+		line := strings.TrimSpace(raw)
+		if line == "" {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) != 3 || strings.Contains(fields[0], "://") ||
+			!strings.HasPrefix(fields[1], "v") || !verificationGoSumHashPattern.MatchString(fields[2]) {
+			return false
+		}
+		seen = true
+	}
+	return seen
 }
 
 func validLockedNodeDependencies(value []byte, registry string) bool {
@@ -928,6 +961,12 @@ func (executor *DockerCandidateExecutor) appendDependencyArguments(
 		return args
 	}
 	switch dependency.Ecosystem {
+	case "go":
+		target := "/dependencies/" + dependency.ID + "/gomodcache"
+		return append(args,
+			"--mount", "type=bind,src="+filepath.Join(dependency.Root, "gomodcache")+",dst="+target+",readonly",
+			"--env", "GOMODCACHE="+target, "--env", "GOPROXY=off", "--env", "GOSUMDB=off",
+		)
 	case "node":
 		target := "/workspace/" + dependency.WorkingDirectory + "/node_modules"
 		if dependency.WorkingDirectory == "." {

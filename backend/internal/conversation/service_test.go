@@ -651,6 +651,58 @@ func TestServerAIGenerationPersistsReviewableProvenanceWithoutExecution(t *testi
 	}
 }
 
+func TestUnavailableIntentAIProducesReviewableDeterministicFallback(t *testing.T) {
+	store := &conversationStoreStub{}
+	projectID, conversationID, actorID := uuid.NewString(), uuid.NewString(), uuid.NewString()
+	input, manifest := proposalInputWithManifest(t, projectID, actorID)
+	requirement := "Build all six reviewed pages, preserve the resource graph, and orchestrate the complete task dependency graph."
+	store.generationContext = intentGenerationContext{
+		Conversation: ProviderConversationContext{TailMessages: []Message{{
+			ID: input.TriggerMessageID, ConversationID: conversationID, Sequence: 1,
+			Role: MessageUser, Content: requirement, CreatedBy: actorID,
+		}}},
+		Definitions: []intentDefinitionContext{{
+			VersionID: input.SuggestedDefinitionVersionID,
+			Key:       "minimum-product-loop",
+			Content:   json.RawMessage(`{"nodes":[],"edges":[]}`),
+		}},
+		Provenance: ConversationContextProvenance{
+			Version: 1, Mode: "full_prefix", TriggerMessageID: input.TriggerMessageID,
+		},
+	}
+	runtimeStub := &conversationRuntimeStub{compatible: []runtime.DefinitionRecord{
+		compatibleConversationDefinition(projectID, input.SuggestedDefinitionVersionID),
+	}}
+	service, err := newService(
+		store,
+		&conversationAccessStub{},
+		runtimeStub,
+		conversationManifestStub{manifest: manifest},
+		conversationProviderStub{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := service.GenerateIntentProposal(context.Background(), projectID, conversationID, actorID, GenerateIntentProposalInput{
+		TriggerMessageID:        input.TriggerMessageID,
+		DesiredOutputCapability: platformdomain.WorkflowOutputApplication,
+		SourceRefs:              input.SourceRefs,
+		ManifestIntent:          input.ManifestIntent,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Provider != "worksflow" || result.Model != "deterministic-intent-router/v1" ||
+		result.Proposal.Origin != ProposalOriginAI || result.Proposal.AI == nil ||
+		result.Proposal.WorkbenchInstruction.Objective != requirement ||
+		result.Proposal.SuggestedDefinitionVersionID != input.SuggestedDefinitionVersionID {
+		t.Fatalf("deterministic fallback lost reviewed routing or exact user intent: %+v", result)
+	}
+	if runtimeStub.starts.Load() != 0 {
+		t.Fatal("deterministic fallback executed the workflow before human acceptance")
+	}
+}
+
 func TestIntentProposalSchemaUsesStrictSelectionAndJSONTextBoundaries(t *testing.T) {
 	startID := uuid.NewString()
 	target := intentWorkbenchTargetContext{
@@ -1260,6 +1312,24 @@ func TestCommandCannotExecuteWithoutAcceptedProposal(t *testing.T) {
 	}
 	if runtimeStub.starts.Load() != 0 {
 		t.Fatal("unapproved command reached workflow runtime")
+	}
+}
+
+func TestCommandExecutionTreatsMissingWorkflowRunAsNotStarted(t *testing.T) {
+	command := conversationCommandFixture()
+	store := &conversationStoreStub{command: command, proposalAccepted: true}
+	runtimeStub := &conversationRuntimeStub{getRunErr: platformdomain.ErrNotFound}
+	service, err := newService(store, &conversationAccessStub{}, runtimeStub, conversationManifestStub{}, conversationProviderStub{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	executed, err := service.ExecuteCommand(
+		context.Background(), command.ProjectID, command.ConversationID, command.ID,
+		uuid.NewString(), command.ETag, ExecuteCommandInput{},
+	)
+	if err != nil || executed.Status != CommandExecuted || runtimeStub.starts.Load() != 1 {
+		t.Fatalf("missing domain workflow run was not started: command=%+v starts=%d err=%v", executed, runtimeStub.starts.Load(), err)
 	}
 }
 

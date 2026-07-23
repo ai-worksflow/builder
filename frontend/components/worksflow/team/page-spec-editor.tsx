@@ -9,7 +9,10 @@ import {
 } from '@/lib/platform/artifact-workspace'
 import { useArtifactWorkspace } from '@/lib/platform/artifact-provider'
 import { usePlatformFlow } from '@/lib/platform/flow-provider'
-import { workflowEditorTargetForArtifact } from '@/lib/platform/workflow-ui-contract'
+import {
+  resolveWorkflowProposalReference,
+  workflowEditorTargetForArtifact,
+} from '@/lib/platform/workflow-ui-contract'
 import { useWorksflow } from '@/lib/worksflow/store'
 import {
   normalizePageSpecContent,
@@ -116,8 +119,10 @@ export function PageSpecEditor({
     workflowReference.runId,
     workspace,
   ])
-  const workflowProposalId = resolvedWorkflowProposalReference(
-    workflowReference,
+  const workflowProposalId = resolveWorkflowProposalReference(
+    workflowReference.runId,
+    workflowReference.proposalId
+      || (workflowReference.runId ? resource?.latestRevision?.proposalId ?? '' : ''),
     inferredWorkflowProposalId,
   )
   const workflowContextRequested = Boolean(workflowReference.runId || workflowReference.proposalId)
@@ -188,7 +193,11 @@ export function PageSpecEditor({
     && reviewGateReadyForRequest(details?.reviewGate)
 
   useEffect(() => {
-    if (workflowReference.proposalId || !inferredWorkflowProposalId || typeof window === 'undefined') return
+    if (
+      !inferredWorkflowProposalId
+      || workflowReference.proposalId === inferredWorkflowProposalId
+      || typeof window === 'undefined'
+    ) return
     const url = new URL(window.location.href)
     url.searchParams.set('proposalId', inferredWorkflowProposalId)
     window.history.replaceState(window.history.state, '', url)
@@ -1030,17 +1039,6 @@ function workflowRouteReference(artifactId: string): WorkflowRouteReference {
     proposalId: query.get('proposalId') ?? '',
     nodeKey: query.get('workbenchNodeKey') ?? '',
   }
-}
-
-function resolvedWorkflowProposalReference(
-  reference: WorkflowRouteReference,
-  inferredProposalId: string,
-) {
-  if (!reference.runId) return reference.proposalId
-  if (!inferredProposalId) return ''
-  return !reference.proposalId || reference.proposalId === inferredProposalId
-    ? inferredProposalId
-    : ''
 }
 
 function commaList(value: string) {

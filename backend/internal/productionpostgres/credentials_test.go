@@ -35,13 +35,24 @@ func secureTestDSN(username, password, host, port, database string) string {
 	return parsed.String()
 }
 
-func TestValidateConfigRequiresFourDistinctCredentialsForOneTarget(t *testing.T) {
+func TestValidateConfigRequiresNineDistinctCredentialsForOneTarget(t *testing.T) {
 	valid := Config{
-		ApplicationDSN:   secureTestDSN("app_login", "app-secret", "db.internal", "5432", "worksflow"),
-		MigratorDSN:      secureTestDSN("migrator_login", "migrator-secret", "db.internal", "5432", "worksflow"),
-		QualificationDSN: secureTestDSN("qualification_login", "qualification-secret", "db.internal", "5432", "worksflow"),
-		PromotionDSN:     secureTestDSN("promotion_login", "promotion-secret", "db.internal", "5432", "worksflow"),
-		Schema:           "worksflow",
+		ApplicationDSN:                    secureTestDSN("app_login", "app-secret", "db.internal", "5432", "worksflow"),
+		MigratorDSN:                       secureTestDSN("migrator_login", "migrator-secret", "db.internal", "5432", "worksflow"),
+		QualificationDSN:                  secureTestDSN("qualification_login", "qualification-secret", "db.internal", "5432", "worksflow"),
+		PromotionDSN:                      secureTestDSN("promotion_login", "promotion-secret", "db.internal", "5432", "worksflow"),
+		PromotionSessionAffinity:          PromotionSessionAffinityDirect,
+		PromotionRuntimeGate:              PromotionRuntimeGateDisabledPendingInputPrecommitAuthorityCanary,
+		PolicyDSN:                         secureTestDSN("policy_login", "policy-secret", "db.internal", "5432", "worksflow"),
+		InputPrecommitDSN:                 secureTestDSN("input_precommit_login", "input-precommit-secret", "db.internal", "5432", "worksflow"),
+		InputPrecommitSessionAffinity:     PromotionSessionAffinityDirect,
+		SourceVerifierDSN:                 secureTestDSN("source_verifier_login", "source-verifier-secret", "db.internal", "5432", "worksflow"),
+		SourceVerifierSessionAffinity:     PromotionSessionAffinityDirect,
+		CredentialResolverDSN:             secureTestDSN("credential_resolver_login", "credential-resolver-secret", "db.internal", "5432", "worksflow"),
+		CredentialResolverSessionAffinity: PromotionSessionAffinityDirect,
+		HandoffDSN:                        secureTestDSN("handoff_login", "handoff-secret", "db.internal", "5432", "worksflow"),
+		HandoffSessionAffinity:            PromotionSessionAffinityDirect,
+		Schema:                            "worksflow",
 	}
 	validated, err := validateConfig(valid)
 	if err != nil {
@@ -50,7 +61,13 @@ func TestValidateConfigRequiresFourDistinctCredentialsForOneTarget(t *testing.T)
 	if validated.application.username != "app_login" ||
 		validated.migrator.username != "migrator_login" ||
 		validated.qualification.username != "qualification_login" ||
-		validated.promotion.username != "promotion_login" {
+		validated.promotion.username != "promotion_login" ||
+		validated.promotionSessionAffinity != PromotionSessionAffinityDirect ||
+		validated.policy.username != "policy_login" ||
+		validated.inputPrecommit.username != "input_precommit_login" ||
+		validated.sourceVerifier.username != "source_verifier_login" ||
+		validated.credentialResolver.username != "credential_resolver_login" ||
+		validated.handoff.username != "handoff_login" {
 		t.Fatalf("unexpected validated identities: %#v", validated)
 	}
 	for _, scoped := range []string{
@@ -58,10 +75,20 @@ func TestValidateConfigRequiresFourDistinctCredentialsForOneTarget(t *testing.T)
 		validated.migrator.scoped,
 		validated.qualification.scoped,
 		validated.promotion.scoped,
+		validated.policy.scoped,
+		validated.inputPrecommit.scoped,
+		validated.sourceVerifier.scoped,
+		validated.credentialResolver.scoped,
+		validated.handoff.scoped,
 	} {
 		if !strings.Contains(scoped, "search_path=worksflow") {
 			t.Fatalf("scoped DSN does not bind the trusted schema")
 		}
+	}
+	sessionPool := valid
+	sessionPool.PromotionSessionAffinity = PromotionSessionAffinitySessionPool
+	if _, err := validateConfig(sessionPool); err != nil {
+		t.Fatalf("session-affine pool posture rejected: %v", err)
 	}
 
 	tests := []struct {
@@ -70,11 +97,49 @@ func TestValidateConfigRequiresFourDistinctCredentialsForOneTarget(t *testing.T)
 	}{
 		{"invalid schema", func(config *Config) { config.Schema = "public;drop" }},
 		{"missing promotion", func(config *Config) { config.PromotionDSN = "" }},
+		{"missing promotion session affinity", func(config *Config) { config.PromotionSessionAffinity = "" }},
+		{"transaction pooling", func(config *Config) { config.PromotionSessionAffinity = "transaction-pool" }},
+		{"promotion runtime enabled", func(config *Config) { config.PromotionRuntimeGate = "enabled" }},
+		{"missing promotion runtime gate", func(config *Config) { config.PromotionRuntimeGate = "" }},
+		{"missing policy", func(config *Config) { config.PolicyDSN = "" }},
+		{"missing input precommit", func(config *Config) { config.InputPrecommitDSN = "" }},
+		{"missing input precommit affinity", func(config *Config) { config.InputPrecommitSessionAffinity = "" }},
+		{"input precommit transaction pooling", func(config *Config) { config.InputPrecommitSessionAffinity = "transaction-pool" }},
+		{"missing source verifier", func(config *Config) { config.SourceVerifierDSN = "" }},
+		{"missing source verifier affinity", func(config *Config) { config.SourceVerifierSessionAffinity = "" }},
+		{"source verifier transaction pooling", func(config *Config) { config.SourceVerifierSessionAffinity = "transaction-pool" }},
+		{"missing credential resolver", func(config *Config) { config.CredentialResolverDSN = "" }},
+		{"missing credential resolver affinity", func(config *Config) { config.CredentialResolverSessionAffinity = "" }},
+		{"credential resolver transaction pooling", func(config *Config) { config.CredentialResolverSessionAffinity = "transaction-pool" }},
+		{"missing handoff", func(config *Config) { config.HandoffDSN = "" }},
+		{"missing handoff affinity", func(config *Config) { config.HandoffSessionAffinity = "" }},
+		{"handoff transaction pooling", func(config *Config) { config.HandoffSessionAffinity = "transaction-pool" }},
+		{"handoff same login", func(config *Config) {
+			config.HandoffDSN = secureTestDSN("app_login", "handoff-secret", "db.internal", "5432", "worksflow")
+		}},
+		{"handoff same secret", func(config *Config) {
+			config.HandoffDSN = secureTestDSN("handoff_login", "app-secret", "db.internal", "5432", "worksflow")
+		}},
+		{"input precommit same login", func(config *Config) {
+			config.InputPrecommitDSN = secureTestDSN("app_login", "input-precommit-secret", "db.internal", "5432", "worksflow")
+		}},
+		{"source verifier same secret", func(config *Config) {
+			config.SourceVerifierDSN = secureTestDSN("source_verifier_login", "app-secret", "db.internal", "5432", "worksflow")
+		}},
+		{"credential resolver other database", func(config *Config) {
+			config.CredentialResolverDSN = secureTestDSN("credential_resolver_login", "credential-resolver-secret", "db.internal", "5432", "other")
+		}},
 		{"promotion same login", func(config *Config) {
 			config.PromotionDSN = secureTestDSN("app_login", "promotion-secret", "db.internal", "5432", "worksflow")
 		}},
 		{"promotion same secret", func(config *Config) {
 			config.PromotionDSN = secureTestDSN("promotion_login", "app-secret", "db.internal", "5432", "worksflow")
+		}},
+		{"policy same login", func(config *Config) {
+			config.PolicyDSN = secureTestDSN("app_login", "policy-secret", "db.internal", "5432", "worksflow")
+		}},
+		{"policy same secret", func(config *Config) {
+			config.PolicyDSN = secureTestDSN("policy_login", "app-secret", "db.internal", "5432", "worksflow")
 		}},
 		{"same login", func(config *Config) {
 			config.MigratorDSN = secureTestDSN("app_login", "other-secret", "db.internal", "5432", "worksflow")
@@ -146,7 +211,7 @@ func TestValidateConfigRequiresFourDistinctCredentialsForOneTarget(t *testing.T)
 			if err == nil {
 				t.Fatal("unsafe configuration was accepted")
 			}
-			for _, secret := range []string{"app-secret", "migrator-secret", "qualification-secret", "promotion-secret"} {
+			for _, secret := range []string{"app-secret", "migrator-secret", "qualification-secret", "promotion-secret", "policy-secret", "input-precommit-secret", "source-verifier-secret", "credential-resolver-secret"} {
 				if strings.Contains(err.Error(), secret) {
 					t.Fatalf("configuration error exposed secret %q: %v", secret, err)
 				}

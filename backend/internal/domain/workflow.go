@@ -1,6 +1,7 @@
 package domain
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"sort"
@@ -11,17 +12,18 @@ import (
 type WorkflowNodeType string
 
 const (
-	NodeArtifactInput    WorkflowNodeType = "artifact_input"
-	NodeAITransform      WorkflowNodeType = "ai_transform"
-	NodeHumanEdit        WorkflowNodeType = "human_edit"
-	NodeReviewGate       WorkflowNodeType = "review_gate"
-	NodeCondition        WorkflowNodeType = "condition"
-	NodeFanOut           WorkflowNodeType = "fan_out"
-	NodeMerge            WorkflowNodeType = "merge"
-	NodeQualityGate      WorkflowNodeType = "quality_gate"
-	NodeManifestCompiler WorkflowNodeType = "manifest_compiler"
-	NodeWorkbenchBuild   WorkflowNodeType = "workbench_build"
-	NodePublish          WorkflowNodeType = "publish"
+	NodeArtifactInput             WorkflowNodeType = "artifact_input"
+	NodeAITransform               WorkflowNodeType = "ai_transform"
+	NodeHumanEdit                 WorkflowNodeType = "human_edit"
+	NodeReviewGate                WorkflowNodeType = "review_gate"
+	NodeCondition                 WorkflowNodeType = "condition"
+	NodeFanOut                    WorkflowNodeType = "fan_out"
+	NodeMerge                     WorkflowNodeType = "merge"
+	NodeQualityGate               WorkflowNodeType = "quality_gate"
+	NodeExternalQualificationGate WorkflowNodeType = "external_qualification_gate"
+	NodeManifestCompiler          WorkflowNodeType = "manifest_compiler"
+	NodeWorkbenchBuild            WorkflowNodeType = "workbench_build"
+	NodePublish                   WorkflowNodeType = "publish"
 
 	// Legacy types remain valid so persisted v1 definitions can still be replayed.
 	NodeAI        WorkflowNodeType = "ai"
@@ -195,6 +197,98 @@ type QualityGateNodeConfig struct {
 	RequiredRole string `json:"requiredRole,omitempty"`
 }
 
+const (
+	ExternalQualificationGateName              = "external-qualification"
+	WorkflowInputAuthoritySchemaV1             = "worksflow-workflow-input-authority/v1"
+	QualificationPromotionConsumeProtocolV2    = "worksflow-qualification-promotion-consume/v2"
+	QualificationReceiptSchemaV3               = "worksflow-qualification-receipt/v3"
+	ExternalQualificationGateWaiverPolicyNever = "never"
+)
+
+// ExternalQualificationGateNodeConfig is deliberately closed: the dedicated
+// gate has no role, runner, retry, or waiver knobs. Its exact schemas and
+// protocol are part of the immutable workflow execution profile.
+type ExternalQualificationGateNodeConfig struct {
+	Blocking             bool   `json:"blocking"`
+	GateName             string `json:"gateName"`
+	InputAuthoritySchema string `json:"inputAuthoritySchema"`
+	PromotionProtocol    string `json:"promotionProtocol"`
+	ReceiptSchema        string `json:"receiptSchema"`
+	WaiverPolicy         string `json:"waiverPolicy"`
+}
+
+func (c *ExternalQualificationGateNodeConfig) UnmarshalJSON(data []byte) error {
+	type wire ExternalQualificationGateNodeConfig
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	token, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	if delimiter, ok := token.(json.Delim); !ok || delimiter != '{' {
+		return fmt.Errorf("external qualification gate config must be a JSON object")
+	}
+	expected := map[string]struct{}{
+		"blocking": {}, "gateName": {}, "inputAuthoritySchema": {},
+		"promotionProtocol": {}, "receiptSchema": {}, "waiverPolicy": {},
+	}
+	seen := make(map[string]struct{}, len(expected))
+	for decoder.More() {
+		fieldToken, err := decoder.Token()
+		if err != nil {
+			return err
+		}
+		field, ok := fieldToken.(string)
+		if !ok {
+			return fmt.Errorf("external qualification gate config contains a non-string field")
+		}
+		if _, ok := expected[field]; !ok {
+			return fmt.Errorf("external qualification gate config contains unsupported field %q", field)
+		}
+		if _, duplicate := seen[field]; duplicate {
+			return fmt.Errorf("external qualification gate config contains duplicate field %q", field)
+		}
+		seen[field] = struct{}{}
+		var value json.RawMessage
+		if err := decoder.Decode(&value); err != nil {
+			return err
+		}
+	}
+	closingToken, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	if delimiter, ok := closingToken.(json.Delim); !ok || delimiter != '}' {
+		return fmt.Errorf("external qualification gate config must be a JSON object")
+	}
+	if err := ensureJSONEOF(decoder); err != nil {
+		return err
+	}
+	if len(seen) != len(expected) {
+		return fmt.Errorf("external qualification gate config must contain exactly the closed v1 fields")
+	}
+	var decoded wire
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	*c = ExternalQualificationGateNodeConfig(decoded)
+	return nil
+}
+
+func ExactExternalQualificationGateConfig() ExternalQualificationGateNodeConfig {
+	return ExternalQualificationGateNodeConfig{
+		Blocking:             true,
+		GateName:             ExternalQualificationGateName,
+		InputAuthoritySchema: WorkflowInputAuthoritySchemaV1,
+		PromotionProtocol:    QualificationPromotionConsumeProtocolV2,
+		ReceiptSchema:        QualificationReceiptSchemaV3,
+		WaiverPolicy:         ExternalQualificationGateWaiverPolicyNever,
+	}
+}
+
+func (c ExternalQualificationGateNodeConfig) IsExact() bool {
+	return c == ExactExternalQualificationGateConfig()
+}
+
 type DeliveryNodeConfig struct {
 	Target            string `json:"target"`
 	RequiresPrototype bool   `json:"requiresPrototype"`
@@ -210,16 +304,17 @@ type NodeDefinition struct {
 	InputPorts   map[string]PortDefinition `json:"inputPorts,omitempty"`
 	OutputPorts  map[string]PortDefinition `json:"outputPorts,omitempty"`
 
-	ArtifactInput    *ArtifactInputNodeConfig    `json:"artifactInput,omitempty"`
-	AITransform      *AITransformNodeConfig      `json:"aiTransform,omitempty"`
-	HumanEdit        *HumanEditNodeConfig        `json:"humanEdit,omitempty"`
-	ReviewGate       *ReviewGateNodeConfig       `json:"reviewGate,omitempty"`
-	Condition        *ConditionNodeConfig        `json:"condition,omitempty"`
-	FanOut           *FanOutNodeConfig           `json:"fanOut,omitempty"`
-	Merge            *MergeNodeConfig            `json:"merge,omitempty"`
-	ManifestCompiler *ManifestCompilerNodeConfig `json:"manifestCompiler,omitempty"`
-	WorkbenchBuild   *WorkbenchBuildNodeConfig   `json:"workbenchBuild,omitempty"`
-	Publish          *PublishNodeConfig          `json:"publish,omitempty"`
+	ArtifactInput             *ArtifactInputNodeConfig             `json:"artifactInput,omitempty"`
+	AITransform               *AITransformNodeConfig               `json:"aiTransform,omitempty"`
+	HumanEdit                 *HumanEditNodeConfig                 `json:"humanEdit,omitempty"`
+	ReviewGate                *ReviewGateNodeConfig                `json:"reviewGate,omitempty"`
+	Condition                 *ConditionNodeConfig                 `json:"condition,omitempty"`
+	FanOut                    *FanOutNodeConfig                    `json:"fanOut,omitempty"`
+	Merge                     *MergeNodeConfig                     `json:"merge,omitempty"`
+	ManifestCompiler          *ManifestCompilerNodeConfig          `json:"manifestCompiler,omitempty"`
+	WorkbenchBuild            *WorkbenchBuildNodeConfig            `json:"workbenchBuild,omitempty"`
+	Publish                   *PublishNodeConfig                   `json:"publish,omitempty"`
+	ExternalQualificationGate *ExternalQualificationGateNodeConfig `json:"externalQualificationGate,omitempty"`
 
 	AI          *AINodeConfig          `json:"ai,omitempty"`
 	HumanTask   *HumanTaskNodeConfig   `json:"humanTask,omitempty"`
@@ -241,7 +336,7 @@ func (n NodeDefinition) Validate() error {
 	for _, present := range []bool{
 		n.ArtifactInput != nil, n.AITransform != nil, n.HumanEdit != nil, n.ReviewGate != nil,
 		n.Condition != nil, n.FanOut != nil, n.Merge != nil, n.ManifestCompiler != nil,
-		n.WorkbenchBuild != nil, n.Publish != nil,
+		n.WorkbenchBuild != nil, n.Publish != nil, n.ExternalQualificationGate != nil,
 		n.AI != nil, n.HumanTask != nil, n.Approval != nil, n.Transform != nil,
 		n.QualityGate != nil, n.Delivery != nil,
 	} {
@@ -317,6 +412,10 @@ func (n NodeDefinition) Validate() error {
 	case NodePublish:
 		if n.Publish == nil || strings.TrimSpace(n.Publish.Environment) == "" || strings.TrimSpace(n.Publish.RequiredRole) == "" {
 			issues = append(issues, ValidationIssue{Path: "node.publish", Message: "matching config with environment and requiredRole is required"})
+		}
+	case NodeExternalQualificationGate:
+		if n.ExternalQualificationGate == nil || !n.ExternalQualificationGate.IsExact() {
+			issues = append(issues, ValidationIssue{Path: "node.externalQualificationGate", Message: "matching closed non-waivable external qualification config is required"})
 		}
 	case NodeAI:
 		if n.AI == nil || strings.TrimSpace(n.AI.JobType) == "" || strings.TrimSpace(n.AI.OutputSchemaVersion) == "" {
@@ -1656,6 +1755,10 @@ func cloneNodeDefinitions(nodes []NodeDefinition) []NodeDefinition {
 		if node.Publish != nil {
 			copy := *node.Publish
 			node.Publish = &copy
+		}
+		if node.ExternalQualificationGate != nil {
+			copy := *node.ExternalQualificationGate
+			node.ExternalQualificationGate = &copy
 		}
 		if node.AI != nil {
 			copy := *node.AI

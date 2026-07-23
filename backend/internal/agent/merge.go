@@ -105,7 +105,7 @@ func NewPatchMergePlanRecord(
 		ExpectedWriterLeaseEpoch:         input.ExpectedWriterLeaseEpoch,
 		Operations:                       cloneMergeOperations(plan.Operations),
 		Conflicts:                        cloneMergeConflicts(plan.Conflicts),
-		CreatedBy:                        input.CreatedBy, CreatedAt: now.UTC(),
+		CreatedBy:                        input.CreatedBy, CreatedAt: canonicalDatabaseTime(now),
 	}
 	switch {
 	case len(record.Conflicts) != 0:
@@ -319,7 +319,7 @@ func NewPatchMergeApplication(
 		JournalSequenceFrom: first.Sequence, JournalSequenceTo: last.Sequence,
 		CandidateVersionFrom: first.CandidateFrom, CandidateVersionTo: last.CandidateTo,
 		BeforeTree: mutation.BeforeTree, AfterTree: mutation.AfterTree,
-		AppliedBy: actorID, AppliedAt: now.UTC(),
+		AppliedBy: actorID, AppliedAt: canonicalDatabaseTime(now),
 	}
 	if err := validatePatchMergeApplication(application, false); err != nil {
 		return PatchMergeApplication{}, err

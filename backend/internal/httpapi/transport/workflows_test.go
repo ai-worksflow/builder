@@ -70,6 +70,9 @@ type fakeWorkflowAPI struct {
 	run          *runtime.RunRecord
 	runPage      runtime.RunPage
 	definitions  []runtime.DefinitionRecord
+	actions      map[string]runtime.WorkflowNodeActionProjection
+	actionsErr   error
+	actionCursor uint64
 }
 
 func (f *fakeWorkflowAPI) ListDefinitions(context.Context, string, string) ([]runtime.DefinitionRecord, error) {
@@ -104,6 +107,14 @@ func (f *fakeWorkflowAPI) Start(_ context.Context, projectID, actorID string, re
 }
 func (f *fakeWorkflowAPI) GetRun(context.Context, string, string, string) (*runtime.RunRecord, error) {
 	return f.run, nil
+}
+func (f *fakeWorkflowAPI) ProjectRunNodeActions(
+	_ context.Context,
+	_, _, _ string,
+	eventCursor uint64,
+) (map[string]runtime.WorkflowNodeActionProjection, error) {
+	f.actionCursor = eventCursor
+	return f.actions, f.actionsErr
 }
 func (f *fakeWorkflowAPI) ListRuns(context.Context, string, string, runtime.RunListOptions) (runtime.RunPage, error) {
 	return f.runPage, nil
@@ -314,6 +325,65 @@ func TestWorkflowHandlerReturnsETagAndMapsSelfApproval(t *testing.T) {
 	approve := workflowRequest(router, http.MethodPost, "/v1/projects/"+projectID+"/workflow-runs/"+runID+"/approve", `{"nodeKey":"review","resolution":"approve"}`)
 	if approve.Code != http.StatusConflict {
 		t.Fatalf("approve status=%d body=%s", approve.Code, approve.Body.String())
+	}
+}
+
+func TestWorkflowRunResponseExposesServerActionProjection(t *testing.T) {
+	projectID, userID, runID := uuid.NewString(), uuid.NewString(), uuid.NewString()
+	nodeID := uuid.NewString()
+	api := &fakeWorkflowAPI{
+		run: &runtime.RunRecord{
+			ID: runID, ProjectID: projectID, Status: runtime.RunWaitingReview,
+			EventCursor: 17,
+			Context:     runtime.NewRunContext(),
+			Nodes: map[string]*runtime.NodeRecord{
+				"review": {
+					ID: nodeID, RunID: runID, Key: "review",
+					DefinitionNodeID: "review", Type: domain.NodeReviewGate,
+					Status: runtime.NodeWaitingReview,
+				},
+			},
+		},
+		actions: map[string]runtime.WorkflowNodeActionProjection{
+			"review": {
+				AllowedActions: []runtime.WorkflowNodeAction{
+					runtime.WorkflowNodeActionRequestReviewChanges,
+				},
+				BlockingReasons: []runtime.WorkflowActionBlockingReason{{
+					Code:      "canonical_review_gate_blocked",
+					Message:   "exact upstream revision is not canonically approved",
+					SourceRef: nil,
+				}},
+			},
+		},
+	}
+	router := workflowRouterForTest(t, api, userID)
+	response := workflowRequest(
+		router,
+		http.MethodGet,
+		"/v1/projects/"+projectID+"/workflow-runs/"+runID,
+		"",
+	)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
+	}
+	var body struct {
+		Nodes []struct {
+			AllowedActions  []runtime.WorkflowNodeAction           `json:"allowedActions"`
+			BlockingReasons []runtime.WorkflowActionBlockingReason `json:"blockingReasons"`
+		} `json:"nodes"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if len(body.Nodes) != 1 || len(body.Nodes[0].AllowedActions) != 1 ||
+		body.Nodes[0].AllowedActions[0] != runtime.WorkflowNodeActionRequestReviewChanges ||
+		len(body.Nodes[0].BlockingReasons) != 1 ||
+		body.Nodes[0].BlockingReasons[0].Code != "canonical_review_gate_blocked" {
+		t.Fatalf("action projection response = %+v", body.Nodes)
+	}
+	if api.actionCursor != 17 {
+		t.Fatalf("action projection cursor = %d, want 17", api.actionCursor)
 	}
 }
 

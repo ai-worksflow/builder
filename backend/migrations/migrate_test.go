@@ -140,6 +140,409 @@ func TestVerifyAppliedPrefixAllowsOnlyExactOrderedLegacyPrefix(t *testing.T) {
 	}
 }
 
+func TestPlannedMigrationChecksumRotationsAreExactAndFailClosed(t *testing.T) {
+	rotation := acceptedMigrationChecksumRotations["000073_qualification_evidence_event_store"][0]
+	expected := []Applied{{
+		Version: rotation.version, Checksum: rotation.toChecksum, DownChecksum: rotation.toDown, DownChecksumValid: true,
+	}}
+	applied := []Applied{{
+		Version: rotation.version, Checksum: rotation.fromChecksum, DownChecksum: rotation.fromDown, DownChecksumValid: true,
+	}}
+
+	planned, err := plannedMigrationChecksumRotations(expected, applied)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(planned) != 1 || planned[0] != rotation {
+		t.Fatalf("planned rotations = %#v", planned)
+	}
+
+	unknown := append([]Applied(nil), applied...)
+	unknown[0].DownChecksum = "unreviewed-drift"
+	if _, err := plannedMigrationChecksumRotations(expected, unknown); err == nil || !strings.Contains(err.Error(), "down checksum differs") {
+		t.Fatalf("unreviewed down checksum drift error = %v", err)
+	}
+
+	changedUp := append([]Applied(nil), applied...)
+	changedUp[0].Checksum = "changed-up"
+	if _, err := plannedMigrationChecksumRotations(expected, changedUp); err == nil || !strings.Contains(err.Error(), "checksum differs") {
+		t.Fatalf("up checksum drift error = %v", err)
+	}
+}
+
+func TestHistoricalUpChecksumRotationRequiresForwardEquivalenceMigration(t *testing.T) {
+	rotation := acceptedMigrationChecksumRotations["000077_canonical_review_authority_hardening"][0]
+	applied := []Applied{{
+		Version: rotation.version, Checksum: rotation.fromChecksum,
+		DownChecksum: rotation.fromDown, DownChecksumValid: true,
+	}}
+	target := Applied{
+		Version: rotation.version, Checksum: rotation.toChecksum,
+		DownChecksum: rotation.toDown, DownChecksumValid: true,
+	}
+
+	if _, err := plannedMigrationChecksumRotations([]Applied{target}, applied); err == nil ||
+		!strings.Contains(err.Error(), "requires forward-equivalence migration") {
+		t.Fatalf("missing forward-equivalence migration error = %v", err)
+	}
+
+	expected := []Applied{target, {Version: rotation.requiresVersion}}
+	planned, err := plannedMigrationChecksumRotations(expected, applied)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(planned) != 1 || planned[0] != rotation {
+		t.Fatalf("planned rotations = %#v", planned)
+	}
+
+	badDown := append([]Applied(nil), applied...)
+	badDown[0].DownChecksum = "unreviewed-down"
+	if _, err := plannedMigrationChecksumRotations(expected, badDown); err == nil ||
+		!strings.Contains(err.Error(), "checksum differs") {
+		t.Fatalf("unreviewed historical rotation error = %v", err)
+	}
+}
+
+func TestHandoffCompletionFenceRotationRequiresQualifiedReleaseMigration(t *testing.T) {
+	rotation := acceptedMigrationChecksumRotations["000082_qualification_handoff_v1"][0]
+	applied := []Applied{{
+		Version: rotation.version, Checksum: rotation.fromChecksum,
+		DownChecksum: rotation.fromDown, DownChecksumValid: true,
+	}}
+	target := Applied{
+		Version: rotation.version, Checksum: rotation.toChecksum,
+		DownChecksum: rotation.toDown, DownChecksumValid: true,
+	}
+
+	if _, err := plannedMigrationChecksumRotations([]Applied{target}, applied); err == nil ||
+		!strings.Contains(err.Error(), "requires forward-equivalence migration") {
+		t.Fatalf("missing qualified-release migration error = %v", err)
+	}
+
+	expected := []Applied{target, {Version: "000083_canonical_review_authority_forward_equivalence"}, {Version: rotation.requiresVersion}}
+	planned, err := plannedMigrationChecksumRotations(expected, applied)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(planned) != 1 || planned[0] != rotation {
+		t.Fatalf("planned rotations = %#v", planned)
+	}
+
+	badUp := append([]Applied(nil), applied...)
+	badUp[0].Checksum = "unreviewed-handoff-drift"
+	if _, err := plannedMigrationChecksumRotations(expected, badUp); err == nil ||
+		!strings.Contains(err.Error(), "checksum differs") {
+		t.Fatalf("unreviewed Handoff checksum drift error = %v", err)
+	}
+}
+
+func TestChecksumRotationWaitsForExactAppliedForwardMigration(t *testing.T) {
+	rotation := acceptedMigrationChecksumRotations["000082_qualification_handoff_v1"][0]
+	dependency := Applied{
+		Version: rotation.requiresVersion, Checksum: "dependency-up",
+		DownChecksum: "dependency-down", DownChecksumValid: true,
+	}
+	expected := []Applied{dependency}
+	if migrationChecksumRotationIsReady(expected, nil, rotation) {
+		t.Fatal("rotation became ready because its dependency exists only in the binary")
+	}
+	stale := dependency
+	stale.Checksum = "stale-up"
+	if migrationChecksumRotationIsReady(expected, []Applied{stale}, rotation) {
+		t.Fatal("rotation became ready with a stale applied dependency")
+	}
+	missingDown := dependency
+	missingDown.DownChecksumValid = false
+	if migrationChecksumRotationIsReady(expected, []Applied{missingDown}, rotation) {
+		t.Fatal("rotation became ready before dependency down-checksum integrity")
+	}
+	if !migrationChecksumRotationIsReady(expected, []Applied{dependency}, rotation) {
+		t.Fatal("rotation did not become ready after its exact dependency was applied")
+	}
+}
+
+func TestForwardEquivalencePortabilityChecksumRotationIsExact(t *testing.T) {
+	rotations := acceptedMigrationChecksumRotations["000083_canonical_review_authority_forward_equivalence"]
+	if len(rotations) != 1 {
+		t.Fatalf("accepted forward-equivalence rotations = %d, want exact old physical lineage", len(rotations))
+	}
+	for _, rotation := range rotations {
+		rotation := rotation
+		t.Run(rotation.fromChecksum[:8], func(t *testing.T) {
+			expected := []Applied{{
+				Version: rotation.version, Checksum: rotation.toChecksum,
+				DownChecksum: rotation.toDown, DownChecksumValid: true,
+			}}
+			applied := []Applied{{
+				Version: rotation.version, Checksum: rotation.fromChecksum,
+				DownChecksum: rotation.fromDown, DownChecksumValid: true,
+			}}
+			planned, err := plannedMigrationChecksumRotations(expected, applied)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(planned) != 1 || planned[0] != rotation {
+				t.Fatalf("planned rotations = %#v", planned)
+			}
+			if !planned[0].replayCurrentUpInTx {
+				t.Fatal("83 checksum rotation was accepted without physical forward repair")
+			}
+			applied[0].Checksum = "unreviewed-portability-drift"
+			if _, err := plannedMigrationChecksumRotations(expected, applied); err == nil ||
+				!strings.Contains(err.Error(), "checksum differs") {
+				t.Fatalf("unreviewed portability drift error = %v", err)
+			}
+		})
+	}
+	rotation := rotations[0]
+	intermediate := []Applied{{
+		Version:           rotation.version,
+		Checksum:          "1ba21a43d0c943615b4d54bdb0b9d4737ea96a331becc8860eb7d111751901db",
+		DownChecksum:      "00242d8f4eb60307854717c4d8c5189d053eccc048c813de147433491ae23387",
+		DownChecksumValid: true,
+	}}
+	expected := []Applied{{
+		Version: rotation.version, Checksum: rotation.toChecksum,
+		DownChecksum: rotation.toDown, DownChecksumValid: true,
+	}}
+	if _, err := plannedMigrationChecksumRotations(expected, intermediate); err == nil {
+		t.Fatal("unavailable intermediate physical lineage was accepted")
+	}
+}
+
+func TestCandidateSandboxMigrationRelocationIsExactAndCrashRecoverable(t *testing.T) {
+	expected, err := expectedVersions()
+	if err != nil {
+		t.Fatal(err)
+	}
+	relocation := acceptedMigrationVersionRelocation
+	predecessorIndex := appliedMigrationIndex(expected, relocation.requiredPredecessor)
+	targetIndex := appliedMigrationIndex(expected, relocation.toVersion)
+	if predecessorIndex < 0 || targetIndex < 0 {
+		t.Fatal("embedded migration lineage does not contain relocation endpoints")
+	}
+	legacy := Applied{
+		Version: relocation.fromVersion, Checksum: relocation.checksum,
+		DownChecksum: relocation.downChecksum, DownChecksumValid: true,
+	}
+	target := expected[targetIndex]
+
+	tests := []struct {
+		name           string
+		applied        []Applied
+		wantRelocation bool
+	}{
+		{
+			name:           "legacy sequence 84",
+			applied:        append(append([]Applied(nil), expected[:predecessorIndex+1]...), legacy),
+			wantRelocation: true,
+		},
+		{
+			name:    "crash after relocation",
+			applied: append(append([]Applied(nil), expected[:predecessorIndex+1]...), target),
+		},
+		{
+			name:    "crash after applying current 84",
+			applied: append(append([]Applied(nil), expected[:predecessorIndex+2]...), target),
+		},
+		{
+			name:    "crash after applying current 85",
+			applied: append(append([]Applied(nil), expected[:targetIndex]...), target),
+		},
+		{
+			name:    "exact current head",
+			applied: append([]Applied(nil), expected...),
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			plan, err := plannedMigrationLineage(expected, test.applied)
+			if err != nil {
+				t.Fatalf("plannedMigrationLineage() error = %v", err)
+			}
+			if (plan.relocation != nil) != test.wantRelocation {
+				t.Fatalf("relocation = %#v, want present=%t", plan.relocation, test.wantRelocation)
+			}
+			if test.wantRelocation {
+				return
+			}
+			if err := verifyAppliedPrefixForUp(expected, test.applied); err != nil {
+				t.Fatalf("recoverable relocated prefix rejected: %v", err)
+			}
+		})
+	}
+}
+
+func TestCandidateSandboxMigrationRelocationRejectsEveryOtherGapOrIdentity(t *testing.T) {
+	expected, err := expectedVersions()
+	if err != nil {
+		t.Fatal(err)
+	}
+	relocation := acceptedMigrationVersionRelocation
+	predecessorIndex := appliedMigrationIndex(expected, relocation.requiredPredecessor)
+	targetIndex := appliedMigrationIndex(expected, relocation.toVersion)
+	legacy := Applied{
+		Version: relocation.fromVersion, Checksum: relocation.checksum,
+		DownChecksum: relocation.downChecksum, DownChecksumValid: true,
+	}
+	target := expected[targetIndex]
+	exactPredecessors := append([]Applied(nil), expected[:predecessorIndex+1]...)
+
+	wrongChecksum := legacy
+	wrongChecksum.Checksum = strings.Repeat("f", 64)
+	wrongDown := legacy
+	wrongDown.DownChecksum = strings.Repeat("e", 64)
+	missingDown := legacy
+	missingDown.DownChecksumValid = false
+	tooEarly := append(append([]Applied(nil), expected[:predecessorIndex]...), target)
+	nonPrefixGap := append(append([]Applied(nil), exactPredecessors...), expected[predecessorIndex+2], target)
+	conflict := append(append(append([]Applied(nil), exactPredecessors...), legacy), target)
+	foreignFuture := append(append([]Applied(nil), exactPredecessors...), Applied{
+		Version: "000087_unapproved_future", Checksum: strings.Repeat("a", 64),
+		DownChecksum: strings.Repeat("b", 64), DownChecksumValid: true,
+	})
+
+	for _, test := range []struct {
+		name    string
+		applied []Applied
+	}{
+		{name: "wrong up checksum", applied: append(append([]Applied(nil), exactPredecessors...), wrongChecksum)},
+		{name: "wrong down checksum", applied: append(append([]Applied(nil), exactPredecessors...), wrongDown)},
+		{name: "missing down checksum", applied: append(append([]Applied(nil), exactPredecessors...), missingDown)},
+		{name: "future before required predecessor", applied: tooEarly},
+		{name: "different gap", applied: nonPrefixGap},
+		{name: "legacy and relocated rows", applied: conflict},
+		{name: "unapproved future", applied: foreignFuture},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if err := verifyAppliedPrefixForUp(expected, test.applied); err == nil {
+				t.Fatal("unapproved migration lineage was accepted")
+			}
+		})
+	}
+}
+
+func TestApplyMigrationVersionRelocationUsesExactCompareAndSwap(t *testing.T) {
+	relocation := acceptedMigrationVersionRelocation
+	for _, test := range []struct {
+		name         string
+		rowsAffected int64
+		wantError    bool
+	}{
+		{name: "exactly once", rowsAffected: 1},
+		{name: "lost compare and swap", rowsAffected: 0, wantError: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			state := &migrationTestDatabase{
+				exec: func(query string, arguments []driver.NamedValue) (driver.Result, error) {
+					if !strings.Contains(query, "SET version = $1") ||
+						!strings.Contains(query, "AND checksum = $3") ||
+						!strings.Contains(query, "AND down_checksum = $4") {
+						t.Fatalf("relocation is not an exact compare-and-swap: %s", query)
+					}
+					assertMigrationArgument(t, arguments, 0, relocation.toVersion)
+					assertMigrationArgument(t, arguments, 1, relocation.fromVersion)
+					assertMigrationArgument(t, arguments, 2, relocation.checksum)
+					assertMigrationArgument(t, arguments, 3, relocation.downChecksum)
+					return driver.RowsAffected(test.rowsAffected), nil
+				},
+			}
+			database := sql.OpenDB(migrationTestConnector{state: state})
+			t.Cleanup(func() { _ = database.Close() })
+			connection, err := database.Conn(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer connection.Close()
+
+			err = applyMigrationVersionRelocation(context.Background(), connection, relocation)
+			if (err != nil) != test.wantError {
+				t.Fatalf("applyMigrationVersionRelocation() error = %v, want error=%t", err, test.wantError)
+			}
+		})
+	}
+}
+
+func TestForwardRepairAndChecksumRotationAreOneAtomicTransaction(t *testing.T) {
+	rotation := acceptedMigrationChecksumRotations["000083_canonical_review_authority_forward_equivalence"][0]
+	for _, test := range []struct {
+		name         string
+		failAt       string
+		rows         int64
+		wantCommit   int
+		wantRollback int
+	}{
+		{name: "repair then exact ledger CAS", rows: 1, wantCommit: 1},
+		{name: "permission preflight fails closed", failAt: "preflight", rows: 1, wantRollback: 1},
+		{name: "physical repair fails closed", failAt: "repair", rows: 1, wantRollback: 1},
+		{name: "lost ledger CAS rolls repair back", rows: 0, wantRollback: 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var preflighted bool
+			var repaired bool
+			var rotated bool
+			state := &migrationTestDatabase{
+				exec: func(query string, arguments []driver.NamedValue) (driver.Result, error) {
+					switch {
+					case strings.Contains(query, "$canonical_review_forward_repair_preflight$"):
+						if test.failAt == "preflight" {
+							return nil, errors.New("permission denied by repair preflight")
+						}
+						preflighted = true
+					case strings.Contains(query, "canonical_review_83_legacy_release_acl_provenance") && len(arguments) == 0:
+						if !preflighted {
+							t.Fatal("physical repair ran before its permission preflight")
+						}
+						if test.failAt == "repair" {
+							return nil, errors.New("physical forward repair rejected")
+						}
+						repaired = true
+					case strings.Contains(query, "UPDATE schema_migrations"):
+						if !repaired {
+							t.Fatal("checksum ledger rotated before physical repair")
+						}
+						assertMigrationArgument(t, arguments, 0, rotation.toChecksum)
+						assertMigrationArgument(t, arguments, 1, rotation.toDown)
+						assertMigrationArgument(t, arguments, 2, rotation.version)
+						assertMigrationArgument(t, arguments, 3, rotation.fromChecksum)
+						assertMigrationArgument(t, arguments, 4, rotation.fromDown)
+						rotated = true
+						return driver.RowsAffected(test.rows), nil
+					default:
+						t.Fatalf("unexpected repair statement: %s", query)
+					}
+					return driver.RowsAffected(1), nil
+				},
+			}
+			database := sql.OpenDB(migrationTestConnector{state: state})
+			t.Cleanup(func() { _ = database.Close() })
+			connection, err := database.Conn(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer connection.Close()
+
+			err = applyMigrationChecksumRotation(context.Background(), connection, rotation)
+			if test.wantCommit == 1 && err != nil {
+				t.Fatalf("applyMigrationChecksumRotation() error = %v", err)
+			}
+			if test.wantCommit == 0 && err == nil {
+				t.Fatal("failed repair transaction returned nil")
+			}
+			if state.beginCount != 1 || state.commitCount != test.wantCommit || state.rollbackCount != test.wantRollback {
+				t.Fatalf(
+					"transaction counts = begin:%d commit:%d rollback:%d, want 1/%d/%d",
+					state.beginCount, state.commitCount, state.rollbackCount,
+					test.wantCommit, test.wantRollback,
+				)
+			}
+			if test.wantCommit == 1 && !rotated {
+				t.Fatal("successful repair did not rotate the exact ledger row")
+			}
+		})
+	}
+}
+
 func TestExpectedVersionsUseEmbeddedChecksums(t *testing.T) {
 	expected, err := expectedVersions()
 	if err != nil {
@@ -185,6 +588,16 @@ func TestMigrationDiscoveryRejectsIncompleteDuplicateAndNoncanonicalPairs(t *tes
 				"000001_second.down.sql": {Data: []byte("down")},
 			},
 			want: "sequence 000001 is duplicated",
+		},
+		{
+			name: "missing sequence",
+			fileSystem: fstest.MapFS{
+				"000001_first.up.sql":   {Data: []byte("up")},
+				"000001_first.down.sql": {Data: []byte("down")},
+				"000003_third.up.sql":   {Data: []byte("up")},
+				"000003_third.down.sql": {Data: []byte("down")},
+			},
+			want: "sequence is not contiguous: found 000003, expected 000002",
 		},
 		{
 			name: "noncanonical name",

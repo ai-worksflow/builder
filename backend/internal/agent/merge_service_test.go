@@ -155,6 +155,7 @@ func (workspace *patchMergeWorkspaceFake) MutateAgentFiles(
 
 func TestPatchMergeServiceAppliesExactPlanAndReplaysApplication(t *testing.T) {
 	fixture := newPatchMergeServiceFixture(t, false)
+	fixture.service.now = func() time.Time { return fixture.workspace.now.Add(321 * time.Nanosecond) }
 	result, err := fixture.service.MergePatch(context.Background(), fixture.input)
 	if err != nil {
 		t.Fatal(err)
@@ -167,6 +168,11 @@ func TestPatchMergeServiceAppliesExactPlanAndReplaysApplication(t *testing.T) {
 		result.Application.AfterTree.TreeHash != result.Plan.PlannedTreeHash ||
 		result.Application.CandidateVersionTo != fixture.input.ExpectedCandidateVersion+1 {
 		t.Fatalf("application did not bind plan: %#v", result.Application)
+	}
+	if result.Plan.CreatedAt != canonicalDatabaseTime(result.Plan.CreatedAt) ||
+		result.Application.AppliedAt != canonicalDatabaseTime(result.Application.AppliedAt) {
+		t.Fatalf("merge timestamps are not PostgreSQL-canonical: plan=%s application=%s",
+			result.Plan.CreatedAt, result.Application.AppliedAt)
 	}
 
 	replayed, err := fixture.service.MergePatch(context.Background(), fixture.input)

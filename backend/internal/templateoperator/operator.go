@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/worksflow/builder/backend/internal/repository"
 	"github.com/worksflow/builder/backend/internal/templateauthority"
@@ -32,11 +33,25 @@ type AdmissionRequest struct {
 	EvaluatedBy   string                            `json:"evaluatedBy"`
 }
 
+// FullStackRegistrationRequest combines exact, already-approved component
+// releases. Mutable policy state, release contents, hashes derived for the
+// resulting document, and the operator clock are deliberately not accepted.
+type FullStackRegistrationRequest struct {
+	SchemaVersion string                                  `json:"schemaVersion"`
+	ID            string                                  `json:"id"`
+	TemplateID    string                                  `json:"templateId"`
+	Version       string                                  `json:"version"`
+	Components    []templates.FullStackComponentSelection `json:"components"`
+	Layout        templates.FullStackLayout               `json:"layout"`
+	CreatedBy     string                                  `json:"createdBy"`
+}
+
 type Operator struct {
 	database    *gorm.DB
 	authority   *templates.VerifiedArtifactAuthority
 	writer      *templates.Writer
 	commitments Commitments
+	now         func() time.Time
 }
 
 func DecodeAdmissionRequest(encoded []byte) (AdmissionRequest, error) {
@@ -49,6 +64,20 @@ func DecodeAdmissionRequest(encoded []byte) (AdmissionRequest, error) {
 	}
 	if request.SchemaVersion != AdmissionSchemaVersion {
 		return AdmissionRequest{}, fmt.Errorf("schemaVersion must equal %q", AdmissionSchemaVersion)
+	}
+	return request, nil
+}
+
+func DecodeFullStackRegistrationRequest(encoded []byte) (FullStackRegistrationRequest, error) {
+	if len(encoded) == 0 || len(encoded) > maxAdmissionRequestBytes {
+		return FullStackRegistrationRequest{}, fmt.Errorf("Full-stack registration request must be between 1 and %d bytes", maxAdmissionRequestBytes)
+	}
+	var request FullStackRegistrationRequest
+	if err := decodeStrictJSON(encoded, &request); err != nil {
+		return FullStackRegistrationRequest{}, fmt.Errorf("decode full-stack registration request: %w", err)
+	}
+	if request.SchemaVersion != FullStackRegistrationSchemaVersion {
+		return FullStackRegistrationRequest{}, fmt.Errorf("schemaVersion must equal %q", FullStackRegistrationSchemaVersion)
 	}
 	return request, nil
 }
@@ -85,48 +114,9 @@ func New(database *gorm.DB, config Config, lookup EnvironmentLookup) (*Operator,
 		return nil, fmt.Errorf("configure exact Git source verifier: %w", err)
 	}
 
-	httpOrigins := make([]templateauthority.RegistryHTTPOrigin, 0, len(compiled.config.Registry.Origins))
-	for _, origin := range compiled.config.Registry.Origins {
-		authorization := ""
-		if origin.AuthorizationEnv != "" {
-			value, present := lookup(origin.AuthorizationEnv)
-			if !present || strings.TrimSpace(value) == "" {
-				return nil, fmt.Errorf("registry credential environment variable %s is required", origin.AuthorizationEnv)
-			}
-			authorization = value
-		}
-		httpOrigins = append(httpOrigins, templateauthority.RegistryHTTPOrigin{
-			Host: origin.Host, Authorization: authorization, RedirectHosts: origin.RedirectHosts,
-		})
-	}
-	registryClient, err := templateauthority.NewHTTPSRegistryClient(templateauthority.HTTPSRegistryClientConfig{
-		Origins: httpOrigins, Timeout: compiled.registryTimeout, MaxRedirects: compiled.config.Registry.MaxRedirects,
-	})
+	registryClient, oci, sbom, err := newRegistryVerifiers(compiled, lookup)
 	if err != nil {
-		return nil, fmt.Errorf("configure HTTPS OCI Registry client: %w", err)
-	}
-	repositories := make([]templateauthority.RepositoryRule, 0, len(compiled.config.Registry.Repositories))
-	for _, repositoryConfig := range compiled.config.Registry.Repositories {
-		repositories = append(repositories, templateauthority.RepositoryRule{
-			Host: repositoryConfig.Host, Repository: repositoryConfig.Repository,
-		})
-	}
-	oci, err := templateauthority.NewOCIVerifier(registryClient, templateauthority.RegistryPolicy{
-		Repositories: repositories, RedirectHosts: compiled.redirectHosts,
-	}, templateauthority.Limits{
-		MaxManifestBytes: compiled.config.Registry.MaxManifestBytes,
-		MaxBlobBytes:     compiled.config.Registry.MaxBlobBytes,
-		MaxTotalBytes:    compiled.config.Registry.MaxTotalBytes,
-		MaxBlobs:         compiled.config.Registry.MaxBlobs,
-		MaxRedirects:     compiled.config.Registry.MaxRedirects,
-		Timeout:          compiled.registryTimeout,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("configure OCI verifier: %w", err)
-	}
-	sbom, err := templateauthority.NewSBOMVerifier(oci)
-	if err != nil {
-		return nil, fmt.Errorf("configure SBOM verifier: %w", err)
+		return nil, err
 	}
 	dsse, err := templateauthority.NewDSSEVerifier(compiled.dssePolicy)
 	if err != nil {
@@ -151,7 +141,63 @@ func New(database *gorm.DB, config Config, lookup EnvironmentLookup) (*Operator,
 	if err != nil {
 		return nil, err
 	}
-	return &Operator{database: database, authority: authority, writer: writer, commitments: compiled.commitments}, nil
+	return &Operator{
+		database: database, authority: authority, writer: writer,
+		commitments: compiled.commitments, now: time.Now,
+	}, nil
+}
+
+func newRegistryVerifiers(
+	compiled compiledConfig,
+	lookup EnvironmentLookup,
+) (*templateauthority.HTTPSRegistryClient, *templateauthority.OCIVerifier, *templateauthority.SBOMVerifier, error) {
+	if lookup == nil {
+		return nil, nil, nil, errors.New("Template Artifact Authority environment lookup is required")
+	}
+	httpOrigins := make([]templateauthority.RegistryHTTPOrigin, 0, len(compiled.config.Registry.Origins))
+	for _, origin := range compiled.config.Registry.Origins {
+		authorization := ""
+		if origin.AuthorizationEnv != "" {
+			value, present := lookup(origin.AuthorizationEnv)
+			if !present || strings.TrimSpace(value) == "" {
+				return nil, nil, nil, fmt.Errorf("registry credential environment variable %s is required", origin.AuthorizationEnv)
+			}
+			authorization = value
+		}
+		httpOrigins = append(httpOrigins, templateauthority.RegistryHTTPOrigin{
+			Host: origin.Host, Authorization: authorization, RedirectHosts: origin.RedirectHosts,
+		})
+	}
+	registryClient, err := templateauthority.NewHTTPSRegistryClient(templateauthority.HTTPSRegistryClientConfig{
+		Origins: httpOrigins, Timeout: compiled.registryTimeout, MaxRedirects: compiled.config.Registry.MaxRedirects,
+	})
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("configure HTTPS OCI Registry client: %w", err)
+	}
+	repositories := make([]templateauthority.RepositoryRule, 0, len(compiled.config.Registry.Repositories))
+	for _, repositoryConfig := range compiled.config.Registry.Repositories {
+		repositories = append(repositories, templateauthority.RepositoryRule{
+			Host: repositoryConfig.Host, Repository: repositoryConfig.Repository,
+		})
+	}
+	oci, err := templateauthority.NewOCIVerifier(registryClient, templateauthority.RegistryPolicy{
+		Repositories: repositories, RedirectHosts: compiled.redirectHosts,
+	}, templateauthority.Limits{
+		MaxManifestBytes: compiled.config.Registry.MaxManifestBytes,
+		MaxBlobBytes:     compiled.config.Registry.MaxBlobBytes,
+		MaxTotalBytes:    compiled.config.Registry.MaxTotalBytes,
+		MaxBlobs:         compiled.config.Registry.MaxBlobs,
+		MaxRedirects:     compiled.config.Registry.MaxRedirects,
+		Timeout:          compiled.registryTimeout,
+	})
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("configure OCI verifier: %w", err)
+	}
+	sbom, err := templateauthority.NewSBOMVerifier(oci)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("configure SBOM verifier: %w", err)
+	}
+	return registryClient, oci, sbom, nil
 }
 
 func (operator *Operator) Commitments() Commitments {
@@ -208,5 +254,56 @@ func (operator *Operator) Admit(ctx context.Context, request AdmissionRequest) (
 		AttemptID: request.AttemptID, ReleaseID: request.ReleaseID,
 		Candidate: request.Candidate, Bundle: request.Bundle,
 		RequestedBy: request.RequestedBy, EvaluatedBy: request.EvaluatedBy,
+	})
+}
+
+// VerifyAdmission performs the complete independent Git, OCI, SPDX, DSSE, and
+// transparency verification and returns the would-be immutable receipt without
+// opening a write transaction. It is an operator preflight, not an approval:
+// only Admit can persist the receipt and transition a release to selectable.
+func (operator *Operator) VerifyAdmission(ctx context.Context, request AdmissionRequest) (templates.ArtifactAuthorityReceiptView, error) {
+	if request.SchemaVersion != AdmissionSchemaVersion {
+		return templates.ArtifactAuthorityReceiptView{}, fmt.Errorf("schemaVersion must equal %q", AdmissionSchemaVersion)
+	}
+	if operator == nil || operator.authority == nil || operator.now == nil {
+		return templates.ArtifactAuthorityReceiptView{}, errors.New("Template Artifact Authority operator is not configured")
+	}
+	if err := operator.Readiness(ctx); err != nil {
+		return templates.ArtifactAuthorityReceiptView{}, err
+	}
+	observedAt := operator.now().UTC().Truncate(time.Microsecond)
+	attempt, err := templates.NewAuthorityAdmissionAttempt(request.AttemptID, request.RequestedBy, request.Candidate, observedAt)
+	if err != nil {
+		return templates.ArtifactAuthorityReceiptView{}, err
+	}
+	view := attempt.Snapshot()
+	receipt, err := operator.authority.Verify(ctx, templates.ArtifactAuthorityVerifyRequest{
+		Candidate: view.Candidate, SubjectHash: view.SubjectHash,
+		Bundle: request.Bundle, RecordedBy: strings.TrimSpace(request.EvaluatedBy),
+	})
+	if err != nil {
+		return templates.ArtifactAuthorityReceiptView{}, err
+	}
+	return receipt.Snapshot(), nil
+}
+
+func (operator *Operator) RegisterFullStack(ctx context.Context, request FullStackRegistrationRequest) (templates.FullStackTemplateRegistration, error) {
+	if request.SchemaVersion != FullStackRegistrationSchemaVersion {
+		return templates.FullStackTemplateRegistration{}, fmt.Errorf("schemaVersion must equal %q", FullStackRegistrationSchemaVersion)
+	}
+	if operator == nil || operator.now == nil {
+		return templates.FullStackTemplateRegistration{}, errors.New("Template Artifact Authority operator clock is not configured")
+	}
+	if err := operator.Readiness(ctx); err != nil {
+		return templates.FullStackTemplateRegistration{}, err
+	}
+	createdAt := operator.now().UTC().Truncate(time.Microsecond)
+	if createdAt.IsZero() {
+		return templates.FullStackTemplateRegistration{}, errors.New("Template Artifact Authority operator clock returned zero")
+	}
+	return operator.writer.RegisterFullStack(ctx, templates.RegisterFullStackInput{
+		ID: request.ID, TemplateID: request.TemplateID, Version: request.Version,
+		Components: request.Components, Layout: request.Layout,
+		CreatedBy: request.CreatedBy, CreatedAt: createdAt,
 	})
 }

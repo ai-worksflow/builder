@@ -87,6 +87,7 @@ func TestQualificationEvidenceEventStoreMigrationIsClosedReplayableAndOwnerScope
 		t.Fatal("Qualification Evidence immutable trigger search_path is not pg_catalog-only")
 	}
 	downText := string(down)
+	assertQualificationRollbackFencePrecedesRelations(t, downText)
 	for _, expected := range []string{
 		"LOCK TABLE qualification_evidence_events IN ACCESS EXCLUSIVE MODE",
 		"LOCK TABLE qualification_evidence_operations IN ACCESS EXCLUSIVE MODE",
@@ -104,5 +105,15 @@ func TestQualificationEvidenceEventStoreMigrationIsClosedReplayableAndOwnerScope
 		if !strings.Contains(downText, expected) {
 			t.Fatalf("Qualification Evidence rollback is missing %q", expected)
 		}
+	}
+}
+
+func assertQualificationRollbackFencePrecedesRelations(t *testing.T, migration string) {
+	t.Helper()
+	fence := strings.Index(migration,
+		"pg_catalog.hashtextextended('worksflow:workflow-input-authority-migration:v1', 0)")
+	firstRelationLock := strings.Index(migration, "LOCK TABLE ")
+	if fence < 0 || firstRelationLock < 0 || fence >= firstRelationLock {
+		t.Fatal("Qualification rollback must acquire the exclusive WIA rollout fence before its first relation lock")
 	}
 }

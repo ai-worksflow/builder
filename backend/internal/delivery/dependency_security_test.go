@@ -105,7 +105,8 @@ func TestResolverAndBuildContainerArgumentsKeepNetworkBoundary(t *testing.T) {
 	}
 	goResolverText := strings.Join(sandbox.dependencyRunArgs("go-resolver", goDependencies, "go", sandbox.goImage, []string{"go", "mod", "download", "all"}), " ")
 	if !strings.Contains(goResolverText, "GOPROXY="+defaultGoProxy) ||
-		!strings.Contains(goResolverText, "GOSUMDB="+defaultGoSumDB) || strings.Contains(goResolverText, ",direct") {
+		!strings.Contains(goResolverText, "GOSUMDB="+defaultGoSumDB) ||
+		!strings.Contains(goResolverText, "GOPATH=/resolver/.gopath") || strings.Contains(goResolverText, ",direct") {
 		t.Fatalf("Go resolver policy is not fixed: %s", goResolverText)
 	}
 	goBuildArgs, err := sandbox.qualityRunArgs("go-quality", workspace, SandboxRequest{

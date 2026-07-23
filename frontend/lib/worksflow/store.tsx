@@ -21,7 +21,6 @@ import {
   RECENT_PROJECTS,
   TODO_TASKS,
   TEAM_DOCUMENTS,
-  USER_PROMPT,
   VERSIONS,
 } from './mock-data'
 import {
@@ -108,8 +107,6 @@ import {
 } from './prompt-library'
 import { GenerationClientError, streamGeneration } from '@/lib/generation/client'
 import { useI18n } from '@/lib/i18n'
-import { generateLocalWorkspace } from '@/lib/generation/local-generator'
-import { parseGenerationRequest } from '@/lib/generation/schema'
 import type {
   GenerationEvent,
   GenerationCost,
@@ -164,14 +161,6 @@ import type {
 
 export { teamPathFor, workbenchPathFor } from './route-state'
 export type { TeamView } from './types'
-
-const INITIAL_GENERATION_RESULT = generateLocalWorkspace(
-  parseGenerationRequest({
-    prompt: USER_PROMPT,
-    mode: 'plan',
-    currentFiles: [],
-  }),
-)
 
 function createInitialProjectCatalog(): ProjectCatalog {
   const initialWorkspace = createInitialWorkspace()
@@ -475,11 +464,10 @@ export function WorksflowProvider({ children }: { children: ReactNode }) {
     [setProjectCatalog],
   )
 
-  // Workbench begins in planning, then auto advances to planReady.
-  const [phase, setPhase] = useState<Phase>('planning')
+  const [phase, setPhase] = useState<Phase>('planReady')
   const [view, setView] = useState<WorkbenchView>('preview')
-  const [tasks, setTasks] = useState<BuildTask[]>(BUILD_TASKS)
-  const [versions, setVersions] = useState<ProjectVersion[]>(VERSIONS.slice(0, 1))
+  const [tasks, setTasks] = useState<BuildTask[]>([])
+  const [versions, setVersions] = useState<ProjectVersion[]>([])
   const [followUps, setFollowUps] = useState<FollowUpRequest[]>([])
   const [planMode, setPlanMode] = useState(true)
   const [composerDraft, setComposerDraft] = useState('')
@@ -496,16 +484,14 @@ export function WorksflowProvider({ children }: { children: ReactNode }) {
     },
     [setProjectCatalog],
   )
-  const [selectedWorkspaceFile, setSelectedWorkspaceFile] = useState('src/App.tsx')
+  const [selectedWorkspaceFile, setSelectedWorkspaceFile] = useState('')
   const [restoreRecoveryCheckpointId, setRestoreRecoveryCheckpointId] = useState<string | null>(null)
   const [attachments, setAttachments] = useState<ComposerAttachment[]>([])
-  const [generationPlan, setGenerationPlan] = useState<GenerationPlan | null>(
-    INITIAL_GENERATION_RESULT.plan,
-  )
+  const [generationPlan, setGenerationPlan] = useState<GenerationPlan | null>(null)
   const [generationEvents, setGenerationEvents] = useState<GenerationEvent[]>([])
   const [generationLifecycleEvents, setGenerationLifecycleEvents] =
     useState<GenerationLifecycleEvent[]>([])
-  const [generationSummary, setGenerationSummary] = useState(INITIAL_GENERATION_RESULT.summary)
+  const [generationSummary, setGenerationSummary] = useState('')
   const [generationError, setGenerationError] = useState<string | null>(null)
   const [generationErrorCode, setGenerationErrorCode] = useState<string | null>(null)
   const [generationErrorStatus, setGenerationErrorStatus] = useState<number>()
@@ -513,7 +499,7 @@ export function WorksflowProvider({ children }: { children: ReactNode }) {
   const [generationErrorCategory, setGenerationErrorCategory] = useState<GenerationErrorCategory>()
   const [generationErrorRetryAfterSeconds, setGenerationErrorRetryAfterSeconds] = useState<number>()
   const [generationErrorAction, setGenerationErrorAction] = useState<string>()
-  const [generationProvider, setGenerationProvider] = useState<GenerationProvider | null>('local')
+  const [generationProvider, setGenerationProvider] = useState<GenerationProvider | null>(null)
   const preferencesPersistence = usePersistentState({
     key: 'worksflow.preferences',
     version: 1,
@@ -539,9 +525,7 @@ export function WorksflowProvider({ children }: { children: ReactNode }) {
     (mode: Exclude<GenerationMode, 'plan'>) => updateUserPreferences({ generationMode: mode }),
     [updateUserPreferences],
   )
-  const [generationUsage, setGenerationUsage] = useState<GenerationUsage | null>(
-    INITIAL_GENERATION_RESULT.usage ?? null,
-  )
+  const [generationUsage, setGenerationUsage] = useState<GenerationUsage | null>(null)
   const [generationDurationMs, setGenerationDurationMs] = useState(0)
   const [generationCost, setGenerationCost] = useState<GenerationCost | null>(null)
   const [generationLimits, setGenerationLimits] = useState<GenerationLimits | null>(null)
@@ -653,7 +637,7 @@ export function WorksflowProvider({ children }: { children: ReactNode }) {
       subtitle: `${version.description ?? t('core.store.workspaceCheckpoint')} · ${new Date(version.createdAt).toLocaleString(locale)}`,
       starred: false,
     }))
-    setVersions(persistedVersions.length > 0 ? persistedVersions : VERSIONS.slice(0, 1))
+    setVersions(persistedVersions)
     versionSerial.current = Math.max(2, activeProductProject.versions.length + 2)
   }, [activeProductProject.id, activeProductProject.versions, locale, t])
 
@@ -1164,10 +1148,11 @@ export function WorksflowProvider({ children }: { children: ReactNode }) {
   )
 
   const startBuild = useCallback(() => {
-    const prompt = lastGenerationRequest.current?.prompt ?? USER_PROMPT
+    const prompt = lastGenerationRequest.current?.prompt
+    if (!prompt || !generationPlan) return
     setPlanMode(false)
     void runGeneration(prompt, generationMode === 'fix' ? 'fix' : workspace.files.length > 0 ? 'iterate' : 'build')
-  }, [generationMode, runGeneration, workspace.files.length])
+  }, [generationMode, generationPlan, runGeneration, workspace.files.length])
 
   const submitPrompt = useCallback(
     (text: string) => {
@@ -1245,14 +1230,14 @@ export function WorksflowProvider({ children }: { children: ReactNode }) {
     cancelActiveGeneration()
     lastGenerationRequest.current = null
     setWorkspace(createInitialWorkspace())
-    setSelectedWorkspaceFile('src/App.tsx')
+    setSelectedWorkspaceFile('')
     setTasks([])
-    setVersions(VERSIONS.slice(0, 1))
+    setVersions([])
     setFollowUps([])
-    setGenerationPlan(INITIAL_GENERATION_RESULT.plan)
+    setGenerationPlan(null)
     setGenerationEvents([])
     setGenerationLifecycleEvents([])
-    setGenerationSummary(INITIAL_GENERATION_RESULT.summary)
+    setGenerationSummary('')
     setGenerationError(null)
     setGenerationErrorCode(null)
     setGenerationErrorStatus(undefined)
@@ -1260,8 +1245,8 @@ export function WorksflowProvider({ children }: { children: ReactNode }) {
     setGenerationErrorCategory(undefined)
     setGenerationErrorRetryAfterSeconds(undefined)
     setGenerationErrorAction(undefined)
-    setGenerationProvider('local')
-    setGenerationUsage(INITIAL_GENERATION_RESULT.usage ?? null)
+    setGenerationProvider(null)
+    setGenerationUsage(null)
     setGenerationDurationMs(0)
     setGenerationCost(null)
     setGenerationLimits(null)
@@ -1269,15 +1254,8 @@ export function WorksflowProvider({ children }: { children: ReactNode }) {
     versionSerial.current = 2
     setPlanMode(true)
     setView('preview')
-    setPhase('planning')
+    setPhase('planReady')
   }, [cancelActiveGeneration, setWorkspace])
-
-  useEffect(() => {
-    if (!routeReady || phase !== 'planning') return
-    if (lastGenerationRequest.current || followUps.length > 0) return
-    const timer = setTimeout(() => setPhase('planReady'), 420)
-    return () => clearTimeout(timer)
-  }, [followUps.length, phase, routeReady])
 
   useEffect(
     () => () => {
@@ -1910,14 +1888,19 @@ export function WorksflowProvider({ children }: { children: ReactNode }) {
         setPhase('error')
       } else {
         setTasks(BUILD_TASKS.map((task) => ({ ...task, status: 'pending', subStatus: undefined })))
-        setPhase(route.phase)
+        setPhase(route.phase === 'planning' ? 'planReady' : route.phase)
       }
     } else if (route.surface === 'team') {
-      const project = teamProjects.find((item) => item.id === route.projectId)
+      const project = teamProjects.find(
+        (item) =>
+          item.id === route.projectId &&
+          (route.teamId === undefined || item.teamId === route.teamId),
+      )
 
-      if (project) loadTeamProject(project)
       setSurface('team')
       setTeamView(route.teamView)
+      if (route.projectId && !project) return
+      if (project) loadTeamProject(project)
     } else if (route.surface === 'recent') {
       setSurface('recent')
     } else if (route.surface === 'settings') {
@@ -2636,7 +2619,7 @@ export function WorksflowProvider({ children }: { children: ReactNode }) {
     setComposerDraft(prompt)
     setPlanMode(true)
     setTasks(BUILD_TASKS.map((task) => ({ ...task, status: 'pending', subStatus: undefined })))
-    setPhase('planning')
+    setPhase('planReady')
     setView('preview')
     setSurface('workbench')
     recordBlueprintOperation(

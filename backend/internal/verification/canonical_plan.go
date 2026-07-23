@@ -96,7 +96,7 @@ func (PlanCompiler) CompileCanonical(input CompileCanonicalPlanInput) (CompiledC
 		return CompiledCanonicalPlan{}, err
 	}
 	checks, err = appendBuiltInChecks(
-		checks, profile.BuiltInChecks, oracles, requiredOracleIDs, oracleObligations, images,
+		checks, profile.BuiltInChecks, oracles, requiredOracleIDs, oracleObligations, images, profile.CommandImageRoles,
 	)
 	if err != nil {
 		return CompiledCanonicalPlan{}, err

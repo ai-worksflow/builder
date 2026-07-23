@@ -7,9 +7,11 @@ import {
   PlatformNetworkError,
   PlatformProtocolError,
   resolvePlatformBaseUrl,
+  verifyResponseBodySha256,
   type FetchLike,
   type CsrfTokenStore,
 } from '../lib/platform/http'
+import { sha256Bytes, sha256DigestString } from '../lib/platform/sha256'
 import {
   PlatformWebSocketClient,
   resolveWebSocketUrl,
@@ -44,6 +46,29 @@ test('HTTP resolves configured, local-development, proxied and server platform b
   assert.equal(resolvePlatformBaseUrl(undefined, { hostname: '127.0.0.1' }), 'http://127.0.0.1:8080')
   assert.equal(resolvePlatformBaseUrl(undefined, { hostname: 'builder.example.test' }), '/api/platform')
   assert.equal(resolvePlatformBaseUrl(), 'http://127.0.0.1:8080')
+})
+
+test('SHA-256 verification works without Web Crypto in insecure browser contexts', async () => {
+  const bytes = new TextEncoder().encode('abc')
+  const body = new ArrayBuffer(bytes.byteLength)
+  new Uint8Array(body).set(bytes)
+  const digest = sha256DigestString(await sha256Bytes(bytes, null))
+  assert.equal(digest, 'sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad')
+  const cryptoDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'crypto')
+  Object.defineProperty(globalThis, 'crypto', { configurable: true, value: undefined })
+  try {
+    await verifyResponseBodySha256(body, digest, 'body digest mismatch')
+  } finally {
+    if (cryptoDescriptor) Object.defineProperty(globalThis, 'crypto', cryptoDescriptor)
+  }
+  await assert.rejects(
+    verifyResponseBodySha256(
+      body,
+      'sha256:0000000000000000000000000000000000000000000000000000000000000000',
+      'body digest mismatch',
+    ),
+    (error: unknown) => error instanceof PlatformProtocolError && error.message === 'body digest mismatch',
+  )
 })
 
 test('HTTP requests include platform headers, credentials, query values and expose response metadata', async () => {

@@ -347,6 +347,18 @@ function parseExactReference(value: unknown, detail: string) {
   })
 }
 
+function parseCandidateVerificationReference(value: unknown) {
+  const detail = 'candidateSource.verificationReceipt'
+  const source = exactRecord(value, ['id', 'contentHash'], [], detail)
+  if (source.id === '' && source.contentHash === '') {
+    return Object.freeze({ id: '', contentHash: '' })
+  }
+  return Object.freeze({
+    id: canonicalUUID(source.id, `${detail}.id`),
+    contentHash: canonicalHash(source.contentHash, `${detail}.contentHash`),
+  })
+}
+
 function parseCandidateSource(value: unknown): CandidateImplementationSourceDto {
   const detail = 'candidateSource'
   const source = exactRecord(value, [
@@ -359,9 +371,10 @@ function parseCandidateSource(value: unknown): CandidateImplementationSourceDto 
   const treeHash = prefixedHash(source.treeHash, `${detail}.treeHash`)
   if (baseTreeHash === treeHash) malformed(`${detail} does not describe a changed tree`)
   const fullStackTemplate = parseExactReference(source.fullStackTemplate, `${detail}.fullStackTemplate`)
-  const verificationReceipt = parseExactReference(source.verificationReceipt, `${detail}.verificationReceipt`)
+  const verificationReceipt = parseCandidateVerificationReference(source.verificationReceipt)
+  const legacyUnverified = verificationReceipt.id === '' && verificationReceipt.contentHash === ''
   if (!PREFIXED_HASH_PATTERN.test(fullStackTemplate.contentHash) ||
-    !PREFIXED_HASH_PATTERN.test(verificationReceipt.contentHash)) {
+    (!legacyUnverified && !PREFIXED_HASH_PATTERN.test(verificationReceipt.contentHash))) {
     malformed(`${detail} exact authorities require prefixed SHA-256 hashes`)
   }
   return Object.freeze({
@@ -445,22 +458,32 @@ function validateCandidateBinding(
       malformed(`operations[${index}] is missing its Candidate predecessor hash`)
     }
   }
+  const legacyUnverified = source.verificationReceipt.id === ''
+    && source.verificationReceipt.contentHash === ''
+  const expectedTraceCount = legacyUnverified ? 1 : 2
+  if (traceLinks.length !== expectedTraceCount) {
+    malformed('traceLinks does not bind the exact Candidate and VerificationReceipt identities')
+  }
   const candidateTrace = exactRecord(traceLinks[0], [
     'baseTreeHash', 'candidateId', 'candidateSnapshotId', 'kind', 'treeHash',
   ], [], 'traceLinks[0]')
-  const verificationTrace = exactRecord(
-    traceLinks[1],
-    ['contentHash', 'id', 'kind'],
-    [],
-    'traceLinks[1]',
-  )
-  if (traceLinks.length !== 2 || candidateTrace.kind !== 'candidate_snapshot' ||
+  const verificationTrace = legacyUnverified
+    ? undefined
+    : exactRecord(
+        traceLinks[1],
+        ['contentHash', 'id', 'kind'],
+        [],
+        'traceLinks[1]',
+      )
+  if (candidateTrace.kind !== 'candidate_snapshot' ||
     candidateTrace.candidateId !== source.candidateId ||
     candidateTrace.candidateSnapshotId !== source.candidateSnapshotId ||
     candidateTrace.baseTreeHash !== source.baseTreeHash || candidateTrace.treeHash !== source.treeHash ||
-    verificationTrace.kind !== 'candidate_verification_receipt' ||
-    verificationTrace.id !== source.verificationReceipt.id ||
-    verificationTrace.contentHash !== source.verificationReceipt.contentHash) {
+    (verificationTrace !== undefined && (
+      verificationTrace.kind !== 'candidate_verification_receipt' ||
+      verificationTrace.id !== source.verificationReceipt.id ||
+      verificationTrace.contentHash !== source.verificationReceipt.contentHash
+    ))) {
     malformed('traceLinks does not bind the exact Candidate and VerificationReceipt identities')
   }
 }

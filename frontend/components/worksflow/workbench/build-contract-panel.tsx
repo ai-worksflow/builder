@@ -291,19 +291,6 @@ export function BuildContractPanel({
 
       {contract && (
         <div className="mt-2 space-y-2">
-          <div className="grid grid-cols-5 gap-1.5 max-xl:grid-cols-3 max-md:grid-cols-2">
-            <ContractFact label={t('platform.buildContract.must')} value={`${formatNumber(contract.mustReadyCount)}/${formatNumber(contract.mustCount)}`} />
-            <ContractFact label={t('platform.buildContract.gaps')} value={formatNumber(contract.blockingCount)} warning={contract.blockingCount > 0} />
-            <ContractFact label={t('platform.buildContract.conflicts')} value={formatNumber(contract.conflictCount)} warning={contract.conflictCount > 0} />
-            <ContractFact label={t('platform.buildContract.canonicalHash')} value={contract.contractHash} mono />
-            <ContractFact label={t('platform.buildContract.storageHash')} value={contract.contentHash} mono />
-          </div>
-          {sourceKinds.length > 0 && (
-            <div className="flex flex-wrap items-center gap-1 text-[7px] text-faint-foreground">
-              <span className="mr-1 font-semibold uppercase tracking-wider">{t('platform.buildContract.sources')}</span>
-              {sourceKinds.map((kind) => <code key={kind} className="rounded bg-white/5 px-1 py-0.5">{kind}</code>)}
-            </div>
-          )}
           {(blockingGaps.length > 0 || blockingConflicts.length > 0) && (
             <details className="rounded border border-warning/25 bg-warning/5">
               <summary className="cursor-pointer px-2 py-1 text-[8px] font-semibold text-warning">{t('platform.buildContract.inspectBlockers', { count: formatNumber(blockingGaps.length + blockingConflicts.length) })}</summary>
@@ -317,6 +304,26 @@ export function BuildContractPanel({
               </div>
             </details>
           )}
+          <details className="rounded border border-border bg-background/40">
+            <summary className="cursor-pointer px-2 py-1 text-[8px] font-semibold text-faint-foreground">
+              {t('platform.technicalEvidence')}
+            </summary>
+            <div className="space-y-2 border-t border-border p-2">
+              <div className="grid grid-cols-5 gap-1.5 max-xl:grid-cols-3 max-md:grid-cols-2">
+                <ContractFact label={t('platform.buildContract.must')} value={`${formatNumber(contract.mustReadyCount)}/${formatNumber(contract.mustCount)}`} />
+                <ContractFact label={t('platform.buildContract.gaps')} value={formatNumber(contract.blockingCount)} warning={contract.blockingCount > 0} />
+                <ContractFact label={t('platform.buildContract.conflicts')} value={formatNumber(contract.conflictCount)} warning={contract.conflictCount > 0} />
+                <ContractFact label={t('platform.buildContract.canonicalHash')} value={contract.contractHash} mono />
+                <ContractFact label={t('platform.buildContract.storageHash')} value={contract.contentHash} mono />
+              </div>
+              {sourceKinds.length > 0 && (
+                <div className="flex flex-wrap items-center gap-1 text-[7px] text-faint-foreground">
+                  <span className="mr-1 font-semibold uppercase tracking-wider">{t('platform.buildContract.sources')}</span>
+                  {sourceKinds.map((kind) => <code key={kind} className="rounded bg-white/5 px-1 py-0.5">{kind}</code>)}
+                </div>
+              )}
+            </div>
+          </details>
         </div>
       )}
 

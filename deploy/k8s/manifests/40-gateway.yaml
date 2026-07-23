@@ -1,0 +1,63 @@
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: EnvoyProxy
+metadata: {name: worksflow-local, namespace: worksflow-gateway}
+spec:
+  provider:
+    type: Kubernetes
+    kubernetes:
+      envoyService:
+        type: NodePort
+        externalTrafficPolicy: Cluster
+        patch:
+          type: StrategicMerge
+          value:
+            spec:
+              ports:
+                - {name: http-80, port: 80, targetPort: 10080, nodePort: 30080}
+                - {name: https-443, port: 443, targetPort: 10443, nodePort: 30443}
+      envoyDeployment:
+        pod:
+          labels: {worksflow.dev/component: gateway-dataplane}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata: {name: worksflow}
+spec:
+  controllerName: gateway.envoyproxy.io/gatewayclass-controller
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata: {name: public, namespace: worksflow-gateway}
+spec:
+  gatewayClassName: worksflow
+  infrastructure:
+    parametersRef: {group: gateway.envoyproxy.io, kind: EnvoyProxy, name: worksflow-local}
+  listeners:
+    - &httpApps
+      name: http-apps
+      hostname: "*.apps.worksflow.localhost"
+      port: 80
+      protocol: HTTP
+      allowedRoutes: &managedRoutes
+        namespaces:
+          from: Selector
+          selector:
+            matchLabels: {worksflow.dev/gateway-attach: enabled}
+    - <<: *httpApps
+      name: http-preview
+      hostname: "*.preview.worksflow.localhost"
+    - &httpsApps
+      name: https-apps
+      hostname: "*.apps.worksflow.localhost"
+      port: 443
+      protocol: HTTPS
+      tls:
+        mode: Terminate
+        certificateRefs: [{kind: Secret, name: local-apps-wildcard}]
+      allowedRoutes: *managedRoutes
+    - <<: *httpsApps
+      name: https-preview
+      hostname: "*.preview.worksflow.localhost"
+      tls:
+        mode: Terminate
+        certificateRefs: [{kind: Secret, name: local-preview-wildcard}]

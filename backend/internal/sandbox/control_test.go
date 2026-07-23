@@ -136,12 +136,47 @@ func (store *controlSessionsFake) Transition(
 	case StateReady:
 		next, err = store.session.MarkReady(expectedVersion, expectedEpoch, now)
 	case StateTerminating:
-		next, err = store.session.BeginTerminate(expectedVersion, expectedEpoch, reason, now)
+		if actorID == SandboxLifecycleWorkerActorID {
+			next, err = store.session.beginTerminateDeadline(expectedVersion, expectedEpoch, reason, now)
+		} else {
+			next, err = store.session.BeginTerminate(expectedVersion, expectedEpoch, reason, now)
+		}
 	case StateTerminated:
 		next, err = store.session.MarkTerminated(expectedVersion, expectedEpoch, now)
 	case StateFailed:
 		next, err = store.session.Fail(expectedVersion, expectedEpoch, reason, now)
 	default:
+		err = ErrInvalidTransition
+	}
+	if err != nil {
+		return SandboxSession{}, err
+	}
+	store.session = next
+	return next.Clone(), nil
+}
+
+func (store *controlSessionsFake) TransitionDeadline(
+	_ context.Context,
+	_, _ string,
+	expectedVersion, expectedEpoch uint64,
+	target State,
+	actorID, reason string,
+) (SandboxSession, error) {
+	if actorID != SandboxLifecycleWorkerActorID {
+		return SandboxSession{}, ErrInvalidSession
+	}
+	view := store.session.Snapshot()
+	if view.Version != expectedVersion || view.SessionEpoch != expectedEpoch {
+		return SandboxSession{}, ErrVersionConflict
+	}
+	now := view.UpdatedAt.Add(time.Second)
+	var next SandboxSession
+	var err error
+	if target == StateTerminating {
+		next, err = store.session.beginTerminateDeadline(expectedVersion, expectedEpoch, reason, now)
+	} else if target == StateTerminated {
+		next, err = store.session.MarkTerminated(expectedVersion, expectedEpoch, now)
+	} else {
 		err = ErrInvalidTransition
 	}
 	if err != nil {
@@ -516,6 +551,73 @@ func TestControlServiceClosesSuspendResumeTerminateLifecycleAndRetries(t *testin
 	if replayed, err := service.Terminate(context.Background(), terminateInput); err != nil ||
 		replayed.Version != terminated.Version || len(runtime.terminateSpecs) != 2 {
 		t.Fatalf("terminate retry was not idempotent: %#v err=%v", replayed, err)
+	}
+}
+
+func TestControlServiceAbsoluteTTLTerminatesDirtySessionWithoutEditorCheckpoint(t *testing.T) {
+	candidate, blobs := workspaceCandidate(t, map[string][]byte{"README.md": []byte("base\n")})
+	leased, lease, err := candidate.AcquireLease(
+		candidate.Version, testActorID, 20*time.Minute, candidate.UpdatedAt.Add(time.Second),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	value := []byte("durable edit\n")
+	digest := sha256.Sum256(value)
+	hash := fmt.Sprintf("sha256:%x", digest)
+	dirty, _, err := leased.Apply(
+		leased.Version, leased.SessionEpoch, lease.Epoch, testActorID, "user",
+		repository.FileOperation{
+			ID: "ttl-edit", Kind: repository.OperationUpsert, Path: "notes.txt",
+			ContentHash: hash, ByteSize: int64(len(value)), Mode: "100644",
+		},
+		leased.UpdatedAt.Add(time.Second),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	blobs[hash] = value
+	ready := readyTestSession(t, dirty, sandboxBaseTime)
+	candidates := &controlCandidatesFake{
+		record:      repository.CandidateMutationRecord{Candidate: dirty},
+		checkpoints: map[string]repository.CandidateSnapshot{},
+	}
+	sessions := &controlSessionsFake{session: ready, candidates: candidates}
+	workspaces, err := NewWorkspaceMaterializer(t.TempDir(), &workspaceResolverFake{values: blobs})
+	if err != nil {
+		t.Fatal(err)
+	}
+	view := ready.Snapshot()
+	if _, err := workspaces.Materialize(context.Background(), view, dirty); err != nil {
+		t.Fatal(err)
+	}
+	runtime := &controlRuntimeFake{}
+	resources := &controlResourceFencerFake{}
+	service, err := newControlService(
+		sessions, candidates, workspaces, runtime, &facadeAccessFake{}, &lifecycleEventsFake{},
+		func() string { return uuid.NewString() }, resources,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	input := TerminateSessionInput{
+		SessionControlInput: SessionControlInput{
+			ProjectID: view.ProjectID, SessionID: view.ID, ActorID: SandboxLifecycleWorkerActorID,
+			ExpectedSessionVersion: view.Version, ExpectedSessionEpoch: view.SessionEpoch,
+		},
+		Reason: "SandboxSession absolute TTL elapsed; the durable Candidate is retained independently",
+	}
+	if _, err := service.Terminate(context.Background(), input); !errors.Is(err, ErrActionBlocked) {
+		t.Fatalf("ordinary terminate bypassed dirty Candidate guard: %v", err)
+	}
+	terminated, err := service.terminateDeadline(context.Background(), input)
+	if err != nil || terminated.State != StateTerminated || len(runtime.terminateSpecs) != 1 ||
+		len(resources.epochs) != 1 || candidates.record.Candidate.Version != dirty.Version ||
+		len(candidates.checkpoints) != 0 {
+		t.Fatalf("absolute TTL did not clean only the runtime boundary: view=%#v runtime=%d fences=%v candidate=%#v err=%v", terminated, len(runtime.terminateSpecs), resources.epochs, candidates.record.Candidate, err)
+	}
+	if _, exists, err := workspaces.ExistingMount(view.ID); err != nil || exists {
+		t.Fatalf("absolute TTL retained the disposable workspace: exists=%t err=%v", exists, err)
 	}
 }
 

@@ -24,8 +24,9 @@ import (
 )
 
 const (
-	ConfigSchemaVersion    = "template-artifact-authority-config/v1"
-	AdmissionSchemaVersion = "template-artifact-authority-admission/v1"
+	ConfigSchemaVersion                = "template-artifact-authority-config/v1"
+	AdmissionSchemaVersion             = "template-artifact-authority-admission/v1"
+	FullStackRegistrationSchemaVersion = "template-artifact-authority-full-stack-registration/v1"
 
 	maxAuthorityConfigBytes = 1 << 20
 	maxPublicKeyBytes       = 64 << 10

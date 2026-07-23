@@ -355,6 +355,51 @@ FROM transition_sandbox_session(?, ?, ?, ?, ?, ?, ?)
 		})
 }
 
+// TransitionDeadline appends the operator-only absolute-TTL transition. The
+// database function retains the Session's historical Candidate projection so
+// a disposable runtime can be reclaimed even when that Candidate has advanced
+// or its editor lease has expired.
+func (store *Store) TransitionDeadline(
+	ctx context.Context,
+	projectID, sessionID string,
+	expectedVersion, expectedSessionEpoch uint64,
+	target State,
+	actorID, reason string,
+) (SandboxSession, error) {
+	if err := validateMutationInput(ctx, projectID, sessionID, actorID, expectedVersion, expectedSessionEpoch); err != nil {
+		return SandboxSession{}, err
+	}
+	if actorID != SandboxLifecycleWorkerActorID || (target != StateTerminating && target != StateTerminated) {
+		return SandboxSession{}, fmt.Errorf("%w: absolute-TTL transition is restricted to lifecycle cleanup", ErrInvalidSession)
+	}
+	reason = strings.TrimSpace(reason)
+	if reason == "" || len(reason) > 2000 {
+		return SandboxSession{}, fmt.Errorf("%w: transition reason is required and bounded", ErrInvalidSession)
+	}
+	return store.mutate(ctx, "transition expired SandboxSession", projectID, sessionID, expectedVersion, expectedSessionEpoch,
+		func(transaction *gorm.DB, _ sandboxSessionRow) error {
+			var result struct {
+				SessionVersion   int64  `gorm:"column:session_version"`
+				SessionState     string `gorm:"column:session_state"`
+				SessionEpoch     int64  `gorm:"column:session_epoch"`
+				CandidateVersion int64  `gorm:"column:candidate_version"`
+			}
+			query := transaction.Raw(`
+SELECT session_version, session_state, session_epoch, candidate_version
+FROM transition_expired_sandbox_session(?, ?, ?, ?, ?, ?)
+`, sessionID, int64(expectedVersion), int64(expectedSessionEpoch), target.String(), actorID, reason).Scan(&result)
+			if query.Error != nil {
+				return query.Error
+			}
+			if query.RowsAffected != 1 || result.SessionVersion != int64(expectedVersion)+1 ||
+				result.SessionState != target.String() || result.SessionEpoch != int64(expectedSessionEpoch) ||
+				result.CandidateVersion <= 0 {
+				return integrityError("transition expired SandboxSession", fmt.Errorf("invalid function result"))
+			}
+			return nil
+		})
+}
+
 // AbandonCandidate commits the Candidate terminal control event and the
 // SandboxSession's transition into terminating in one serializable database
 // transaction. Runtime cleanup happens only after this fence is durable.

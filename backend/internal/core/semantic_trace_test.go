@@ -121,6 +121,30 @@ func TestValidateBlueprintAgainstRequirementBaselineAcceptsExactIDs(t *testing.T
 	}
 }
 
+func TestValidateBlueprintDraftAllowsIncrementalNodesButKeepsRequirementBoundary(t *testing.T) {
+	t.Parallel()
+	baseline := requirementBaselineTraceFixture()
+	partial := json.RawMessage(`{
+  "nodes":[{"id":"feature-a","key":"FEATURE-A","kind":"feature","requirementIds":["REQ-A"]}],
+  "edges":[]
+}`)
+	if err := ValidateBlueprintAgainstRequirementBaseline(partial, baseline, false); err != nil {
+		t.Fatalf("incremental Blueprint draft was rejected: %v", err)
+	}
+	if err := ValidateBlueprintAgainstRequirementBaseline(partial, baseline, true); err == nil ||
+		!strings.Contains(err.Error(), "no semantic Page") {
+		t.Fatalf("strict Blueprint gate accepted an incomplete draft: %v", err)
+	}
+	forged := json.RawMessage(`{
+  "nodes":[{"id":"feature-a","key":"FEATURE-A","kind":"feature","requirementIds":["REQ-FORGED"]}],
+  "edges":[]
+}`)
+	if err := ValidateBlueprintAgainstRequirementBaseline(forged, baseline, false); err == nil ||
+		!strings.Contains(err.Error(), "REQ-FORGED") {
+		t.Fatalf("incremental Blueprint draft crossed its Requirement Baseline boundary: %v", err)
+	}
+}
+
 func TestValidateBlueprintAgainstRequirementBaselineRejectsUnknownID(t *testing.T) {
 	t.Parallel()
 	err := ValidateBlueprintAgainstRequirementBaseline(
@@ -375,6 +399,37 @@ func TestPrototypeSemanticTraceSeparatesDraftIdentityFromReviewCoverage(t *testi
 	}`)
 	if err := validatePrototypeSemanticTrace(valid, pageSpec, true); err != nil {
 		t.Fatalf("legal Prototype semantic coverage was rejected: %v", err)
+	}
+	var tracedPrototype map[string]any
+	if err := json.Unmarshal(valid, &tracedPrototype); err != nil {
+		t.Fatal(err)
+	}
+	tracedPrototype["layers"].(map[string]any)["layer-a"].(map[string]any)["requirementIds"] = []any{"REQ-PAGE"}
+	tracedPayload, err := json.Marshal(tracedPrototype)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tracedPageSpec := json.RawMessage(`{
+		"requirementIds":["REQ-PAGE"],
+		"states":[
+			{"id":"state-ready","key":"ready","required":true,"fixtureIds":["fixture-ready"]},
+			{"id":"state-loading","key":"loading","required":true,"fixtureIds":[]},
+			{"id":"state-empty","key":"empty","required":true,"fixtureIds":[]},
+			{"id":"state-error","key":"error","required":true,"fixtureIds":[]}
+		],
+		"interactions":[{"id":"interaction-a","trigger":"click","outcome":"Open details"}],
+		"dataBindings":[{"id":"binding-a","source":"api","required":true}]
+	}`)
+	if err := ValidatePrototypeAgainstPageSpec(tracedPayload, tracedPageSpec, true); err != nil {
+		t.Fatalf("Page-owned Prototype requirement trace was rejected: %v", err)
+	}
+	tracedPrototype["layers"].(map[string]any)["layer-a"].(map[string]any)["requirementIds"] = []any{"REQ-GLOBAL"}
+	forgedPayload, err := json.Marshal(tracedPrototype)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidatePrototypeAgainstPageSpec(forgedPayload, tracedPageSpec, true); err == nil || !strings.Contains(err.Error(), "REQ-GLOBAL") {
+		t.Fatalf("Prototype accepted a global requirement outside its PageSpec: %v", err)
 	}
 
 	for name, testCase := range map[string]struct {

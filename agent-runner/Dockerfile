@@ -26,6 +26,13 @@ ARG CODEX_VERSION
 ARG CODEX_INTEGRITY
 COPY --from=launcher-build /usr/local/libexec/validate-runner-build-args.sh /usr/local/libexec/validate-runner-build-args.sh
 RUN sh /usr/local/libexec/validate-runner-build-args.sh "${GO_IMAGE}" "${NODE_IMAGE}" "${CODEX_VERSION}" "${CODEX_INTEGRITY}" \
+    && if command -v apt-get >/dev/null 2>&1; then \
+      apt-get update \
+      && apt-get install -y --no-install-recommends bubblewrap jq \
+      && rm -rf /var/lib/apt/lists/*; \
+    else \
+      apk add --no-cache bubblewrap jq; \
+    fi \
     && mkdir -p /tmp/codex-package \
     && npm pack --ignore-scripts --json --pack-destination /tmp/codex-package "@openai/codex@${CODEX_VERSION}" >/tmp/codex-pack.json \
     && node -e 'const fs=require("fs");const value=JSON.parse(fs.readFileSync("/tmp/codex-pack.json","utf8"));if(value.length!==1||value[0].integrity!==process.argv[1]||!/^[A-Za-z0-9_.-]+\.tgz$/.test(value[0].filename)){process.exit(1)}' "${CODEX_INTEGRITY}" \
@@ -41,8 +48,13 @@ COPY --from=launcher-build /out/worksflow-agent-model-relay /usr/local/bin/works
 COPY backend/internal/agent/schema/output.schema.json /opt/worksflow-agent/output.schema.json
 COPY agent-runner/runner-contract.json /opt/worksflow-agent/runner-contract.json
 
-RUN groupadd --gid 10001 worksflow \
-    && useradd --uid 10001 --gid 10001 --no-create-home --home-dir /tmp/worksflow-home --shell /usr/sbin/nologin worksflow \
+RUN if command -v groupadd >/dev/null 2>&1; then \
+      groupadd --gid 10001 worksflow \
+      && useradd --uid 10001 --gid 10001 --no-create-home --home-dir /tmp/worksflow-home --shell /usr/sbin/nologin worksflow; \
+    else \
+      addgroup -g 10001 -S worksflow \
+      && adduser -u 10001 -S -D -H -h /tmp/worksflow-home -s /sbin/nologin -G worksflow worksflow; \
+    fi \
     && chmod 0555 /usr/local/bin/worksflow-agent-runner /usr/local/bin/worksflow-agent-model-relay \
     && chmod 0444 /opt/worksflow-agent/output.schema.json /opt/worksflow-agent/runner-contract.json
 

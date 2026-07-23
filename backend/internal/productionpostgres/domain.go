@@ -12,15 +12,29 @@ import (
 	"time"
 )
 
-const ResultSchemaVersion = "worksflow-production-postgresql-posture-result/v1"
+const ResultSchemaVersion = "worksflow-production-postgresql-posture-result/v2"
+
+type PromotionSessionAffinity string
+
+const (
+	PromotionSessionAffinityDirect      PromotionSessionAffinity = "direct"
+	PromotionSessionAffinitySessionPool PromotionSessionAffinity = "session-pool"
+)
+
+const PromotionRuntimeGateDisabledPendingInputPrecommitAuthorityCanary = "disabled-pending-input-precommit-authority-canary"
 
 type RoleKind string
 
 const (
-	RoleApplication   RoleKind = "application"
-	RoleMigrator      RoleKind = "migrator"
-	RoleQualification RoleKind = "qualification"
-	RolePromotion     RoleKind = "promotion"
+	RoleApplication        RoleKind = "application"
+	RoleMigrator           RoleKind = "migrator"
+	RoleQualification      RoleKind = "qualification"
+	RolePromotion          RoleKind = "promotion"
+	RolePolicy             RoleKind = "qualification-policy"
+	RoleInputPrecommit     RoleKind = "qualification-input-precommit"
+	RoleSourceVerifier     RoleKind = "qualification-source-verifier"
+	RoleCredentialResolver RoleKind = "qualification-credential-resolver"
+	RoleHandoff            RoleKind = "qualification-handoff"
 )
 
 const (
@@ -30,14 +44,19 @@ const (
 )
 
 const (
-	FailureConfigurationInvalid     = "configuration_invalid"
-	FailureConnectionUnavailable    = "connection_unavailable"
-	FailureCatalogInspectionFailed  = "catalog_inspection_failed"
-	FailureApplicationPostureUnsafe = "application_posture_unsafe"
-	FailureMigratorPostureUnsafe    = "migrator_posture_unsafe"
-	FailureAuditorPostureUnsafe     = "qualification_posture_unsafe"
-	FailurePromotionPostureUnsafe   = "promotion_posture_unsafe"
-	FailureIdentityScopeMismatch    = "identity_scope_mismatch"
+	FailureConfigurationInvalid            = "configuration_invalid"
+	FailureConnectionUnavailable           = "connection_unavailable"
+	FailureCatalogInspectionFailed         = "catalog_inspection_failed"
+	FailureApplicationPostureUnsafe        = "application_posture_unsafe"
+	FailureMigratorPostureUnsafe           = "migrator_posture_unsafe"
+	FailureAuditorPostureUnsafe            = "qualification_posture_unsafe"
+	FailurePromotionPostureUnsafe          = "promotion_posture_unsafe"
+	FailurePolicyPostureUnsafe             = "qualification_policy_posture_unsafe"
+	FailureInputPrecommitPostureUnsafe     = "qualification_input_precommit_posture_unsafe"
+	FailureSourceVerifierPostureUnsafe     = "qualification_source_verifier_posture_unsafe"
+	FailureCredentialResolverPostureUnsafe = "qualification_credential_resolver_posture_unsafe"
+	FailureHandoffPostureUnsafe            = "qualification_handoff_posture_unsafe"
+	FailureIdentityScopeMismatch           = "identity_scope_mismatch"
 )
 
 var (
@@ -46,16 +65,28 @@ var (
 	ErrOperational          = errors.New("production PostgreSQL posture check could not complete")
 )
 
-// Config contains credential material only in memory. Callers must never log
-// or serialize it. The standalone command loads each value from a separate,
-// permission-checked file rather than accepting secrets as arguments or
-// direct environment values.
+// Config keeps credential material only in memory and carries fail-closed,
+// non-secret Promotion/Input session-affinity and runtime-gate declarations.
+// Callers must never log or serialize the Config. The standalone command loads
+// each DSN from a separate, permission-checked file rather than accepting
+// secrets as arguments or direct environment values.
 type Config struct {
-	ApplicationDSN   string `json:"-"`
-	MigratorDSN      string `json:"-"`
-	QualificationDSN string `json:"-"`
-	PromotionDSN     string `json:"-"`
-	Schema           string `json:"-"`
+	ApplicationDSN                    string                   `json:"-"`
+	MigratorDSN                       string                   `json:"-"`
+	QualificationDSN                  string                   `json:"-"`
+	PromotionDSN                      string                   `json:"-"`
+	PromotionSessionAffinity          PromotionSessionAffinity `json:"-"`
+	PromotionRuntimeGate              string                   `json:"-"`
+	PolicyDSN                         string                   `json:"-"`
+	InputPrecommitDSN                 string                   `json:"-"`
+	InputPrecommitSessionAffinity     PromotionSessionAffinity `json:"-"`
+	SourceVerifierDSN                 string                   `json:"-"`
+	SourceVerifierSessionAffinity     PromotionSessionAffinity `json:"-"`
+	CredentialResolverDSN             string                   `json:"-"`
+	CredentialResolverSessionAffinity PromotionSessionAffinity `json:"-"`
+	HandoffDSN                        string                   `json:"-"`
+	HandoffSessionAffinity            PromotionSessionAffinity `json:"-"`
+	Schema                            string                   `json:"-"`
 }
 
 type RoleResult struct {
@@ -73,14 +104,20 @@ type Failure struct {
 // Result is a safe, structured projection. It contains no DSN, endpoint,
 // password, credential-file path, or database driver error.
 type Result struct {
-	SchemaVersion  string       `json:"schemaVersion"`
-	Status         string       `json:"status"`
-	CheckedAt      string       `json:"checkedAt"`
-	Schema         string       `json:"schema,omitempty"`
-	EvidenceClass  string       `json:"evidenceClass"`
-	Roles          []RoleResult `json:"roles"`
-	ExcludedClaims []string     `json:"excludedClaims"`
-	Failure        *Failure     `json:"failure,omitempty"`
+	SchemaVersion                     string                   `json:"schemaVersion"`
+	Status                            string                   `json:"status"`
+	CheckedAt                         string                   `json:"checkedAt"`
+	Schema                            string                   `json:"schema,omitempty"`
+	EvidenceClass                     string                   `json:"evidenceClass"`
+	PromotionSessionAffinity          PromotionSessionAffinity `json:"promotionSessionAffinity,omitempty"`
+	PromotionRuntimeGate              string                   `json:"promotionRuntimeGate,omitempty"`
+	InputPrecommitSessionAffinity     PromotionSessionAffinity `json:"inputPrecommitSessionAffinity,omitempty"`
+	SourceVerifierSessionAffinity     PromotionSessionAffinity `json:"sourceVerifierSessionAffinity,omitempty"`
+	CredentialResolverSessionAffinity PromotionSessionAffinity `json:"credentialResolverSessionAffinity,omitempty"`
+	HandoffSessionAffinity            PromotionSessionAffinity `json:"handoffSessionAffinity,omitempty"`
+	Roles                             []RoleResult             `json:"roles"`
+	ExcludedClaims                    []string                 `json:"excludedClaims"`
+	Failure                           *Failure                 `json:"failure,omitempty"`
 }
 
 func newResult(now time.Time, schema string) Result {
@@ -108,7 +145,32 @@ func newResult(now time.Time, schema string) Result {
 			},
 			{
 				Kind:           RolePromotion,
-				Responsibility: "dedicated qualification-promotion consume and pending-handoff reader",
+				Responsibility: "disabled Promotion-v2 consumer with no handoff-resolver or data-plane table authority",
+				Status:         StatusNotChecked,
+			},
+			{
+				Kind:           RolePolicy,
+				Responsibility: "dedicated qualification-policy issuer and resolver",
+				Status:         StatusNotChecked,
+			},
+			{
+				Kind:           RoleInputPrecommit,
+				Responsibility: "disabled qualification input-precommit authority issuer and resolver",
+				Status:         StatusNotChecked,
+			},
+			{
+				Kind:           RoleSourceVerifier,
+				Responsibility: "disabled qualification source-verifier receipt admission",
+				Status:         StatusNotChecked,
+			},
+			{
+				Kind:           RoleCredentialResolver,
+				Responsibility: "disabled qualification credential-resolver receipt admission",
+				Status:         StatusNotChecked,
+			},
+			{
+				Kind:           RoleHandoff,
+				Responsibility: "disabled private qualification handoff completion and inspection",
 				Status:         StatusNotChecked,
 			},
 		},
@@ -116,6 +178,8 @@ func newResult(now time.Time, schema string) Result {
 			"external-qualification-receipt",
 			"gc-scheduler-qualification",
 			"promotion-authority",
+			"promotion-runtime-activation",
+			"input-precommit-authority-canary",
 		},
 	}
 }
@@ -128,7 +192,8 @@ type checkFailure struct {
 
 func (e *checkFailure) Error() string {
 	switch e.role {
-	case RoleApplication, RoleMigrator, RoleQualification, RolePromotion:
+	case RoleApplication, RoleMigrator, RoleQualification, RolePromotion, RolePolicy,
+		RoleInputPrecommit, RoleSourceVerifier, RoleCredentialResolver, RoleHandoff:
 		return string(e.role) + " production PostgreSQL posture check failed"
 	default:
 		return "production PostgreSQL posture check failed"

@@ -10,9 +10,11 @@ import (
 )
 
 type planningSourceFake struct {
-	facts PlanningFacts
-	err   error
-	calls int
+	facts    PlanningFacts
+	err      error
+	calls    int
+	graph    TaskGraph
+	graphErr error
 }
 
 func (source *planningSourceFake) LoadPlanningFacts(
@@ -21,6 +23,13 @@ func (source *planningSourceFake) LoadPlanningFacts(
 ) (PlanningFacts, error) {
 	source.calls++
 	return source.facts, source.err
+}
+
+func (source *planningSourceFake) LoadTaskGraph(
+	_ context.Context,
+	_, _ string,
+) (TaskGraph, error) {
+	return source.graph, source.graphErr
 }
 
 func TestDeterministicPlannerKeepsClientOutOfConstraintSurface(t *testing.T) {

@@ -26,9 +26,27 @@ func dryRunPostgres(t *testing.T) *gorm.DB {
 
 func TestGORMLeaseClaimUsesSkipLockedAndRecoveryPredicate(t *testing.T) {
 	normalized := strings.ToLower(claimRunnableSQL)
-	for _, fragment := range []string{"for update skip locked", "run.status not in ('completed', 'failed', 'cancelled', 'stale')", "status = 'ready'", "lease_expires_at < @now", "attempt = attempt + 1", "returning node.*"} {
+	for _, fragment := range []string{"for update skip locked", "run.status not in ('completed', 'failed', 'cancelled', 'stale')", "node.node_type <> 'external_qualification_gate'", "status = 'ready'", "lease_expires_at < @now", "attempt = attempt + 1", "returning node.*"} {
 		if !strings.Contains(normalized, fragment) {
 			t.Fatalf("claim SQL missing %q", fragment)
+		}
+	}
+}
+
+func TestWorkflowRunMutationsDeclareRollingMigrationFence(t *testing.T) {
+	if workflowInputAuthorityMigrationAdvisoryKey != "worksflow:workflow-input-authority-migration:v1" {
+		t.Fatalf("unexpected Workflow Input migration fence key %q", workflowInputAuthorityMigrationAdvisoryKey)
+	}
+	database := dryRunPostgres(t)
+	statement := database.ToSQL(func(tx *gorm.DB) *gorm.DB {
+		return tx.Exec(
+			"SELECT pg_catalog.pg_advisory_xact_lock_shared(pg_catalog.hashtextextended(CAST(? AS text), 0))",
+			workflowInputAuthorityMigrationAdvisoryKey,
+		)
+	})
+	for _, fragment := range []string{"pg_advisory_xact_lock_shared", workflowInputAuthorityMigrationAdvisoryKey} {
+		if !strings.Contains(statement, fragment) {
+			t.Fatalf("workflow rolling-migration fence SQL missing %q: %s", fragment, statement)
 		}
 	}
 }

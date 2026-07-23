@@ -46,6 +46,7 @@ export function AppShell() {
     view,
     teamView,
     activeTeamProjectId,
+    activeTeamProject,
   } = useWorksflow()
   const { locale, t } = useI18n()
   const { unreadCount } = useCollaboration()
@@ -57,7 +58,7 @@ export function AppShell() {
       surface === 'workbench'
         ? workbenchPathFor(phase, view)
         : surface === 'team'
-          ? teamPathFor(activeTeamProjectId, teamView)
+          ? teamPathFor(activeTeamProject.teamId, activeTeamProjectId, teamView)
           : `/${surface}`
     const currentUrl = new URL(window.location.href)
     const nextUrl = new URL(nextPath, window.location.origin)
@@ -78,7 +79,7 @@ export function AppShell() {
     if (currentPath !== preservedPath) {
       window.history.replaceState(null, '', preservedPath)
     }
-  }, [activeTeamProjectId, phase, routeReady, surface, teamView, view])
+  }, [activeTeamProject.teamId, activeTeamProjectId, phase, routeReady, surface, teamView, view])
 
   return (
     <div className="flex h-dvh w-full overflow-hidden bg-background text-foreground max-md:flex-col">

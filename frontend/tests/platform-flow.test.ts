@@ -1,20 +1,26 @@
 import assert from 'node:assert/strict'
 import {
+  canUseGenericWorkflowExecutionAuthorization,
   deliverySliceContext,
   estimateWorkflowSemanticStates,
   parseEditableDefinition,
   reviewGateApprovalReadiness,
   revisionCandidates,
   starterWorkflowDefinition as starterDefinition,
+  validateWorkflowNode,
+  workflowExternalQualificationCapability,
   workflowEditorTargetForArtifact,
   workflowRoleSatisfies,
 } from '../lib/platform/workflow-ui-contract'
 import {
   projectBriefEntryAction,
+  workflowDefinitionAcceptsProjectBriefStart,
 } from '../lib/platform/workflow-entry'
 import { PlatformClient } from '../lib/platform/client'
 import { exactBuildContractRefForActiveManifest } from '../lib/platform/build-contract-gate'
 import type { FetchLike } from '../lib/platform/http'
+import type { WorkflowCapabilitiesDto } from '../lib/platform/flow-contract'
+import { normalizeWorkflowRun } from '../lib/platform/workflow-run-normalization'
 
 type TestCase = {
   readonly name: string
@@ -22,6 +28,47 @@ type TestCase = {
 }
 
 const tests: TestCase[] = []
+
+test('Project Brief entry accepts only workflow-start Project Brief definitions', () => {
+  assert.equal(workflowDefinitionAcceptsProjectBriefStart({
+    inputContract: {
+      manifestJobTypes: ['workflow_start'],
+      artifactKinds: ['project_brief'],
+    },
+  }), true)
+  assert.equal(workflowDefinitionAcceptsProjectBriefStart({
+    inputContract: {
+      manifestJobTypes: ['blueprint.selection'],
+      artifactKinds: ['product_blueprint'],
+    },
+  }), false)
+  assert.equal(workflowDefinitionAcceptsProjectBriefStart(undefined), false)
+})
+
+test('generic authorization stays closed for workflow-engine/v3 Publish', () => {
+  const waitingPublish = {
+    status: 'waiting_input',
+    type: 'publish',
+    allowedActions: ['authorize_execution'],
+  } as const
+  assert.equal(canUseGenericWorkflowExecutionAuthorization({
+    executionProfile: { version: 'workflow-engine/v3', hash: 'v3-hash' },
+  }, waitingPublish), false)
+  assert.equal(canUseGenericWorkflowExecutionAuthorization({
+    executionProfile: { version: 'workflow-engine/v2', hash: 'v2-hash' },
+  }, waitingPublish), true)
+  assert.equal(canUseGenericWorkflowExecutionAuthorization({
+    executionProfile: { version: 'workflow-engine/v3', hash: 'v3-hash' },
+  }, {
+    status: 'waiting_input',
+    type: 'quality_gate',
+    allowedActions: ['authorize_execution'],
+  }), true)
+  assert.equal(canUseGenericWorkflowExecutionAuthorization({
+    executionProfile: { version: 'workflow-engine/v2', hash: 'v2-hash' },
+  }, { status: 'waiting_input', type: 'publish' }), false)
+  assert.equal(canUseGenericWorkflowExecutionAuthorization(undefined, waitingPublish), false)
+})
 
 function test(name: string, run: TestCase['run']) {
   tests.push({ name, run })
@@ -197,6 +244,105 @@ test('starting a run preserves the exact manifest id and hash', async () => {
   })
   assert.ok(calls[0].headers.get('idempotency-key'))
   assert.ok(calls[1].headers.get('idempotency-key'))
+})
+
+test('Workflow action projection normalization fails closed on malformed authority', () => {
+  const timestamp = new Date(0).toISOString()
+  const actionNode = (
+    key: string,
+    projection: Record<string, unknown>,
+  ) => ({
+    id: `node-${key}`,
+    runId: 'run-actions',
+    key,
+    definitionNodeId: key,
+    type: 'review_gate',
+    status: 'waiting_review',
+    attempt: 0,
+    availableAt: timestamp,
+    createdAt: timestamp,
+    updatedAt: timestamp,
+    ...projection,
+  })
+  const normalized = normalizeWorkflowRun({
+    id: 'run-actions',
+    projectId: 'project-1',
+    definitionVersionId: 'definition-version-1',
+    definition: {
+      id: 'definition-1',
+      version: 1,
+      hash: 'definition-hash',
+      executionProfile: { version: 'workflow-engine/v2', hash: 'profile-hash' },
+    },
+    executionProfile: { version: 'workflow-engine/v2', hash: 'profile-hash' },
+    status: 'waiting_review',
+    context: { nodes: {} },
+    eventCursor: 7,
+    startedBy: 'user-1',
+    createdAt: timestamp,
+    updatedAt: timestamp,
+    nodes: [
+      actionNode('valid', {
+        allowedActions: ['approve_review'],
+        blockingReasons: [],
+      }),
+      actionNode('missing', {}),
+      actionNode('unknown', {
+        allowedActions: ['approve_review', 'future_action'],
+        blockingReasons: [],
+      }),
+      actionNode('duplicate', {
+        allowedActions: ['retry', 'retry'],
+        blockingReasons: [],
+      }),
+      actionNode('bad-blocker', {
+        allowedActions: ['approve_review'],
+        blockingReasons: [{ code: 'blocked', message: 'blocked' }],
+      }),
+      actionNode('cross-run', {
+        runId: 'another-run',
+        allowedActions: ['approve_review'],
+        blockingReasons: [],
+      }),
+      actionNode('duplicate-identity-a', {
+        id: 'duplicate-node-id',
+        allowedActions: ['approve_review'],
+        blockingReasons: [],
+      }),
+      actionNode('duplicate-identity-b', {
+        id: 'duplicate-node-id',
+        allowedActions: ['approve_review'],
+        blockingReasons: [],
+      }),
+    ],
+  } as never)
+
+  assert.deepEqual(normalized.nodes[0].allowedActions, ['approve_review'])
+  assert.deepEqual(normalized.nodes[0].blockingReasons, [])
+  for (const node of normalized.nodes.slice(1)) {
+    assert.deepEqual(node.allowedActions, [])
+    assert.equal(node.blockingReasons?.[0]?.code, 'workflow_action_projection_invalid')
+  }
+})
+
+test('Workflow run clients normalize both start and hydrated projections', async () => {
+  const client = flowClient(() => json({
+    id: 'run-actions',
+    nodes: [{ key: 'review', allowedActions: null, blockingReasons: null }],
+  }))
+  const started = await client.startRun('project-1', {
+    definitionVersionId: 'definition-version-1',
+    inputManifest: { id: 'manifest-1', hash: 'a'.repeat(64) },
+  })
+  const hydrated = await client.getRun('project-1', 'run-actions')
+
+  for (const result of [started, hydrated]) {
+    assert.deepEqual(result.data.nodes[0].allowedActions, [])
+    assert.equal(
+      result.data.nodes[0].blockingReasons?.[0]?.code,
+      'workflow_action_projection_invalid',
+    )
+  }
 })
 
 test('Blueprint selection compile is conditional, idempotent, and pins exact anchors server-side', async () => {
@@ -632,6 +778,38 @@ test('workflow JSON parsing rejects null and malformed node and edge entries', (
     parseEditableDefinition(JSON.stringify({ ...definition, nodes: [null] }), true).error ?? '',
     /nodes\[0\].*object/i,
   )
+})
+
+test('external qualification authoring requires the exact closed capability schema', () => {
+  const config = {
+    blocking: true as const,
+    gateName: 'external-qualification' as const,
+    inputAuthoritySchema: 'worksflow-workflow-input-authority/v1' as const,
+    promotionProtocol: 'worksflow-qualification-promotion-consume/v2' as const,
+    receiptSchema: 'worksflow-qualification-receipt/v3' as const,
+    waiverPolicy: 'never' as const,
+  }
+  const node = {
+    id: 'external-qualification', name: 'External qualification', type: 'external_qualification_gate' as const,
+    inputSchema: { type: 'object' }, outputSchema: { type: 'object' }, externalQualificationGate: config,
+  }
+  assert.equal(validateWorkflowNode(node), undefined)
+  assert.match(validateWorkflowNode({
+    ...node,
+    externalQualificationGate: { ...config, runner: 'generic-runner' },
+  }) ?? '', /malformed/i)
+
+  const capabilities = {
+    version: 5,
+    nodeTypes: ['external_qualification_gate'],
+    externalQualificationGate: config,
+  } as unknown as WorkflowCapabilitiesDto
+  assert.deepEqual(workflowExternalQualificationCapability(capabilities), config)
+  assert.equal(workflowExternalQualificationCapability({ ...capabilities, version: 4 }), undefined)
+  assert.equal(workflowExternalQualificationCapability({
+    ...capabilities,
+    externalQualificationGate: { ...config, allowWaiver: false },
+  } as unknown as WorkflowCapabilitiesDto), undefined)
 })
 
 test('workflow authoring estimates Condition state growth before server validation', () => {

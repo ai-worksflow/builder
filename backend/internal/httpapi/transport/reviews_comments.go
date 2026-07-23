@@ -2,11 +2,14 @@ package transport
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
+	"slices"
 	"strings"
 
 	"github.com/gin-gonic/gin"
 	"github.com/worksflow/builder/backend/internal/core"
+	worksmiddleware "github.com/worksflow/builder/backend/internal/httpapi/middleware"
 	"github.com/worksflow/builder/backend/internal/httpapi/problem"
 )
 
@@ -131,11 +134,18 @@ func (s *Server) submitReview(context *gin.Context, projectID, pathRevisionID st
 	artifactID := strings.TrimSpace(input.ArtifactID)
 	revisionID := strings.TrimSpace(input.RevisionID)
 	if input.Target != nil {
+		targetArtifactID := strings.TrimSpace(input.Target.ArtifactID)
+		targetRevisionID := strings.TrimSpace(input.Target.RevisionID)
+		if artifactID != "" && targetArtifactID != "" && artifactID != targetArtifactID ||
+			revisionID != "" && targetRevisionID != "" && revisionID != targetRevisionID {
+			problem.WriteError(context, core.ErrInvalidInput)
+			return
+		}
 		if artifactID == "" {
-			artifactID = input.Target.ArtifactID
+			artifactID = targetArtifactID
 		}
 		if revisionID == "" {
-			revisionID = input.Target.RevisionID
+			revisionID = targetRevisionID
 		}
 	}
 	if pathRevisionID != "" {
@@ -177,6 +187,11 @@ func (s *Server) submitReview(context *gin.Context, projectID, pathRevisionID st
 			problem.WriteError(context, core.ErrConflict)
 			return
 		}
+	}
+	if len(input.ReviewerIDs) > 0 && len(input.RequiredReviewers) > 0 &&
+		!slices.Equal(input.ReviewerIDs, input.RequiredReviewers) {
+		problem.WriteError(context, core.ErrInvalidInput)
+		return
 	}
 	reviewers := input.ReviewerIDs
 	if len(reviewers) == 0 {
@@ -220,18 +235,11 @@ func (s *Server) DecideReview(context *gin.Context) {
 	if !found {
 		return
 	}
-	if !matchETag(context, current.ETag, "review request") {
-		return
-	}
-	var updated core.ReviewRequest
-	var err error
-	if conditional, ok := s.services.Reviews.(ConditionalReviewService); ok {
-		updated, err = conditional.DecideIfMatch(context.Request.Context(), current.ID, actor, current.ETag, input)
-	} else {
-		updated, err = s.services.Reviews.Decide(context.Request.Context(), current.ID, actor, input)
-	}
+	updated, err := s.services.Reviews.DecideIfMatch(
+		context.Request.Context(), current.ID, actor, worksmiddleware.IfMatch(context), input,
+	)
 	if err != nil {
-		s.businessError(context, err)
+		conditionalServiceError(s, context, "review request", err)
 		return
 	}
 	updated = reviewDTO(updated)
@@ -240,6 +248,14 @@ func (s *Server) DecideReview(context *gin.Context) {
 }
 
 func (s *Server) findReview(context *gin.Context, reviewID, projectID, actor string) (core.ReviewRequest, bool) {
+	if projectID != "" {
+		item, err := s.services.Reviews.Get(context.Request.Context(), projectID, reviewID, actor)
+		if err != nil {
+			s.businessError(context, err)
+			return core.ReviewRequest{}, false
+		}
+		return item, true
+	}
 	projectIDs := []string{}
 	if projectID != "" {
 		projectIDs = append(projectIDs, projectID)
@@ -258,16 +274,15 @@ func (s *Server) findReview(context *gin.Context, reviewID, projectID, actor str
 		}
 	}
 	for _, candidateProjectID := range projectIDs {
-		items, err := s.services.Reviews.List(context.Request.Context(), candidateProjectID, actor)
+		item, err := s.services.Reviews.Get(context.Request.Context(), candidateProjectID, reviewID, actor)
+		if errors.Is(err, core.ErrNotFound) {
+			continue
+		}
 		if err != nil {
 			s.businessError(context, err)
 			return core.ReviewRequest{}, false
 		}
-		for _, item := range items {
-			if item.ID == reviewID {
-				return item, true
-			}
-		}
+		return item, true
 	}
 	problem.WriteError(context, core.ErrNotFound)
 	return core.ReviewRequest{}, false

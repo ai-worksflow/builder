@@ -52,15 +52,19 @@ func NewRedisCredentialStore(client redis.UniversalClient, encryptionKey []byte,
 	return &RedisCredentialStore{redis: client, aead: aead, prefix: prefix}, nil
 }
 
-func (s *RedisCredentialStore) key(userID, projectID string) string {
+func (s *RedisCredentialStore) key(userID string) string {
+	return s.prefix + userID
+}
+func (s *RedisCredentialStore) legacyKey(userID, projectID string) string {
 	return s.prefix + userID + ":" + projectID
 }
-func credentialAAD(userID, projectID string) []byte { return []byte(userID + "\x00" + projectID) }
+func credentialAAD(userID string) []byte                  { return []byte("github-user-credential\x00" + userID) }
+func legacyCredentialAAD(userID, projectID string) []byte { return []byte(userID + "\x00" + projectID) }
 
 func (s *RedisCredentialStore) Get(ctx context.Context, userID, projectID string) (Credential, error) {
-	encoded, err := s.redis.Get(ctx, s.key(userID, projectID)).Bytes()
+	encoded, err := s.redis.Get(ctx, s.key(userID)).Bytes()
 	if errors.Is(err, redis.Nil) {
-		return Credential{}, ErrCredentialNotFound
+		return s.migrateLegacy(ctx, userID, projectID)
 	}
 	if err != nil {
 		return Credential{}, fmt.Errorf("load GitHub credential: %w", err)
@@ -69,7 +73,7 @@ func (s *RedisCredentialStore) Get(ctx context.Context, userID, projectID string
 		return Credential{}, errors.New("stored GitHub credential is malformed")
 	}
 	nonce := encoded[:s.aead.NonceSize()]
-	plaintext, err := s.aead.Open(nil, nonce, encoded[s.aead.NonceSize():], credentialAAD(userID, projectID))
+	plaintext, err := s.aead.Open(nil, nonce, encoded[s.aead.NonceSize():], credentialAAD(userID))
 	if err != nil {
 		return Credential{}, errors.New("stored GitHub credential could not be authenticated")
 	}
@@ -97,16 +101,52 @@ func (s *RedisCredentialStore) Set(ctx context.Context, userID, projectID string
 		return err
 	}
 	envelope := append([]byte(nil), nonce...)
-	envelope = s.aead.Seal(envelope, nonce, plaintext, credentialAAD(userID, projectID))
-	if err := s.redis.Set(ctx, s.key(userID, projectID), envelope, ttl).Err(); err != nil {
+	envelope = s.aead.Seal(envelope, nonce, plaintext, credentialAAD(userID))
+	if err := s.redis.Set(ctx, s.key(userID), envelope, ttl).Err(); err != nil {
 		return fmt.Errorf("store GitHub credential: %w", err)
 	}
 	return nil
 }
 
 func (s *RedisCredentialStore) Delete(ctx context.Context, userID, projectID string) error {
-	if err := s.redis.Del(ctx, s.key(userID, projectID)).Err(); err != nil {
+	keys := []string{s.key(userID)}
+	if projectID != "" {
+		keys = append(keys, s.legacyKey(userID, projectID))
+	}
+	if err := s.redis.Del(ctx, keys...).Err(); err != nil {
 		return fmt.Errorf("delete GitHub credential: %w", err)
 	}
 	return nil
+}
+
+func (s *RedisCredentialStore) migrateLegacy(ctx context.Context, userID, projectID string) (Credential, error) {
+	if projectID == "" {
+		return Credential{}, ErrCredentialNotFound
+	}
+	encoded, err := s.redis.Get(ctx, s.legacyKey(userID, projectID)).Bytes()
+	if errors.Is(err, redis.Nil) {
+		return Credential{}, ErrCredentialNotFound
+	}
+	if err != nil {
+		return Credential{}, fmt.Errorf("load legacy GitHub credential: %w", err)
+	}
+	if len(encoded) <= s.aead.NonceSize() {
+		return Credential{}, errors.New("stored GitHub credential is malformed")
+	}
+	nonce := encoded[:s.aead.NonceSize()]
+	plaintext, err := s.aead.Open(nil, nonce, encoded[s.aead.NonceSize():], legacyCredentialAAD(userID, projectID))
+	if err != nil {
+		return Credential{}, errors.New("stored GitHub credential could not be authenticated")
+	}
+	var credential Credential
+	if err := json.Unmarshal(plaintext, &credential); err != nil || credential.Token == "" || credential.User.ID < 1 || !credential.ExpiresAt.After(time.Now().UTC()) {
+		_ = s.redis.Del(context.WithoutCancel(ctx), s.legacyKey(userID, projectID)).Err()
+		return Credential{}, ErrCredentialNotFound
+	}
+	ttl := time.Until(credential.ExpiresAt)
+	if err := s.Set(ctx, userID, projectID, credential, ttl); err != nil {
+		return Credential{}, err
+	}
+	_ = s.redis.Del(context.WithoutCancel(ctx), s.legacyKey(userID, projectID)).Err()
+	return credential, nil
 }

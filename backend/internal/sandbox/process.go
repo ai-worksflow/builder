@@ -151,17 +151,18 @@ func (err *ProcessControlError) Unwrap() error {
 }
 
 type ProcessService struct {
-	sessions   ControlSessionStore
-	candidates CandidateControls
-	commands   SessionProcessCommandResolver
-	workspaces *WorkspaceMaterializer
-	runtime    RuntimeProcessManager
-	processes  SandboxProcessStore
-	access     ProjectAuthorizer
-	events     StreamEventStore
-	logLimit   int64
-	newID      func() string
-	now        func() time.Time
+	sessions     ControlSessionStore
+	candidates   CandidateControls
+	commands     SessionProcessCommandResolver
+	workspaces   *WorkspaceMaterializer
+	runtime      RuntimeProcessManager
+	processes    SandboxProcessStore
+	access       ProjectAuthorizer
+	events       StreamEventStore
+	dependencies ProcessDependencyPreparer
+	logLimit     int64
+	newID        func() string
+	now          func() time.Time
 }
 
 func NewProcessService(
@@ -174,11 +175,22 @@ func NewProcessService(
 	access ProjectAuthorizer,
 	events StreamEventStore,
 	logLimit int64,
+	dependencyPreparers ...ProcessDependencyPreparer,
 ) (*ProcessService, error) {
-	return newProcessService(
+	service, err := newProcessService(
 		sessions, candidates, commands, workspaces, runtime, processes, access, events,
 		logLimit, uuid.NewString, time.Now,
 	)
+	if err != nil {
+		return nil, err
+	}
+	if len(dependencyPreparers) > 1 || len(dependencyPreparers) == 1 && dependencyPreparers[0] == nil {
+		return nil, errors.New("at most one interactive dependency preparer is allowed")
+	}
+	if len(dependencyPreparers) == 1 {
+		service.dependencies = dependencyPreparers[0]
+	}
+	return service, nil
 }
 
 func newProcessService(
@@ -235,6 +247,11 @@ func (service *ProcessService) Start(ctx context.Context, input StartProcessInpu
 	mount, err := service.workspaces.Materialize(ctx, view, record.Candidate)
 	if err != nil {
 		return ProcessResult{}, err
+	}
+	if service.dependencies != nil {
+		if err := service.dependencies.Prepare(ctx, mount, command); err != nil {
+			return ProcessResult{}, err
+		}
 	}
 	runtimeSpec, err := RuntimeSpecForSession(view, mount)
 	if err != nil {

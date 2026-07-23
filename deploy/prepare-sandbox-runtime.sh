@@ -28,11 +28,20 @@ require_digest_image() {
   fi
 }
 
+ensure_image() {
+  image=$1
+  if docker image inspect "$image" >/dev/null 2>&1; then
+    printf 'sandbox runtime preparation: using pre-provisioned image %s\n' "$image"
+    return
+  fi
+  docker pull "$image"
+}
+
 pull_quality_images() {
   test -n "${NODE_IMAGE:-}" || fail 'NODE_IMAGE is required'
   test -n "${GO_IMAGE:-}" || fail 'GO_IMAGE is required'
-  docker pull "$NODE_IMAGE"
-  docker pull "$GO_IMAGE"
+  ensure_image "$NODE_IMAGE"
+  ensure_image "$GO_IMAGE"
 }
 
 prepare_interactive_runner() {
@@ -40,7 +49,7 @@ prepare_interactive_runner() {
     return
   fi
   require_digest_image SANDBOX_RUNNER_IMAGE "${SANDBOX_RUNNER_IMAGE:-}"
-  docker pull "$SANDBOX_RUNNER_IMAGE"
+  ensure_image "$SANDBOX_RUNNER_IMAGE"
 }
 
 prepare_lsp_images() {
@@ -50,7 +59,7 @@ prepare_lsp_images() {
   test -n "${LSP_PRELOAD_IMAGES:-}" || fail 'LSP_PRELOAD_IMAGES is required when LSP_ENABLED=true'
   for image in $LSP_PRELOAD_IMAGES; do
     require_digest_image LSP_PRELOAD_IMAGES "$image"
-    docker pull "$image"
+    ensure_image "$image"
   done
 }
 
@@ -100,7 +109,7 @@ prepare_agent_relay() {
     return
   fi
   require_digest_image AGENT_RUNNER_IMAGE "${AGENT_RUNNER_IMAGE:-}"
-  docker pull "$AGENT_RUNNER_IMAGE"
+  ensure_image "$AGENT_RUNNER_IMAGE"
   prepare_agent_network
   remove_managed_relay
 

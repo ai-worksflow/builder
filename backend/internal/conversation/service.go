@@ -478,7 +478,26 @@ func (s *Service) GenerateIntentProposal(ctx context.Context, projectID, convers
 		Input:        providerInput, OutputSchema: schema, OutputSchemaName: "workflow_intent_proposal", MaxOutputTokens: 8192,
 	})
 	if err != nil {
-		return GeneratedIntentProposal{}, err
+		if !errors.Is(err, ai.ErrNotConfigured) && !errors.Is(err, ai.ErrUnavailable) {
+			return GeneratedIntentProposal{}, err
+		}
+		fallback, fallbackErr := deterministicIntentFallback(
+			input.TriggerMessageID,
+			generationContext,
+			selectionOptions,
+		)
+		if fallbackErr != nil {
+			return GeneratedIntentProposal{}, fallbackErr
+		}
+		fallbackOutput, fallbackErr := platformdomain.CanonicalJSON(fallback)
+		if fallbackErr != nil {
+			return GeneratedIntentProposal{}, fallbackErr
+		}
+		generated = ai.Result{
+			Provider: "worksflow",
+			Model:    "deterministic-intent-router/v1",
+			Output:   fallbackOutput,
+		}
 	}
 	var output generatedIntentProposalOutput
 	canonicalOutput, err := platformdomain.CanonicalJSON(generated.Output)
@@ -654,7 +673,7 @@ func (s *Service) ExecuteCommand(ctx context.Context, projectID, conversationID,
 				return ConversationCommand{}, core.ErrConflict
 			}
 			recoveredRun = existing
-		case errors.Is(getErr, core.ErrNotFound):
+		case errors.Is(getErr, core.ErrNotFound), errors.Is(getErr, platformdomain.ErrNotFound):
 			if err := s.workflow.ValidateCompatibleDefinitionVersion(
 				ctx, projectID, actorID, current.Payload.DefinitionVersionID,
 				current.Payload.ManifestIntent.InputManifest, current.Payload.DesiredOutputCapability,
@@ -1613,6 +1632,110 @@ func intentSelectionOptionByKey(options []intentSelectionOption, selectionKey st
 		}
 	}
 	return intentSelectionOption{}, false
+}
+
+func deterministicIntentFallback(
+	triggerMessageID string,
+	context intentGenerationContext,
+	options []intentSelectionOption,
+) (generatedIntentProposalOutput, error) {
+	definitionKeys := make(map[string]string, len(context.Definitions))
+	for _, definition := range context.Definitions {
+		definitionKeys[definition.VersionID] = definition.Key
+	}
+	selected := -1
+	for index, option := range options {
+		if option.Kind == IntentStartWorkflow && definitionKeys[option.DefinitionVersionID] == "minimum-product-loop" {
+			selected = index
+			break
+		}
+	}
+	if selected < 0 {
+		for index, option := range options {
+			if option.Kind == IntentStartWorkflow {
+				selected = index
+				break
+			}
+		}
+	}
+	if selected < 0 && len(options) == 1 && options[0].Kind == IntentWorkbenchInstruction {
+		selected = 0
+	}
+	if selected < 0 {
+		return generatedIntentProposalOutput{}, fmt.Errorf(
+			"%w: AI is unavailable and the executable Workbench continuation is ambiguous",
+			core.ErrConflict,
+		)
+	}
+
+	triggerContent := ""
+	for _, message := range context.Conversation.TailMessages {
+		if message.ID == triggerMessageID && message.Role == MessageUser {
+			triggerContent = strings.TrimSpace(message.Content)
+			break
+		}
+	}
+	if triggerContent == "" {
+		return generatedIntentProposalOutput{}, fmt.Errorf("%w: immutable trigger message is missing", core.ErrConflict)
+	}
+	chunks := splitIntentInstruction(triggerContent)
+	if len(chunks) == 0 {
+		return generatedIntentProposalOutput{}, fmt.Errorf("%w: immutable trigger message is empty", core.ErrConflict)
+	}
+	objective := chunks[0]
+	constraints := append([]string(nil), chunks[1:]...)
+	choice := options[selected]
+	return generatedIntentProposalOutput{
+		AssistantContent: "The configured AI service is unavailable. I created a deterministic, reviewable routing proposal from the exact immutable user message; no workflow has been executed.",
+		SelectionKey:     choice.SelectionKey,
+		ScopeJSON:        `{}`,
+		WorkbenchInstruction: generatedIntentWorkbenchInstruction{
+			Objective: objective, Constraints: constraints,
+		},
+	}, nil
+}
+
+func splitIntentInstruction(value string) []string {
+	const objectiveBytes = 4000
+	const constraintBytes = 1000
+	remaining := strings.TrimSpace(value)
+	if remaining == "" {
+		return nil
+	}
+	chunks := make([]string, 0, 1+len(remaining)/constraintBytes)
+	for remaining != "" {
+		limit := constraintBytes
+		if len(chunks) == 0 {
+			limit = objectiveBytes
+		}
+		chunk, rest := splitUTF8Prefix(remaining, limit)
+		chunk = strings.TrimSpace(chunk)
+		if chunk != "" {
+			chunks = append(chunks, chunk)
+		}
+		remaining = strings.TrimSpace(rest)
+		if len(chunks) > 100 {
+			return nil
+		}
+	}
+	return chunks
+}
+
+func splitUTF8Prefix(value string, maxBytes int) (string, string) {
+	if len(value) <= maxBytes {
+		return value, ""
+	}
+	boundary := 0
+	for index := range value {
+		if index > maxBytes {
+			break
+		}
+		boundary = index
+	}
+	if boundary == 0 {
+		return value[:maxBytes], value[maxBytes:]
+	}
+	return value[:boundary], value[boundary:]
 }
 
 func decodeGeneratedIntentScope(scopeJSON string) (json.RawMessage, error) {

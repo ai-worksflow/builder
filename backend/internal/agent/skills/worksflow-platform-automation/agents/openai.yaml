@@ -1,0 +1,4 @@
+interface:
+  display_name: "Worksflow Platform Automation"
+  short_description: "Safely advance reviewed platform work"
+  default_prompt: "Use $worksflow-platform-automation to advance an exact reviewed proposal to the next required human decision."

@@ -105,7 +105,7 @@ func (Compiler) Compile(input CompileInput) (CompiledContract, error) {
 			)
 		}
 	}
-	semanticSources := validateSemanticSources(sourcesByKind, content.DeliverySliceID, contractFacts, gapBuilder)
+	semanticSources := validateSemanticSources(sourcesByKind, strings.TrimSpace(input.DeliverySlicePageNodeID), contractFacts, gapBuilder)
 
 	baselineCriteria, mustRequirements := compileBaseline(sourcesByKind["requirement_baseline"], gapBuilder)
 	compilePageSpecs(sourcesByKind["page_spec"], semanticSources.validPageSpecRevisions, baselineCriteria, contractFacts, contractSourceRefs, &content, gapBuilder)
@@ -183,7 +183,8 @@ func validateAndIndexSources(sources []PinnedBuildSource, content *ContractConte
 			diagnostics.gap("source", "source_revision_invalid", path, "Every source must pin kind, artifact, revision, and canonical content hash.", source.Ref.RevisionID, nil)
 		}
 		actualHash, hashErr := domain.CanonicalHash(source.Content)
-		if hashErr != nil || actualHash != source.Ref.ContentHash {
+		expectedHash := strings.TrimPrefix(source.Ref.ContentHash, "sha256:")
+		if hashErr != nil || actualHash != expectedHash {
 			diagnostics.gap("source", "source_content_hash_mismatch", path+".content", "Frozen source content does not match its exact revision hash.", source.Ref.RevisionID, nil)
 		}
 		if source.Ref.ApprovalStatus != "approved" {

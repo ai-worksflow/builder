@@ -43,9 +43,9 @@ func run(arguments []string, output io.Writer) error {
 	flags := flag.NewFlagSet("template-authority", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
 	configuration := options{}
-	flags.StringVar(&configuration.mode, "mode", "", "commitments, readiness, or admit")
+	flags.StringVar(&configuration.mode, "mode", "", "commitments, prepare-admission, readiness, verify-admission, admit, or register-stack")
 	flags.StringVar(&configuration.configPath, "config", "", "absolute path to the authority config")
-	flags.StringVar(&configuration.inputPath, "input", "-", "admission JSON file, or - for stdin")
+	flags.StringVar(&configuration.inputPath, "input", "-", "operator request JSON file, or - for stdin")
 	flags.DurationVar(&configuration.timeout, "timeout", 5*time.Minute, "whole operation timeout")
 	if err := flags.Parse(arguments); err != nil {
 		return err
@@ -53,8 +53,8 @@ func run(arguments []string, output io.Writer) error {
 	if flags.NArg() != 0 {
 		return errors.New("positional arguments are not accepted")
 	}
-	if configuration.mode != "commitments" && configuration.mode != "readiness" && configuration.mode != "admit" {
-		return errors.New("-mode must be commitments, readiness, or admit")
+	if configuration.mode != "commitments" && configuration.mode != "prepare-admission" && configuration.mode != "readiness" && configuration.mode != "verify-admission" && configuration.mode != "admit" && configuration.mode != "register-stack" {
+		return errors.New("-mode must be commitments, prepare-admission, readiness, verify-admission, admit, or register-stack")
 	}
 	if configuration.configPath == "" {
 		return errors.New("-config is required")
@@ -73,6 +73,25 @@ func run(arguments []string, output io.Writer) error {
 			return err
 		}
 		return writeCanonicalJSON(output, commitments)
+	}
+	if configuration.mode == "prepare-admission" {
+		encoded, err := readOperatorInput(configuration.inputPath, os.Stdin)
+		if err != nil {
+			return err
+		}
+		request, err := templateoperator.DecodeEvidencePreparationRequest(encoded)
+		if err != nil {
+			return err
+		}
+		parent, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
+		ctx, cancel := context.WithTimeout(parent, configuration.timeout)
+		defer cancel()
+		prepared, err := templateoperator.PrepareAdmission(ctx, config, os.LookupEnv, request, time.Now)
+		if err != nil {
+			return err
+		}
+		return writeCanonicalJSON(output, prepared)
 	}
 
 	dsn, present := os.LookupEnv(postgresDSNEnvironment)
@@ -104,13 +123,31 @@ func run(arguments []string, output io.Writer) error {
 		}{SchemaVersion: "template-artifact-authority-readiness/v1", Ready: true, Commitments: operator.Commitments()})
 	}
 
-	encoded, err := readAdmissionInput(configuration.inputPath, os.Stdin)
+	encoded, err := readOperatorInput(configuration.inputPath, os.Stdin)
 	if err != nil {
 		return err
+	}
+	if configuration.mode == "register-stack" {
+		request, err := templateoperator.DecodeFullStackRegistrationRequest(encoded)
+		if err != nil {
+			return err
+		}
+		registration, err := operator.RegisterFullStack(ctx, request)
+		if err != nil {
+			return err
+		}
+		return writeCanonicalJSON(output, registration)
 	}
 	request, err := templateoperator.DecodeAdmissionRequest(encoded)
 	if err != nil {
 		return err
+	}
+	if configuration.mode == "verify-admission" {
+		receipt, err := operator.VerifyAdmission(ctx, request)
+		if err != nil {
+			return err
+		}
+		return writeCanonicalJSON(output, receipt)
 	}
 	registration, err := operator.Admit(ctx, request)
 	if err != nil {
@@ -138,28 +175,28 @@ func openDatabase(dsn string) (*gorm.DB, func(), error) {
 	return database, func() { _ = sqlDatabase.Close() }, nil
 }
 
-func readAdmissionInput(path string, standardInput io.Reader) ([]byte, error) {
+func readOperatorInput(path string, standardInput io.Reader) ([]byte, error) {
 	var reader io.Reader = standardInput
 	var file *os.File
 	if path != "-" {
 		opened, err := os.Open(path)
 		if err != nil {
-			return nil, fmt.Errorf("open admission input: %w", err)
+			return nil, fmt.Errorf("open operator input: %w", err)
 		}
 		file = opened
 		defer file.Close()
 		info, err := file.Stat()
 		if err != nil || !info.Mode().IsRegular() {
-			return nil, errors.New("admission input must be a regular file")
+			return nil, errors.New("operator input must be a regular file")
 		}
 		reader = file
 	}
 	encoded, err := io.ReadAll(io.LimitReader(reader, maximumInputBytes+1))
 	if err != nil {
-		return nil, fmt.Errorf("read admission input: %w", err)
+		return nil, fmt.Errorf("read operator input: %w", err)
 	}
 	if len(encoded) == 0 || len(encoded) > maximumInputBytes {
-		return nil, fmt.Errorf("admission input must be between 1 and %d bytes", maximumInputBytes)
+		return nil, fmt.Errorf("operator input must be between 1 and %d bytes", maximumInputBytes)
 	}
 	return encoded, nil
 }

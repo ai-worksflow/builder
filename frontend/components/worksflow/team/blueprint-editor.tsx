@@ -231,7 +231,11 @@ export function BlueprintEditor() {
   const appliedRevisionSubmissionNodes = useMemo(() => {
     if (!appliedProposalRevisionRef || !flow.run || !flow.runDefinition) return []
     return flow.run.nodes.filter((node) => {
-      if (node.type !== 'human_edit' || node.status !== 'waiting_input') return false
+      if (
+        node.type !== 'human_edit'
+        || node.status !== 'waiting_input'
+        || !node.allowedActions?.includes('submit_input')
+      ) return false
       const definitionNode = flow.runDefinition?.definition.nodes.find(
         (candidate) => candidate.id === node.definitionNodeId,
       )

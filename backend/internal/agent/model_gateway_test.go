@@ -27,7 +27,8 @@ type modelGatewayCapabilitiesFake struct {
 	outputRequested       int64
 	lease                 ModelBudgetLease
 	acquireErr            error
-	releaseUsage          int64
+	releaseInputUsage     int64
+	releaseOutputUsage    int64
 	releaseUsageAvailable bool
 }
 
@@ -68,11 +69,13 @@ func (capabilities *modelGatewayCapabilitiesFake) Release(
 	_ context.Context,
 	_ ModelCapabilityRecord,
 	_ ModelBudgetLease,
+	observedInputTokens int64,
 	observedOutputTokens int64,
 	usageAvailable bool,
 ) error {
 	capabilities.released++
-	capabilities.releaseUsage = observedOutputTokens
+	capabilities.releaseInputUsage = observedInputTokens
+	capabilities.releaseOutputUsage = observedOutputTokens
 	capabilities.releaseUsageAvailable = usageAvailable
 	return nil
 }
@@ -99,7 +102,7 @@ func TestModelGatewayReplacesCapabilityWithUpstreamSecretAndForcesEphemeralReque
 		}
 		writer.Header().Set("Content-Type", "text/event-stream")
 		writer.WriteHeader(http.StatusOK)
-		_, _ = io.WriteString(writer, "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"output_tokens\":123}}}\n\n")
+		_, _ = io.WriteString(writer, "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":456,\"output_tokens\":123}}}\n\n")
 	}))
 	defer upstream.Close()
 	capabilities := modelGatewayCapabilitiesFixture()
@@ -129,7 +132,8 @@ func TestModelGatewayReplacesCapabilityWithUpstreamSecretAndForcesEphemeralReque
 		t.Fatalf("gateway calls upstream=%d capabilities=%+v", upstreamCalls, capabilities)
 	}
 	if capabilities.inputReserved <= int64(len(`{"model":"qualified-model","input":"implement"}`)) ||
-		capabilities.outputRequested != 4096 || capabilities.releaseUsage != 123 ||
+		capabilities.outputRequested != 4096 || capabilities.releaseInputUsage != 456 ||
+		capabilities.releaseOutputUsage != 123 ||
 		!capabilities.releaseUsageAvailable {
 		t.Fatalf("gateway budget accounting=%+v", capabilities)
 	}
@@ -183,7 +187,7 @@ func TestModelGatewayClampsRequestToRemainingOutputBudget(t *testing.T) {
 			t.Fatalf("remaining output allowance was not enforced: %#v", body)
 		}
 		writer.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(writer, `{"id":"response-1","usage":{"output_tokens":17}}`)
+		_, _ = io.WriteString(writer, `{"id":"response-1","usage":{"input_tokens":23,"output_tokens":17}}`)
 	}))
 	defer upstream.Close()
 	capabilities := modelGatewayCapabilitiesFixture()
@@ -203,7 +207,8 @@ func TestModelGatewayClampsRequestToRemainingOutputBudget(t *testing.T) {
 	request.Header.Set("Authorization", "Bearer "+capabilities.token)
 	response := httptest.NewRecorder()
 	gateway.ServeHTTP(response, request)
-	if response.Code != http.StatusOK || capabilities.releaseUsage != 17 || !capabilities.releaseUsageAvailable {
+	if response.Code != http.StatusOK || capabilities.releaseInputUsage != 23 ||
+		capabilities.releaseOutputUsage != 17 || !capabilities.releaseUsageAvailable {
 		t.Fatalf("response=%d %s accounting=%+v", response.Code, response.Body.String(), capabilities)
 	}
 }
@@ -243,19 +248,19 @@ func TestConservativeInputAdmissionAndUsageObservation(t *testing.T) {
 		t.Fatalf("conservative input bound=%d err=%v", bound, err)
 	}
 	sse := newModelUsageObserver("text/event-stream; charset=utf-8")
-	sse.Observe([]byte("data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"output_tokens\":42}}}\n\n"))
-	if usage, ok := sse.Usage(); !ok || usage != 42 {
-		t.Fatalf("SSE usage=%d available=%v", usage, ok)
+	sse.Observe([]byte("data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":84,\"output_tokens\":42}}}\n\n"))
+	if input, output, ok := sse.Usage(); !ok || input != 84 || output != 42 {
+		t.Fatalf("SSE usage input=%d output=%d available=%v", input, output, ok)
 	}
 	jsonObserver := newModelUsageObserver("application/json")
-	jsonObserver.Observe([]byte(`{"usage":{"output_tokens":9}}`))
-	if usage, ok := jsonObserver.Usage(); !ok || usage != 9 {
-		t.Fatalf("JSON usage=%d available=%v", usage, ok)
+	jsonObserver.Observe([]byte(`{"usage":{"input_tokens":18,"output_tokens":9}}`))
+	if input, output, ok := jsonObserver.Usage(); !ok || input != 18 || output != 9 {
+		t.Fatalf("JSON usage input=%d output=%d available=%v", input, output, ok)
 	}
 	missing := newModelUsageObserver("application/json")
 	missing.Observe([]byte(`{"usage":{}}`))
-	if _, ok := missing.Usage(); ok {
-		t.Fatal("missing output token usage was accepted as a zero-token response")
+	if _, _, ok := missing.Usage(); ok {
+		t.Fatal("missing token usage was accepted as a zero-token response")
 	}
 }
 
@@ -308,27 +313,27 @@ func TestRedisModelCapabilityBudgetLedger(t *testing.T) {
 	if _, err := authority.Acquire(context.Background(), record, time.Minute, 1, 1); !errors.Is(err, ErrModelCapabilityBusy) {
 		t.Fatalf("concurrent lease error=%v", err)
 	}
-	if err := authority.Release(context.Background(), record, first, 20, true); err != nil {
+	if err := authority.Release(context.Background(), record, first, 2_000, 20, true); err != nil {
 		t.Fatalf("release exact usage: %v", err)
 	}
 	second, err := authority.Acquire(context.Background(), record, time.Minute, 4_000, 100)
 	if err != nil || second.OutputTokenAllowance != 100 {
 		t.Fatalf("second budget lease=%+v err=%v", second, err)
 	}
-	if err := authority.Release(context.Background(), record, first, 20, true); err == nil {
+	if err := authority.Release(context.Background(), record, first, 2_000, 20, true); err == nil {
 		t.Fatal("stale budget lease released a newer request")
 	}
-	if err := authority.Release(context.Background(), record, second, 0, false); err != nil {
+	if err := authority.Release(context.Background(), record, second, 0, 0, false); err != nil {
 		t.Fatalf("conservatively charge missing usage: %v", err)
 	}
-	if _, err := authority.Acquire(context.Background(), record, time.Minute, 2_000, 1); !errors.Is(err, ErrModelInputBudgetExceeded) {
+	if _, err := authority.Acquire(context.Background(), record, time.Minute, 4_500, 1); !errors.Is(err, ErrModelInputBudgetExceeded) {
 		t.Fatalf("cumulative input budget error=%v", err)
 	}
-	third, err := authority.Acquire(context.Background(), record, time.Minute, 500, 100)
+	third, err := authority.Acquire(context.Background(), record, time.Minute, 4_000, 100)
 	if err != nil || third.OutputTokenAllowance != 30 {
 		t.Fatalf("remaining output lease=%+v err=%v", third, err)
 	}
-	if err := authority.Release(context.Background(), record, third, 30, true); err != nil {
+	if err := authority.Release(context.Background(), record, third, 1_000, 30, true); err != nil {
 		t.Fatalf("release final output allowance: %v", err)
 	}
 	if _, err := authority.Acquire(context.Background(), record, time.Minute, 1, 1); !errors.Is(err, ErrModelOutputBudgetExceeded) {

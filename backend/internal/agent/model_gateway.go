@@ -45,7 +45,7 @@ type ModelCapabilityRecord struct {
 type ModelGatewayCapabilities interface {
 	Authenticate(context.Context, string) (ModelCapabilityRecord, error)
 	Acquire(context.Context, ModelCapabilityRecord, time.Duration, int64, int64) (ModelBudgetLease, error)
-	Release(context.Context, ModelCapabilityRecord, ModelBudgetLease, int64, bool) error
+	Release(context.Context, ModelCapabilityRecord, ModelBudgetLease, int64, int64, bool) error
 }
 
 type ModelBudgetLease struct {
@@ -268,31 +268,42 @@ func (authority *RedisModelCapabilityAuthority) Release(
 	ctx context.Context,
 	record ModelCapabilityRecord,
 	lease ModelBudgetLease,
+	observedInputTokens int64,
 	observedOutputTokens int64,
 	usageAvailable bool,
 ) error {
 	if authority == nil || ctx == nil || !validUUIDs(record.ID, lease.ID) ||
 		lease.InputTokenUpperBound < 1 || lease.OutputTokenAllowance < 1 ||
+		observedInputTokens < 0 || observedInputTokens > lease.InputTokenUpperBound ||
 		observedOutputTokens < 0 || observedOutputTokens > lease.OutputTokenAllowance {
 		return ErrModelCapability
 	}
-	refund := int64(0)
+	inputRefund, outputRefund := int64(0), int64(0)
 	if usageAvailable {
-		refund = lease.OutputTokenAllowance - observedOutputTokens
+		inputRefund = lease.InputTokenUpperBound - observedInputTokens
+		outputRefund = lease.OutputTokenAllowance - observedOutputTokens
 	}
 	script := redis.NewScript(`
 if redis.call('GET', KEYS[1]) ~= ARGV[1] then
   return 0
 end
-local output_used = tonumber(redis.call('GET', KEYS[2]) or '0')
-local refund = tonumber(ARGV[2])
-if refund < 0 or output_used < refund then
+local input_used = tonumber(redis.call('GET', KEYS[2]) or '0')
+local output_used = tonumber(redis.call('GET', KEYS[3]) or '0')
+local input_refund = tonumber(ARGV[2])
+local output_refund = tonumber(ARGV[3])
+if input_refund < 0 or output_refund < 0 or input_used < input_refund or output_used < output_refund then
   return -1
 end
-if refund > 0 then
+if input_refund > 0 then
   local ttl = redis.call('PTTL', KEYS[2])
   if ttl > 0 then
-    redis.call('PSETEX', KEYS[2], ttl, output_used - refund)
+    redis.call('PSETEX', KEYS[2], ttl, input_used - input_refund)
+  end
+end
+if output_refund > 0 then
+  local ttl = redis.call('PTTL', KEYS[3])
+  if ttl > 0 then
+    redis.call('PSETEX', KEYS[3], ttl, output_used - output_refund)
   end
 end
 redis.call('DEL', KEYS[1])
@@ -301,9 +312,10 @@ return 1
 	result, err := script.Run(
 		ctx,
 		authority.client,
-		[]string{authority.useKey(record), authority.outputUseKey(record)},
+		[]string{authority.useKey(record), authority.inputUseKey(record), authority.outputUseKey(record)},
 		lease.ID,
-		refund,
+		inputRefund,
+		outputRefund,
 	).Int()
 	if err != nil {
 		return fmt.Errorf("%w: release capability use: %v", ErrModelCapability, err)
@@ -462,12 +474,12 @@ func (gateway *ModelGateway) ServeHTTP(writer http.ResponseWriter, request *http
 		}
 		return
 	}
-	observedOutputTokens := int64(0)
+	observedInputTokens, observedOutputTokens := int64(0), int64(0)
 	usageAvailable := false
 	defer func() {
 		if releaseErr := gateway.capabilities.Release(
 			context.WithoutCancel(request.Context()), record, lease,
-			observedOutputTokens, usageAvailable,
+			observedInputTokens, observedOutputTokens, usageAvailable,
 		); releaseErr != nil {
 			gateway.logger.Error(
 				"Agent Model Gateway budget lease release failed",
@@ -505,7 +517,7 @@ func (gateway *ModelGateway) ServeHTTP(writer http.ResponseWriter, request *http
 	response, err := gateway.client.Do(upstream)
 	if err != nil {
 		writeModelGatewayError(writer, http.StatusBadGateway, "model_upstream_unavailable")
-		gateway.audit(record, lease, 0, false, 0, 0, started, err)
+		gateway.audit(record, lease, 0, 0, false, 0, 0, started, err)
 		return
 	}
 	defer response.Body.Close()
@@ -523,13 +535,15 @@ func (gateway *ModelGateway) ServeHTTP(writer http.ResponseWriter, request *http
 		response.Body,
 		gateway.config.MaxOutputBytes,
 	)
-	if usage, ok := observer.Usage(); ok && usage >= 0 && usage <= lease.OutputTokenAllowance {
-		observedOutputTokens, usageAvailable = usage, true
+	if inputUsage, outputUsage, ok := observer.Usage(); ok &&
+		inputUsage >= 0 && inputUsage <= lease.InputTokenUpperBound &&
+		outputUsage >= 0 && outputUsage <= lease.OutputTokenAllowance {
+		observedInputTokens, observedOutputTokens, usageAvailable = inputUsage, outputUsage, true
 	} else if ok && copyErr == nil {
-		copyErr = fmt.Errorf("%w: upstream output usage exceeded the capability allowance", ErrModelGateway)
+		copyErr = fmt.Errorf("%w: upstream usage exceeded the capability allowance", ErrModelGateway)
 	}
 	gateway.audit(
-		record, lease, observedOutputTokens, usageAvailable,
+		record, lease, observedInputTokens, observedOutputTokens, usageAvailable,
 		response.StatusCode, written, started, copyErr,
 	)
 }
@@ -706,13 +720,13 @@ func (observer *modelUsageObserver) Observe(value []byte) {
 	_, _ = observer.buffer.Write(value)
 }
 
-func (observer *modelUsageObserver) Usage() (int64, bool) {
+func (observer *modelUsageObserver) Usage() (int64, int64, bool) {
 	if observer == nil || observer.overflow || observer.buffer.Len() == 0 {
-		return 0, false
+		return 0, 0, false
 	}
 	payload := observer.buffer.Bytes()
 	if strings.Contains(observer.contentType, "text/event-stream") {
-		usage, available := int64(0), false
+		inputUsage, outputUsage, available := int64(0), int64(0), false
 		for _, rawLine := range bytes.Split(payload, []byte{'\n'}) {
 			line := bytes.TrimSpace(rawLine)
 			if !bytes.HasPrefix(line, []byte("data:")) {
@@ -722,43 +736,48 @@ func (observer *modelUsageObserver) Usage() (int64, bool) {
 			if bytes.Equal(data, []byte("[DONE]")) {
 				continue
 			}
-			if observed, ok := responseOutputTokenUsage(data); ok {
-				usage, available = observed, true
+			if observedInput, observedOutput, ok := responseTokenUsage(data); ok {
+				inputUsage, outputUsage, available = observedInput, observedOutput, true
 			}
 		}
-		return usage, available
+		return inputUsage, outputUsage, available
 	}
-	return responseOutputTokenUsage(payload)
+	return responseTokenUsage(payload)
 }
 
-func responseOutputTokenUsage(payload []byte) (int64, bool) {
+func responseTokenUsage(payload []byte) (int64, int64, bool) {
 	var event struct {
 		Type  string `json:"type"`
 		Usage *struct {
+			InputTokens  *int64 `json:"input_tokens"`
 			OutputTokens *int64 `json:"output_tokens"`
 		} `json:"usage,omitempty"`
 		Response *struct {
 			Usage *struct {
+				InputTokens  *int64 `json:"input_tokens"`
 				OutputTokens *int64 `json:"output_tokens"`
 			} `json:"usage,omitempty"`
 		} `json:"response,omitempty"`
 	}
 	decoder := json.NewDecoder(bytes.NewReader(payload))
 	if err := decoder.Decode(&event); err != nil {
-		return 0, false
+		return 0, 0, false
 	}
 	var trailing any
 	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
-		return 0, false
+		return 0, 0, false
 	}
-	if event.Response != nil && event.Response.Usage != nil && event.Response.Usage.OutputTokens != nil &&
+	if event.Response != nil && event.Response.Usage != nil && event.Response.Usage.InputTokens != nil &&
+		event.Response.Usage.OutputTokens != nil &&
 		(event.Type == "response.completed" || event.Type == "response.incomplete" || event.Type == "response.failed") {
-		return *event.Response.Usage.OutputTokens, *event.Response.Usage.OutputTokens >= 0
+		return *event.Response.Usage.InputTokens, *event.Response.Usage.OutputTokens,
+			*event.Response.Usage.InputTokens >= 0 && *event.Response.Usage.OutputTokens >= 0
 	}
-	if event.Type == "" && event.Usage != nil && event.Usage.OutputTokens != nil {
-		return *event.Usage.OutputTokens, *event.Usage.OutputTokens >= 0
+	if event.Type == "" && event.Usage != nil && event.Usage.InputTokens != nil && event.Usage.OutputTokens != nil {
+		return *event.Usage.InputTokens, *event.Usage.OutputTokens,
+			*event.Usage.InputTokens >= 0 && *event.Usage.OutputTokens >= 0
 	}
-	return 0, false
+	return 0, 0, false
 }
 
 func copyBoundedStreaming(writer io.Writer, reader io.Reader, maximum int64) (int64, error) {
@@ -799,6 +818,7 @@ func copyBoundedStreaming(writer io.Writer, reader io.Reader, maximum int64) (in
 func (gateway *ModelGateway) audit(
 	record ModelCapabilityRecord,
 	lease ModelBudgetLease,
+	observedInputTokens int64,
 	observedOutputTokens int64,
 	usageAvailable bool,
 	status int,
@@ -819,6 +839,7 @@ func (gateway *ModelGateway) audit(
 		"project_id", record.ProjectID,
 		"model", record.Model,
 		"input_token_admission_upper_bound", lease.InputTokenUpperBound,
+		"observed_input_tokens", observedInputTokens,
 		"output_token_allowance", lease.OutputTokenAllowance,
 		"observed_output_tokens", observedOutputTokens,
 		"output_usage_available", usageAvailable,

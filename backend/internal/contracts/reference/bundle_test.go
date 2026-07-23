@@ -351,9 +351,11 @@ func referenceCompileInput(t *testing.T, bundle Bundle) constructor.CompileInput
 		{ID: "test-only-reference-api", ReleaseHash: canonicalTestHash(t, map[string]any{"release": "api"}), Role: "api", Certification: "approved", PolicyStatus: "active"},
 	}
 	return constructor.CompileInput{
-		ProjectID: "reference-ai-conversation-project", DeliverySliceID: bundle.manifest.DeliverySliceID,
-		BuildManifest: constructor.BuildManifestRef{ID: "reference-ai-conversation-bundle", ContentHash: manifestHash},
-		Sources:       sources, FullStackTemplate: template, TemplateReleaseRefs: releases,
+		ProjectID:               "reference-ai-conversation-project",
+		DeliverySliceID:         bundle.manifest.DeliverySliceID,
+		DeliverySlicePageNodeID: bundle.manifest.DeliverySliceID,
+		BuildManifest:           constructor.BuildManifestRef{ID: "reference-ai-conversation-bundle", ContentHash: manifestHash},
+		Sources:                 sources, FullStackTemplate: template, TemplateReleaseRefs: releases,
 		TemplateRuntime: referenceTemplateRuntime(template, releases),
 	}
 }

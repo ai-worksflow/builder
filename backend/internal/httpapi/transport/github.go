@@ -17,6 +17,7 @@ type GitHubAPI interface {
 	Disconnect(context.Context, string, string) (worksgithub.ConnectionStatus, error)
 	Status(context.Context, string, string) (worksgithub.ConnectionStatus, error)
 	Repositories(context.Context, string, string) ([]worksgithub.Repository, error)
+	CreateRepository(context.Context, string, string, worksgithub.CreateRepositoryInput) (worksgithub.CreateRepositoryResult, error)
 	Branches(context.Context, string, string, string, string) ([]worksgithub.Branch, error)
 	Preview(context.Context, string, string, worksgithub.PreviewInput) (worksgithub.ChangesPreview, error)
 	Push(context.Context, string, string, worksgithub.PushInput) (worksgithub.PushResult, error)
@@ -46,6 +47,7 @@ func RegisterGitHubRoutes(routes gin.IRoutes, handler *GitHubHandler, mutationMi
 	routes.POST("/projects/:projectId/github/connect", githubHandlers(mutationMiddleware, handler.connect)...)
 	routes.POST("/projects/:projectId/github/disconnect", githubHandlers(mutationMiddleware, handler.disconnect)...)
 	routes.GET("/projects/:projectId/github/repositories", handler.repositories)
+	routes.POST("/projects/:projectId/github/repositories", githubHandlers(mutationMiddleware, handler.createRepository)...)
 	routes.GET("/projects/:projectId/github/branches", handler.branches)
 	routes.POST("/projects/:projectId/github/preview", githubHandlers(mutationMiddleware, handler.preview)...)
 	routes.POST("/projects/:projectId/github/push", githubHandlers(mutationMiddleware, handler.push)...)
@@ -113,6 +115,23 @@ func (h *GitHubHandler) repositories(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"repositories": items})
+}
+func (h *GitHubHandler) createRepository(c *gin.Context) {
+	var input worksgithub.CreateRepositoryInput
+	if err := DecodeJSON(c, &input, h.maxBody); err != nil {
+		WriteJSONError(c, err)
+		return
+	}
+	actor, ok := actorID(c)
+	if !ok {
+		return
+	}
+	value, err := h.service.CreateRepository(c.Request.Context(), c.Param("projectId"), actor, input)
+	if err != nil {
+		writeGitHubError(c, err)
+		return
+	}
+	c.JSON(http.StatusCreated, gin.H{"result": value})
 }
 func (h *GitHubHandler) branches(c *gin.Context) {
 	actor, ok := actorID(c)

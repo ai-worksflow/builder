@@ -91,7 +91,7 @@ func NewPatchUndoPlanRecord(
 		Operations:                       cloneMergeOperations(plan.Operations),
 		Conflicts:                        cloneMergeConflicts(plan.Conflicts),
 		CreatedBy:                        input.CreatedBy,
-		CreatedAt:                        now.UTC(),
+		CreatedAt:                        canonicalDatabaseTime(now),
 	}
 	if plan.MergeID != input.MergeID {
 		return PatchUndoPlanRecord{}, fmt.Errorf("%w: merge identity", ErrPatchUndoInvalid)
@@ -286,7 +286,7 @@ func NewPatchUndoApplication(
 		JournalSequenceFrom: first.Sequence, JournalSequenceTo: last.Sequence,
 		CandidateVersionFrom: first.CandidateFrom, CandidateVersionTo: last.CandidateTo,
 		BeforeTree: mutation.BeforeTree, AfterTree: mutation.AfterTree,
-		AppliedBy: actorID, AppliedAt: now.UTC(),
+		AppliedBy: actorID, AppliedAt: canonicalDatabaseTime(now),
 	}
 	if err := validatePatchUndoApplication(application, false); err != nil {
 		return PatchUndoApplication{}, err

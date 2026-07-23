@@ -181,7 +181,10 @@ func (authority *VerifiedArtifactAuthority) Verify(
 	if err != nil {
 		return ArtifactAuthorityReceipt{}, err
 	}
-	verifiedAt := authority.clock().UTC()
+	// PostgreSQL timestamptz stores microsecond precision. Normalize the trusted
+	// clock before it is written both to the typed receipt column and the exact
+	// JSON receipt document so their database equality constraint is stable.
+	verifiedAt := authority.clock().UTC().Truncate(time.Microsecond)
 	if verifiedAt.IsZero() || verifiedAt.Before(transparency.CheckpointSignedAt) {
 		return ArtifactAuthorityReceipt{}, invalid("invalid_authority_time", "verifiedAt", "trusted verification time must not predate the transparency checkpoint")
 	}

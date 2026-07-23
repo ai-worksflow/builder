@@ -33,7 +33,7 @@ async function openExactBrowserWorkspace(
   sandbox: GoldenSandbox,
 ) {
   const subject = goldenSubject()
-  await page.goto(`${subject.platform.webOrigin}/team/acme/project/${sandbox.projectId}/dashboard`)
+  await page.goto(`${subject.platform.webOrigin}/team/${sandbox.projectId}/project/${sandbox.projectId}/dashboard`)
   await page.goto(workbenchURL())
   await expect(page).toHaveURL(new RegExp(
     `^${subject.platform.webOrigin.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/`,

@@ -41,3 +41,19 @@ frontend/.vercel/
 # Local Worksflow runtime data
 .worksflow-data/
 frontend/.worksflow-data/
+
+# Repository-local Kubernetes tools and runtime state
+.tools/
+.kube/
+deploy/k8s/.generated/
+
+# Local secret and signing material
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Local build and scratch artifacts
+/backend/api
+/.freeze-gate-tool-check
+/.closure-worktree/

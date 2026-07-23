@@ -1,4 +1,5 @@
 import type { ProblemDetailsDto } from './dto'
+import { sha256Bytes, sha256DigestString } from './sha256'
 
 export type FetchLike = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>
 export type QueryValue = string | number | boolean | null | undefined
@@ -110,9 +111,8 @@ const SHA256_DIGEST_PATTERN = /^sha256:[0-9a-f]{64}$/
 
 /**
  * Recomputes a response body's byte-level SHA-256 before a higher-level
- * decoder is allowed to interpret it. Web Crypto is available in supported
- * browsers and modern Node test runtimes; absence is an integrity failure,
- * never a reason to trust the server-supplied digest.
+ * decoder is allowed to interpret it. Web Crypto is preferred, with a
+ * byte-identical portable implementation for insecure browser contexts.
  */
 export async function verifyResponseBodySha256(
   value: ArrayBuffer,
@@ -124,17 +124,9 @@ export async function verifyResponseBodySha256(
   if (!(value instanceof ArrayBuffer) || !SHA256_DIGEST_PATTERN.test(expectedDigest)) {
     throw new PlatformProtocolError(detail, requestId, status)
   }
-  const subtle = globalThis.crypto?.subtle
-  if (!subtle) {
-    throw new PlatformProtocolError(
-      'This runtime cannot verify the platform response body SHA-256.',
-      requestId,
-      status,
-    )
-  }
-  let digest: ArrayBuffer
+  let digest: Uint8Array
   try {
-    digest = await subtle.digest('SHA-256', value)
+    digest = await sha256Bytes(value)
   } catch {
     throw new PlatformProtocolError(
       'The platform response body SHA-256 could not be verified.',
@@ -142,9 +134,7 @@ export async function verifyResponseBodySha256(
       status,
     )
   }
-  const actualDigest = `sha256:${Array.from(new Uint8Array(digest), (byte) => (
-    byte.toString(16).padStart(2, '0')
-  )).join('')}`
+  const actualDigest = sha256DigestString(digest)
   if (actualDigest !== expectedDigest) {
     throw new PlatformProtocolError(detail, requestId, status)
   }

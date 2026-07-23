@@ -23,6 +23,7 @@ import {
   parseEditableDefinition as parseWorkflowDefinition,
   type EditableWorkflowDefinition,
   validateWorkflowNode as validateNodeContract,
+  workflowExternalQualificationCapability,
   workflowSemanticAnalysisLimit,
 } from '@/lib/platform/workflow-ui-contract'
 import { cn } from '@/lib/utils'
@@ -114,6 +115,15 @@ export function WorkflowGraphEditor({ value, onChange, capabilities }: WorkflowG
 
   function addNode() {
     if (!definition) return
+    if (newNodeType === 'external_qualification_gate' && !workflowExternalQualificationCapability(capabilities)) {
+      setLocalError(t('workflowGraph.error.invalidNode'))
+      return
+    }
+    if (newNodeType === 'external_qualification_gate'
+      && definition.nodes.some((node) => node.id === 'external-qualification')) {
+      setLocalError(t('workflowGraph.error.invalidNode'))
+      return
+    }
     if (newNodeType === 'fan_out' || newNodeType === 'merge') {
       const pair = appendPairedFanOutSubgraph(
         definition,
@@ -124,7 +134,9 @@ export function WorkflowGraphEditor({ value, onChange, capabilities }: WorkflowG
       setSelectedNodeId(pair.selectedNodeId)
       return
     }
-    const id = uniqueNodeId(newNodeType.replaceAll('_', '-'), definition.nodes)
+    const id = newNodeType === 'external_qualification_gate'
+      ? 'external-qualification'
+      : uniqueNodeId(newNodeType.replaceAll('_', '-'), definition.nodes)
     const node = createNode(id, newNodeType, capabilities, t)
     commit({ ...definition, nodes: [...definition.nodes, node] })
     setSelectedNodeId(id)
@@ -238,7 +250,9 @@ export function WorkflowGraphEditor({ value, onChange, capabilities }: WorkflowG
         <div className="flex min-h-0 flex-col bg-background">
           <div className="flex flex-wrap items-center gap-1.5 border-b border-border p-2">
             <select value={newNodeType} onChange={(event) => setNewNodeType(event.target.value as WorkflowNodeType)} className="h-8 min-w-40 rounded border border-border bg-panel px-2 text-[10px] text-foreground">
-              {NODE_TYPES.filter((item) => !capabilities || capabilities.nodeTypes.includes(item)).map((item) => (
+              {NODE_TYPES.filter((item) => item === 'external_qualification_gate'
+                ? Boolean(workflowExternalQualificationCapability(capabilities))
+                : !capabilities || capabilities.nodeTypes.includes(item)).map((item) => (
                 <option key={item} value={item}>{workflowGraphNodeTypeLabel(item, t)}</option>
               ))}
             </select>
@@ -414,6 +428,11 @@ function createNode(
     case 'manifest_compiler': return { ...base, manifestCompiler: capabilities?.manifestCompilers.at(0) ?? { manifestKind: 'application_build', schemaVersion: 1, hook: 'application-build-manifest/v1' } }
     case 'workbench_build': return { ...base, workbenchBuild: { buildManifestSchemaVersion: capabilities?.workbenchSchemaVersions.at(0) ?? 1, maxAttempts: 2, timeout: 300_000_000_000 } }
     case 'quality_gate': return { ...base, qualityGate: { gateName: capabilities?.qualityGates.at(0) ?? 'release', blocking: true } }
+    case 'external_qualification_gate': {
+      const externalQualificationGate = workflowExternalQualificationCapability(capabilities)
+      if (!externalQualificationGate) throw new Error('external qualification capability is unavailable')
+      return { ...base, externalQualificationGate }
+    }
     case 'publish': return { ...base, publish: { environment: capabilities?.publishEnvironments.at(0) ?? 'preview', requiredRole: 'admin', allowRollback: true } }
     case 'transform': return { ...base, transform: { transform: capabilities?.transforms.at(0) ?? 'selection_passthrough' } }
   }
@@ -433,6 +452,7 @@ function workflowGraphNodeTypeLabel(type: WorkflowNodeType, t: Translate) {
     case 'manifest_compiler': return t('flow.nodeType.manifestCompiler')
     case 'workbench_build': return t('flow.nodeType.workbenchBuild')
     case 'quality_gate': return t('flow.nodeType.qualityGate')
+    case 'external_qualification_gate': return t('flow.nodeType.externalQualificationGate')
     case 'publish': return t('flow.nodeType.publish')
     case 'transform': return t('flow.nodeType.transform')
   }

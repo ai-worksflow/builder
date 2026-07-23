@@ -153,6 +153,8 @@ func TestContextMaterializerWritesExactInputIndexAndPrompt(t *testing.T) {
 		manifest.ContentHash,
 		"Never change protectedPaths",
 		"Return only output conforming",
+		"Platform-qualified skill: frontend-resource-graph",
+		"Never use emoji, emoticons, Unicode dingbats",
 	} {
 		if !strings.Contains(string(prompt), expected) {
 			t.Fatalf("compiled prompt is missing %q", expected)

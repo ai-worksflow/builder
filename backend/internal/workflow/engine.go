@@ -373,6 +373,9 @@ func (e *Engine) ExecuteLease(ctx context.Context, lease Lease) error {
 	if err != nil {
 		return err
 	}
+	if err := rejectGenericWorkflowControl(run, definition); err != nil {
+		return err
+	}
 	if !nodeMatchesLease(node, lease) {
 		return ErrLeaseLost
 	}
@@ -801,6 +804,9 @@ func (e *Engine) AuthorizeNodeExecution(ctx context.Context, runID, nodeKey stri
 	if err != nil {
 		return err
 	}
+	if err := rejectGenericWorkflowControl(run, definitionNode); err != nil {
+		return err
+	}
 	action, requiredRole, required := nodeExecutionPolicy(definitionNode)
 	if !required || node.Status != NodeWaitingInput {
 		return &domain.DomainError{Kind: domain.ErrInvalidTransition, Field: "node", Message: "node is not waiting for privileged execution authorization"}
@@ -836,10 +842,13 @@ func (e *Engine) RecordProposal(ctx context.Context, runID, nodeKey string, prop
 	if err != nil {
 		return err
 	}
+	if err := rejectGenericWorkflowControl(run, definitionNode); err != nil {
+		return err
+	}
 	if node.Status != NodeWaitingInput {
 		return &domain.DomainError{Kind: domain.ErrInvalidTransition, Field: "node", Message: "node is not waiting for a proposal"}
 	}
-	if definitionNode.Type != domain.NodeAITransform && definitionNode.Type != domain.NodeAI && definitionNode.Type != domain.NodeWorkbenchBuild {
+	if definitionNode.Type != domain.NodeAITransform && definitionNode.Type != domain.NodeAI {
 		return &domain.DomainError{Kind: domain.ErrInvalidTransition, Field: "node", Message: "node does not accept proposals"}
 	}
 	proposal, err := e.Store.GetProposal(ctx, proposalRef.ID)
@@ -869,6 +878,9 @@ func (e *Engine) RecordProposal(ctx context.Context, runID, nodeKey string, prop
 func (e *Engine) SubmitHumanInput(ctx context.Context, runID, nodeKey string, output json.RawMessage, actorID string) error {
 	run, record, node, definitionNode, err := e.loadExecution(ctx, runID, nodeKey)
 	if err != nil {
+		return err
+	}
+	if err := rejectGenericWorkflowControl(run, definitionNode); err != nil {
 		return err
 	}
 	profile, err := e.executionProfile(run.ExecutionProfile)
@@ -1074,6 +1086,104 @@ const (
 	ReviewWaive   ReviewResolution = "waive"
 )
 
+// VerifyReviewApproval evaluates the exact same immutable-review predicate
+// used by ResolveReview without mutating the Workflow aggregate. Transport
+// action projections use this method so an approval control is never exposed
+// from a looser, client-reconstructed view of the upstream revisions.
+func (e *Engine) VerifyReviewApproval(
+	ctx context.Context,
+	runID, nodeKey string,
+	expectedEventCursor uint64,
+) (bool, error) {
+	run, record, node, definitionNode, err := e.loadExecution(ctx, runID, nodeKey)
+	if err != nil {
+		return false, err
+	}
+	if run.EventCursor != expectedEventCursor {
+		return false, ErrCASConflict
+	}
+	if err := rejectGenericWorkflowControl(run, definitionNode); err != nil {
+		return false, err
+	}
+	if node.Status != NodeWaitingReview {
+		return false, &domain.DomainError{Kind: domain.ErrInvalidTransition, Field: "node", Message: "node is not waiting for review"}
+	}
+	profile, err := e.executionProfile(run.ExecutionProfile)
+	if err != nil {
+		return false, err
+	}
+	return e.verifyCanonicalReviewApproval(
+		ctx,
+		run,
+		record,
+		node,
+		definitionNode,
+		profile.executionRuntime(e),
+	)
+}
+
+func (e *Engine) verifyCanonicalReviewApproval(
+	ctx context.Context,
+	run *RunRecord,
+	record DefinitionRecord,
+	node *NodeRecord,
+	definitionNode domain.NodeDefinition,
+	runtime workflowExecutionRuntime,
+) (bool, error) {
+	if definitionNode.Type != domain.NodeReviewGate || runtime.reviewGate == nil {
+		return false, nil
+	}
+	inputs, hasInputs, inputErr := decodeStoredInputs(run.Context.Nodes[node.Key].Input)
+	if inputErr != nil {
+		return false, inputErr
+	}
+	refs := make([]domain.ArtifactRef, 0)
+	if hasInputs {
+		if governedApplicationWorkflow(record.Definition) {
+			refs = append(refs, inputs.MaterializedArtifactRefs()...)
+			// Compatibility for already-running governed nodes whose direct
+			// HumanEdit predecessor predates the explicit materialized marker.
+			if len(refs) == 0 {
+				for _, binding := range inputs.Bindings() {
+					if binding.Source.OutputRevisionID == "" {
+						continue
+					}
+					for _, ref := range binding.Source.ArtifactRevisions {
+						if ref.RevisionID == binding.Source.OutputRevisionID {
+							refs = appendUniqueArtifactRef(refs, ref)
+						}
+					}
+				}
+			}
+			if len(refs) != 1 {
+				return false, &domain.DomainError{Kind: domain.ErrInvalidTransition, Field: "review", Message: "governed review requires exactly one current HumanEdit materialization"}
+			}
+		} else {
+			refs = append(refs, inputs.ArtifactRefs()...)
+		}
+	} else {
+		if governedApplicationWorkflow(record.Definition) {
+			return false, &domain.DomainError{Kind: domain.ErrInvalidTransition, Field: "review", Message: "governed review requires a typed materialized input envelope"}
+		}
+		// Compatibility for runs that entered review before input envelopes
+		// were introduced. New executions always use the pinned envelope.
+		for _, predecessor := range effectiveIncoming(run, record.Definition, node) {
+			if predecessor == nil || predecessor.Status != NodeCompleted {
+				continue
+			}
+			found, parseErr := artifactRefsFromNodeOutput(run.Context.Nodes[predecessor.Key].Output)
+			if parseErr != nil {
+				return false, parseErr
+			}
+			refs = append(refs, found...)
+		}
+	}
+	if err := runtime.reviewGate.VerifyApproval(ctx, run.ProjectID, refs, *definitionNode.ReviewGate); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 func (e *Engine) ResolveReview(ctx context.Context, runID, nodeKey string, decision ReviewDecision) error {
 	if err := decision.Actor.Validate(); err != nil {
 		return err
@@ -1088,6 +1198,9 @@ func (e *Engine) ResolveReview(ctx context.Context, runID, nodeKey string, decis
 	resolution, reason, actorID := decision.Resolution, decision.Reason, decision.Actor.ActorID
 	run, record, node, definitionNode, err := e.loadExecution(ctx, runID, nodeKey)
 	if err != nil {
+		return err
+	}
+	if err := rejectGenericWorkflowControl(run, definitionNode); err != nil {
 		return err
 	}
 	if node.Status != NodeWaitingReview {
@@ -1110,56 +1223,18 @@ func (e *Engine) ResolveReview(ctx context.Context, runID, nodeKey string, decis
 		prohibitSelf = definitionNode.Approval.ProhibitSelfReview
 	}
 	canonicalReviewVerified := false
-	if resolution == ReviewApprove && definitionNode.Type == domain.NodeReviewGate && runtime.reviewGate != nil {
-		inputs, hasInputs, inputErr := decodeStoredInputs(run.Context.Nodes[node.Key].Input)
-		if inputErr != nil {
-			return inputErr
-		}
-		refs := make([]domain.ArtifactRef, 0)
-		if hasInputs {
-			if governedApplicationWorkflow(record.Definition) {
-				refs = append(refs, inputs.MaterializedArtifactRefs()...)
-				// Compatibility for already-running governed nodes whose direct
-				// HumanEdit predecessor predates the explicit materialized marker.
-				if len(refs) == 0 {
-					for _, binding := range inputs.Bindings() {
-						if binding.Source.OutputRevisionID == "" {
-							continue
-						}
-						for _, ref := range binding.Source.ArtifactRevisions {
-							if ref.RevisionID == binding.Source.OutputRevisionID {
-								refs = appendUniqueArtifactRef(refs, ref)
-							}
-						}
-					}
-				}
-				if len(refs) != 1 {
-					return &domain.DomainError{Kind: domain.ErrInvalidTransition, Field: "review", Message: "governed review requires exactly one current HumanEdit materialization"}
-				}
-			} else {
-				refs = append(refs, inputs.ArtifactRefs()...)
-			}
-		} else {
-			if governedApplicationWorkflow(record.Definition) {
-				return &domain.DomainError{Kind: domain.ErrInvalidTransition, Field: "review", Message: "governed review requires a typed materialized input envelope"}
-			}
-			// Compatibility for runs that entered review before input envelopes
-			// were introduced. New executions always use the pinned envelope.
-			for _, predecessor := range effectiveIncoming(run, record.Definition, node) {
-				if predecessor == nil || predecessor.Status != NodeCompleted {
-					continue
-				}
-				found, parseErr := artifactRefsFromNodeOutput(run.Context.Nodes[predecessor.Key].Output)
-				if parseErr != nil {
-					return parseErr
-				}
-				refs = append(refs, found...)
-			}
-		}
-		if err := runtime.reviewGate.VerifyApproval(ctx, run.ProjectID, refs, *definitionNode.ReviewGate); err != nil {
+	if resolution == ReviewApprove {
+		canonicalReviewVerified, err = e.verifyCanonicalReviewApproval(
+			ctx,
+			run,
+			record,
+			node,
+			definitionNode,
+			runtime,
+		)
+		if err != nil {
 			return err
 		}
-		canonicalReviewVerified = true
 	}
 	if decision.SoloSelfReview {
 		if resolution != ReviewApprove || actorID != run.StartedBy || run.GovernanceMode != core.GovernanceModeSolo || decision.GovernanceMode != core.GovernanceModeSolo {
@@ -1260,6 +1335,9 @@ func (e *Engine) ResolveReview(ctx context.Context, runID, nodeKey string, decis
 			if !exists {
 				return domain.ErrNotFound
 			}
+			if err := rejectGenericWorkflowControl(run, successorDefinition); err != nil {
+				return err
+			}
 			action, role, required := nodeExecutionPolicy(successorDefinition)
 			if !required || grant.Action != action || !workflowRoleSatisfies(grant.Role, role) {
 				return core.ErrForbidden
@@ -1297,6 +1375,9 @@ func (e *Engine) WaiveNode(ctx context.Context, runID, nodeKey string, actor Act
 	}
 	run, record, node, definitionNode, err := e.loadExecution(ctx, runID, nodeKey)
 	if err != nil {
+		return err
+	}
+	if err := rejectGenericWorkflowControl(run, definitionNode); err != nil {
 		return err
 	}
 	governedReleaseGate := definitionNode.Type == domain.NodeQualityGate && definitionNode.QualityGate != nil &&
@@ -1341,12 +1422,52 @@ func governedApplicationWorkflow(definition domain.WorkflowDefinition) bool {
 		definition.OutputContract.Capability == domain.WorkflowOutputApplication
 }
 
+// The dedicated qualification node is not a human or runner-controlled gate.
+// Its only legal transitions are the private authority freeze and promotion
+// handoff protocols, which each verify their immutable upstream facts. Keep
+// every generic control-plane entry point closed even if a corrupt store
+// projects the node into a status normally accepted by that entry point.
+func rejectGenericExternalQualificationControl(definition domain.NodeDefinition) error {
+	if definition.Type != domain.NodeExternalQualificationGate {
+		return nil
+	}
+	return &domain.DomainError{
+		Kind:    domain.ErrInvalidTransition,
+		Field:   "node",
+		Message: "external qualification is controlled only by the canonical qualification authority protocols",
+	}
+}
+
+// workflow-engine/v3 Publish is owned by the qualified Release Controller.
+// Generic Workflow commands and shared workers must never advance it, even if
+// a corrupt store presents a status that those entry points normally accept.
+func rejectGenericQualifiedReleaseControl(run *RunRecord, definition domain.NodeDefinition) error {
+	if run == nil || run.ExecutionProfile != WorkflowExecutionProfileV3Ref() || definition.Type != domain.NodePublish {
+		return nil
+	}
+	return &domain.DomainError{
+		Kind:    domain.ErrInvalidTransition,
+		Field:   "node",
+		Message: "workflow-engine/v3 Publish is controlled only by the qualified Release Controller authority",
+	}
+}
+
+func rejectGenericWorkflowControl(run *RunRecord, definition domain.NodeDefinition) error {
+	if err := rejectGenericExternalQualificationControl(definition); err != nil {
+		return err
+	}
+	return rejectGenericQualifiedReleaseControl(run, definition)
+}
+
 func (e *Engine) RetryNode(ctx context.Context, runID, nodeKey, actorID, reason string) error {
 	if strings.TrimSpace(reason) == "" {
 		return &domain.DomainError{Kind: domain.ErrInvalidArgument, Field: "reason", Message: "retry reason is required"}
 	}
 	run, record, node, definitionNode, err := e.loadExecution(ctx, runID, nodeKey)
 	if err != nil {
+		return err
+	}
+	if err := rejectGenericWorkflowControl(run, definitionNode); err != nil {
 		return err
 	}
 	if node.Status != NodeFailed {
@@ -1825,9 +1946,11 @@ func (e *Engine) refreshRunStatus(run *RunRecord, definition domain.WorkflowDefi
 			return
 		}
 	}
-	waitReview, waitInput, active := false, false, false
+	waitQualification, waitReview, waitInput, active := false, false, false, false
 	for _, node := range run.Nodes {
 		switch node.Status {
+		case NodeWaitingQualification:
+			waitQualification = true
 		case NodeWaitingReview:
 			waitReview = true
 		case NodeWaitingInput:
@@ -1837,6 +1960,8 @@ func (e *Engine) refreshRunStatus(run *RunRecord, definition domain.WorkflowDefi
 		}
 	}
 	switch {
+	case waitQualification:
+		run.Status = RunWaitingQualification
 	case waitInput:
 		run.Status = RunWaitingInput
 	case waitReview:
@@ -1851,14 +1976,15 @@ func (e *Engine) refreshRunStatus(run *RunRecord, definition domain.WorkflowDefi
 }
 
 type mutationBuilder struct {
-	engine   *Engine
-	run      *RunRecord
-	now      time.Time
-	expected map[string]NodeStatus
-	owners   map[string]string
-	newKeys  map[string]bool
-	slices   []SliceRecord
-	events   []Event
+	engine                     *Engine
+	run                        *RunRecord
+	now                        time.Time
+	expected                   map[string]NodeStatus
+	owners                     map[string]string
+	newKeys                    map[string]bool
+	slices                     []SliceRecord
+	events                     []Event
+	qualityCompletionPrecommit *QualityCompletionPrecommitMutation
 }
 
 func newMutationBuilder(engine *Engine, run *RunRecord, now time.Time) *mutationBuilder {
@@ -1874,12 +2000,22 @@ func (b *mutationBuilder) mark(node *NodeRecord, expected NodeStatus, owner stri
 		b.owners[node.Key] = owner
 	}
 }
-func (b *mutationBuilder) event(eventType, nodeKey string, payload any, actorID string) {
+func (b *mutationBuilder) event(eventType, nodeKey string, payload any, actorID string) Event {
 	raw := json.RawMessage(`{}`)
 	if payload != nil {
 		raw = mustJSON(payload)
 	}
-	b.events = append(b.events, Event{ID: b.engine.id(), RunID: b.run.ID, Type: eventType, NodeKey: nodeKey, Payload: raw, ActorID: actorID, CreatedAt: b.now})
+	event := Event{
+		ID: b.engine.id(), RunID: b.run.ID,
+		Sequence: b.run.EventCursor + uint64(len(b.events)) + 1,
+		Type:     eventType, NodeKey: nodeKey, Payload: raw,
+		ActorID: actorID, CreatedAt: b.now,
+	}
+	b.events = append(b.events, event)
+	return event
+}
+func (b *mutationBuilder) setQualityCompletionPrecommit(precommit *QualityCompletionPrecommitMutation) {
+	b.qualityCompletionPrecommit = cloneQualityCompletionPrecommitMutation(precommit)
 }
 func (b *mutationBuilder) upsertSlice(record SliceRecord) {
 	for index := range b.slices {
@@ -1910,7 +2046,7 @@ func (b *mutationBuilder) build() RunMutation {
 	for _, key := range newKeys {
 		newNodes = append(newNodes, *cloneNodeRecord(b.run.Nodes[key]))
 	}
-	return RunMutation{RunID: b.run.ID, ExpectedCursor: b.run.EventCursor, Status: b.run.Status, Context: b.run.Context, Failure: b.run.Failure, CompletedAt: b.run.CompletedAt, CancelledAt: b.run.CancelledAt, Nodes: nodes, NewNodes: newNodes, Slices: append([]SliceRecord(nil), b.slices...), Events: append([]Event(nil), b.events...), UpdatedAt: b.now}
+	return RunMutation{RunID: b.run.ID, ExpectedCursor: b.run.EventCursor, Status: b.run.Status, Context: b.run.Context, Failure: b.run.Failure, CompletedAt: b.run.CompletedAt, CancelledAt: b.run.CancelledAt, Nodes: nodes, NewNodes: newNodes, Slices: append([]SliceRecord(nil), b.slices...), Events: append([]Event(nil), b.events...), QualityCompletionPrecommit: cloneQualityCompletionPrecommitMutation(b.qualityCompletionPrecommit), UpdatedAt: b.now}
 }
 
 func applyConditionRoute(run *RunRecord, definition domain.WorkflowDefinition, node *NodeRecord, branch string) error {
@@ -2108,7 +2244,7 @@ func sliceActive(run *RunRecord, region []string, sliceID string) bool {
 		if node == nil {
 			continue
 		}
-		if node.Status == NodeReady || node.Status == NodeRunning || node.Status == NodeWaitingInput || node.Status == NodeWaitingReview {
+		if node.Status == NodeReady || node.Status == NodeRunning || node.Status == NodeWaitingInput || node.Status == NodeWaitingReview || node.Status == NodeWaitingQualification {
 			return true
 		}
 	}

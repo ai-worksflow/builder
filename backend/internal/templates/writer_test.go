@@ -99,6 +99,41 @@ func TestWriterPostgresPersistsExactAuthorityLineageAndFullStackTransactions(t *
 	}
 	configureDeterministicWriterClock(writer)
 
+	t.Run("trusted clock is normalized to PostgreSQL precision before hashing", func(t *testing.T) {
+		precisionWriter, err := NewWriter(gormDB, &fakeArtifactAuthority{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		call := 0
+		precisionWriter.now = func() time.Time {
+			value := baseTime.Add(4*time.Hour + time.Duration(call)*time.Minute + 987654321*time.Nanosecond)
+			call++
+			return value
+		}
+		input := writerAdmissionInput(
+			uuid.NewString(), uuid.NewString(), validCandidate("writer-clock-precision-template", "api"),
+		)
+		registration, err := precisionWriter.Admit(ctx, input)
+		if err != nil {
+			t.Fatalf("admit with nanosecond trusted clock: %v", err)
+		}
+		if registration.Release == nil {
+			t.Fatal("nanosecond trusted clock did not produce an approved release")
+		}
+		registry, err := NewRegistry(gormDB)
+		if err != nil {
+			t.Fatal(err)
+		}
+		loaded, err := registry.GetTemplateReleaseExact(ctx, exactTemplateReleaseRef(registration.Release.Release))
+		if err != nil {
+			t.Fatalf("reload release after PostgreSQL timestamp round trip: %v", err)
+		}
+		view := loaded.Release.Snapshot()
+		if view.ApprovedAt.Nanosecond()%1000 != 0 {
+			t.Fatalf("stored immutable release retained sub-microsecond approval time: %s", view.ApprovedAt)
+		}
+	})
+
 	t.Run("authority verification failure writes nothing", func(t *testing.T) {
 		failingWriter, err := NewWriter(gormDB, &fakeArtifactAuthority{verifyErr: errors.New("invalid DSSE signature")})
 		if err != nil {

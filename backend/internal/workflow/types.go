@@ -25,14 +25,15 @@ var (
 type RunStatus string
 
 const (
-	RunPending       RunStatus = "pending"
-	RunRunning       RunStatus = "running"
-	RunWaitingInput  RunStatus = "waiting_input"
-	RunWaitingReview RunStatus = "waiting_review"
-	RunCompleted     RunStatus = "completed"
-	RunFailed        RunStatus = "failed"
-	RunCancelled     RunStatus = "cancelled"
-	RunStale         RunStatus = "stale"
+	RunPending              RunStatus = "pending"
+	RunRunning              RunStatus = "running"
+	RunWaitingInput         RunStatus = "waiting_input"
+	RunWaitingReview        RunStatus = "waiting_review"
+	RunWaitingQualification RunStatus = "waiting_qualification"
+	RunCompleted            RunStatus = "completed"
+	RunFailed               RunStatus = "failed"
+	RunCancelled            RunStatus = "cancelled"
+	RunStale                RunStatus = "stale"
 )
 
 func (s RunStatus) Terminal() bool {
@@ -42,15 +43,16 @@ func (s RunStatus) Terminal() bool {
 type NodeStatus string
 
 const (
-	NodePending       NodeStatus = "pending"
-	NodeReady         NodeStatus = "ready"
-	NodeRunning       NodeStatus = "running"
-	NodeWaitingInput  NodeStatus = "waiting_input"
-	NodeWaitingReview NodeStatus = "waiting_review"
-	NodeCompleted     NodeStatus = "completed"
-	NodeFailed        NodeStatus = "failed"
-	NodeCancelled     NodeStatus = "cancelled"
-	NodeStale         NodeStatus = "stale"
+	NodePending              NodeStatus = "pending"
+	NodeReady                NodeStatus = "ready"
+	NodeRunning              NodeStatus = "running"
+	NodeWaitingInput         NodeStatus = "waiting_input"
+	NodeWaitingReview        NodeStatus = "waiting_review"
+	NodeWaitingQualification NodeStatus = "waiting_qualification"
+	NodeCompleted            NodeStatus = "completed"
+	NodeFailed               NodeStatus = "failed"
+	NodeCancelled            NodeStatus = "cancelled"
+	NodeStale                NodeStatus = "stale"
 )
 
 func (s NodeStatus) Terminal() bool {
@@ -301,6 +303,7 @@ type NodeRecord struct {
 	InputManifest    *domain.ManifestRef     `json:"inputManifest,omitempty"`
 	OutputProposal   *domain.ProposalRef     `json:"outputProposal,omitempty"`
 	OutputRevisionID string                  `json:"outputRevisionId,omitempty"`
+	InputAuthorityID string                  `json:"inputAuthorityId,omitempty"`
 	LeaseOwner       string                  `json:"-"`
 	LeaseExpiresAt   *time.Time              `json:"leaseExpiresAt,omitempty"`
 	AvailableAt      time.Time               `json:"availableAt"`
@@ -353,18 +356,19 @@ type NodeMutation struct {
 }
 
 type RunMutation struct {
-	RunID          string
-	ExpectedCursor uint64
-	Status         RunStatus
-	Context        RunContext
-	Failure        json.RawMessage
-	CompletedAt    *time.Time
-	CancelledAt    *time.Time
-	Nodes          []NodeMutation
-	NewNodes       []NodeRecord
-	Slices         []SliceRecord
-	Events         []Event
-	UpdatedAt      time.Time
+	RunID                      string
+	ExpectedCursor             uint64
+	Status                     RunStatus
+	Context                    RunContext
+	Failure                    json.RawMessage
+	CompletedAt                *time.Time
+	CancelledAt                *time.Time
+	Nodes                      []NodeMutation
+	NewNodes                   []NodeRecord
+	Slices                     []SliceRecord
+	Events                     []Event
+	QualityCompletionPrecommit *QualityCompletionPrecommitMutation
+	UpdatedAt                  time.Time
 }
 
 type Store interface {

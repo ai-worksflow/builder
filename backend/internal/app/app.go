@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"os"
 	"sync"
 	"time"
 
@@ -32,6 +33,7 @@ import (
 	"github.com/worksflow/builder/backend/internal/logging"
 	"github.com/worksflow/builder/backend/internal/lsp"
 	"github.com/worksflow/builder/backend/internal/platform"
+	"github.com/worksflow/builder/backend/internal/qualificationrelease"
 	"github.com/worksflow/builder/backend/internal/realtime"
 	"github.com/worksflow/builder/backend/internal/release"
 	"github.com/worksflow/builder/backend/internal/repository"
@@ -139,7 +141,33 @@ func Run(ctx context.Context, cfg config.Config, logger *slog.Logger) (runErr er
 	if err != nil {
 		return fmt.Errorf("create GitHub credential store: %w", err)
 	}
-	githubService, err := worksgithub.NewService(githubAPI, githubCredentials, accessControl, dependencies.Postgres, logger, cfg.GitHub.CredentialTTL)
+	var platformCredentials []worksgithub.PlatformCredentialProvider
+	if cfg.GitHub.PlatformAppEnabled() {
+		privateKey, readErr := os.ReadFile(cfg.GitHub.PrivateKeyFile)
+		if readErr != nil {
+			return fmt.Errorf("read GitHub App private key: %w", readErr)
+		}
+		provider, providerErr := worksgithub.NewInstallationTokenProvider(
+			githubAPI,
+			cfg.GitHub.AppID,
+			cfg.GitHub.InstallationID,
+			cfg.GitHub.Organization,
+			privateKey,
+		)
+		if providerErr != nil {
+			return fmt.Errorf("create GitHub App installation provider: %w", providerErr)
+		}
+		platformCredentials = append(platformCredentials, provider)
+	}
+	githubService, err := worksgithub.NewService(
+		githubAPI,
+		githubCredentials,
+		accessControl,
+		dependencies.Postgres,
+		logger,
+		cfg.GitHub.CredentialTTL,
+		platformCredentials...,
+	)
 	if err != nil {
 		return fmt.Errorf("create GitHub service: %w", err)
 	}
@@ -475,10 +503,30 @@ func Run(ctx context.Context, cfg config.Config, logger *slog.Logger) (runErr er
 		if processStoreErr != nil {
 			return fmt.Errorf("create sandbox process store: %w", processStoreErr)
 		}
+		interactiveDependencyResolver, resolverErr := delivery.NewContainerSandbox(delivery.ContainerSandboxConfig{
+			RuntimeBinary: cfg.Delivery.SandboxRuntime, DaemonHost: cfg.Delivery.SandboxHost,
+			WorkspaceRoot: cfg.Sandbox.WorkspaceRoot,
+			NodeImage:     cfg.Delivery.SandboxNodeImage,
+			GoImage:       cfg.Delivery.SandboxGoImage, Timeout: cfg.Delivery.SandboxTimeout,
+			OutputLimit: cfg.Delivery.SandboxOutputMax, MemoryLimit: cfg.Delivery.SandboxMemory,
+			CPULimit: cfg.Delivery.SandboxCPUs, PIDsLimit: cfg.Delivery.SandboxPIDs,
+			ResolverNetwork: cfg.Delivery.ResolverNetwork, ResolverNPMRegistry: cfg.Delivery.ResolverNPMRegistry,
+			ResolverGoProxy: cfg.Delivery.ResolverGoProxy, ResolverGoSumDB: cfg.Delivery.ResolverGoSumDB,
+			ResolverTimeout: cfg.Delivery.ResolverTimeout, ResolverOutputLimit: cfg.Delivery.ResolverOutputMax,
+			ResolverMemoryLimit: cfg.Delivery.ResolverMemory, ResolverCPULimit: cfg.Delivery.ResolverCPUs,
+			ResolverPIDsLimit: cfg.Delivery.ResolverPIDs,
+		})
+		if resolverErr != nil {
+			return fmt.Errorf("create interactive dependency resolver: %w", resolverErr)
+		}
+		interactiveDependencies, resolverErr := sandbox.NewProcessDependencyPreparer(interactiveDependencyResolver)
+		if resolverErr != nil {
+			return fmt.Errorf("create interactive dependency preparer: %w", resolverErr)
+		}
 		sandboxProcesses, err = sandbox.NewProcessService(
 			sandboxStore, candidateControls, sessionConfiguration, workspaceMaterializer,
 			interactiveRuntime, processStore, sandboxAccess, sandboxStreamEvents,
-			int64(cfg.Sandbox.RuntimeOutputMax),
+			int64(cfg.Sandbox.RuntimeOutputMax), interactiveDependencies,
 		)
 		if err != nil {
 			return fmt.Errorf("create sandbox process service: %w", err)
@@ -761,6 +809,12 @@ func Run(ctx context.Context, cfg config.Config, logger *slog.Logger) (runErr er
 	var releaseDeliveryWorker *release.ReconciledDeliveryWorkerService
 	var releaseDeliveryProvider *release.HTTPDeliveryOperationProvider
 	var reconciledReleaseStore *release.ReconciledDeliveryStore
+	var qualificationReleaseWorker *qualificationrelease.WorkerService
+	var qualificationReleaseStore *qualificationrelease.PostgresStore
+	var qualificationReleaseSource *qualificationrelease.PostgresCandidateSource
+	var qualificationReleaseObserver *qualificationrelease.PostgresControllerObserver
+	var qualificationReleaseRuntimeBinding workflowruntime.WorkerRunner
+	var workflowQualificationActivationRuntime *WorkflowQualificationActivationRuntime
 	if cfg.Delivery.ReleaseWorkerEnabled {
 		controllerIdentity := release.DeliveryControllerIdentity{
 			SchemaVersion: release.DeliveryControllerIdentitySchemaVersion,
@@ -823,6 +877,110 @@ func Run(ctx context.Context, cfg config.Config, logger *slog.Logger) (runErr er
 		releaseDeliveryWorker.SetErrorHandler(func(workerErr error) {
 			logger.Error("release delivery operation will be retried or requires reconciliation", "error", workerErr)
 		})
+	}
+	if cfg.QualificationRelease.Enabled {
+		qualifiedCtx, cancelQualified := context.WithTimeout(ctx, cfg.Dependencies.ConnectTimeout)
+		qualifiedDatabase, poolErr := qualificationrelease.OpenPostgresPool(
+			qualifiedCtx,
+			qualificationrelease.PostgresPoolConfig{
+				DSN: cfg.QualificationRelease.PostgresDSN, Schema: cfg.Postgres.Schema,
+				MaxOpenConns:    cfg.QualificationRelease.MaxOpenConns,
+				MaxIdleConns:    cfg.QualificationRelease.MaxIdleConns,
+				ConnMaxLifetime: cfg.Postgres.ConnMaxLifetime,
+				ConnMaxIdleTime: cfg.Postgres.ConnMaxIdleTime,
+			},
+		)
+		cancelQualified()
+		if poolErr != nil {
+			return fmt.Errorf("connect qualified release operator: %w", poolErr)
+		}
+		defer func() {
+			if closeErr := qualifiedDatabase.Close(); closeErr != nil {
+				logger.Warn("close qualified release operator pool", "error", closeErr)
+			}
+		}()
+		qualificationReleaseStore, err = qualificationrelease.NewPostgresStore(
+			qualifiedDatabase,
+			qualificationrelease.PostgresStoreConfig{
+				MaxTransactionRetries: cfg.QualificationRelease.MaxTransactionRetries,
+			},
+		)
+		if err != nil {
+			return fmt.Errorf("create qualified release operator store: %w", err)
+		}
+		qualificationReleaseSource, err = qualificationrelease.NewPostgresCandidateSource(dependencies.PostgresSQL)
+		if err != nil {
+			return fmt.Errorf("create qualified release Workflow candidate source: %w", err)
+		}
+		qualificationReleaseObserver, err = qualificationrelease.NewPostgresControllerObserver(dependencies.PostgresSQL)
+		if err != nil {
+			return fmt.Errorf("create qualified release Controller observer: %w", err)
+		}
+		expectedController := qualificationrelease.ControllerIdentity{
+			SchemaVersion: qualificationrelease.ControllerIdentitySchemaVersion,
+			ID:            cfg.Delivery.ReleaseControllerID, Version: cfg.Delivery.ReleaseControllerVersion,
+			Protocol:       cfg.Delivery.ReleaseControllerProtocol,
+			TrustKeyDigest: cfg.Delivery.ReleaseControllerTrustKeyDigest,
+		}
+		qualifiedReadinessCtx, cancelReadiness := context.WithTimeout(ctx, cfg.Dependencies.ReadinessTimeout)
+		if err := qualificationReleaseStore.Readiness(
+			qualifiedReadinessCtx, expectedController, dependencies.PostgresSQL,
+		); err != nil {
+			cancelReadiness()
+			return fmt.Errorf("verify qualified release operator and Controller bootstrap: %w", err)
+		}
+		if err := qualificationReleaseSource.Readiness(qualifiedReadinessCtx); err != nil {
+			cancelReadiness()
+			return fmt.Errorf("verify qualified release Workflow candidate source: %w", err)
+		}
+		if err := qualificationReleaseObserver.Readiness(qualifiedReadinessCtx); err != nil {
+			cancelReadiness()
+			return fmt.Errorf("verify qualified release Controller observer: %w", err)
+		}
+		cancelReadiness()
+		qualifiedPublisher, publisherErr := qualificationrelease.NewQualifiedReleaseControllerPublisher(
+			qualificationReleaseStore, qualificationReleaseObserver,
+			qualificationrelease.PublisherConfig{
+				LeaseDuration: cfg.QualificationRelease.LeaseDuration,
+				PollInterval:  cfg.QualificationRelease.ControllerPollInterval,
+			},
+		)
+		if publisherErr != nil {
+			return fmt.Errorf("create qualified Release Controller publisher: %w", publisherErr)
+		}
+		workerID := cfg.QualificationRelease.WorkerID
+		if workerID == "" {
+			workerID = "qualification-release-" + uuid.NewString()
+		}
+		qualificationReleaseWorker, err = qualificationrelease.NewWorkerService(
+			qualificationReleaseSource, qualifiedPublisher, workerID,
+			cfg.QualificationRelease.WorkerConcurrency,
+			cfg.QualificationRelease.SchedulerPollInterval,
+		)
+		if err != nil {
+			return fmt.Errorf("create qualified release worker service: %w", err)
+		}
+		qualificationReleaseWorker.SetErrorHandler(func(workerErr error) {
+			logger.Error("qualified release operation will be reclaimed or requires intervention", "error", workerErr)
+		})
+		qualificationReleaseRuntimeBinding = workflowruntime.NewQualifiedReleaseControllerRuntimeBinding()
+	}
+	if cfg.WorkflowQualificationActivation.WorkerEnabled {
+		activationRuntime, operatorDatabase, activationErr := newWorkflowQualificationActivationRuntimeFromConfig(
+			ctx,
+			cfg,
+			dependencies.PostgresSQL,
+			dependencies.JetStream,
+		)
+		if activationErr != nil {
+			return fmt.Errorf("create workflow qualification activation runtime: %w", activationErr)
+		}
+		workflowQualificationActivationRuntime = activationRuntime
+		defer func() {
+			if closeErr := operatorDatabase.Close(); closeErr != nil {
+				logger.Warn("close workflow input authority operator pool", "error", closeErr)
+			}
+		}()
 	}
 	releaseHandler, err := transport.NewReleaseHandler(transport.ReleaseDependencies{
 		Service: releaseService, DeliveryRead: releaseDeliveryReadService,
@@ -1184,11 +1342,13 @@ func Run(ctx context.Context, cfg config.Config, logger *slog.Logger) (runErr er
 		WorkbenchCompletion: workflowruntime.CoreWorkbenchCompletionValidator{Database: dependencies.Postgres},
 		ReviewGate:          workflowruntime.CoreReviewGateVerifier{Database: dependencies.Postgres},
 		Access:              accessControl, FanOut: workflowruntime.ContextFanOutResolver{ValueKey: "deliverySlices"},
-		BlueprintPages:  workflowruntime.CoreBlueprintPageFanOutResolver{Artifacts: artifactService, Proposals: proposalService},
-		Quality:         deliveryServices.WorkflowQuality,
-		QualityManifest: workflowruntime.CoreQualityManifestResolver{Database: dependencies.Postgres},
-		Publisher:       deliveryServices.WorkflowPublisher,
-		DefaultModel:    cfg.AI.DefaultModel,
+		BlueprintPages:             workflowruntime.CoreBlueprintPageFanOutResolver{Artifacts: artifactService, Proposals: proposalService},
+		Quality:                    deliveryServices.WorkflowQuality,
+		QualityManifest:            workflowruntime.CoreQualityManifestResolver{Database: dependencies.Postgres},
+		Publisher:                  deliveryServices.WorkflowPublisher,
+		ProfileV3Enabled:           cfg.Workflow.ProfileV3RuntimeEnabled,
+		QualifiedReleaseController: qualificationReleaseRuntimeBinding,
+		DefaultModel:               cfg.AI.DefaultModel,
 	})
 	if err != nil {
 		return fmt.Errorf("create workflow engine: %w", err)
@@ -1241,6 +1401,7 @@ func Run(ctx context.Context, cfg config.Config, logger *slog.Logger) (runErr er
 
 	runtimeCtx, stopRuntime := context.WithCancel(context.Background())
 	var runtimeWorkers sync.WaitGroup
+	runtimeFatalErrors := make(chan error, 1)
 	defer func() {
 		stopRuntime()
 		runtimeWorkers.Wait()
@@ -1334,6 +1495,29 @@ func Run(ctx context.Context, cfg config.Config, logger *slog.Logger) (runErr er
 			}
 		}()
 	}
+	if qualificationReleaseWorker != nil {
+		runtimeWorkers.Add(1)
+		go func() {
+			defer runtimeWorkers.Done()
+			if workerErr := qualificationReleaseWorker.Run(runtimeCtx); workerErr != nil &&
+				!errors.Is(workerErr, context.Canceled) {
+				logger.Error("qualified release worker stopped", "error", workerErr)
+			}
+		}()
+	}
+	if workflowQualificationActivationRuntime != nil {
+		runtimeWorkers.Add(1)
+		go func() {
+			defer runtimeWorkers.Done()
+			if workerErr := workflowQualificationActivationRuntime.Run(runtimeCtx); workerErr != nil &&
+				!errors.Is(workerErr, context.Canceled) {
+				select {
+				case runtimeFatalErrors <- fmt.Errorf("workflow qualification activation worker stopped: %w", workerErr):
+				case <-runtimeCtx.Done():
+				}
+			}
+		}()
+	}
 
 	var authenticator realtime.Authenticator = transport.NewRealtimeAuthenticator(authService, cfg.Security)
 	var subscriptionAuthorizer realtime.SubscriptionAuthorizer = transport.NewRealtimeSubscriptionAuthorizer(accessControl, dependencies.Postgres)
@@ -1391,6 +1575,26 @@ func Run(ctx context.Context, cfg config.Config, logger *slog.Logger) (runErr er
 			}
 			return releaseDeliveryProvider.Readiness(ctx)
 		}
+	}
+	if qualificationReleaseWorker != nil {
+		readinessChecks["qualification_release_publisher"] = func(ctx context.Context) error {
+			expectedController := qualificationrelease.ControllerIdentity{
+				SchemaVersion: qualificationrelease.ControllerIdentitySchemaVersion,
+				ID:            cfg.Delivery.ReleaseControllerID, Version: cfg.Delivery.ReleaseControllerVersion,
+				Protocol:       cfg.Delivery.ReleaseControllerProtocol,
+				TrustKeyDigest: cfg.Delivery.ReleaseControllerTrustKeyDigest,
+			}
+			if err := qualificationReleaseStore.Readiness(ctx, expectedController, dependencies.PostgresSQL); err != nil {
+				return err
+			}
+			if err := qualificationReleaseSource.Readiness(ctx); err != nil {
+				return err
+			}
+			return qualificationReleaseObserver.Readiness(ctx)
+		}
+	}
+	if workflowQualificationActivationRuntime != nil {
+		readinessChecks["workflow_qualification_activation"] = workflowQualificationActivationRuntime.Readiness
 	}
 	readinessChecks["nats_event_stream"] = func(checkCtx context.Context) error {
 		_, checkErr := dependencies.JetStream.StreamInfo(events.DefaultStreamName, nats.Context(checkCtx))
@@ -1469,9 +1673,12 @@ func Run(ctx context.Context, cfg config.Config, logger *slog.Logger) (runErr er
 		serverErrors <- server.ListenAndServe()
 	}()
 
+	var runtimeFailure error
 	select {
 	case <-ctx.Done():
 		logger.Info("shutdown requested")
+	case runtimeFailure = <-runtimeFatalErrors:
+		logger.Error("critical runtime worker failed; shutting down", "error", runtimeFailure)
 	case serveErr := <-serverErrors:
 		if !errors.Is(serveErr, http.ErrServerClosed) {
 			stopRuntime()
@@ -1497,6 +1704,9 @@ func Run(ctx context.Context, cfg config.Config, logger *slog.Logger) (runErr er
 		return errors.New("HTTP server did not stop before shutdown timeout")
 	}
 	logger.Info("HTTP server stopped")
+	if runtimeFailure != nil {
+		return runtimeFailure
+	}
 	return nil
 }
 

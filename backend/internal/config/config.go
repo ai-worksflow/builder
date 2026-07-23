@@ -37,33 +37,35 @@ var sandboxAndAgentResponseFenceHeaders = []string{
 }
 
 type Config struct {
-	Environment    string
-	ServiceName    string
-	HTTP           HTTPConfig
-	Log            LogConfig
-	CORS           CORSConfig
-	Security       SecurityConfig
-	Dependencies   DependencyConfig
-	Postgres       PostgresConfig
-	Redis          RedisConfig
-	Mongo          MongoConfig
-	NATS           NATSConfig
-	WebSocket      WebSocketConfig
-	Startup        StartupConfig
-	Content        ContentConfig
-	Outbox         OutboxConfig
-	Idempotency    IdempotencyConfig
-	AI             AIConfig
-	Workflow       WorkflowConfig
-	Secrets        SecretsConfig
-	GitHub         GitHubConfig
-	TemplateSource TemplateSourceConfig
-	Repository     RepositoryConfig
-	Delivery       DeliveryConfig
-	Sandbox        SandboxConfig
-	LSP            LSPConfig
-	Verification   VerificationConfig
-	Agent          AgentConfig
+	Environment                     string
+	ServiceName                     string
+	HTTP                            HTTPConfig
+	Log                             LogConfig
+	CORS                            CORSConfig
+	Security                        SecurityConfig
+	Dependencies                    DependencyConfig
+	Postgres                        PostgresConfig
+	Redis                           RedisConfig
+	Mongo                           MongoConfig
+	NATS                            NATSConfig
+	WebSocket                       WebSocketConfig
+	Startup                         StartupConfig
+	Content                         ContentConfig
+	Outbox                          OutboxConfig
+	Idempotency                     IdempotencyConfig
+	AI                              AIConfig
+	Workflow                        WorkflowConfig
+	WorkflowQualificationActivation WorkflowQualificationActivationConfig
+	QualificationRelease            QualificationReleaseConfig
+	Secrets                         SecretsConfig
+	GitHub                          GitHubConfig
+	TemplateSource                  TemplateSourceConfig
+	Repository                      RepositoryConfig
+	Delivery                        DeliveryConfig
+	Sandbox                         SandboxConfig
+	LSP                             LSPConfig
+	Verification                    VerificationConfig
+	Agent                           AgentConfig
 }
 
 type HTTPConfig struct {
@@ -216,11 +218,33 @@ type AIConfig struct {
 }
 
 type WorkflowConfig struct {
-	WorkerEnabled bool
-	WorkerID      string
-	PollInterval  time.Duration
-	LeaseDuration time.Duration
-	Heartbeat     time.Duration
+	WorkerEnabled           bool
+	ProfileV3RuntimeEnabled bool
+	WorkerID                string
+	PollInterval            time.Duration
+	LeaseDuration           time.Duration
+	Heartbeat               time.Duration
+}
+
+type WorkflowQualificationActivationConfig struct {
+	WorkerEnabled         bool
+	PostgresDSN           string
+	MaxTransactionRetries int
+	MaxOpenConns          int
+	MaxIdleConns          int
+}
+
+type QualificationReleaseConfig struct {
+	Enabled                bool
+	PostgresDSN            string
+	WorkerID               string
+	WorkerConcurrency      int
+	SchedulerPollInterval  time.Duration
+	ControllerPollInterval time.Duration
+	LeaseDuration          time.Duration
+	MaxTransactionRetries  int
+	MaxOpenConns           int
+	MaxIdleConns           int
 }
 
 type SecretsConfig struct {
@@ -232,6 +256,17 @@ type GitHubConfig struct {
 	RequestTimeout time.Duration
 	CredentialTTL  time.Duration
 	RedisPrefix    string
+	AppID          string
+	InstallationID string
+	Organization   string
+	PrivateKeyFile string
+}
+
+func (c GitHubConfig) PlatformAppEnabled() bool {
+	return strings.TrimSpace(c.AppID) != "" &&
+		strings.TrimSpace(c.InstallationID) != "" &&
+		strings.TrimSpace(c.Organization) != "" &&
+		strings.TrimSpace(c.PrivateKeyFile) != ""
 }
 
 type TemplateSourceConfig struct {
@@ -575,11 +610,31 @@ func Load() (Config, error) {
 			Project:        loader.string("OPENAI_PROJECT", ""),
 		},
 		Workflow: WorkflowConfig{
-			WorkerEnabled: loader.boolean("WORKFLOW_WORKER_ENABLED", true),
-			WorkerID:      loader.string("WORKFLOW_WORKER_ID", ""),
-			PollInterval:  loader.duration("WORKFLOW_POLL_INTERVAL", 500*time.Millisecond),
-			LeaseDuration: loader.duration("WORKFLOW_LEASE_DURATION", 2*time.Minute),
-			Heartbeat:     loader.duration("WORKFLOW_HEARTBEAT", 30*time.Second),
+			WorkerEnabled:           loader.boolean("WORKFLOW_WORKER_ENABLED", true),
+			ProfileV3RuntimeEnabled: loader.boolean("WORKFLOW_PROFILE_V3_RUNTIME_ENABLED", false),
+			WorkerID:                loader.string("WORKFLOW_WORKER_ID", ""),
+			PollInterval:            loader.duration("WORKFLOW_POLL_INTERVAL", 500*time.Millisecond),
+			LeaseDuration:           loader.duration("WORKFLOW_LEASE_DURATION", 2*time.Minute),
+			Heartbeat:               loader.duration("WORKFLOW_HEARTBEAT", 30*time.Second),
+		},
+		WorkflowQualificationActivation: WorkflowQualificationActivationConfig{
+			WorkerEnabled:         loader.boolean("WORKFLOW_QUALIFICATION_ACTIVATION_WORKER_ENABLED", false),
+			PostgresDSN:           loader.rawString("WORKFLOW_INPUT_AUTHORITY_OPERATOR_POSTGRES_DSN", ""),
+			MaxTransactionRetries: loader.integer("WORKFLOW_QUALIFICATION_ACTIVATION_MAX_TRANSACTION_RETRIES", 3),
+			MaxOpenConns:          loader.integer("WORKFLOW_INPUT_AUTHORITY_OPERATOR_POSTGRES_MAX_OPEN_CONNS", 10),
+			MaxIdleConns:          loader.integer("WORKFLOW_INPUT_AUTHORITY_OPERATOR_POSTGRES_MAX_IDLE_CONNS", 4),
+		},
+		QualificationRelease: QualificationReleaseConfig{
+			Enabled:                loader.boolean("QUALIFICATION_RELEASE_PUBLISHER_ENABLED", false),
+			PostgresDSN:            loader.rawString("QUALIFICATION_RELEASE_POSTGRES_DSN", ""),
+			WorkerID:               loader.string("QUALIFICATION_RELEASE_WORKER_ID", ""),
+			WorkerConcurrency:      loader.integer("QUALIFICATION_RELEASE_WORKER_CONCURRENCY", 4),
+			SchedulerPollInterval:  loader.duration("QUALIFICATION_RELEASE_SCHEDULER_POLL_INTERVAL", time.Second),
+			ControllerPollInterval: loader.duration("QUALIFICATION_RELEASE_CONTROLLER_POLL_INTERVAL", 2*time.Second),
+			LeaseDuration:          loader.duration("QUALIFICATION_RELEASE_LEASE_DURATION", 2*time.Minute),
+			MaxTransactionRetries:  loader.integer("QUALIFICATION_RELEASE_MAX_TRANSACTION_RETRIES", 3),
+			MaxOpenConns:           loader.integer("QUALIFICATION_RELEASE_POSTGRES_MAX_OPEN_CONNS", 12),
+			MaxIdleConns:           loader.integer("QUALIFICATION_RELEASE_POSTGRES_MAX_IDLE_CONNS", 4),
 		},
 		Secrets: SecretsConfig{
 			EncryptionKey: loader.string("PLATFORM_ENCRYPTION_KEY", developmentEncryptionKey),
@@ -587,8 +642,12 @@ func Load() (Config, error) {
 		GitHub: GitHubConfig{
 			APIBaseURL:     loader.string("GITHUB_API_BASE_URL", "https://api.github.com"),
 			RequestTimeout: loader.duration("GITHUB_REQUEST_TIMEOUT", 12*time.Second),
-			CredentialTTL:  loader.duration("GITHUB_CREDENTIAL_TTL", 8*time.Hour),
+			CredentialTTL:  loader.duration("GITHUB_CREDENTIAL_TTL", 30*24*time.Hour),
 			RedisPrefix:    loader.string("GITHUB_REDIS_PREFIX", "worksflow:github:credential:"),
+			AppID:          loader.string("GITHUB_APP_ID", ""),
+			InstallationID: loader.string("GITHUB_APP_INSTALLATION_ID", ""),
+			Organization:   loader.string("GITHUB_APP_ORGANIZATION", ""),
+			PrivateKeyFile: loader.string("GITHUB_APP_PRIVATE_KEY_FILE", ""),
 		},
 		TemplateSource: TemplateSourceConfig{
 			GitBinary:    loader.string("TEMPLATE_SOURCE_GIT_BINARY", "git"),
@@ -936,6 +995,68 @@ func (c Config) Validate() error {
 	if c.Workflow.PollInterval <= 0 || c.Workflow.LeaseDuration <= 0 || c.Workflow.Heartbeat <= 0 || c.Workflow.Heartbeat >= c.Workflow.LeaseDuration {
 		errs = append(errs, errors.New("workflow poll, lease, and heartbeat durations are invalid"))
 	}
+	activation := c.WorkflowQualificationActivation
+	if activation.WorkerEnabled {
+		if !c.Workflow.ProfileV3RuntimeEnabled {
+			errs = append(errs, errors.New("WORKFLOW_QUALIFICATION_ACTIVATION_WORKER_ENABLED requires WORKFLOW_PROFILE_V3_RUNTIME_ENABLED"))
+		}
+		if !c.Outbox.Enabled {
+			errs = append(errs, errors.New("WORKFLOW_QUALIFICATION_ACTIVATION_WORKER_ENABLED requires OUTBOX_ENABLED"))
+		}
+		if err := validatePostgresDSN(activation.PostgresDSN); err != nil {
+			errs = append(errs, errors.New(strings.Replace(err.Error(), "POSTGRES_DSN", "WORKFLOW_INPUT_AUTHORITY_OPERATOR_POSTGRES_DSN", 1)))
+		}
+		if activation.PostgresDSN == c.Postgres.DSN {
+			errs = append(errs, errors.New("WORKFLOW_INPUT_AUTHORITY_OPERATOR_POSTGRES_DSN must use a credential distinct from POSTGRES_DSN"))
+		}
+		if !samePostgresAuthorityScope(activation.PostgresDSN, c.Postgres.DSN) {
+			errs = append(errs, errors.New("WORKFLOW_INPUT_AUTHORITY_OPERATOR_POSTGRES_DSN must target the same PostgreSQL endpoint, database, and TLS authority as POSTGRES_DSN"))
+		}
+		if activation.MaxTransactionRetries < 1 || activation.MaxTransactionRetries > 10 ||
+			activation.MaxOpenConns < 9 || activation.MaxOpenConns > 256 ||
+			activation.MaxIdleConns < 0 || activation.MaxIdleConns > activation.MaxOpenConns {
+			errs = append(errs, errors.New("workflow qualification activation retry or PostgreSQL pool limits are invalid"))
+		}
+	} else if activation.PostgresDSN != "" {
+		errs = append(errs, errors.New("WORKFLOW_INPUT_AUTHORITY_OPERATOR_POSTGRES_DSN requires WORKFLOW_QUALIFICATION_ACTIVATION_WORKER_ENABLED"))
+	}
+	if c.Workflow.ProfileV3RuntimeEnabled && !activation.WorkerEnabled {
+		errs = append(errs, errors.New("WORKFLOW_PROFILE_V3_RUNTIME_ENABLED requires WORKFLOW_QUALIFICATION_ACTIVATION_WORKER_ENABLED unless a separately verified activation deployment mode is implemented"))
+	}
+	qualified := c.QualificationRelease
+	if qualified.Enabled {
+		if !c.Workflow.ProfileV3RuntimeEnabled {
+			errs = append(errs, errors.New("QUALIFICATION_RELEASE_PUBLISHER_ENABLED requires WORKFLOW_PROFILE_V3_RUNTIME_ENABLED"))
+		}
+		if !c.Delivery.ReleaseWorkerEnabled {
+			errs = append(errs, errors.New("QUALIFICATION_RELEASE_PUBLISHER_ENABLED requires RELEASE_DELIVERY_WORKER_ENABLED"))
+		}
+		if err := validatePostgresDSN(qualified.PostgresDSN); err != nil {
+			errs = append(errs, errors.New(strings.Replace(err.Error(), "POSTGRES_DSN", "QUALIFICATION_RELEASE_POSTGRES_DSN", 1)))
+		}
+		if qualified.PostgresDSN == c.Postgres.DSN {
+			errs = append(errs, errors.New("QUALIFICATION_RELEASE_POSTGRES_DSN must use a credential distinct from POSTGRES_DSN"))
+		}
+		if !samePostgresAuthorityScope(qualified.PostgresDSN, c.Postgres.DSN) {
+			errs = append(errs, errors.New("QUALIFICATION_RELEASE_POSTGRES_DSN must target the same PostgreSQL endpoint, database, and TLS authority as POSTGRES_DSN"))
+		}
+		if qualified.WorkerID != "" && (qualified.WorkerID != strings.TrimSpace(qualified.WorkerID) ||
+			len(qualified.WorkerID) > 160 || strings.ContainsAny(qualified.WorkerID, "\r\n\x00")) {
+			errs = append(errs, errors.New("QUALIFICATION_RELEASE_WORKER_ID is invalid"))
+		}
+		if qualified.WorkerConcurrency < 1 || qualified.WorkerConcurrency > 64 ||
+			qualified.SchedulerPollInterval < 100*time.Millisecond || qualified.SchedulerPollInterval > time.Minute ||
+			qualified.LeaseDuration < 30*time.Second || qualified.LeaseDuration > 4*time.Minute ||
+			qualified.ControllerPollInterval < 100*time.Millisecond ||
+			qualified.ControllerPollInterval > qualified.LeaseDuration/4 ||
+			qualified.MaxTransactionRetries < 1 || qualified.MaxTransactionRetries > 10 ||
+			qualified.MaxOpenConns < qualified.WorkerConcurrency+2 || qualified.MaxOpenConns > 256 ||
+			qualified.MaxIdleConns < 0 || qualified.MaxIdleConns > qualified.MaxOpenConns {
+			errs = append(errs, errors.New("qualification release worker concurrency, polling, lease, retry, or pool limits are invalid"))
+		}
+	} else if qualified.PostgresDSN != "" || qualified.WorkerID != "" || c.Workflow.ProfileV3RuntimeEnabled {
+		errs = append(errs, errors.New("workflow profile v3 and qualification release credentials require QUALIFICATION_RELEASE_PUBLISHER_ENABLED"))
+	}
 	if _, err := parseEncryptionKey(c.Secrets.EncryptionKey); err != nil {
 		errs = append(errs, fmt.Errorf("PLATFORM_ENCRYPTION_KEY: %w", err))
 	}
@@ -945,8 +1066,26 @@ func (c Config) Validate() error {
 	if err := validateURL("GITHUB_API_BASE_URL", c.GitHub.APIBaseURL, "https"); err != nil {
 		errs = append(errs, err)
 	}
-	if c.GitHub.RequestTimeout <= 0 || c.GitHub.CredentialTTL <= 0 || c.GitHub.CredentialTTL > 7*24*time.Hour || strings.TrimSpace(c.GitHub.RedisPrefix) == "" {
+	if c.GitHub.RequestTimeout <= 0 || c.GitHub.CredentialTTL <= 0 || c.GitHub.CredentialTTL > 90*24*time.Hour || strings.TrimSpace(c.GitHub.RedisPrefix) == "" {
 		errs = append(errs, errors.New("GitHub timeout, credential TTL, and Redis prefix are invalid"))
+	}
+	githubAppFields := []string{
+		strings.TrimSpace(c.GitHub.AppID),
+		strings.TrimSpace(c.GitHub.InstallationID),
+		strings.TrimSpace(c.GitHub.Organization),
+		strings.TrimSpace(c.GitHub.PrivateKeyFile),
+	}
+	configuredGitHubAppFields := 0
+	for _, value := range githubAppFields {
+		if value != "" {
+			configuredGitHubAppFields++
+		}
+	}
+	if configuredGitHubAppFields != 0 && configuredGitHubAppFields != len(githubAppFields) {
+		errs = append(errs, errors.New("GITHUB_APP_ID, GITHUB_APP_INSTALLATION_ID, GITHUB_APP_ORGANIZATION, and GITHUB_APP_PRIVATE_KEY_FILE must be configured together"))
+	} else if configuredGitHubAppFields == len(githubAppFields) &&
+		(!filepath.IsAbs(c.GitHub.PrivateKeyFile) || filepath.Clean(c.GitHub.PrivateKeyFile) != c.GitHub.PrivateKeyFile) {
+		errs = append(errs, errors.New("GITHUB_APP_PRIVATE_KEY_FILE must be an absolute clean path"))
 	}
 	if strings.TrimSpace(c.TemplateSource.GitBinary) == "" ||
 		!filepath.IsAbs(c.TemplateSource.CacheRoot) || filepath.Clean(c.TemplateSource.CacheRoot) != c.TemplateSource.CacheRoot ||
@@ -1488,6 +1627,34 @@ func validatePostgresDSN(raw string) error {
 		}
 	}
 	return nil
+}
+
+func samePostgresAuthorityScope(leftRaw, rightRaw string) bool {
+	left, leftErr := url.Parse(leftRaw)
+	right, rightErr := url.Parse(rightRaw)
+	if leftErr != nil || rightErr != nil || left.Hostname() == "" || right.Hostname() == "" {
+		return false
+	}
+	port := func(parsed *url.URL) string {
+		if value := parsed.Port(); value != "" {
+			return value
+		}
+		return "5432"
+	}
+	database := func(parsed *url.URL) string {
+		return strings.TrimPrefix(parsed.Path, "/")
+	}
+	setting := func(parsed *url.URL, key, fallback string) string {
+		if value := parsed.Query().Get(key); value != "" {
+			return value
+		}
+		return fallback
+	}
+	return strings.EqualFold(left.Hostname(), right.Hostname()) &&
+		port(left) == port(right) && database(left) == database(right) &&
+		setting(left, "sslmode", "prefer") == setting(right, "sslmode", "prefer") &&
+		setting(left, "sslrootcert", "") == setting(right, "sslrootcert", "") &&
+		setting(left, "target_session_attrs", "any") == setting(right, "target_session_attrs", "any")
 }
 
 func validPostgresSchema(value string) bool {

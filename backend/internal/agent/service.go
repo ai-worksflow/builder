@@ -104,6 +104,31 @@ type TaskAttemptResult struct {
 	Replayed    bool         `json:"replayed"`
 }
 
+type AdvanceTaskGraphInput struct {
+	ProjectID        string `json:"projectId"`
+	SandboxSessionID string `json:"sandboxSessionId"`
+	Instruction      string `json:"instruction"`
+	ExecutorProfile  string `json:"executorProfile"`
+	ActorID          string `json:"-"`
+	OperationID      string `json:"-"`
+}
+
+type TaskGraphAdvanceDisposition string
+
+const (
+	TaskGraphAdvanceStarted   TaskGraphAdvanceDisposition = "started"
+	TaskGraphAdvanceWaiting   TaskGraphAdvanceDisposition = "waiting"
+	TaskGraphAdvanceCompleted TaskGraphAdvanceDisposition = "completed"
+	TaskGraphAdvanceBlocked   TaskGraphAdvanceDisposition = "blocked"
+)
+
+type TaskGraphAdvanceResult struct {
+	Graph       TaskGraph                   `json:"graph"`
+	Attempt     *TaskAttemptResult          `json:"attempt,omitempty"`
+	Disposition TaskGraphAdvanceDisposition `json:"disposition"`
+	Replayed    bool                        `json:"replayed"`
+}
+
 type ControlService struct {
 	store     ControlStore
 	planner   TaskPlanner
@@ -279,6 +304,125 @@ func (service *ControlService) ListAttempts(
 	return service.store.ListAttempts(ctx, projectID, sessionID, limit)
 }
 
+func (service *ControlService) GetTaskGraph(
+	ctx context.Context,
+	projectID, sessionID, actorID string,
+) (TaskGraph, error) {
+	if !validUUIDs(projectID, sessionID, actorID) {
+		return TaskGraph{}, fmt.Errorf("%w: project, Session, or actor identity", ErrTaskGraphBlocked)
+	}
+	if err := service.access.RequireProjectView(ctx, projectID, actorID); err != nil {
+		return TaskGraph{}, fmt.Errorf("authorize Agent task graph view: %w", err)
+	}
+	return service.loadTaskGraph(ctx, projectID, sessionID)
+}
+
+func (service *ControlService) AdvanceTaskGraph(
+	ctx context.Context,
+	input AdvanceTaskGraphInput,
+) (TaskGraphAdvanceResult, error) {
+	normalized, err := normalizeAdvanceTaskGraphInput(input)
+	if err != nil {
+		return TaskGraphAdvanceResult{}, err
+	}
+	input = normalized
+	if err := service.access.RequireProjectEdit(ctx, input.ProjectID, input.ActorID); err != nil {
+		return TaskGraphAdvanceResult{}, fmt.Errorf("authorize Agent task graph advance: %w", err)
+	}
+	executor, err := service.executors.ResolveExecutor(ctx, input.ProjectID, input.ExecutorProfile)
+	if err != nil {
+		return TaskGraphAdvanceResult{}, err
+	}
+	if existing, found, findErr := service.store.FindAttemptByOperation(
+		ctx, input.ProjectID, input.ActorID, input.OperationID,
+	); findErr != nil {
+		return TaskGraphAdvanceResult{}, findErr
+	} else if found {
+		capsule, loadErr := service.store.GetTaskCapsule(ctx, input.ProjectID, existing.TaskCapsule.ID)
+		if loadErr != nil {
+			return TaskGraphAdvanceResult{}, loadErr
+		}
+		attempt, recoverErr := service.recoverCreate(ctx, CreateTaskAttemptInput{
+			ProjectID: input.ProjectID, SandboxSessionID: input.SandboxSessionID,
+			TaskKey: capsule.TaskKey, Instruction: input.Instruction,
+			ExecutorProfile: input.ExecutorProfile, ActorID: input.ActorID,
+			OperationID: input.OperationID,
+		}, executor, existing)
+		if recoverErr != nil {
+			return TaskGraphAdvanceResult{}, recoverErr
+		}
+		graph, graphErr := service.loadTaskGraph(ctx, input.ProjectID, input.SandboxSessionID)
+		if graphErr != nil {
+			return TaskGraphAdvanceResult{}, graphErr
+		}
+		return TaskGraphAdvanceResult{
+			Graph: graph, Attempt: &attempt,
+			Disposition: TaskGraphAdvanceStarted, Replayed: true,
+		}, nil
+	}
+
+	graph, err := service.loadTaskGraph(ctx, input.ProjectID, input.SandboxSessionID)
+	if err != nil {
+		return TaskGraphAdvanceResult{}, err
+	}
+	if graph.NextTaskKey == "" {
+		return TaskGraphAdvanceResult{
+			Graph: graph, Disposition: taskGraphAdvanceDisposition(graph.State),
+		}, nil
+	}
+	attempt, err := service.CreateTaskAttempt(ctx, CreateTaskAttemptInput{
+		ProjectID: input.ProjectID, SandboxSessionID: input.SandboxSessionID,
+		TaskKey: graph.NextTaskKey, Instruction: input.Instruction,
+		ExecutorProfile: input.ExecutorProfile, ActorID: input.ActorID,
+		OperationID: input.OperationID,
+	})
+	if err != nil {
+		return TaskGraphAdvanceResult{}, err
+	}
+	graph, err = service.loadTaskGraph(ctx, input.ProjectID, input.SandboxSessionID)
+	if err != nil {
+		return TaskGraphAdvanceResult{}, err
+	}
+	return TaskGraphAdvanceResult{
+		Graph: graph, Attempt: &attempt,
+		Disposition: TaskGraphAdvanceStarted, Replayed: attempt.Replayed,
+	}, nil
+}
+
+func (service *ControlService) loadTaskGraph(
+	ctx context.Context,
+	projectID, sessionID string,
+) (TaskGraph, error) {
+	planner, ok := service.planner.(TaskGraphPlanner)
+	if !ok {
+		return TaskGraph{}, fmt.Errorf("%w: planner does not provide task graphs", ErrTaskGraphBlocked)
+	}
+	progressStore, ok := service.store.(TaskGraphProgressStore)
+	if !ok {
+		return TaskGraph{}, fmt.Errorf("%w: store does not provide task graph progress", ErrTaskGraphBlocked)
+	}
+	graph, err := planner.PlanTaskGraph(ctx, projectID, sessionID)
+	if err != nil {
+		return TaskGraph{}, err
+	}
+	progress, err := progressStore.ListTaskAttemptProgress(ctx, projectID, sessionID)
+	if err != nil {
+		return TaskGraph{}, err
+	}
+	return applyTaskGraphProgress(graph, progress), nil
+}
+
+func taskGraphAdvanceDisposition(state TaskGraphState) TaskGraphAdvanceDisposition {
+	switch state {
+	case TaskGraphCompleted:
+		return TaskGraphAdvanceCompleted
+	case TaskGraphBlocked:
+		return TaskGraphAdvanceBlocked
+	default:
+		return TaskGraphAdvanceWaiting
+	}
+}
+
 func (service *ControlService) ListEvents(
 	ctx context.Context,
 	attemptID, actorID string,
@@ -445,6 +589,20 @@ func normalizeRetryAttemptInput(input RetryAttemptInput) (RetryAttemptInput, err
 		return RetryAttemptInput{}, fmt.Errorf("%w: retry reason is required", ErrInvalidAttempt)
 	}
 	input.Reason = reason
+	return input, nil
+}
+
+func normalizeAdvanceTaskGraphInput(input AdvanceTaskGraphInput) (AdvanceTaskGraphInput, error) {
+	created, err := normalizeCreateTaskAttemptInput(CreateTaskAttemptInput{
+		ProjectID: input.ProjectID, SandboxSessionID: input.SandboxSessionID,
+		TaskKey: TaskKeyPrefix + "advance", Instruction: input.Instruction,
+		ExecutorProfile: input.ExecutorProfile, ActorID: input.ActorID,
+		OperationID: input.OperationID,
+	})
+	if err != nil {
+		return AdvanceTaskGraphInput{}, err
+	}
+	input.Instruction = created.Instruction
 	return input, nil
 }
 

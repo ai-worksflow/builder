@@ -116,10 +116,12 @@ func TestCompileInputForManifestPreservesTrustedTemplateRuntime(t *testing.T) {
 	t.Parallel()
 
 	deliverySliceID := "page-messages"
+	pageNodeID := "page-messages"
 	workspace := core.VersionRef{ArtifactID: "workspace", RevisionID: "workspace-r1", ContentHash: strings.Repeat("c", 64)}
 	bundle := core.WorkbenchBundle{
 		ID: "manifest", ProjectID: "project", DeliverySliceID: &deliverySliceID,
-		ManifestHash: strings.Repeat("a", 64), CurrentWorkspaceRevision: &workspace,
+		BlueprintRevision: core.VersionRef{AnchorID: &pageNodeID},
+		ManifestHash:      strings.Repeat("a", 64), CurrentWorkspaceRevision: &workspace,
 	}
 	sources := []PinnedBuildSource{{Ref: ExactRevisionRef{Kind: "blueprint", RevisionID: "blueprint-r1"}}}
 	runtime := &TemplateRuntimeFacts{FullStackTemplateID: "stack", FullStackTemplateHash: strings.Repeat("b", 64)}
@@ -129,7 +131,7 @@ func TestCompileInputForManifestPreservesTrustedTemplateRuntime(t *testing.T) {
 	}
 
 	input := compileInputForManifest(bundle, sources, resolved)
-	if input.ProjectID != bundle.ProjectID || input.DeliverySliceID != deliverySliceID || input.BuildManifest.ID != bundle.ID ||
+	if input.ProjectID != bundle.ProjectID || input.DeliverySliceID != deliverySliceID || input.DeliverySlicePageNodeID != "page-messages" || input.BuildManifest.ID != bundle.ID ||
 		input.BuildManifest.ContentHash != bundle.ManifestHash || input.TemplateRuntime != runtime ||
 		input.FullStackTemplate != resolved.Template || len(input.TemplateReleaseRefs) != 1 || len(input.Sources) != 1 {
 		t.Fatalf("compile input = %#v", input)

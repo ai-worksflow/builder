@@ -187,7 +187,14 @@ func (s *ArtifactService) loadReviewGateApproval(transaction *gorm.DB, artifact 
 		return nil
 	}
 	for _, request := range requests {
-		if request.Status != "approved" || request.ClosedAt == nil {
+		if request.ReviewAuthorityVersion != 1 || request.Status != "approved" || request.ClosedAt == nil {
+			continue
+		}
+		exact, err := canonicalReviewReceiptExists(transaction, artifact.ProjectID, revision.ID, request.ID)
+		if err != nil {
+			return err
+		}
+		if !exact {
 			continue
 		}
 		policy, err := decodeReviewPolicy(request.Policy)

@@ -186,8 +186,21 @@ func (service *PortService) List(
 	if view.State != StateReady || len(ports) == 0 {
 		return PortList{Session: view, Ports: ports}, nil
 	}
+	view, err = service.syncReadyCandidateProjection(ctx, view, actorID)
+	if err != nil {
+		return PortList{}, err
+	}
 	status, err := service.runtimeStatus(ctx, view)
 	if err != nil {
+		// Port discovery is an observational endpoint. A stale workspace or
+		// runtime projection must never expose the old runtime, but it also must
+		// not turn the frontend's health polling into a stream of 409 responses.
+		// Keep the declared ports visible and conservatively mark them
+		// unavailable until lifecycle reconciliation catches up.
+		if errors.Is(err, ErrSessionProjectionStale) || errors.Is(err, ErrWorkspaceConflict) ||
+			errors.Is(err, ErrRuntimeConflict) {
+			return PortList{Session: view, Ports: ports}, nil
+		}
 		return PortList{}, err
 	}
 	if status.State != "running" || !status.Healthy {
@@ -221,6 +234,28 @@ func (service *PortService) List(
 	return PortList{Session: view, Ports: ports}, nil
 }
 
+func (service *PortService) syncReadyCandidateProjection(
+	ctx context.Context,
+	view SessionView,
+	actorID string,
+) (SessionView, error) {
+	record, err := service.candidates.Get(ctx, view.ProjectID, view.Candidate.ID)
+	if err != nil {
+		return SessionView{}, err
+	}
+	if candidateProjectionMatches(view.Candidate, record.Candidate) {
+		return view, nil
+	}
+	if view.State != StateReady {
+		return SessionView{}, ErrSessionProjectionStale
+	}
+	synced, err := service.sessions.SyncCandidate(ctx, view.ProjectID, view.ID, view.Version, view.SessionEpoch, actorID)
+	if err != nil {
+		return SessionView{}, err
+	}
+	return synced.Snapshot(), nil
+}
+
 func (service *PortService) Issue(
 	ctx context.Context,
 	input IssuePreviewInput,
@@ -243,6 +278,14 @@ func (service *PortService) Issue(
 	view := session.Snapshot()
 	if view.State != StateReady {
 		return PreviewLink{}, ErrPortNotReady
+	}
+	// Writer-lease heartbeats advance Candidate/session fences without changing
+	// the source tree. Bring a ready session forward before inspecting its
+	// runtime so preview creation does not spuriously fail between port polling
+	// and this capability request.
+	view, err = service.syncReadyCandidateProjection(ctx, view, input.ActorID)
+	if err != nil {
+		return PreviewLink{}, err
 	}
 	port, ok := exactAllowedPort(view.AllowedPorts, strings.TrimSpace(input.PortName))
 	if !ok {

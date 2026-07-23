@@ -13,6 +13,8 @@ import {
   FileText,
   GitCompareArrows,
   LoaderCircle,
+  Maximize2,
+  Minimize2,
   PackageCheck,
   Monitor,
   PencilLine,
@@ -64,6 +66,9 @@ export function PlatformWorkbench() {
   const [prototypeId, setPrototypeId] = useState('')
   const [showRelease, setShowRelease] = useState(false)
   const [showConversation, setShowConversation] = useState(false)
+  const [previewFocus, setPreviewFocus] = useState(false)
+  const [retainedSandboxIdentity, setRetainedSandboxIdentity] = useState<string | null>(null)
+  const [retainedSandboxMode, setRetainedSandboxMode] = useState<'preview' | 'code'>('preview')
   const selectedPrototype = artifacts.prototypes.find((item) => item.artifact.id === prototypeId)
     ?? artifacts.prototypes.find((item) => item.approvedRevision)
     ?? artifacts.prototypes[0]
@@ -80,6 +85,18 @@ export function PlatformWorkbench() {
     ? flow.proposal
     : proposalApplied(selectedQueueItem?.proposal) ? selectedQueueItem?.proposal : null
   const sandboxBuildManifestId = flow.bundle?.id ?? appliedProposal?.buildManifestId ?? null
+  const sandboxIdentity = project && sandboxBuildManifestId
+    ? `${project.id}:${sandboxBuildManifestId}`
+    : null
+  const governedSandboxVisible = Boolean(
+    sandboxIdentity
+    && (view === 'preview' || (view === 'code' && candidateEntryAvailable)),
+  )
+  const keepGovernedSandboxMounted = Boolean(
+    sandboxIdentity
+    && (governedSandboxVisible || retainedSandboxIdentity === sandboxIdentity),
+  )
+  const sandboxMode = view === 'preview' || view === 'code' ? view : retainedSandboxMode
 
   useEffect(() => {
     if (!prototypeId && selectedPrototype) setPrototypeId(selectedPrototype.artifact.id)
@@ -90,6 +107,12 @@ export function PlatformWorkbench() {
       setShowConversation(true)
     }
   }, [])
+
+  useEffect(() => {
+    if (!sandboxIdentity || !governedSandboxVisible) return
+    setRetainedSandboxIdentity(sandboxIdentity)
+    if (view === 'preview' || view === 'code') setRetainedSandboxMode(view)
+  }, [governedSandboxVisible, sandboxIdentity, view])
 
   const unavailable = !session.signedIn || !project || backendStatus === 'error'
 
@@ -131,7 +154,19 @@ export function PlatformWorkbench() {
           })}
         </nav>
 
-        <div className="ml-auto flex min-w-0 items-center gap-2 max-md:ml-0 max-md:w-full">
+        {view === 'preview' && (
+          <button
+            type="button"
+            onClick={() => setPreviewFocus((value) => !value)}
+            className="inline-flex h-8 shrink-0 items-center gap-1.5 rounded-md border border-border bg-background px-2.5 text-[9px] font-semibold text-muted-foreground hover:text-foreground"
+            title={previewFocus ? t('platform.preview.exitFocus') : t('platform.preview.focus')}
+          >
+            {previewFocus ? <Minimize2 className="size-3" /> : <Maximize2 className="size-3" />}
+            {previewFocus ? t('platform.preview.exitFocus') : t('platform.preview.focus')}
+          </button>
+        )}
+
+        <div className="ml-auto flex min-w-0 items-center gap-2 max-md:ml-0 max-md:w-full max-md:flex-wrap max-md:pb-2">
           <button
             type="button"
             onClick={() => setShowConversation(true)}
@@ -177,8 +212,11 @@ export function PlatformWorkbench() {
       </header>
 
       <div className="flex min-h-0 flex-1 max-lg:flex-col">
-        <FlowPanel />
-        <main className="min-h-0 min-w-0 flex-1 bg-canvas p-3 max-lg:min-h-[520px]">
+        {(view !== 'preview' || !previewFocus) && <FlowPanel />}
+        <main className={cn(
+          'min-h-0 min-w-0 flex-1 bg-canvas max-lg:min-h-[520px]',
+          view === 'preview' && previewFocus ? 'p-1' : 'p-3',
+        )}>
           <div className="h-full overflow-hidden rounded-lg border border-border bg-panel">
             {unavailable ? (
               <ServiceGate
@@ -189,42 +227,104 @@ export function PlatformWorkbench() {
               <ServiceGate loading title={t('platform.gate.loading')} description={t('platform.gate.loadingDescription')} />
             ) : flow.status === 'error' ? (
               <ServiceGate title={t('platform.gate.workflowUnavailable')} description={flow.error ?? t('platform.gate.workflowFallback')} onRetry={flow.refresh} />
-            ) : view === 'preview' && project && sandboxBuildManifestId ? (
-              <div className="flex h-full min-h-0 flex-col">
-                <WorkbenchGroupTabs />
-                <div className="min-h-0 flex-1">
-                  <SandboxWorkspace
-                    key={`${project.id}:${sandboxBuildManifestId}`}
-                    mode={view}
-                    projectId={project.id}
-                    buildManifestId={sandboxBuildManifestId}
-                  />
-                </div>
-              </div>
-            ) : view === 'preview' ? (
-              <PlatformPreview />
-            ) : view === 'code' && project && sandboxBuildManifestId && candidateEntryAvailable ? (
-              <div className="flex h-full min-h-0 flex-col">
-                <WorkbenchGroupTabs />
-                <div className="min-h-0 flex-1">
-                  <SandboxWorkspace
-                    key={`${project.id}:${sandboxBuildManifestId}:code`}
-                    mode="code"
-                    projectId={project.id}
-                    buildManifestId={sandboxBuildManifestId}
-                  />
-                </div>
-              </div>
-            ) : view === 'code' ? (
-              <ImplementationWorkspace />
             ) : (
-              <DatabasePanel />
+              <>
+                {keepGovernedSandboxMounted && project && sandboxBuildManifestId && (
+                  <div className={cn('h-full', governedSandboxVisible ? 'block' : 'hidden')}>
+                    <GovernedSandboxWorkspace
+                      key={sandboxIdentity}
+                      mode={sandboxMode}
+                      projectId={project.id}
+                      buildManifestId={sandboxBuildManifestId}
+                    />
+                  </div>
+                )}
+                {!governedSandboxVisible && view === 'preview' && <PlatformPreview />}
+                {!governedSandboxVisible && view === 'code' && <ImplementationWorkspace />}
+                {view === 'database' && <DatabasePanel />}
+              </>
             )}
           </div>
         </main>
       </div>
       {showConversation && <ConversationPanel onClose={() => setShowConversation(false)} />}
       {showRelease && <ReleasePanel onClose={() => setShowRelease(false)} />}
+    </div>
+  )
+}
+
+function GovernedSandboxWorkspace({
+  mode,
+  projectId,
+  buildManifestId,
+}: {
+  readonly mode: 'preview' | 'code'
+  readonly projectId: string
+  readonly buildManifestId: string
+}) {
+  const { t } = useI18n()
+  const { can } = useCollaboration()
+  const flow = usePlatformFlow()
+  const [gate, setGate] = useState<BuildContractGateSnapshot>({
+    bundleId: buildManifestId,
+    phase: 'loading',
+    contract: null,
+    ready: false,
+    reason: 'missing',
+  })
+  const [showPreparation, setShowPreparation] = useState(false)
+  const contractReady = gate.bundleId === buildManifestId && gate.ready
+
+  useEffect(() => {
+    setShowPreparation(!contractReady)
+  }, [contractReady])
+
+  const preparation = (
+    <div className={cn(
+      contractReady
+        ? showPreparation
+          ? 'absolute right-3 top-12 z-40 max-h-[70vh] w-[min(760px,calc(100vw-2rem))] overflow-y-auto rounded-lg bg-background/95 shadow-2xl backdrop-blur scrollbar-thin'
+          : 'hidden'
+        : 'shrink-0 border-b border-border bg-background/40 px-3 pb-3',
+    )}>
+      <BuildContractPanel
+        bundleId={buildManifestId}
+        canCompile={can('edit') && !flow.busy}
+        onGateChange={setGate}
+      />
+    </div>
+  )
+
+  return (
+    <div className="flex h-full min-h-0 flex-col">
+      <WorkbenchGroupTabs />
+      <div className="relative min-h-0 flex-1">
+        {preparation}
+        {contractReady ? (
+          <SandboxWorkspace
+            mode={mode}
+            projectId={projectId}
+            buildManifestId={buildManifestId}
+            toolbarAccessory={(
+              <button
+                type="button"
+                onClick={() => setShowPreparation((value) => !value)}
+                aria-expanded={showPreparation}
+                className="inline-flex h-7 items-center gap-1.5 rounded border border-success/30 bg-success/10 px-2 text-[9px] font-semibold text-success"
+              >
+                <ShieldCheck className="size-3" />
+                {t('platform.buildContract.title')}
+                <ChevronDown className={cn('size-3 transition-transform', !showPreparation && '-rotate-90')} />
+              </button>
+            )}
+          />
+        ) : (
+          <ServiceGate
+            title={t('platform.buildContract.title')}
+            description={t('platform.buildContract.nextBlocked')}
+          />
+        )}
+      </div>
     </div>
   )
 }
@@ -240,7 +340,7 @@ function ImplementationWorkspace() {
     : files[0]
   const [draft, setDraft] = useState(selectedFile?.content ?? '')
   const [newPath, setNewPath] = useState('')
-  const [showManifest, setShowManifest] = useState(true)
+  const [showManifest, setShowManifest] = useState(false)
   const [buildContractGate, setBuildContractGate] = useState<BuildContractGateSnapshot>({
     bundleId: '',
     phase: 'loading',
@@ -248,6 +348,7 @@ function ImplementationWorkspace() {
     ready: false,
     reason: 'missing',
   })
+  const [showDevelopmentSetup, setShowDevelopmentSetup] = useState(false)
   const selectedQueueIndex = flow.workbenchQueue.findIndex(
     (item) => item.bundleId === flow.selectedBundleId,
   )
@@ -264,6 +365,10 @@ function ImplementationWorkspace() {
   const buildContractReady = buildContractGate.bundleId === flow.bundle?.id
     && buildContractGate.ready
     && buildContractGate.contract?.buildManifestId === flow.bundle?.id
+
+  useEffect(() => {
+    setShowDevelopmentSetup(!buildContractReady)
+  }, [buildContractReady])
   const updateBuildContractGate = useCallback((next: BuildContractGateSnapshot) => {
     setBuildContractGate(next)
   }, [])
@@ -291,7 +396,7 @@ function ImplementationWorkspace() {
   return (
     <div className="flex h-full min-h-0 flex-col">
       <WorkbenchGroupTabs />
-      <section className="shrink-0 border-b border-border bg-background/40 p-3">
+      <section className="relative shrink-0 border-b border-border bg-background/40 p-3">
         <div className="flex flex-wrap items-start gap-3">
           <div className="min-w-0 flex-1">
             <div className="flex items-center gap-2">
@@ -303,16 +408,32 @@ function ImplementationWorkspace() {
                 </span>
               )}
               <button type="button" onClick={() => setShowManifest((value) => !value)} className="rounded p-1 text-faint-foreground hover:text-foreground" aria-label={t('platform.manifest.toggle')}><ChevronDown className={cn('size-3 transition-transform', !showManifest && '-rotate-90')} /></button>
+              {buildContractReady && (
+                <button
+                  type="button"
+                  onClick={() => setShowDevelopmentSetup((value) => !value)}
+                  aria-expanded={showDevelopmentSetup}
+                  className="inline-flex h-7 items-center gap-1.5 rounded border border-success/30 bg-success/10 px-2 text-[9px] font-semibold text-success"
+                >
+                  <ShieldCheck className="size-3" />
+                  {t('platform.buildContract.title')}
+                  <ChevronDown className={cn('size-3 transition-transform', !showDevelopmentSetup && '-rotate-90')} />
+                </button>
+              )}
             </div>
-            <p className="mt-1 truncate font-mono text-[9px] text-faint-foreground" title={flow.bundle.contentHash}>
-              {currentQueueItem && flow.bundle.id !== currentQueueItem.bundleId
-                ? `${currentQueueItem.bundleId} → ${flow.bundle.id}`
-                : flow.bundle.id} · {flow.bundle.contentHash}
-            </p>
+            <p className="mt-1 text-[9px] text-faint-foreground">{t('platform.manifest.summary')}</p>
+            <details className="mt-1 text-[8px] text-faint-foreground">
+              <summary className="cursor-pointer font-medium">{t('platform.technicalEvidence')}</summary>
+              <p className="mt-1 truncate font-mono" title={flow.bundle.contentHash}>
+                {currentQueueItem && flow.bundle.id !== currentQueueItem.bundleId
+                  ? `${currentQueueItem.bundleId} → ${flow.bundle.id}`
+                  : flow.bundle.id} · {flow.bundle.contentHash}
+              </p>
+            </details>
           </div>
           <div role="status" className="flex min-w-[320px] flex-1 items-center gap-2 rounded-md border border-primary/25 bg-primary/5 px-3 py-2 text-[9px] leading-relaxed text-muted-foreground max-md:min-w-0 max-md:basis-full">
             <ShieldCheck className="size-3.5 shrink-0 text-primary-bright" />
-            AI changes are created in the durable Candidate sandbox, verified against the exact checkpoint, then frozen into this immutable Proposal for review.
+            {t('platform.journey.governanceSummary')}
           </div>
         </div>
         {!orderedGenerationAllowed && currentQueueItem && blockingPredecessor && (
@@ -370,11 +491,19 @@ function ImplementationWorkspace() {
           </div>
         )}
         {showManifest && <ManifestFacts />}
-        <BuildContractPanel
-          bundleId={flow.bundle.id}
-          canCompile={can('edit') && !flow.busy}
-          onGateChange={updateBuildContractGate}
-        />
+        <div className={cn(
+          buildContractReady
+            ? showDevelopmentSetup
+              ? 'absolute right-3 top-11 z-40 max-h-[70vh] w-[min(760px,calc(100vw-2rem))] overflow-y-auto rounded-lg bg-background/95 shadow-2xl backdrop-blur scrollbar-thin'
+              : 'hidden'
+            : 'mt-3',
+        )}>
+          <BuildContractPanel
+            bundleId={flow.bundle.id}
+            canCompile={can('edit') && !flow.busy}
+            onGateChange={updateBuildContractGate}
+          />
+        </div>
       </section>
 
       <div className="flex min-h-0 flex-1 max-md:flex-col">
@@ -505,7 +634,7 @@ function ProposalReview() {
   const flow = usePlatformFlow()
   const { can } = useCollaboration()
   const [rejectionReason, setRejectionReason] = useState(() => t('platform.rejection.default'))
-  const [quarantineReason, setQuarantineReason] = useState('Replace this unreviewable Proposal with a governed verified Candidate.')
+  const [quarantineReason, setQuarantineReason] = useState(() => t('platform.proposal.quarantineDefault'))
   const proposal = flow.proposal
   const queueIndex = flow.workbenchQueue.findIndex(
     (item) => item.bundleId === flow.selectedBundleId,
@@ -582,28 +711,32 @@ function ProposalReview() {
             {exactCandidate && (
               <section className="rounded-md border border-primary/30 bg-primary/10 p-2 text-[8px] leading-relaxed text-primary-bright">
                 <div className="flex items-center gap-1.5 font-semibold">
-                  <PackageCheck className="size-3" /> Exact frozen Candidate
+                  <PackageCheck className="size-3" /> {t('platform.proposal.verifiedTitle')}
                 </div>
                 <p className="mt-1 text-faint-foreground">
-                  This Proposal is the complete immutable diff for Candidate {exactCandidate.candidateId.slice(0, 12)}.
-                  Every operation must be accepted before Apply can create its WorkspaceRevision.
+                  {t('platform.proposal.verifiedDescription')}
                 </p>
-                <p className="mt-1 truncate font-mono text-faint-foreground" title={exactCandidate.treeHash}>
-                  C{exactCandidate.candidateVersion} · J{exactCandidate.journalSequence} · {exactCandidate.treeHash}
-                </p>
+                <details className="mt-1.5 rounded border border-primary/20 bg-background/30">
+                  <summary className="cursor-pointer px-1.5 py-1 font-semibold text-faint-foreground">
+                    {t('platform.technicalEvidence')}
+                  </summary>
+                  <p className="truncate border-t border-primary/15 px-1.5 py-1 font-mono text-faint-foreground" title={exactCandidate.treeHash}>
+                    C{exactCandidate.candidateVersion} · J{exactCandidate.journalSequence} · {exactCandidate.treeHash}
+                  </p>
+                </details>
               </section>
             )}
             {governedReviewBlocked && (
               <section role="alert" className="rounded-md border border-destructive/35 bg-destructive/10 p-2 text-[8px] leading-relaxed text-destructive">
                 <div className="flex items-center gap-1.5 font-semibold">
-                  <CircleAlert className="size-3" /> Proposal cannot enter the approval gate
+                  <CircleAlert className="size-3" /> {t('platform.proposal.reviewBlockedTitle')}
                 </div>
                 <p className="mt-1">
                   {legacyAIProposal
-                    ? 'This Proposal came from the retired direct-model path and has no exact Candidate VerificationReceipt. Quarantine it and create a governed Candidate instead.'
+                    ? t('platform.proposal.legacyBlocked')
                     : unverifiedCandidateProposal
-                      ? 'This historical Candidate Proposal predates the exact VerificationReceipt gate. It cannot be approved or repaired in place; quarantine it and freeze a new verified Candidate.'
-                      : `This immutable manual Proposal contains ${completionBlockers} unimplemented or blocking diagnostic item(s). Quarantine it and resolve them in a governed Candidate before freezing a replacement.`}
+                      ? t('platform.proposal.unverifiedBlocked')
+                      : t('platform.proposal.incompleteBlocked', { count: completionBlockers })}
                 </p>
                 {quarantineAvailable && (
                   <div className="mt-2 flex gap-1.5">
@@ -620,7 +753,7 @@ function ProposalReview() {
                       disabled={!can('edit') || flow.busy || !quarantineReason.trim()}
                       className="h-7 shrink-0 rounded bg-destructive px-2 text-[8px] font-semibold text-destructive-foreground disabled:opacity-35"
                     >
-                      Quarantine and open Candidate
+                      {t('platform.proposal.returnToDevelopment')}
                     </button>
                   </div>
                 )}
@@ -640,9 +773,9 @@ function ProposalReview() {
             </button>
             <p className="mt-1.5 text-[8px] leading-relaxed text-faint-foreground">
               {governedReviewBlocked
-                ? 'This Proposal has no admissible completion evidence and cannot create an immutable revision.'
+                ? t('platform.proposal.applyBlocked')
                 : exactCandidate && !exactCandidateFullyAccepted
-                ? 'Accept every exact file operation to enable immutable revision creation.'
+                ? t('platform.proposal.acceptAllFirst')
                 : applyDescription}
             </p>
           </div>

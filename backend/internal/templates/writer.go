@@ -89,7 +89,7 @@ func (w *Writer) Admit(ctx context.Context, input AdmitInput) (AdmissionRegistra
 		return AdmissionRegistration{}, invalid("independent_review_required", "evaluatedBy", "requester and evaluator must be different users")
 	}
 
-	candidateAt := w.now().UTC()
+	candidateAt := w.now().UTC().Truncate(time.Microsecond)
 	if candidateAt.IsZero() {
 		return AdmissionRegistration{}, invalid("invalid_time", "createdAt", "trusted writer clock returned zero")
 	}
@@ -97,7 +97,7 @@ func (w *Writer) Admit(ctx context.Context, input AdmitInput) (AdmissionRegistra
 	if err != nil {
 		return AdmissionRegistration{}, err
 	}
-	validatingAt := w.now().UTC()
+	validatingAt := w.now().UTC().Truncate(time.Microsecond)
 	validating, err := candidate.BeginValidation(validatingAt)
 	if err != nil {
 		return AdmissionRegistration{}, err
@@ -110,7 +110,7 @@ func (w *Writer) Admit(ctx context.Context, input AdmitInput) (AdmissionRegistra
 	if err != nil {
 		return AdmissionRegistration{}, err
 	}
-	evaluatedAt := w.now().UTC()
+	evaluatedAt := w.now().UTC().Truncate(time.Microsecond)
 	completed, release, err := validating.CompleteWithAuthority(input.ReleaseID, receipt, input.EvaluatedBy, evaluatedAt)
 	if err != nil {
 		return AdmissionRegistration{}, err

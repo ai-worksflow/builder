@@ -121,15 +121,23 @@ func TestCodexEventWriterRejectsIncompleteUsageEvidence(t *testing.T) {
 }
 
 func TestCodexArgumentsIsolateToolEnvironmentAndAvoidDeprecatedFullAuto(t *testing.T) {
+	t.Setenv("OPENAI_BASE_URL", "http://agent-model-gateway:8080/internal/agent-model/v1")
 	arguments := codexArguments(validRunnerRequest())
 	joined := strings.Join(arguments, "\n")
 	if strings.Contains(joined, "--full-auto") {
 		t.Fatal("deprecated full-auto compatibility flag remains enabled")
 	}
 	for _, required := range []string{
+		"--ask-for-approval",
+		"never",
 		"--strict-config",
 		"--ignore-user-config",
 		"--ignore-rules",
+		`model_provider="worksflow_gateway"`,
+		`model_providers.worksflow_gateway.base_url="http://agent-model-gateway:8080/internal/agent-model/v1"`,
+		`model_providers.worksflow_gateway.env_key="OPENAI_API_KEY"`,
+		`model_providers.worksflow_gateway.wire_api="responses"`,
+		"model_providers.worksflow_gateway.supports_websockets=false",
 		`shell_environment_policy.include_only=["PATH","HOME"]`,
 		"allow_login_shell=false",
 		"--sandbox",
@@ -138,6 +146,12 @@ func TestCodexArgumentsIsolateToolEnvironmentAndAvoidDeprecatedFullAuto(t *testi
 		if !slices.Contains(arguments, required) {
 			t.Fatalf("Codex arguments omit %q: %#v", required, arguments)
 		}
+	}
+	if strings.Contains(joined, "api.openai.com") {
+		t.Fatalf("Codex arguments route around the attempt-scoped Model Gateway: %#v", arguments)
+	}
+	if len(arguments) < 3 || arguments[0] != "--ask-for-approval" || arguments[1] != "never" || arguments[2] != "exec" {
+		t.Fatalf("approval policy must be a global flag before exec: %#v", arguments)
 	}
 }
 

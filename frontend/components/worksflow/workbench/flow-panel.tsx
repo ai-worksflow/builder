@@ -26,6 +26,7 @@ import { useCollaboration } from '@/lib/collaboration/provider'
 import { useI18n } from '@/lib/i18n'
 import { useArtifactWorkspace } from '@/lib/platform/artifact-provider'
 import { usePlatformFlow } from '@/lib/platform/flow-provider'
+import { workflowDefinitionAcceptsProjectBriefStart } from '@/lib/platform/workflow-entry'
 import { useWorksflow } from '@/lib/worksflow/store'
 import type {
   CreateWorkflowDefinitionInputDto,
@@ -34,13 +35,12 @@ import type {
   WorkflowNodeRunDto,
 } from '@/lib/platform/flow-contract'
 import {
+  canUseGenericWorkflowExecutionAuthorization,
   exactArtifactRefsEqual,
   parseEditableDefinition as parseWorkflowContract,
-  reviewGateApprovalReadiness,
   resolveCandidateSelection as resolveLineageSelection,
   revisionCandidates as resolveLineageCandidates,
   starterWorkflowDefinition,
-  workflowRoleSatisfies,
 } from '@/lib/platform/workflow-ui-contract'
 import { cn } from '@/lib/utils'
 import { requiresSoloReviewConfirmation } from '@/lib/worksflow/project-governance'
@@ -65,6 +65,15 @@ export function FlowPanel() {
     ?? flow.definitionVersions.find((item) => item.published)
     ?? flow.definitionVersions[0]
     ?? flow.selectedDefinition
+  const projectBriefStartAvailable = Boolean(
+    selectedVersion?.published
+    && workflowDefinitionAcceptsProjectBriefStart(selectedVersion.definition),
+  )
+  const fallbackProjectBriefStartAvailable = flow.definitions.some((definition) => (
+    definition.key === 'minimum-product-loop'
+    && definition.published
+    && workflowDefinitionAcceptsProjectBriefStart(definition.definition)
+  ))
 
   function openEditor(mode: Exclude<EditorMode, 'closed'>) {
     const source = selectedVersion?.definition
@@ -234,9 +243,15 @@ export function FlowPanel() {
                 <button
                   type="button"
                   onClick={() => void flow.startFromProjectBrief({
-                    definitionVersionId: selectedVersion?.published ? selectedVersion.versionId : undefined,
+                    definitionVersionId: projectBriefStartAvailable
+                      ? selectedVersion?.versionId
+                      : undefined,
                   })}
-                  disabled={!canStart || flow.busy || (selectedVersion ? !selectedVersion.published : false)}
+                  disabled={
+                    !canStart
+                    || flow.busy
+                    || (!projectBriefStartAvailable && !fallbackProjectBriefStartAvailable)
+                  }
                   className="mt-2 inline-flex h-9 w-full items-center justify-center gap-1.5 rounded-md bg-primary px-3 text-[11px] font-semibold text-primary-foreground hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-40"
                   title={t('flow.startTitle')}
                 >
@@ -377,24 +392,21 @@ function RunNodeCard({ node }: { node: WorkflowNodeRunDto }) {
   const submitError = candidateResolution.error
     ?? (staleSelection ? t('flow.error.staleRevision') : undefined)
     ?? (selectionRequired ? t('flow.error.multipleRevisions') : undefined)
-  const active = ['waiting_input', 'waiting_review', 'failed'].includes(node.status)
+  const active = ['waiting_input', 'waiting_review', 'waiting_qualification', 'failed'].includes(node.status)
+  const projectedActions = node.allowedActions ?? []
+  const projectedBlockers = node.blockingReasons ?? []
+  const dedicatedExternalQualification = node.type === 'external_qualification_gate'
+  const genericExecutionAuthorization = canUseGenericWorkflowExecutionAuthorization(flow.run, node)
+  const qualifiedReleaseControllerPublish = node.status === 'waiting_input'
+    && node.type === 'publish'
+    && flow.run?.executionProfile.version === 'workflow-engine/v3'
   const reviewRequiredRole = definitionNode?.reviewGate?.requiredRole ?? 'editor'
-  const canApproveReview = Boolean(project && workflowRoleSatisfies(project.role, reviewRequiredRole))
-  const canonicalReview = useMemo(
-    () => reviewGateApprovalReadiness(
-      flow.runDefinition?.definition,
-      node,
-      flow.run,
-      artifacts,
-    ),
-    [artifacts, flow.run, flow.runDefinition?.definition, node],
-  )
   const soloApprovalRequiresConfirmation = project
     ? requiresSoloReviewConfirmation(flow.run?.governanceMode ?? project.governanceMode, 'approve')
     : false
 
   async function approveReview() {
-    if (!canonicalReview.ready) return
+    if (!projectedActions.includes('approve_review')) return
     const approved = await flow.resolveReview(
       node,
       'approve',
@@ -464,12 +476,28 @@ function RunNodeCard({ node }: { node: WorkflowNodeRunDto }) {
             {node.sliceId && <span>{t('flow.slice')} {node.sliceId.slice(0, 8)}</span>}
           </div>
         </div>
-        {node.status === 'failed' && (
+        {node.status === 'failed' && !dedicatedExternalQualification && projectedActions.includes('retry') && (
           <button type="button" onClick={() => void flow.retryNode(node)} disabled={!can('edit') || flow.busy} className="rounded p-1 text-warning hover:bg-warning/10" aria-label={t('flow.retryNode')}>
             <RotateCcw className="size-3" />
           </button>
         )}
       </div>
+
+      {active && projectedBlockers.length > 0 && (
+        <div className="mt-2 space-y-1" data-testid={`workflow-action-blockers-${node.key}`}>
+          {projectedBlockers.map((blocker) => (
+            <p
+              key={`${blocker.code}:${blocker.message}`}
+              className="rounded border border-warning/25 bg-warning/5 px-2 py-1 text-[8px] leading-relaxed text-warning"
+              data-testid={blocker.code === 'canonical_review_gate_blocked'
+                ? `workflow-review-canonical-blocker-${node.key}`
+                : undefined}
+            >
+              {blocker.message}
+            </p>
+          ))}
+        </div>
+      )}
 
       {node.status === 'waiting_input' && node.type === 'human_edit' && (
         <div className="mt-2 border-t border-border pt-2">
@@ -492,7 +520,7 @@ function RunNodeCard({ node }: { node: WorkflowNodeRunDto }) {
               <button
                 type="button"
                 onClick={submitSelectedRevision}
-                disabled={!selected || Boolean(submitError) || !can('edit') || flow.busy}
+                disabled={!projectedActions.includes('submit_input') || !selected || Boolean(submitError) || !can('edit') || flow.busy}
                 className="mt-1.5 inline-flex h-7 w-full items-center justify-center gap-1 rounded bg-primary text-[9px] font-semibold text-primary-foreground disabled:opacity-40"
               >
                 <Send className="size-3" /> {t('flow.submitPinnedRevision')}
@@ -509,7 +537,7 @@ function RunNodeCard({ node }: { node: WorkflowNodeRunDto }) {
                 <button
                   type="button"
                   onClick={openLinkedEditor}
-                  disabled={!can('edit') || flow.busy}
+                  disabled={!projectedActions.includes('submit_input') || !can('edit') || flow.busy}
                   className="mb-1.5 inline-flex h-7 w-full items-center justify-center gap-1 rounded bg-primary text-[9px] font-semibold text-primary-foreground disabled:opacity-40"
                 >
                   <PencilLine className="size-3" /> {t('flow.openLinkedEditor')}
@@ -523,8 +551,7 @@ function RunNodeCard({ node }: { node: WorkflowNodeRunDto }) {
         </div>
       )}
 
-      {node.status === 'waiting_input'
-        && (node.type === 'quality_gate' || node.type === 'publish') && (
+      {genericExecutionAuthorization && (
         <div className="mt-2 border-t border-border pt-2">
           <button
             type="button"
@@ -541,26 +568,39 @@ function RunNodeCard({ node }: { node: WorkflowNodeRunDto }) {
         </div>
       )}
 
+      {qualifiedReleaseControllerPublish && (
+        <p
+          className="mt-2 border-t border-border pt-2 text-[9px] leading-relaxed text-warning"
+          data-testid={`workflow-qualified-release-${node.key}`}
+        >
+          {t('flow.qualifiedRelease.pending')}
+        </p>
+      )}
+
       {node.status === 'waiting_input' && node.type === 'workbench_build' && (
         <p className="mt-2 border-t border-border pt-2 text-[9px] leading-relaxed text-primary-bright">
           {t('flow.reviewBuildCopy')}
         </p>
       )}
 
-      {node.status === 'waiting_review' && (
-        <div className="mt-2 border-t border-border pt-2">
-          {!canonicalReview.ready && (
-            <div
-              role="alert"
-              className="mb-2 rounded border border-warning/35 bg-warning/10 p-2 text-[9px] leading-relaxed text-warning"
-              data-testid={`workflow-review-canonical-blocker-${node.key}`}
-            >
-              <div className="flex items-start gap-1.5">
-                <CircleAlert className="mt-0.5 size-3 shrink-0" />
-                <span>{t('flow.canonicalReviewRequired')}</span>
-              </div>
-            </div>
+      {node.status === 'waiting_qualification' && node.type === 'external_qualification_gate' && (
+        <div className="mt-2 border-t border-border pt-2" data-testid={`workflow-external-qualification-${node.key}`}>
+          <p className="text-[9px] leading-relaxed text-warning">
+            {t('flow.externalQualification.waiting')}
+          </p>
+          {node.inputAuthorityId && (
+            <p className="mt-1 break-all font-mono text-[8px] text-faint-foreground">
+              {t('flow.externalQualification.authority', { authority: node.inputAuthorityId })}
+            </p>
           )}
+          <p className="mt-1 text-[8px] leading-relaxed text-faint-foreground">
+            {t('flow.externalQualification.recovery')}
+          </p>
+        </div>
+      )}
+
+      {node.status === 'waiting_review' && !dedicatedExternalQualification && (
+        <div className="mt-2 border-t border-border pt-2">
           {soloApprovalRequiresConfirmation && (
             <div role="alert" className="mb-2 rounded border border-warning/35 bg-warning/10 p-2 text-[9px] leading-relaxed text-warning" data-testid={`solo-review-warning-${node.key}`}>
               <div className="flex items-start gap-1.5">
@@ -586,10 +626,10 @@ function RunNodeCard({ node }: { node: WorkflowNodeRunDto }) {
             className="h-7 w-full rounded border border-border bg-panel px-2 text-[9px] text-foreground outline-none placeholder:text-faint-foreground"
           />
           <div className="mt-1.5 grid grid-cols-2 gap-1">
-            <button type="button" data-testid={`workflow-review-approve-${node.key}`} onClick={() => void approveReview()} disabled={!canApproveReview || !canonicalReview.ready || flow.busy || (soloApprovalRequiresConfirmation && (!soloReviewConfirmed || !reason.trim()))} className="inline-flex h-7 items-center justify-center gap-1 rounded bg-success/15 text-[9px] font-medium text-success disabled:opacity-35">
+            <button type="button" data-testid={`workflow-review-approve-${node.key}`} onClick={() => void approveReview()} disabled={!projectedActions.includes('approve_review') || flow.busy || (soloApprovalRequiresConfirmation && (!soloReviewConfirmed || !reason.trim()))} className="inline-flex h-7 items-center justify-center gap-1 rounded bg-success/15 text-[9px] font-medium text-success disabled:opacity-35">
               <Check className="size-3" /> {t('flow.approve')}
             </button>
-            <button type="button" onClick={() => void flow.resolveReview(node, 'changes_requested', reason || t('flow.defaultChangeRequest'))} disabled={!can('edit') || flow.busy} className="inline-flex h-7 items-center justify-center gap-1 rounded bg-warning/15 text-[9px] font-medium text-warning disabled:opacity-35">
+            <button type="button" onClick={() => void flow.resolveReview(node, 'changes_requested', reason || t('flow.defaultChangeRequest'))} disabled={!projectedActions.includes('request_review_changes') || !can('edit') || flow.busy} className="inline-flex h-7 items-center justify-center gap-1 rounded bg-warning/15 text-[9px] font-medium text-warning disabled:opacity-35">
               <PencilLine className="size-3" /> {t('flow.requestChanges')}
             </button>
           </div>
@@ -728,6 +768,7 @@ function workflowStatusLabel(status: string, t: Translate) {
     case 'running': return t('flow.status.running')
     case 'waiting_input': return t('flow.status.waitingInput')
     case 'waiting_review': return t('flow.status.waitingReview')
+    case 'waiting_qualification': return t('flow.status.waitingQualification')
     case 'completed': return t('flow.status.completed')
     case 'failed': return t('flow.status.failed')
     case 'cancelled': return t('flow.status.cancelled')
@@ -750,6 +791,7 @@ function workflowNodeTypeLabel(type: string, t: Translate) {
     case 'manifest_compiler': return t('flow.nodeType.manifestCompiler')
     case 'workbench_build': return t('flow.nodeType.workbenchBuild')
     case 'quality_gate': return t('flow.nodeType.qualityGate')
+    case 'external_qualification_gate': return t('flow.nodeType.externalQualificationGate')
     case 'publish': return t('flow.nodeType.publish')
     case 'transform': return t('flow.nodeType.transform')
     default: return type.replaceAll('_', ' ')
@@ -776,6 +818,6 @@ function RunStatusIcon({ status }: { status: string }) {
 function NodeStatusIcon({ status }: { status: WorkflowNodeRunDto['status'] }) {
   if (status === 'completed') return <CircleCheck className="mt-0.5 size-3.5 shrink-0 text-success" />
   if (status === 'failed' || status === 'cancelled' || status === 'stale') return <CircleAlert className="mt-0.5 size-3.5 shrink-0 text-destructive" />
-  if (status === 'waiting_input' || status === 'waiting_review') return <CircleDashed className="mt-0.5 size-3.5 shrink-0 text-warning" />
+  if (status === 'waiting_input' || status === 'waiting_review' || status === 'waiting_qualification') return <CircleDashed className="mt-0.5 size-3.5 shrink-0 text-warning" />
   return <CircleDashed className="mt-0.5 size-3.5 shrink-0 text-faint-foreground" />
 }

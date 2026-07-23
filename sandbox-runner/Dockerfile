@@ -37,6 +37,11 @@ ARG CODEX_INTEGRITY
 ARG SANDBOX_UID=10001
 ARG SANDBOX_GID=10001
 
+# The interactive runner executes every command declared by the admitted
+# full-stack template. Keep the Go toolchain from the same digest-pinned image
+# that compiled the fixed runner helpers so Go services do not depend on a
+# mutable package repository at session start time.
+COPY --from=gateway-build /usr/local/go /usr/local/go
 COPY --from=gateway-build /usr/local/libexec/validate-runner-build-args.sh /usr/local/libexec/validate-runner-build-args.sh
 RUN sh /usr/local/libexec/validate-runner-build-args.sh "${GO_IMAGE}" "${NODE_IMAGE}" "${CODEX_VERSION}" "${CODEX_INTEGRITY}" \
   && apt-get update \
@@ -72,7 +77,14 @@ RUN chmod 0555 /usr/local/bin/worksflow-sandbox-init \
 
 ENV HOME=/tmp/home \
     CODEX_HOME=/codex \
-    NO_UPDATE_NOTIFIER=1
+    NO_UPDATE_NOTIFIER=1 \
+    PATH=/usr/local/go/bin:${PATH} \
+    GOTOOLCHAIN=local \
+    GOMODCACHE=/workspace/.worksflow/dependencies/go/pkg/mod \
+    GOCACHE=/workspace/.worksflow/dependencies/go/build-cache \
+    GOTMPDIR=/workspace/.worksflow/dependencies/go/tmp \
+    GOPROXY=off \
+    GOFLAGS=-mod=readonly
 
 WORKDIR /workspace
 USER ${SANDBOX_UID}:${SANDBOX_GID}

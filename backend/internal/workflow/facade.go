@@ -29,6 +29,29 @@ type ProjectGovernanceResolver interface {
 	Governance(context.Context, string) (core.ProjectGovernance, error)
 }
 
+type WorkflowNodeAction string
+
+const (
+	WorkflowNodeActionSubmitInput          WorkflowNodeAction = "submit_input"
+	WorkflowNodeActionRecordProposal       WorkflowNodeAction = "record_proposal"
+	WorkflowNodeActionAuthorizeExecution   WorkflowNodeAction = "authorize_execution"
+	WorkflowNodeActionApproveReview        WorkflowNodeAction = "approve_review"
+	WorkflowNodeActionRequestReviewChanges WorkflowNodeAction = "request_review_changes"
+	WorkflowNodeActionWaiveReview          WorkflowNodeAction = "waive_review"
+	WorkflowNodeActionRetry                WorkflowNodeAction = "retry"
+)
+
+type WorkflowActionBlockingReason struct {
+	Code      string              `json:"code"`
+	Message   string              `json:"message"`
+	SourceRef *domain.ArtifactRef `json:"sourceRef"`
+}
+
+type WorkflowNodeActionProjection struct {
+	AllowedActions  []WorkflowNodeAction           `json:"allowedActions"`
+	BlockingReasons []WorkflowActionBlockingReason `json:"blockingReasons"`
+}
+
 type CreateDefinitionInput struct {
 	Key            string                        `json:"key"`
 	Title          string                        `json:"title"`
@@ -450,6 +473,278 @@ func (f Facade) GetRun(ctx context.Context, projectID, runID, actorID string) (*
 	return run, nil
 }
 
+// ProjectRunNodeActions is the authoritative actor-specific control
+// projection for a hydrated Workflow run. It intentionally reuses Engine's
+// immutable Canonical Review verifier and keeps dedicated v3 qualification
+// and Release nodes closed to generic Workflow routes.
+func (f Facade) ProjectRunNodeActions(
+	ctx context.Context,
+	projectID, runID, actorID string,
+	expectedEventCursor uint64,
+) (map[string]WorkflowNodeActionProjection, error) {
+	run, err := f.GetRun(ctx, projectID, runID, actorID)
+	if err != nil {
+		return nil, err
+	}
+	if run.EventCursor != expectedEventCursor {
+		return nil, ErrCASConflict
+	}
+	record, err := f.Store.GetDefinitionVersion(ctx, run.DefinitionVersionID)
+	if err != nil {
+		return nil, err
+	}
+	if record.ProjectID != "" && record.ProjectID != projectID {
+		return nil, core.ErrNotFound
+	}
+	if record.VersionID != run.DefinitionVersionID ||
+		record.ExecutionProfile != run.ExecutionProfile ||
+		record.Definition.RefForExecutionProfile(record.ExecutionProfile) != run.Definition {
+		return nil, fmt.Errorf("project Workflow actions: immutable run definition pin mismatch")
+	}
+
+	keys := make([]string, 0, len(run.Nodes))
+	for key := range run.Nodes {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	projections := make(map[string]WorkflowNodeActionProjection, len(keys))
+	for _, key := range keys {
+		node := run.Nodes[key]
+		projection := WorkflowNodeActionProjection{
+			AllowedActions:  []WorkflowNodeAction{},
+			BlockingReasons: []WorkflowActionBlockingReason{},
+		}
+		if node == nil {
+			projection.BlockingReasons = append(projection.BlockingReasons, workflowActionBlocker(
+				"workflow_node_unavailable",
+				"The Workflow node projection is unavailable.",
+			))
+			projections[key] = projection
+			continue
+		}
+		definitionNode, exists := record.Definition.FindNode(node.DefinitionNodeID)
+		if !exists || definitionNode.Type != node.Type {
+			projection.BlockingReasons = append(projection.BlockingReasons, workflowActionBlocker(
+				"workflow_definition_node_mismatch",
+				"The Workflow node does not match its immutable definition.",
+			))
+			projections[key] = projection
+			continue
+		}
+
+		dedicatedExternalQualification := definitionNode.Type == domain.NodeExternalQualificationGate
+		dedicatedQualifiedRelease := run.ExecutionProfile == WorkflowExecutionProfileV3Ref() &&
+			definitionNode.Type == domain.NodePublish
+		if dedicatedExternalQualification {
+			projection.BlockingReasons = append(projection.BlockingReasons, workflowActionBlocker(
+				"external_qualification_authority_required",
+				"External qualification is controlled by its immutable authority chain.",
+			))
+		}
+		if dedicatedQualifiedRelease {
+			projection.BlockingReasons = append(projection.BlockingReasons, workflowActionBlocker(
+				"qualified_release_controller_required",
+				"Publish is controlled by the qualified Release Controller authority.",
+			))
+		}
+		if dedicatedExternalQualification || dedicatedQualifiedRelease {
+			projections[key] = projection
+			continue
+		}
+
+		switch node.Status {
+		case NodeWaitingInput:
+			switch definitionNode.Type {
+			case domain.NodeHumanEdit, domain.NodeHumanTask, domain.NodeWorkbenchBuild:
+				allowed, actionErr := f.nodeActionAuthorized(
+					ctx, projectID, actorID, core.ActionEdit, requiredNodeRole(definitionNode),
+				)
+				if actionErr != nil {
+					return nil, actionErr
+				}
+				if allowed {
+					projection.AllowedActions = append(projection.AllowedActions, WorkflowNodeActionSubmitInput)
+				} else {
+					projection.BlockingReasons = append(projection.BlockingReasons, workflowRoleBlocker())
+				}
+			case domain.NodeAITransform, domain.NodeAI:
+				allowed, actionErr := f.nodeActionAuthorized(
+					ctx, projectID, actorID, core.ActionEdit, core.RoleEditor,
+				)
+				if actionErr != nil {
+					return nil, actionErr
+				}
+				if allowed {
+					projection.AllowedActions = append(projection.AllowedActions, WorkflowNodeActionRecordProposal)
+				} else {
+					projection.BlockingReasons = append(projection.BlockingReasons, workflowRoleBlocker())
+				}
+			}
+			if !dedicatedExternalQualification && !dedicatedQualifiedRelease {
+				action, requiredRole, required := nodeExecutionPolicy(definitionNode)
+				if required {
+					allowed, actionErr := f.nodeActionAuthorized(ctx, projectID, actorID, action, requiredRole)
+					if actionErr != nil {
+						return nil, actionErr
+					}
+					if allowed {
+						projection.AllowedActions = append(projection.AllowedActions, WorkflowNodeActionAuthorizeExecution)
+					} else {
+						projection.BlockingReasons = append(projection.BlockingReasons, workflowRoleBlocker())
+					}
+				}
+			}
+		case NodeWaitingReview:
+			requiredRole := requiredNodeRole(definitionNode)
+			canRequestChanges, actionErr := f.nodeActionAuthorized(
+				ctx, projectID, actorID, core.ActionReview, requiredRole,
+			)
+			if actionErr != nil {
+				return nil, actionErr
+			}
+			if canRequestChanges {
+				projection.AllowedActions = append(
+					projection.AllowedActions,
+					WorkflowNodeActionRequestReviewChanges,
+				)
+			}
+			canApprove, actionErr := f.nodeActionAuthorized(
+				ctx, projectID, actorID, core.ActionApprove, requiredRole,
+			)
+			if actionErr != nil {
+				return nil, actionErr
+			}
+			if canApprove {
+				canonicalReviewVerified, verifyErr := f.Engine.VerifyReviewApproval(
+					ctx,
+					run.ID,
+					node.Key,
+					expectedEventCursor,
+				)
+				switch {
+				case verifyErr == nil:
+					approvalAllowed := true
+					if actorID == run.StartedBy && workflowNodeProhibitsSelfReview(definitionNode) && !canonicalReviewVerified {
+						approvalAllowed, actionErr = f.soloSelfReviewActionAuthorized(ctx, projectID, actorID, run)
+						if actionErr != nil {
+							return nil, actionErr
+						}
+						if !approvalAllowed {
+							projection.BlockingReasons = append(projection.BlockingReasons, workflowActionBlocker(
+								"workflow_self_review_prohibited",
+								"This actor cannot approve their own Workflow output.",
+							))
+						}
+					}
+					if approvalAllowed {
+						projection.AllowedActions = append(projection.AllowedActions, WorkflowNodeActionApproveReview)
+					}
+				case errors.Is(verifyErr, domain.ErrInvalidTransition),
+					errors.Is(verifyErr, domain.ErrValidation),
+					errors.Is(verifyErr, domain.ErrInvalidArgument):
+					projection.BlockingReasons = append(projection.BlockingReasons, workflowActionBlocker(
+						"canonical_review_gate_blocked",
+						verifyErr.Error(),
+					))
+				default:
+					return nil, fmt.Errorf("project Workflow review action: %w", verifyErr)
+				}
+				allowWaiver := definitionNode.ReviewGate != nil && definitionNode.ReviewGate.AllowWaiver
+				if governedApplicationWorkflow(record.Definition) {
+					allowWaiver = false
+				}
+				if allowWaiver && !(actorID == run.StartedBy && workflowNodeProhibitsSelfReview(definitionNode)) {
+					projection.AllowedActions = append(projection.AllowedActions, WorkflowNodeActionWaiveReview)
+				}
+			}
+			if !canRequestChanges || !canApprove {
+				projection.BlockingReasons = append(projection.BlockingReasons, workflowRoleBlocker())
+			}
+		case NodeFailed:
+			if !dedicatedExternalQualification && !dedicatedQualifiedRelease {
+				allowed, actionErr := f.nodeActionAuthorized(
+					ctx, projectID, actorID, core.ActionEdit, core.RoleEditor,
+				)
+				if actionErr != nil {
+					return nil, actionErr
+				}
+				if allowed {
+					projection.AllowedActions = append(projection.AllowedActions, WorkflowNodeActionRetry)
+				} else {
+					projection.BlockingReasons = append(projection.BlockingReasons, workflowRoleBlocker())
+				}
+			}
+		}
+		projections[key] = projection
+	}
+	return projections, nil
+}
+
+func (f Facade) nodeActionAuthorized(
+	ctx context.Context,
+	projectID, actorID string,
+	action core.Action,
+	requiredRole core.Role,
+) (bool, error) {
+	role, err := f.Access.Authorize(ctx, projectID, actorID, action)
+	if errors.Is(err, core.ErrForbidden) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if requiredRole == "" {
+		return true, nil
+	}
+	return workflowRoleSatisfies(role, requiredRole), nil
+}
+
+func workflowNodeProhibitsSelfReview(definition domain.NodeDefinition) bool {
+	if definition.ReviewGate != nil {
+		return definition.ReviewGate.ProhibitSelfReview
+	}
+	return definition.Approval != nil && definition.Approval.ProhibitSelfReview
+}
+
+func (f Facade) soloSelfReviewActionAuthorized(
+	ctx context.Context,
+	projectID, actorID string,
+	run *RunRecord,
+) (bool, error) {
+	if run == nil || run.GovernanceMode != core.GovernanceModeSolo || f.Governance == nil {
+		return false, nil
+	}
+	governance, err := f.Governance.Governance(ctx, projectID)
+	if err != nil {
+		return false, err
+	}
+	role, err := f.Access.Authorize(ctx, projectID, actorID, core.ActionApprove)
+	if errors.Is(err, core.ErrForbidden) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if err := core.RequireSoloSelfReview(governance, role, true, "server-authoritative action projection"); err != nil {
+		if errors.Is(err, core.ErrSelfApproval) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
+func workflowActionBlocker(code, message string) WorkflowActionBlockingReason {
+	return WorkflowActionBlockingReason{Code: code, Message: message, SourceRef: nil}
+}
+
+func workflowRoleBlocker() WorkflowActionBlockingReason {
+	return workflowActionBlocker(
+		"workflow_role_insufficient",
+		"The current actor does not satisfy the action and node role requirements.",
+	)
+}
+
 func (f Facade) ListRuns(ctx context.Context, projectID, actorID string, options RunListOptions) (RunPage, error) {
 	if err := f.authorize(ctx, projectID, actorID, core.ActionView); err != nil {
 		return RunPage{}, err
@@ -517,7 +812,7 @@ func decodeRunCursor(value string) (time.Time, string, error) {
 
 func validRunStatus(status RunStatus) bool {
 	switch status {
-	case RunPending, RunRunning, RunWaitingInput, RunWaitingReview, RunCompleted, RunFailed, RunCancelled, RunStale:
+	case RunPending, RunRunning, RunWaitingInput, RunWaitingReview, RunWaitingQualification, RunCompleted, RunFailed, RunCancelled, RunStale:
 		return true
 	default:
 		return false
@@ -538,6 +833,9 @@ func (f Facade) Resume(ctx context.Context, projectID, runID, nodeKey, actorID s
 	if err != nil {
 		return err
 	}
+	if err := f.rejectGenericWorkflowCommand(ctx, run, nodeKey); err != nil {
+		return err
+	}
 	if err := f.requireNodeRole(ctx, actorID, run, nodeKey); err != nil {
 		return err
 	}
@@ -554,6 +852,9 @@ func (f Facade) AuthorizeExecution(ctx context.Context, projectID, runID, nodeKe
 	}
 	_, definition, err := f.nodeDefinition(ctx, run, nodeKey)
 	if err != nil {
+		return err
+	}
+	if err := rejectGenericWorkflowControl(run, definition); err != nil {
 		return err
 	}
 	action, requiredRole, required := nodeExecutionPolicy(definition)
@@ -577,7 +878,11 @@ func (f Facade) RecordProposal(ctx context.Context, projectID, runID, nodeKey, a
 	if err := f.authorize(ctx, projectID, actorID, core.ActionEdit); err != nil {
 		return err
 	}
-	if _, err := f.GetRun(ctx, projectID, runID, actorID); err != nil {
+	run, err := f.GetRun(ctx, projectID, runID, actorID)
+	if err != nil {
+		return err
+	}
+	if err := f.rejectGenericWorkflowCommand(ctx, run, nodeKey); err != nil {
 		return err
 	}
 	return f.Engine.RecordProposal(ctx, runID, nodeKey, proposal, actorID)
@@ -596,6 +901,9 @@ func (f Facade) ResolveReview(ctx context.Context, projectID, runID, nodeKey, ac
 	}
 	run, err := f.GetRun(ctx, projectID, runID, actorID)
 	if err != nil {
+		return err
+	}
+	if err := f.rejectGenericWorkflowCommand(ctx, run, nodeKey); err != nil {
 		return err
 	}
 	if err := f.requireNodeRole(ctx, actorID, run, nodeKey); err != nil {
@@ -652,6 +960,9 @@ func (f Facade) ResolveReview(ctx context.Context, projectID, runID, nodeKey, ac
 			if !exists {
 				return core.ErrNotFound
 			}
+			if err := rejectGenericWorkflowControl(run, successorDefinition); err != nil {
+				continue
+			}
 			requiredAction, requiredRole, required := nodeExecutionPolicy(successorDefinition)
 			if !required {
 				continue
@@ -687,7 +998,11 @@ func (f Facade) Retry(ctx context.Context, projectID, runID, nodeKey, actorID, r
 	if err := f.authorize(ctx, projectID, actorID, core.ActionEdit); err != nil {
 		return err
 	}
-	if _, err := f.GetRun(ctx, projectID, runID, actorID); err != nil {
+	run, err := f.GetRun(ctx, projectID, runID, actorID)
+	if err != nil {
+		return err
+	}
+	if err := f.rejectGenericWorkflowCommand(ctx, run, nodeKey); err != nil {
 		return err
 	}
 	return f.Engine.RetryNode(ctx, runID, nodeKey, actorID, reason)
@@ -702,6 +1017,9 @@ func (f Facade) Waive(ctx context.Context, projectID, runID, nodeKey, actorID, r
 	}
 	run, err := f.GetRun(ctx, projectID, runID, actorID)
 	if err != nil {
+		return err
+	}
+	if err := f.rejectGenericWorkflowCommand(ctx, run, nodeKey); err != nil {
 		return err
 	}
 	if err := f.requireNodeRole(ctx, actorID, run, nodeKey); err != nil {
@@ -732,11 +1050,34 @@ func (f Facade) nodeDefinition(ctx context.Context, run *RunRecord, nodeKey stri
 	return node, definition, nil
 }
 
+func (f Facade) rejectGenericWorkflowCommand(ctx context.Context, run *RunRecord, nodeKey string) error {
+	_, definition, err := f.nodeDefinition(ctx, run, nodeKey)
+	if err != nil {
+		return err
+	}
+	return rejectGenericWorkflowControl(run, definition)
+}
+
 func (f Facade) requireNodeRole(ctx context.Context, actorID string, run *RunRecord, nodeKey string) error {
 	_, definition, err := f.nodeDefinition(ctx, run, nodeKey)
 	if err != nil {
 		return err
 	}
+	required := requiredNodeRole(definition)
+	if required == "" {
+		return nil
+	}
+	actual, err := f.Access.Authorize(ctx, run.ProjectID, actorID, core.ActionView)
+	if err != nil {
+		return err
+	}
+	if !workflowRoleSatisfies(actual, required) {
+		return core.ErrForbidden
+	}
+	return nil
+}
+
+func requiredNodeRole(definition domain.NodeDefinition) core.Role {
 	required := ""
 	if definition.HumanEdit != nil {
 		required = definition.HumanEdit.RequiredRole
@@ -754,17 +1095,7 @@ func (f Facade) requireNodeRole(ctx context.Context, actorID string, run *RunRec
 	} else if definition.Publish != nil {
 		required = definition.Publish.RequiredRole
 	}
-	if required == "" {
-		return nil
-	}
-	actual, err := f.Access.Authorize(ctx, run.ProjectID, actorID, core.ActionView)
-	if err != nil {
-		return err
-	}
-	if !workflowRoleSatisfies(actual, core.Role(required)) {
-		return core.ErrForbidden
-	}
-	return nil
+	return core.Role(required)
 }
 
 func workflowRoleSatisfies(actual, required core.Role) bool {

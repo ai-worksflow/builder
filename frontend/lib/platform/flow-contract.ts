@@ -20,6 +20,7 @@ export type WorkflowNodeType =
   | 'fan_out'
   | 'merge'
   | 'quality_gate'
+  | 'external_qualification_gate'
   | 'manifest_compiler'
   | 'workbench_build'
   | 'publish'
@@ -122,6 +123,15 @@ export interface WorkflowQualityGateConfigDto {
   readonly requiredRole?: string
 }
 
+export interface WorkflowExternalQualificationGateConfigDto {
+  readonly blocking: true
+  readonly gateName: 'external-qualification'
+  readonly inputAuthoritySchema: 'worksflow-workflow-input-authority/v1'
+  readonly promotionProtocol: 'worksflow-qualification-promotion-consume/v2'
+  readonly receiptSchema: 'worksflow-qualification-receipt/v3'
+  readonly waiverPolicy: 'never'
+}
+
 export interface WorkflowManifestCompilerConfigDto {
   readonly manifestKind: string
   readonly schemaVersion: number
@@ -157,6 +167,7 @@ export interface WorkflowNodeDefinitionDto {
   readonly fanOut?: WorkflowFanOutConfigDto
   readonly merge?: WorkflowMergeConfigDto
   readonly qualityGate?: WorkflowQualityGateConfigDto
+  readonly externalQualificationGate?: WorkflowExternalQualificationGateConfigDto
   readonly manifestCompiler?: WorkflowManifestCompilerConfigDto
   readonly workbenchBuild?: WorkflowWorkbenchBuildConfigDto
   readonly publish?: WorkflowPublishConfigDto
@@ -258,6 +269,7 @@ export interface WorkflowCapabilitiesDto {
   readonly qualityGates: readonly string[]
   readonly publishEnvironments: readonly string[]
   readonly workbenchSchemaVersions: readonly number[]
+  readonly externalQualificationGate?: WorkflowExternalQualificationGateConfigDto
   readonly analysisLimits: {
     readonly maximumDefinitionNodes: number
     readonly maximumDefinitionEdges: number
@@ -345,6 +357,7 @@ export type WorkflowRunStatus =
   | 'running'
   | 'waiting_input'
   | 'waiting_review'
+  | 'waiting_qualification'
   | 'completed'
   | 'failed'
   | 'cancelled'
@@ -356,10 +369,26 @@ export type WorkflowNodeStatus =
   | 'running'
   | 'waiting_input'
   | 'waiting_review'
+  | 'waiting_qualification'
   | 'completed'
   | 'failed'
   | 'cancelled'
   | 'stale'
+
+export type WorkflowNodeAction =
+  | 'submit_input'
+  | 'record_proposal'
+  | 'authorize_execution'
+  | 'approve_review'
+  | 'request_review_changes'
+  | 'waive_review'
+  | 'retry'
+
+export interface WorkflowActionBlockingReasonDto {
+  readonly code: string
+  readonly message: string
+  readonly sourceRef: ExactArtifactRefDto | null
+}
 
 export interface WorkflowNodeRunDto {
   readonly id: string
@@ -373,6 +402,7 @@ export interface WorkflowNodeRunDto {
   readonly inputManifest?: ManifestRefDto
   readonly outputProposal?: { readonly id: string; readonly payloadHash: string }
   readonly outputRevisionId?: string
+  readonly inputAuthorityId?: string
   readonly leaseExpiresAt?: IsoDateTime
   readonly availableAt: IsoDateTime
   readonly startedAt?: IsoDateTime
@@ -380,6 +410,12 @@ export interface WorkflowNodeRunDto {
   readonly failure?: JsonValue
   readonly createdAt: IsoDateTime
   readonly updatedAt: IsoDateTime
+  /**
+   * Actor-specific server projection. Optional only while reading responses
+   * from an older server; UI controls must treat absence as no authority.
+   */
+  readonly allowedActions?: readonly WorkflowNodeAction[]
+  readonly blockingReasons?: readonly WorkflowActionBlockingReasonDto[]
 }
 
 export interface WorkflowProposalLineagePinDto {

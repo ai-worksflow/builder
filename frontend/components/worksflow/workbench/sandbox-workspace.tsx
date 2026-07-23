@@ -2,6 +2,7 @@
 
 import dynamic from 'next/dynamic'
 import {
+  type ReactNode,
   useCallback,
   useEffect,
   useMemo,
@@ -13,6 +14,7 @@ import {
   Bot,
   Braces,
   CheckCircle2,
+  ChevronDown,
   ChevronRight,
   CircleStop,
   Code2,
@@ -50,7 +52,10 @@ import { resolveSandboxLSPAdmission } from './sandbox-lsp-admission'
 import { SandboxLSPStatus } from './sandbox-lsp-status'
 import { useSandboxLSP } from './use-sandbox-lsp'
 import { useCollaboration } from '@/lib/collaboration/provider'
-import type { AgentCreateAttemptInput } from '@/lib/platform/agent-client'
+import type {
+  AgentAdvanceTaskGraphInput,
+  AgentCreateAttemptInput,
+} from '@/lib/platform/agent-client'
 import { PlatformHttpError } from '@/lib/platform/http'
 import { candidateDocumentURI } from '@/lib/platform/lsp-contract'
 import { usePlatformFlow } from '@/lib/platform/flow-provider'
@@ -80,6 +85,10 @@ import {
 import type { SandboxClient } from '@/lib/platform/sandbox-client'
 import { candidateAbandonEntryAllowed } from '@/lib/platform/sandbox-abandon'
 import {
+  preferredPreviewPort,
+  sandboxPreviewStage,
+} from '@/lib/platform/sandbox-experience'
+import {
   candidateFileReadCommitDecision,
   createExactCandidateFileOpenFence,
   openFileHeadRefreshDisposition,
@@ -91,6 +100,7 @@ import type {
   CandidateVerificationRunViewDto,
   VerificationProfileSummaryDto,
 } from '@/lib/platform/verification-contract'
+import { useI18n } from '@/lib/i18n'
 import { cn } from '@/lib/utils'
 
 const MonacoEditor = dynamic(
@@ -382,10 +392,12 @@ export function SandboxWorkspace({
   mode,
   projectId,
   buildManifestId,
+  toolbarAccessory,
 }: {
   readonly mode: SandboxWorkspaceMode
   readonly projectId: string
   readonly buildManifestId: string
+  readonly toolbarAccessory?: ReactNode
 }) {
   const { platformClient, can } = useCollaboration()
   const flow = usePlatformFlow()
@@ -419,6 +431,7 @@ export function SandboxWorkspace({
   const [candidateSearchRetryToken, setCandidateSearchRetryToken] = useState(0)
   const [markers, setMarkers] = useState<readonly MarkerSummary[]>([])
   const [inspector, setInspector] = useState<'diff' | 'problems'>('diff')
+  const [inspectorExpanded, setInspectorExpanded] = useState(false)
   const [process, setProcess] = useState<SandboxProcessDto | null>(null)
   const [processEtag, setProcessEtag] = useState('')
   const [ports, setPorts] = useState<SandboxPortListDto['ports']>([])
@@ -458,6 +471,7 @@ export function SandboxWorkspace({
   const sessionRef = useRef<SandboxSessionDto | null>(null)
   const candidateRef = useRef<CandidateWorkspaceDto | null>(null)
   const fencesRef = useRef<SandboxFences | null>(null)
+  const processRef = useRef<SandboxProcessDto | null>(null)
   const selectedFileRef = useRef<OpenFile | null>(null)
   const pendingSaveRef = useRef<PendingSave | null>(null)
   const mutationChainRef = useRef<Promise<void>>(Promise.resolve())
@@ -468,6 +482,7 @@ export function SandboxWorkspace({
   const candidateSearchAbortRef = useRef<AbortController | null>(null)
   const candidateSearchRequestRef = useRef(0)
   const candidateSearchAutomaticRetryIdentityRef = useRef<string | null>(null)
+  const previewAutoOpenRef = useRef('')
   const autoRestoreRef = useRef(false)
   const canMutateCandidate = Boolean(
     can('edit')
@@ -805,14 +820,41 @@ export function SandboxWorkspace({
 
   const acquireLease = useCallback(async (current: SandboxSessionDto, headers: Headers) => {
     if (!sandbox) throw new Error(copy.unavailable)
-    const currentFences = sandboxFences(headers, current)
-    const result = await sandbox.acquireWriterLease(current.id, 900, {
-      fences: currentFences,
-      idempotencyKey: `lease-v${currentFences.candidateVersion}-e${currentFences.sessionEpoch}`,
-    })
-    updateSession(result.data.session, result.headers)
-    updateCandidate(result.data.candidate)
-    return result
+    let projected = current
+    let projectedHeaders = headers
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const currentFences = sandboxFences(projectedHeaders, projected)
+      try {
+        const result = await sandbox.acquireWriterLease(projected.id, 900, {
+          fences: currentFences,
+          idempotencyKey: deterministicOperationKey('writer-lease', JSON.stringify({
+            sessionId: projected.id,
+            sessionVersion: projected.version,
+            candidateId: projected.candidate.id,
+            candidateVersion: currentFences.candidateVersion,
+            sessionEpoch: currentFences.sessionEpoch,
+            writerLeaseEpoch: currentFences.writerLeaseEpoch,
+            leaseSeconds: 900,
+          })),
+        })
+        updateSession(result.data.session, result.headers)
+        updateCandidate(result.data.candidate)
+        return result
+      } catch (cause) {
+        const refreshableProjection = cause instanceof PlatformHttpError && (
+          (cause.status === 409 && cause.code === 'sandbox_projection_stale')
+          || (cause.status === 412 && cause.code === 'sandbox_precondition_failed')
+        )
+        if (!refreshableProjection || attempt > 0) {
+          throw cause
+        }
+        const refreshed = await sandbox.getSession(projected.id)
+        projected = refreshed.data
+        projectedHeaders = refreshed.headers
+        updateSession(projected, projectedHeaders)
+      }
+    }
+    throw new Error('The SandboxSession projection could not be refreshed for a writer lease.')
   }, [copy.unavailable, sandbox, updateCandidate, updateSession])
 
   const openSandbox = useCallback(async () => {
@@ -1023,23 +1065,77 @@ export function SandboxWorkspace({
           sessionKey,
         } satisfies PersistedSession)
       }
+      const replaceStaleSession = async () => {
+        // A Candidate may advance through activity owned by another browser
+        // session while this durable session is suspended. The old session
+        // remains correctly fenced; replace it with a new session that
+        // projects the exact current Candidate instead of weakening resume CAS.
+        const replacementKey = randomKey('session')
+        persisted = { candidateId: workspaceCandidate.id, sessionKey: replacementKey }
+        setStorageValue(sessionStorageKey, persisted)
+        const replacement = await sandbox.createSession(
+          projectId,
+          workspaceCandidate.id,
+          { signal: controller.signal, idempotencyKey: replacementKey },
+        )
+        setStorageValue(sessionStorageKey, {
+          candidateId: workspaceCandidate.id,
+          sessionId: replacement.data.id,
+          sessionKey: replacementKey,
+        } satisfies PersistedSession)
+        return replacement
+      }
+      const projected = sessionResult.data.candidate
+      if (sessionResult.data.state === 'suspended' && (
+        projected.version !== workspaceCandidate.version
+        || projected.journalSequence !== workspaceCandidate.journalSequence
+        || projected.sessionEpoch !== workspaceCandidate.sessionEpoch
+        || projected.writerLeaseEpoch !== workspaceCandidate.writerLeaseEpoch
+        || projected.treeHash !== workspaceCandidate.treeHash
+      )) {
+        sessionResult = await replaceStaleSession()
+      }
       const replayed = workspaceCandidate.status === 'active'
         ? await replayPendingSave(sessionResult.data.id)
         : undefined
-      const interactive = await waitUntilInteractive(
-        replayed?.session ?? sessionResult.data,
-        replayed?.headers ?? sessionResult.headers,
-        controller.signal,
-      )
+      let interactive
+      try {
+        interactive = await waitUntilInteractive(
+          replayed?.session ?? sessionResult.data,
+          replayed?.headers ?? sessionResult.headers,
+          controller.signal,
+        )
+      } catch (cause) {
+        const suspendedProjectionStale = cause instanceof PlatformHttpError
+          && cause.status === 409
+          && cause.code === 'sandbox_projection_stale'
+          && sessionResult.data.state === 'suspended'
+        if (!suspendedProjectionStale) throw cause
+
+        sessionResult = await replaceStaleSession()
+        interactive = await waitUntilInteractive(
+          sessionResult.data,
+          sessionResult.headers,
+          controller.signal,
+        )
+      }
       const leased = interactive.session.candidate.status === 'active'
         ? await acquireLease(interactive.session, interactive.headers)
         : undefined
       const openedSession = leased?.data.session ?? interactive.session
       const opened = await loadTree(openedSession.id)
       const services = opened.session.allowedServices
-      const defaultService = services.find((service) => service.profiles.includes('dev')) ?? services[0]
+      const defaultService = mode === 'preview'
+        ? services.find((service) => service.kind === 'web' && service.profiles.includes('start'))
+          ?? services.find((service) => service.profiles.includes('start'))
+          ?? services[0]
+        : services.find((service) => service.profiles.includes('dev')) ?? services[0]
       setSelectedService(defaultService?.id ?? '')
-      setSelectedProfile(defaultService?.profiles.includes('dev') ? 'dev' : defaultService?.profiles[0] ?? '')
+      setSelectedProfile(
+        mode === 'preview' && defaultService?.profiles.includes('start')
+          ? 'start'
+          : defaultService?.profiles.includes('dev') ? 'dev' : defaultService?.profiles[0] ?? '',
+      )
       const processes = await sandbox.listProcesses(opened.session.id, { limit: 50 })
       const running = processes.data.processes.find((item) => item.state === 'running' || item.state === 'starting') ?? null
       if (running) {
@@ -1076,6 +1172,7 @@ export function SandboxWorkspace({
     copy.unavailable,
     loadTree,
     loadVerificationContext,
+    mode,
     projectId,
     replayPendingSave,
     repository,
@@ -1090,8 +1187,9 @@ export function SandboxWorkspace({
     sessionRef.current = session
     candidateRef.current = candidate
     fencesRef.current = fences
+    processRef.current = process
     selectedFileRef.current = selectedFile
-  }, [candidate, fences, selectedFile, session])
+  }, [candidate, fences, process, selectedFile, session])
 
   useEffect(() => () => {
     openAbortRef.current?.abort()
@@ -1721,6 +1819,26 @@ export function SandboxWorkspace({
           input,
         }))
         return agent.createAttempt(currentSession.id, input, { idempotencyKey })
+      })
+    } finally {
+      finishAgentMutation()
+    }
+  }, [agent, beginAgentMutation, enqueueMutation, finishAgentMutation, queueSave, requireExactAgentWorkspace])
+
+  const advanceAgentTaskGraph = useCallback(async (input: AgentAdvanceTaskGraphInput) => {
+    if (!agent) throw new Error('The authenticated platform client does not expose Agent APIs.')
+    beginAgentMutation()
+    try {
+      await queueSave()
+      return await enqueueMutation(async () => {
+        const { currentSession, currentCandidate } = requireExactAgentWorkspace()
+        const idempotencyKey = deterministicOperationKey('agent-task-graph-advance', JSON.stringify({
+          sessionId: currentSession.id,
+          candidateVersion: currentCandidate.version,
+          treeHash: currentCandidate.treeHash,
+          input,
+        }))
+        return agent.advanceTaskGraph(currentSession.id, input, { idempotencyKey })
       })
     } finally {
       finishAgentMutation()
@@ -2559,38 +2677,115 @@ export function SandboxWorkspace({
     }
   }, [sandbox, updateSession])
 
+  const refreshProcess = useCallback(async () => {
+    const current = sessionRef.current
+    const currentProcess = processRef.current
+    if (!sandbox || !current || !currentProcess) return
+    try {
+      const result = await sandbox.getProcess(current.id, currentProcess.id)
+      updateSession(result.data.session, result.headers)
+      setProcess(result.data.process)
+      setProcessEtag(
+        result.etag
+        ?? result.headers.get('x-sandbox-process-etag')
+        ?? `"sandbox-process:${result.data.process.id}:${result.data.process.version}"`,
+      )
+      if (result.data.process.state === 'failed') {
+        const logs = await sandbox.readProcessLogs(current.id, currentProcess.id, 0, 16 << 10)
+        const output = conflictText({ encoding: 'base64', data: logs.data.log.valueBase64 })
+        const lastLine = output.trim().split('\n').filter(Boolean).at(-1)?.trim()
+        setError(
+          lastLine
+            ? `Preview start failed: ${lastLine}`
+            : result.data.process.failure || `Preview process exited with code ${result.data.process.exitCode ?? 'unknown'}.`,
+        )
+      }
+    } catch (cause) {
+      setError(errorMessage(cause))
+    }
+  }, [sandbox, updateSession])
+
   useEffect(() => {
     if (phase !== 'ready' || !process || (process.state !== 'running' && process.state !== 'starting')) return
-    const timer = window.setInterval(() => void refreshPorts(), 2000)
+    const refreshRuntime = () => {
+      void refreshProcess()
+      void refreshPorts()
+    }
+    refreshRuntime()
+    const timer = window.setInterval(refreshRuntime, 2000)
     return () => window.clearInterval(timer)
-  }, [phase, process, refreshPorts])
+  }, [phase, process, refreshPorts, refreshProcess])
 
   const startProcess = useCallback(() => {
     const current = sessionRef.current
     const currentFences = fencesRef.current
     if (!sandbox || !current || !currentFences || !current.allowedActions.includes('process') || !selectedService || !selectedProfile) return
     setRuntimeBusy(true)
+    setPreview(null)
+    previewAutoOpenRef.current = ''
     void enqueueMutation(async () => {
       try {
-        const result = await sandbox.startProcess(
-          current.id,
-          { serviceId: selectedService, commandId: selectedProfile },
-          {
-            fences: currentFences,
-            idempotencyKey: randomKey(`process-v${currentFences.sessionEpoch}-${current.version}`),
-          },
-        )
-        updateSession(result.data.session, result.headers)
-        setProcess(result.data.process)
-        setProcessEtag(result.etag ?? result.headers.get('x-sandbox-process-etag') ?? '')
-        await refreshPorts()
+        let projected = current
+        let projectedFences = currentFences
+        let replacedRuntime = false
+        for (let attempt = 0; attempt < 3; attempt += 1) {
+          try {
+            const result = await sandbox.startProcess(
+              projected.id,
+              { serviceId: selectedService, commandId: selectedProfile },
+              {
+                fences: projectedFences,
+                idempotencyKey: randomKey(`process-v${projectedFences.sessionEpoch}-${projected.version}`),
+              },
+            )
+            updateSession(result.data.session, result.headers)
+            setProcess(result.data.process)
+            setProcessEtag(result.etag ?? result.headers.get('x-sandbox-process-etag') ?? '')
+            await refreshPorts()
+            return
+          } catch (cause) {
+            const projectionStale = cause instanceof PlatformHttpError && (
+              (cause.status === 409 && cause.code === 'sandbox_projection_stale')
+              || (cause.status === 412 && cause.code === 'sandbox_precondition_failed')
+            )
+            if (projectionStale && attempt === 0) {
+              const refreshed = await sandbox.getSession(projected.id)
+              projected = refreshed.data
+              projectedFences = sandboxFences(refreshed.headers, refreshed.data)
+              updateSession(projected, refreshed.headers)
+              continue
+            }
+            const runtimeStale = cause instanceof PlatformHttpError
+              && cause.status === 409
+              && cause.code === 'sandbox_runtime_stale'
+            if (runtimeStale && !replacedRuntime) {
+              const staleSessionId = projected.id
+              replacedRuntime = true
+              setStorageValue(sessionStorageKey)
+              await openSandbox()
+              const replacement = sessionRef.current
+              const replacementFences = fencesRef.current
+              if (!replacement || !replacementFences || replacement.id === staleSessionId) {
+                throw new Error('The stale SandboxSession could not be replaced with the current runtime.', { cause })
+              }
+              const replacementService = replacement.allowedServices.find((service) => service.id === selectedService)
+              if (!replacementService?.profiles.includes(selectedProfile)) {
+                throw new Error('The refreshed SandboxSession no longer exposes the selected preview command.', { cause })
+              }
+              projected = replacement
+              projectedFences = replacementFences
+              continue
+            }
+            throw cause
+          }
+        }
       } catch (cause) {
         setError(errorMessage(cause))
       } finally {
         setRuntimeBusy(false)
       }
     })
-  }, [enqueueMutation, refreshPorts, sandbox, selectedProfile, selectedService, updateSession])
+  }, [enqueueMutation, openSandbox, refreshPorts, sandbox, selectedProfile, selectedService, sessionStorageKey, updateSession])
 
   const stopProcess = useCallback(() => {
     const currentSession = sessionRef.current
@@ -2607,6 +2802,8 @@ export function SandboxWorkspace({
         updateSession(result.data.session, result.headers)
         setProcess(result.data.process)
         setProcessEtag(result.etag ?? processEtag)
+        setPreview(null)
+        previewAutoOpenRef.current = ''
       } catch (cause) {
         setError(errorMessage(cause))
       } finally {
@@ -2634,6 +2831,16 @@ export function SandboxWorkspace({
       }
     })
   }, [enqueueMutation, sandbox])
+
+  useEffect(() => {
+    if (mode !== 'preview' || phase !== 'ready' || runtimeBusy || !session || !process) return
+    const port = preferredPreviewPort(ports, preview)
+    if (!port) return
+    const identity = [session.id, session.sessionEpoch, process.id, process.version, port.name].join(':')
+    if (previewAutoOpenRef.current === identity) return
+    previewAutoOpenRef.current = identity
+    openPreview(port.name)
+  }, [mode, openPreview, phase, ports, preview, process, runtimeBusy, session])
 
   const openTerminal = useCallback(() => {
     const current = sessionRef.current
@@ -2797,6 +3004,7 @@ export function SandboxWorkspace({
   return (
     <div className="flex h-full min-h-0 flex-col bg-background">
       <SandboxToolbar
+        mode={mode}
         session={session}
         candidate={candidate}
         saveState={saveState}
@@ -2811,10 +3019,15 @@ export function SandboxWorkspace({
         checkpointBusy={checkpointBusy}
         freezeBusy={freezeBusy}
         verificationReadyForFreeze={verificationReadyForFreeze}
+        accessory={toolbarAccessory}
         onService={(serviceId) => {
           setSelectedService(serviceId)
           const service = session.allowedServices.find((item) => item.id === serviceId)
-          setSelectedProfile(service?.profiles.includes('dev') ? 'dev' : service?.profiles[0] ?? '')
+          setSelectedProfile(
+            mode === 'preview' && service?.profiles.includes('start')
+              ? 'start'
+              : service?.profiles.includes('dev') ? 'dev' : service?.profiles[0] ?? '',
+          )
         }}
         onProfile={setSelectedProfile}
         onStart={startProcess}
@@ -2934,24 +3147,26 @@ export function SandboxWorkspace({
           </button>
         </div>
       )}
-      <VerificationPanel
-        session={session}
-        candidate={candidate}
-        profiles={verificationProfiles}
-        selectedProfileKey={selectedVerificationProfileKey}
-        run={verificationRun}
-        receipt={verificationReceipt}
-        retryReason={verificationRetryReason}
-        error={verificationError}
-        busy={verificationBusy}
-        workspaceBusy={abandonBusy || checkpointBusy || freezeBusy || agentMutationBusy || saveState !== 'saved'}
-        canEdit={can('edit')}
-        onProfile={setSelectedVerificationProfileKey}
-        onVerify={createVerificationRun}
-        onCancel={cancelVerificationRun}
-        onRetryReason={setVerificationRetryReason}
-        onRetry={retryVerificationRun}
-      />
+      {mode === 'code' && (
+        <VerificationPanel
+          session={session}
+          candidate={candidate}
+          profiles={verificationProfiles}
+          selectedProfileKey={selectedVerificationProfileKey}
+          run={verificationRun}
+          receipt={verificationReceipt}
+          retryReason={verificationRetryReason}
+          error={verificationError}
+          busy={verificationBusy}
+          workspaceBusy={abandonBusy || checkpointBusy || freezeBusy || agentMutationBusy || saveState !== 'saved'}
+          canEdit={can('edit')}
+          onProfile={setSelectedVerificationProfileKey}
+          onVerify={createVerificationRun}
+          onCancel={cancelVerificationRun}
+          onRetryReason={setVerificationRetryReason}
+          onRetry={retryVerificationRun}
+        />
+      )}
       {error && (
         <div role="alert" className="flex shrink-0 items-center gap-2 border-b border-destructive/30 bg-destructive/10 px-3 py-2 text-[10px] text-destructive">
           <AlertTriangle className="size-3.5 shrink-0" />
@@ -2978,8 +3193,12 @@ export function SandboxWorkspace({
           onRetry={sandboxLSP.retry}
         />
       )}
-      {mode === 'preview' ? (
+      <div
+        className={cn('min-h-0 flex-1', mode === 'preview' ? 'flex' : 'hidden')}
+        aria-hidden={mode !== 'preview'}
+      >
         <SandboxPreview
+          process={process}
           preview={preview}
           ports={ports}
           viewport={viewport}
@@ -2988,8 +3207,11 @@ export function SandboxWorkspace({
           onOpen={openPreview}
           busy={runtimeBusy || abandonBusy}
         />
-      ) : (
-        <div className="flex min-h-0 flex-1">
+      </div>
+      <div
+        className={cn('min-h-0 flex-1', mode === 'code' ? 'flex' : 'hidden')}
+        aria-hidden={mode !== 'code'}
+      >
           <FileTree
             files={treeFiles}
             selected={selectedFile?.path}
@@ -3097,6 +3319,8 @@ export function SandboxWorkspace({
               <InspectorPane
                 tab={inspector}
                 onTab={setInspector}
+                expanded={inspectorExpanded}
+                onExpanded={setInspectorExpanded}
                 file={selectedFile}
                 markers={markers}
               />
@@ -3117,14 +3341,14 @@ export function SandboxWorkspace({
               sessionId={session.id}
               canEdit={!selectedFile?.stale && canMutateCandidate && session.allowedActions.includes('agent')}
               workspaceBusy={abandonBusy || agentMutationBusy || checkpointBusy || freezeBusy || saveState !== 'saved'}
+              onAdvance={advanceAgentTaskGraph}
               onCreate={createAgentAttempt}
               onMerge={mergeAgentPatch}
               onUndo={undoAgentPatch}
               onClose={() => setShowAgent(false)}
             />
           )}
-        </div>
-      )}
+      </div>
     </div>
   )
 }
@@ -3607,6 +3831,7 @@ function VerificationMetric({ label, value }: { readonly label: string; readonly
 }
 
 function SandboxToolbar({
+  mode,
   session,
   candidate,
   saveState,
@@ -3621,6 +3846,7 @@ function SandboxToolbar({
   checkpointBusy,
   freezeBusy,
   verificationReadyForFreeze,
+  accessory,
   onService,
   onProfile,
   onStart,
@@ -3638,6 +3864,7 @@ function SandboxToolbar({
   onFreeze,
   onRetrySave,
 }: {
+  readonly mode: SandboxWorkspaceMode
   readonly session: SandboxSessionDto
   readonly candidate: CandidateWorkspaceDto
   readonly saveState: SaveState
@@ -3652,6 +3879,7 @@ function SandboxToolbar({
   readonly checkpointBusy: boolean
   readonly freezeBusy: boolean
   readonly verificationReadyForFreeze: boolean
+  readonly accessory?: ReactNode
   readonly onService: (value: string) => void
   readonly onProfile: (value: string) => void
   readonly onStart: () => void
@@ -3669,6 +3897,7 @@ function SandboxToolbar({
   readonly onFreeze: () => void
   readonly onRetrySave: () => void
 }) {
+  const { t } = useI18n()
   const profiles = services.find((service) => service.id === selectedService)?.profiles ?? []
   const checkpoint = session.latestCheckpoint
   const checkpointed = Boolean(
@@ -3694,26 +3923,42 @@ function SandboxToolbar({
     <div className="flex min-h-11 shrink-0 flex-wrap items-center gap-2 border-b border-border bg-panel px-3 py-1.5">
       <div className="flex min-w-0 items-center gap-2">
         <Server className="size-3.5 text-success" />
-        <span className="font-mono text-[9px] text-muted-foreground" title={session.id}>{session.id.slice(0, 8)}</span>
+        <span className="text-[9px] font-semibold text-muted-foreground">
+          {mode === 'preview' ? t('sandbox.mode.preview') : t('sandbox.mode.code')}
+        </span>
         <span className="rounded bg-success/10 px-1.5 py-0.5 text-[8px] font-semibold uppercase text-success">{session.state}</span>
-        <span className={cn(
-          'rounded px-1.5 py-0.5 text-[8px] font-semibold uppercase',
-          frozen ? 'bg-primary/10 text-primary-bright' : 'bg-white/5 text-faint-foreground',
-        )}>{candidate.status}</span>
-        <span className="font-mono text-[8px] text-faint-foreground">C{candidate.version} · E{candidate.writerLeaseEpoch}</span>
+        {mode === 'code' ? (
+          <>
+            <span className={cn(
+              'rounded px-1.5 py-0.5 text-[8px] font-semibold uppercase',
+              frozen ? 'bg-primary/10 text-primary-bright' : 'bg-white/5 text-faint-foreground',
+            )}>{candidate.status}</span>
+            <details className="text-[8px] text-faint-foreground">
+              <summary className="cursor-pointer">{t('sandbox.technicalState')}</summary>
+              <span className="font-mono" title={session.id}>{session.id.slice(0, 8)} · C{candidate.version} · E{candidate.writerLeaseEpoch}</span>
+            </details>
+          </>
+        ) : (
+          <span className="rounded bg-warning/10 px-1.5 py-0.5 text-[8px] font-semibold text-warning">
+            {t('sandbox.preview.notProduction')}
+          </span>
+        )}
       </div>
-      <div className="ml-auto flex items-center gap-1.5">
-        <select value={selectedService} onChange={(event) => onService(event.target.value)} disabled={abandonBusy || !canProcess} className="h-7 max-w-36 rounded border border-border bg-background px-1.5 text-[9px] text-muted-foreground disabled:opacity-40">
+      {accessory}
+      <div className="ml-auto flex w-full flex-wrap items-center justify-end gap-1.5 sm:w-auto">
+        <select aria-label={t('sandbox.service')} value={selectedService} onChange={(event) => onService(event.target.value)} disabled={abandonBusy || !canProcess} className="h-7 max-w-36 rounded border border-border bg-background px-1.5 text-[9px] text-muted-foreground disabled:opacity-40">
           {services.map((service) => <option key={service.id} value={service.id}>{service.id}</option>)}
         </select>
-        <select value={selectedProfile} onChange={(event) => onProfile(event.target.value)} disabled={abandonBusy || !canProcess} className="h-7 max-w-28 rounded border border-border bg-background px-1.5 text-[9px] text-muted-foreground disabled:opacity-40">
+        <select aria-label={t('sandbox.profile')} value={selectedProfile} onChange={(event) => onProfile(event.target.value)} disabled={abandonBusy || !canProcess} className="h-7 max-w-28 rounded border border-border bg-background px-1.5 text-[9px] text-muted-foreground disabled:opacity-40">
           {profiles.map((profile) => <option key={profile} value={profile}>{profile}</option>)}
         </select>
         {process && (process.state === 'running' || process.state === 'starting') ? (
-          <button type="button" onClick={onStop} disabled={runtimeBusy || agentBusy || abandonBusy || !canProcess} className="inline-flex h-7 items-center gap-1 rounded border border-destructive/30 px-2 text-[9px] text-destructive disabled:opacity-40"><CircleStop className="size-3" /> Stop</button>
+          <button type="button" onClick={onStop} disabled={runtimeBusy || agentBusy || abandonBusy || !canProcess} className="inline-flex h-7 items-center gap-1 rounded border border-destructive/30 px-2 text-[9px] text-destructive disabled:opacity-40"><CircleStop className="size-3" /> {t('sandbox.stop')}</button>
         ) : (
-          <button type="button" onClick={onStart} disabled={runtimeBusy || agentBusy || abandonBusy || !canProcess || !selectedService || !selectedProfile} className="inline-flex h-7 items-center gap-1 rounded bg-primary px-2 text-[9px] font-semibold text-primary-foreground disabled:opacity-40">{runtimeBusy ? <LoaderCircle className="size-3 animate-spin" /> : <Play className="size-3" />} Run</button>
+          <button type="button" onClick={onStart} disabled={runtimeBusy || agentBusy || abandonBusy || !canProcess || !selectedService || !selectedProfile} className="inline-flex h-7 items-center gap-1 rounded bg-primary px-2 text-[9px] font-semibold text-primary-foreground disabled:opacity-40">{runtimeBusy ? <LoaderCircle className="size-3 animate-spin" /> : <Play className="size-3" />} {mode === 'preview' ? t('sandbox.preview.start') : t('sandbox.run')}</button>
         )}
+        {mode === 'code' && (
+          <>
         <button type="button" onClick={onTerminal} disabled={agentBusy || abandonBusy || !canUseTerminal} className="inline-flex h-7 items-center gap-1 rounded border border-border px-2 text-[9px] text-muted-foreground hover:text-foreground disabled:opacity-40"><SquareTerminal className="size-3" /> Terminal</button>
         <button type="button" onClick={onAgent} disabled={abandonBusy || !agentAvailable || !canUseAgent} title={agentAvailable ? 'Open the exact-input Project Agent.' : 'Agent APIs are unavailable in this deployment.'} className={cn('inline-flex h-7 items-center gap-1 rounded border px-2 text-[9px] disabled:opacity-40', agentOpen ? 'border-primary/40 bg-primary/10 text-primary-bright' : 'border-border text-muted-foreground hover:text-foreground')}><Bot className="size-3" /> Agent</button>
         {canResume ? (
@@ -3770,7 +4015,9 @@ function SandboxToolbar({
             : <PackageCheck className="size-3" />}
           {frozen ? 'Proposal created' : 'Create Proposal'}
         </button>
-        <SaveStatus state={saveState} onRetry={onRetrySave} />
+          </>
+        )}
+        {mode === 'code' && <SaveStatus state={saveState} onRetry={onRetrySave} />}
       </div>
     </div>
   )
@@ -4030,21 +4277,35 @@ function FileTree({
 function InspectorPane({
   tab,
   onTab,
+  expanded,
+  onExpanded,
   file,
   markers,
 }: {
   readonly tab: 'diff' | 'problems'
   readonly onTab: (value: 'diff' | 'problems') => void
+  readonly expanded: boolean
+  readonly onExpanded: (value: boolean) => void
   readonly file: OpenFile
   readonly markers: readonly MarkerSummary[]
 }) {
   return (
-    <section className="h-48 shrink-0 border-t border-border bg-panel">
-      <div className="flex h-8 items-center gap-1 border-b border-border px-2">
+    <section className={cn('shrink-0 border-t border-border bg-panel', expanded ? 'h-48' : 'h-8')}>
+      <div className={cn('flex h-8 items-center gap-1 px-2', expanded && 'border-b border-border')}>
         <button type="button" onClick={() => onTab('diff')} className={cn('inline-flex h-6 items-center gap-1 rounded px-2 text-[9px]', tab === 'diff' ? 'bg-primary/10 text-primary-bright' : 'text-faint-foreground')}><FileDiff className="size-3" /> Diff</button>
         <button type="button" onClick={() => onTab('problems')} className={cn('inline-flex h-6 items-center gap-1 rounded px-2 text-[9px]', tab === 'problems' ? 'bg-primary/10 text-primary-bright' : 'text-faint-foreground')}><AlertTriangle className="size-3" /> Problems <span className="rounded bg-white/5 px-1">{markers.length}</span></button>
+        <button
+          type="button"
+          onClick={() => onExpanded(!expanded)}
+          aria-expanded={expanded}
+          aria-label={expanded ? 'Collapse Diff and Problems' : 'Expand Diff and Problems'}
+          title={expanded ? 'Collapse Diff and Problems' : 'Expand Diff and Problems'}
+          className="ml-auto inline-flex size-6 items-center justify-center rounded text-faint-foreground hover:bg-white/5 hover:text-foreground"
+        >
+          <ChevronDown className={cn('size-3.5 transition-transform', !expanded && '-rotate-90')} />
+        </button>
       </div>
-      <div className="h-[calc(100%-2rem)]">
+      {expanded && <div className="h-[calc(100%-2rem)]">
         {tab === 'diff' ? (
           <MonacoDiffEditor
             original={file.savedContent}
@@ -4064,7 +4325,7 @@ function InspectorPane({
             ))}
           </div>
         )}
-      </div>
+      </div>}
     </section>
   )
 }
@@ -4105,6 +4366,7 @@ function BinaryFileViewer({ file }: { readonly file: OpenFile }) {
 }
 
 function SandboxPreview({
+  process,
   preview,
   ports,
   viewport,
@@ -4113,6 +4375,7 @@ function SandboxPreview({
   onOpen,
   busy,
 }: {
+  readonly process: SandboxProcessDto | null
   readonly preview: SandboxPreviewLinkDto | null
   readonly ports: SandboxPortListDto['ports']
   readonly viewport: 'desktop' | 'tablet' | 'mobile'
@@ -4121,13 +4384,46 @@ function SandboxPreview({
   readonly onOpen: (portName: string) => void
   readonly busy: boolean
 }) {
+  const { t } = useI18n()
   const width = viewport === 'desktop' ? '100%' : viewport === 'tablet' ? 768 : 390
+  const stage = sandboxPreviewStage(process, ports, preview)
+  const stageCopy = {
+    'not-started': {
+      label: t('sandbox.preview.stage.readyToStart'),
+      title: t('sandbox.preview.empty.startTitle'),
+      detail: t('sandbox.preview.empty.startDetail'),
+    },
+    starting: {
+      label: t('sandbox.preview.stage.starting'),
+      title: t('sandbox.preview.empty.startingTitle'),
+      detail: t('sandbox.preview.empty.startingDetail'),
+    },
+    'waiting-for-port': {
+      label: t('sandbox.preview.stage.waiting'),
+      title: t('sandbox.preview.empty.waitingTitle'),
+      detail: t('sandbox.preview.empty.waitingDetail'),
+    },
+    ready: {
+      label: preview ? t('sandbox.preview.stage.ready') : t('sandbox.preview.stage.opening'),
+      title: t('sandbox.preview.empty.openingTitle'),
+      detail: t('sandbox.preview.empty.openingDetail'),
+    },
+    stopped: {
+      label: t('sandbox.preview.stage.stopped'),
+      title: t('sandbox.preview.empty.stoppedTitle'),
+      detail: t('sandbox.preview.empty.stoppedDetail'),
+    },
+  }[stage]
   return (
     <div className="flex min-h-0 flex-1 flex-col bg-canvas">
       <div className="flex min-h-10 shrink-0 flex-wrap items-center gap-2 border-b border-border bg-panel px-3 py-1">
         <MonitorPlay className="size-3.5 text-primary-bright" />
-        <span className="text-[10px] font-semibold">Isolated Preview</span>
-        <button type="button" onClick={() => void onRefresh()} className="rounded p-1 text-faint-foreground hover:text-foreground" title="Probe declared ports"><RefreshCw className="size-3" /></button>
+        <span className="text-[10px] font-semibold">{t('sandbox.preview.title')}</span>
+        <span role="status" className={cn(
+          'rounded px-1.5 py-0.5 text-[8px] font-semibold',
+          stage === 'ready' && preview ? 'bg-success/10 text-success' : 'bg-primary/10 text-primary-bright',
+        )}>{stageCopy.label}</span>
+        <button type="button" onClick={() => void onRefresh()} className="rounded p-1 text-faint-foreground hover:text-foreground" title={t('sandbox.preview.refreshPorts')}><RefreshCw className="size-3" /></button>
         <div className="flex min-w-0 flex-1 gap-1 overflow-x-auto">
           {ports.map((port) => (
             <button key={port.name} type="button" disabled={!port.previewable || !port.healthy || busy} onClick={() => onOpen(port.name)} className={cn('inline-flex h-7 shrink-0 items-center gap-1 rounded border px-2 text-[8px]', port.healthy ? 'border-success/30 bg-success/10 text-success' : 'border-border text-faint-foreground', 'disabled:opacity-40')}>
@@ -4136,9 +4432,11 @@ function SandboxPreview({
             </button>
           ))}
         </div>
-        {(['desktop', 'tablet', 'mobile'] as const).map((value) => (
-          <button key={value} type="button" onClick={() => onViewport(value)} className={cn('rounded px-2 py-1 text-[8px]', viewport === value ? 'bg-primary/15 text-primary-bright' : 'text-faint-foreground')}>{value}</button>
-        ))}
+        <div className="ml-auto flex shrink-0 items-center gap-0.5" aria-label={t('sandbox.preview.viewport')}>
+          {(['desktop', 'tablet', 'mobile'] as const).map((value) => (
+            <button key={value} type="button" onClick={() => onViewport(value)} className={cn('rounded px-2 py-1 text-[8px]', viewport === value ? 'bg-primary/15 text-primary-bright' : 'text-faint-foreground')}>{t(`sandbox.preview.viewport.${value}`)}</button>
+          ))}
+        </div>
       </div>
       <div className="flex min-h-0 flex-1 justify-center overflow-auto bg-[#08080a] p-3 scrollbar-thin">
         {preview ? (
@@ -4153,9 +4451,14 @@ function SandboxPreview({
           />
         ) : (
           <div className="m-auto max-w-md rounded-lg border border-dashed border-border bg-panel p-6 text-center">
-            <MonitorPlay className="mx-auto mb-3 size-6 text-faint-foreground" />
-            <h3 className="text-xs font-semibold">No listening Preview port yet</h3>
-            <p className="mt-2 text-[9px] leading-relaxed text-faint-foreground">Run an exact Template profile, wait for a declared HTTP port to become healthy, then open its short-lived capability URL.</p>
+            {stage === 'starting' || stage === 'waiting-for-port' || stage === 'ready'
+              ? <LoaderCircle className="mx-auto mb-3 size-6 animate-spin text-primary-bright" />
+              : <MonitorPlay className="mx-auto mb-3 size-6 text-faint-foreground" />}
+            <h3 className="text-xs font-semibold">{stageCopy.title}</h3>
+            <p className="mt-2 text-[9px] leading-relaxed text-faint-foreground">{stageCopy.detail}</p>
+            <p className="mt-3 border-t border-border pt-3 text-[8px] leading-relaxed text-faint-foreground">
+              {t('sandbox.preview.boundary')}
+            </p>
           </div>
         )}
       </div>

@@ -394,6 +394,33 @@ func validateBlueprintRequirementTrace(payload json.RawMessage, trace requiremen
 	if len(envelope.Nodes)+semanticNodeCount == 0 {
 		return nil
 	}
+	// Draft editing is intentionally incremental: the UI persists every node
+	// addition and field change independently. Keep the immutable Requirement
+	// Baseline boundary active during those partial saves, but defer complete
+	// graph, Page, edge, and coverage validation until review/revision gates.
+	if !semanticStrict(strictValues) {
+		nodeSets := [][]json.RawMessage{envelope.Nodes}
+		if envelope.Semantic != nil {
+			nodeSets = append(nodeSets, envelope.Semantic.Nodes)
+		}
+		for _, candidates := range nodeSets {
+			for _, raw := range candidates {
+				var node map[string]any
+				if err := json.Unmarshal(raw, &node); err != nil {
+					return fmt.Errorf("decode Blueprint draft node trace: %w", err)
+				}
+				for _, requirementID := range stringSlice(node["requirementIds"]) {
+					if !trace.requirements[requirementID] {
+						return fmt.Errorf(
+							"Blueprint draft node %s references unknown Requirement Baseline ID %q",
+							strings.TrimSpace(firstString(node, "id")), requirementID,
+						)
+					}
+				}
+			}
+		}
+		return nil
+	}
 	nodes, _, err := DecodeBlueprintSemanticGraph(payload)
 	if err != nil {
 		return err
@@ -665,6 +692,28 @@ type prototypeSemanticAuthority struct {
 	baselineRef        VersionRef
 	blueprintRef       VersionRef
 	pageSpecRef        VersionRef
+}
+
+// ValidatePrototypeAgainstPageSpec performs the semantic lineage checks needed
+// before a generated Prototype proposal is persisted. It uses only the frozen
+// PageSpec authority available to generation; the apply boundary repeats the
+// checks with the full Blueprint authority.
+func ValidatePrototypeAgainstPageSpec(payload, pageSpecPayload json.RawMessage, requireCoverage bool) error {
+	var pageSpec map[string]any
+	if json.Unmarshal(pageSpecPayload, &pageSpec) != nil {
+		return fmt.Errorf("PageSpec content must be a JSON object")
+	}
+	authority := prototypeSemanticAuthority{
+		requirementIDs: map[string]bool{},
+		acceptanceIDs:  map[string]bool{},
+	}
+	for _, id := range stringSlice(pageSpec["requirementIds"]) {
+		if id = strings.TrimSpace(id); id != "" {
+			authority.requirementIDs[id] = true
+		}
+	}
+	collectAcceptanceIDs(pageSpec, authority.acceptanceIDs)
+	return validatePrototypeSemanticTrace(payload, pageSpecPayload, requireCoverage, authority)
 }
 
 func validatePrototypeSemanticTrace(

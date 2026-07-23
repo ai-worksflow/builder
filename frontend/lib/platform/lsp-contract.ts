@@ -1,3 +1,5 @@
+import { sha256Bytes, sha256DigestString } from './sha256'
+
 export const LSP_TICKET_REQUEST_SCHEMA_VERSION = 'sandbox-lsp-ticket-request/v1'
 export const LSP_TICKET_SCHEMA_VERSION = 'sandbox-lsp-ticket/v1'
 export const LSP_CONNECTION_SCHEMA_VERSION = 'sandbox-lsp-connection/v1'
@@ -869,13 +871,8 @@ function canonicalJSON(value: unknown): string {
 }
 
 async function sha256(value: string) {
-  const subtle = globalThis.crypto?.subtle
-  if (!subtle) throw new SandboxLSPError('lsp_crypto_unavailable')
-  let encoded: Uint8Array
   try {
-    encoded = new TextEncoder().encode(value)
-    const result = new Uint8Array(await subtle.digest('SHA-256', encoded))
-    return `sha256:${Array.from(result, (entry) => entry.toString(16).padStart(2, '0')).join('')}`
+    return sha256DigestString(await sha256Bytes(new TextEncoder().encode(value)))
   } catch {
     throw new SandboxLSPError('lsp_crypto_unavailable')
   }

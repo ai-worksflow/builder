@@ -544,8 +544,14 @@ BEGIN
      OR v_head.plan_document <> v_authority.evidence_plan_document
      OR v_head.command_hash <> v_authority.evidence_plan_hash
      OR v_head.trust_bindings_digest <> v_authority.trust_bindings_digest
+     OR v_event.orchestration_id <> v_head.orchestration_id
+     OR v_event.version <> v_head.version
+     OR v_event.event_id <> v_head.last_event_id
      OR v_event.event_kind <> 'artifact-indexed'
-     OR qualification_receipt_v3_sha256(v_event.event_bytes) <> v_event.event_hash THEN
+     OR qualification_receipt_v3_sha256(v_event.event_bytes) <> v_event.event_hash
+     OR convert_from(v_event.event_bytes, 'UTF8')::jsonb <> v_event.event_document
+     OR jsonb_typeof(v_event.event_document->'artifactIndex') IS DISTINCT FROM 'object'
+     OR v_event.event_document->'artifactIndex'->>'stage' IS DISTINCT FROM 'committed' THEN
     RAISE EXCEPTION 'Qualification Receipt v3 completion Plan or Evidence closure drifted'
       USING ERRCODE = 'WQR02';
   END IF;
@@ -576,14 +582,90 @@ BEGIN
      OR v_verification_request.operation_id <> v_snapshot_request.operation_id
      OR v_runner_request.operation_id
         <> (v_authority.evidence_plan_document->'operations'->>'receiptSign')::uuid
-     OR v_approver_request.operation_id <> v_runner_request.operation_id
-     OR v_runner_request.payload_hash <> p_payload_hash
+     OR v_approver_request.operation_id <> v_runner_request.operation_id THEN
+    RAISE EXCEPTION 'Qualification Receipt v3 completion does not bind four exact Plan-reserved requests'
+      USING ERRCODE = 'WQR04';
+  END IF;
+
+  IF ROW(
+       v_snapshot_request.evidence_head_version,
+       v_snapshot_request.evidence_last_event_id,
+       v_snapshot_request.evidence_last_event_hash,
+       v_snapshot_request.evidence_command_digest,
+       v_snapshot_request.evidence_trust_digest,
+       v_snapshot_request.evidence_closure_digest,
+       v_snapshot_request.artifact_index_digest
+     ) IS DISTINCT FROM ROW(
+       v_head.version,
+       v_head.last_event_id,
+       v_event.event_hash,
+       v_head.command_hash,
+       v_head.trust_bindings_digest,
+       v_event.event_document->'artifactIndex'->>'evidenceClosureDigest',
+       v_event.event_document->'artifactIndex'->>'contentDigest'
+     )
+     OR ROW(
+       v_verification_request.evidence_head_version,
+       v_verification_request.evidence_last_event_id,
+       v_verification_request.evidence_last_event_hash,
+       v_verification_request.evidence_command_digest,
+       v_verification_request.evidence_trust_digest,
+       v_verification_request.evidence_closure_digest,
+       v_verification_request.artifact_index_digest
+     ) IS DISTINCT FROM ROW(
+       v_head.version,
+       v_head.last_event_id,
+       v_event.event_hash,
+       v_head.command_hash,
+       v_head.trust_bindings_digest,
+       v_event.event_document->'artifactIndex'->>'evidenceClosureDigest',
+       v_event.event_document->'artifactIndex'->>'contentDigest'
+     )
+     OR ROW(
+       v_runner_request.evidence_head_version,
+       v_runner_request.evidence_last_event_id,
+       v_runner_request.evidence_last_event_hash,
+       v_runner_request.evidence_command_digest,
+       v_runner_request.evidence_trust_digest,
+       v_runner_request.evidence_closure_digest,
+       v_runner_request.artifact_index_digest
+     ) IS DISTINCT FROM ROW(
+       v_head.version,
+       v_head.last_event_id,
+       v_event.event_hash,
+       v_head.command_hash,
+       v_head.trust_bindings_digest,
+       v_event.event_document->'artifactIndex'->>'evidenceClosureDigest',
+       v_event.event_document->'artifactIndex'->>'contentDigest'
+     )
+     OR ROW(
+       v_approver_request.evidence_head_version,
+       v_approver_request.evidence_last_event_id,
+       v_approver_request.evidence_last_event_hash,
+       v_approver_request.evidence_command_digest,
+       v_approver_request.evidence_trust_digest,
+       v_approver_request.evidence_closure_digest,
+       v_approver_request.artifact_index_digest
+     ) IS DISTINCT FROM ROW(
+       v_head.version,
+       v_head.last_event_id,
+       v_event.event_hash,
+       v_head.command_hash,
+       v_head.trust_bindings_digest,
+       v_event.event_document->'artifactIndex'->>'evidenceClosureDigest',
+       v_event.event_document->'artifactIndex'->>'contentDigest'
+     ) THEN
+    RAISE EXCEPTION 'Qualification Receipt v3 completion current indexed Evidence drifted from a frozen request'
+      USING ERRCODE = 'WQR02';
+  END IF;
+
+  IF v_runner_request.payload_hash <> p_payload_hash
      OR v_approver_request.payload_hash <> p_payload_hash
      OR v_runner_request.payload_bytes <> p_payload_bytes
      OR v_approver_request.payload_bytes <> p_payload_bytes
      OR v_runner_request.pae_hash <> p_pae_hash OR v_approver_request.pae_hash <> p_pae_hash
      OR v_runner_request.pae_bytes <> p_pae_bytes OR v_approver_request.pae_bytes <> p_pae_bytes THEN
-    RAISE EXCEPTION 'Qualification Receipt v3 completion does not bind four exact Plan-reserved requests'
+    RAISE EXCEPTION 'Qualification Receipt v3 signing requests do not bind the exact completion payload'
       USING ERRCODE = 'WQR04';
   END IF;
 

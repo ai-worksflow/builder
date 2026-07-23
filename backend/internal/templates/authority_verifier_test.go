@@ -115,6 +115,24 @@ func TestVerifiedArtifactAuthorityVerifiesCompositeArtifactEvidence(t *testing.T
 	}
 }
 
+func TestVerifiedArtifactAuthorityNormalizesReceiptTimeToDatabasePrecision(t *testing.T) {
+	fixture := newAuthorityCompositeFixture(t)
+	fixture.now = fixture.now.Add(987654321 * time.Nanosecond)
+
+	receipt, err := fixture.authority.Verify(context.Background(), fixture.request)
+	if err != nil {
+		t.Fatalf("verify composite artifact evidence: %v", err)
+	}
+	view := receipt.Snapshot()
+	want := fixture.now.UTC().Truncate(time.Microsecond)
+	if !view.VerifiedAt.Equal(want) || !view.CreatedAt.Equal(want) {
+		t.Fatalf("receipt times = verified %s created %s, want %s", view.VerifiedAt, view.CreatedAt, want)
+	}
+	if view.VerifiedAt.Nanosecond()%int(time.Microsecond) != 0 {
+		t.Fatalf("verified time %s exceeds PostgreSQL microsecond precision", view.VerifiedAt)
+	}
+}
+
 func TestVerifiedArtifactAuthorityRejectsCompositeTampering(t *testing.T) {
 	tests := []struct {
 		name   string

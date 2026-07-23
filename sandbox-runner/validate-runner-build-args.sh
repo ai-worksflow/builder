@@ -139,6 +139,15 @@ check_dockerfiles() {
   repository_root=${1:-.}
   check_dockerfile "${repository_root}/agent-runner/Dockerfile" || return 1
   check_dockerfile "${repository_root}/sandbox-runner/Dockerfile" || return 1
+  if ! grep -q '^COPY --from=gateway-build /usr/local/go /usr/local/go$' "${repository_root}/sandbox-runner/Dockerfile" ||
+    ! grep -Eq 'PATH=/usr/local/go/bin:' "${repository_root}/sandbox-runner/Dockerfile" ||
+    ! grep -q 'GOMODCACHE=/workspace/.worksflow/dependencies/go/pkg/mod' "${repository_root}/sandbox-runner/Dockerfile" ||
+    ! grep -q 'GOCACHE=/workspace/.worksflow/dependencies/go/build-cache' "${repository_root}/sandbox-runner/Dockerfile" ||
+    ! grep -q 'GOTMPDIR=/workspace/.worksflow/dependencies/go/tmp' "${repository_root}/sandbox-runner/Dockerfile" ||
+    ! grep -q 'GOPROXY=off' "${repository_root}/sandbox-runner/Dockerfile"; then
+    validation_error 'sandbox runner must use its digest-pinned Go toolchain and prepared offline module cache'
+    return 1
+  fi
   printf 'runner build contract: Dockerfile wiring checks passed\n'
 }
 

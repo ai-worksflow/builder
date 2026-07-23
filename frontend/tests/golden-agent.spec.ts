@@ -243,6 +243,12 @@ test.describe('Golden Agent external qualification', () => {
     ))).toBe(false)
     expect(structured.data.changedPaths).toEqual([operation.path])
     expect(structured.data.blockers).toEqual([])
+    expect(structured.data.obligations.map((entry) => entry.id))
+      .toEqual(created.data.taskCapsule.obligationIds)
+    expect(structured.data.obligations.every((entry) => entry.status === 'satisfied')).toBe(true)
+    expect(structured.data.acceptanceCriteria.map((entry) => entry.id))
+      .toEqual(created.data.taskCapsule.acceptanceCriterionIds)
+    expect(structured.data.acceptanceCriteria.every((entry) => entry.status === 'satisfied')).toBe(true)
     expect(structured.data.verification.map((entry) => entry.commandId).sort())
       .toEqual([...created.data.taskCapsule.verificationCommandIds].sort())
     expect(structured.data.verification.every((entry) => entry.status === 'passed')).toBe(true)
@@ -397,7 +403,7 @@ test.describe('Golden Agent external qualification', () => {
         + `&bundleId=${subject.sharedArtifacts.buildManifest.id}`
         + `&workspaceRevisionId=${subject.sharedArtifacts.workspaceRevision.id}`
       const open = async (page: typeof pageA) => {
-        await page.goto(`${subject.platform.webOrigin}/team/acme/project/${sandbox.projectId}/dashboard`)
+        await page.goto(`${subject.platform.webOrigin}/team/${sandbox.projectId}/project/${sandbox.projectId}/dashboard`)
         await page.goto(exactURL)
         await expect(page.getByText(sandbox.session.id.slice(0, 8), { exact: true })).toBeVisible()
         await page.getByRole('button', { name: file!.path, exact: true }).click()
@@ -560,7 +566,7 @@ test.describe('Golden Agent external qualification', () => {
       }
     })
     const subject = goldenSubject()
-    await page.goto(`${subject.platform.webOrigin}/team/acme/project/${opening.projectId}/dashboard`)
+    await page.goto(`${subject.platform.webOrigin}/team/${opening.projectId}/project/${opening.projectId}/dashboard`)
     await page.goto(
       `${subject.platform.webOrigin}/workbench/complete?view=code`
       + `&bundleId=${subject.sharedArtifacts.buildManifest.id}`

@@ -30,6 +30,7 @@ type ProfileBuiltInCheck struct {
 	ID                     string   `json:"id"`
 	Kind                   string   `json:"kind"`
 	ImageRole              string   `json:"imageRole"`
+	ServiceID              string   `json:"serviceId,omitempty"`
 	Argv                   []string `json:"argv"`
 	WorkingDirectory       string   `json:"workingDirectory"`
 	Required               bool     `json:"required"`
@@ -231,7 +232,7 @@ func (PlanCompiler) Compile(input CompileCandidatePlanInput) (CompiledPlan, erro
 		return CompiledPlan{}, err
 	}
 	checks, err = appendBuiltInChecks(
-		checks, profile.BuiltInChecks, oracles, requiredOracleIDs, oracleObligations, images,
+		checks, profile.BuiltInChecks, oracles, requiredOracleIDs, oracleObligations, images, profile.CommandImageRoles,
 	)
 	if err != nil {
 		return CompiledPlan{}, err
@@ -584,13 +585,11 @@ func compilePlanDependencies(
 		switch release.Role {
 		case "web":
 			ecosystem = "node"
-		case "api":
-			ecosystem = "python"
-		case "worker":
+		case "api", "worker":
 			for _, toolchain := range release.Manifest.Toolchains {
-				if toolchain.Name == "node" || toolchain.Name == "python" {
+				if toolchain.Name == "go" || toolchain.Name == "node" || toolchain.Name == "python" {
 					if ecosystem != "" {
-						return nil, planInvalid("worker TemplateRelease has ambiguous dependency ecosystem")
+						return nil, planInvalid(release.Role + " TemplateRelease has ambiguous dependency ecosystem")
 					}
 					ecosystem = toolchain.Name
 				}
@@ -618,7 +617,8 @@ func compilePlanDependencies(
 			lockfile := release.Manifest.Lockfiles[index]
 			base := path.Base(lockfile.Path)
 			matches := ecosystem == "node" && base == "package-lock.json" ||
-				ecosystem == "python" && (base == "requirements.lock" || base == "requirements.txt")
+				ecosystem == "python" && (base == "requirements.lock" || base == "requirements.txt") ||
+				ecosystem == "go" && base == "go.sum"
 			if !matches {
 				continue
 			}
@@ -658,6 +658,13 @@ func compilePlanDependencies(
 				"--target", "/resolver/site-packages", "--requirement", "/resolver/" + path.Base(lockPath),
 				"--index-url", selected.Registry, "--disable-pip-version-check", "--no-input",
 			}
+		case "go":
+			manifestPath := path.Join(workingDirectory, "go.mod")
+			if workingDirectory == "." {
+				manifestPath = "go.mod"
+			}
+			manifestPaths = []string{manifestPath}
+			resolverArgv = []string{"go", "mod", "download"}
 		}
 		dependency := PlanDependency{
 			ID: "dependency-" + release.Role, ServiceID: release.Role, Ecosystem: ecosystem,
@@ -698,7 +705,7 @@ func validatePersistedPlanDependencies(
 	for index, value := range values {
 		if !stableIDPattern.MatchString(value.ID) || value.ID != "dependency-"+value.ServiceID ||
 			!releaseRoles[value.ServiceID] || (previousID != "" && value.ID <= previousID) ||
-			(value.Ecosystem != "node" && value.Ecosystem != "python") ||
+			(value.Ecosystem != "go" && value.Ecosystem != "node" && value.Ecosystem != "python") ||
 			!imagePattern.MatchString(value.ToolchainImageDigest) || !exactSHA256(value.CacheKey) ||
 			(value.WorkingDirectory != "." && !validRelativePath(value.WorkingDirectory)) ||
 			len(value.Lockfiles) != 1 || len(value.ResolverArgv) == 0 || len(value.ResolverArgv) > 32 {
@@ -717,7 +724,8 @@ func validatePersistedPlanDependencies(
 		if !validRelativePath(lockfile.Path) || !exactSHA256(lockfile.Digest) ||
 			!validDependencyRegistry(lockfile.Registry) ||
 			(value.Ecosystem == "node" && path.Base(lockfile.Path) != "package-lock.json") ||
-			(value.Ecosystem == "python" && path.Base(lockfile.Path) != "requirements.lock" && path.Base(lockfile.Path) != "requirements.txt") {
+			(value.Ecosystem == "python" && path.Base(lockfile.Path) != "requirements.lock" && path.Base(lockfile.Path) != "requirements.txt") ||
+			(value.Ecosystem == "go" && path.Base(lockfile.Path) != "go.sum") {
 			return planInvalid(fmt.Sprintf("dependency projection %d lockfile", index))
 		}
 		for _, argument := range value.ResolverArgv {
@@ -745,6 +753,9 @@ func validatePersistedPlanDependencies(
 
 func expectedDependencyResolverArgv(value PlanDependency) []string {
 	lockfile := value.Lockfiles[0]
+	if value.Ecosystem == "go" {
+		return []string{"go", "mod", "download"}
+	}
 	if value.Ecosystem == "node" {
 		return []string{
 			"npm", "ci", "--ignore-scripts", "--no-audit", "--no-fund",
@@ -860,7 +871,14 @@ func compileOracleChecks(
 				}{release: release, command: command})
 			}
 		}
-		if len(matches) != 1 {
+		if len(matches) == 0 {
+			// A profile-owned built-in check may intentionally provide the
+			// executable implementation for an Oracle whose stable command ID is
+			// not part of either immutable TemplateRelease. appendBuiltInChecks
+			// still fails closed unless that exact Oracle is covered.
+			continue
+		}
+		if len(matches) > 1 {
 			return nil, planInvalid("Oracle command must resolve to one exact TemplateRelease: " + oracle.ID)
 		}
 		match := matches[0]
@@ -897,6 +915,7 @@ func appendBuiltInChecks(
 	requiredOracles map[string]bool,
 	oracleObligations map[string][]string,
 	images map[string]string,
+	serviceImageRoles map[string]string,
 ) ([]PlanCheck, error) {
 	seenChecks, resolvedOracles := map[string]bool{}, map[string]bool{}
 	for _, check := range checks {
@@ -908,11 +927,15 @@ func appendBuiltInChecks(
 	for index := range builtins {
 		value := builtins[index]
 		value.ID, value.Kind, value.ImageRole = strings.TrimSpace(value.ID), strings.TrimSpace(value.Kind), strings.TrimSpace(value.ImageRole)
+		value.ServiceID = strings.TrimSpace(value.ServiceID)
 		oracleIDs, err := normalizeStableList(value.OracleIDs, 0, 256, "built-in Oracle IDs")
 		if err != nil || !stableIDPattern.MatchString(value.ID) || !stableIDPattern.MatchString(value.Kind) ||
 			seenChecks[value.ID] || images[value.ImageRole] == "" || len(value.Argv) == 0 ||
 			value.TimeoutSeconds < 1 || value.TimeoutSeconds > 7200 {
 			return nil, planInvalid(fmt.Sprintf("built-in check %d", index))
+		}
+		if value.ServiceID != "" && (!stableIDPattern.MatchString(value.ServiceID) || serviceImageRoles[value.ServiceID] != value.ImageRole) {
+			return nil, planInvalid("built-in check service binding")
 		}
 		workingDirectory := strings.TrimSpace(value.WorkingDirectory)
 		if workingDirectory != "." {
@@ -966,7 +989,7 @@ func appendBuiltInChecks(
 			}
 		}
 		checks = append(checks, PlanCheck{
-			ID: value.ID, Kind: value.Kind, Required: required,
+			ID: value.ID, Kind: value.Kind, ServiceID: value.ServiceID, Required: required,
 			VerifierImageDigest: images[value.ImageRole], Argv: append([]string{}, value.Argv...),
 			WorkingDirectory: workingDirectory, OracleIDs: oracleIDs,
 			AcceptanceCriterionIDs: acceptance, ObligationIDs: obligations,

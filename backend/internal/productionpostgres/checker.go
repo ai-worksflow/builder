@@ -12,15 +12,20 @@ import (
 )
 
 const (
-	applicationGroupRole  = "worksflow_application"
-	migrationOwnerRole    = "worksflow_migration_owner"
-	gcOperatorRole        = "worksflow_repository_index_gc_operator"
-	goldenFaultRole       = "worksflow_golden_fault_operator"
-	promotionOperatorRole = "worksflow_qualification_promotion_operator"
+	applicationGroupRole           = "worksflow_application"
+	migrationOwnerRole             = "worksflow_migration_owner"
+	gcOperatorRole                 = "worksflow_repository_index_gc_operator"
+	goldenFaultRole                = "worksflow_golden_fault_operator"
+	promotionOperatorRole          = "worksflow_qualification_promotion_operator"
+	policyOperatorRole             = "worksflow_qualification_policy_operator"
+	inputPrecommitOperatorRole     = "worksflow_qualification_input_precommit_operator"
+	sourceVerifierOperatorRole     = "worksflow_qualification_source_verifier_operator"
+	credentialResolverOperatorRole = "worksflow_qualification_credential_resolver_operator"
+	handoffOperatorRole            = "worksflow_qualification_handoff_operator"
 )
 
 // sessionPostureQuery takes one catalog snapshot per connected identity. The
-// four identities cannot share a transaction, so endpoint/database equality
+// nine identities cannot share a transaction, so endpoint/database equality
 // is also pinned in validated configuration and observed database names are
 // compared after inspection.
 const sessionPostureQuery = `
@@ -31,6 +36,8 @@ current_role_facts AS (
     coalesce(min(role.rolname), '') AS role_name,
     session_user::text AS session_role_name,
     coalesce(bool_or(role.rolcanlogin), false) AS can_login,
+	coalesce(bool_or(role.rolinherit), false) AS role_inherits,
+	pg_catalog.current_setting('role') = 'none' AS role_setting_is_none,
     coalesce(bool_or(
       role.rolsuper OR role.rolbypassrls OR role.rolcreaterole OR
       role.rolcreatedb OR role.rolreplication
@@ -38,6 +45,23 @@ current_role_facts AS (
     min(role.oid) AS role_oid
   FROM pg_catalog.pg_roles AS role
   WHERE role.rolname = current_user
+),
+direct_membership_facts AS (
+  SELECT
+	count(membership.roleid)::integer AS membership_count,
+	count(membership.roleid) FILTER (
+	  WHERE membership.inherit_option
+	    AND NOT membership.set_option
+	    AND NOT membership.admin_option
+	)::integer AS exact_inherit_only_membership_count,
+	coalesce(max((
+	  SELECT pg_catalog.count(*)::integer
+	  FROM pg_catalog.pg_auth_members AS inbound
+	  WHERE inbound.roleid = membership.roleid
+	)), 0)::integer AS membership_group_member_count
+  FROM current_role_facts AS role_state
+  LEFT JOIN pg_catalog.pg_auth_members AS membership
+	ON membership.member = role_state.role_oid
 ),
 session_reachable_roles(role_oid) AS (
   SELECT role.oid
@@ -65,8 +89,18 @@ reachable_role_facts AS (
       AS gc_operator_is_reachable,
     coalesce(bool_or(role.rolname = '` + goldenFaultRole + `'), false)
       AS golden_fault_operator_is_reachable,
-    coalesce(bool_or(role.rolname = '` + promotionOperatorRole + `'), false)
-      AS promotion_operator_is_reachable,
+	coalesce(bool_or(role.rolname = '` + promotionOperatorRole + `'), false)
+	  AS promotion_operator_is_reachable,
+	coalesce(bool_or(role.rolname = '` + policyOperatorRole + `'), false)
+	  AS policy_operator_is_reachable,
+	coalesce(bool_or(role.rolname = '` + inputPrecommitOperatorRole + `'), false)
+	  AS input_precommit_operator_is_reachable,
+	coalesce(bool_or(role.rolname = '` + sourceVerifierOperatorRole + `'), false)
+	  AS source_verifier_operator_is_reachable,
+	coalesce(bool_or(role.rolname = '` + credentialResolverOperatorRole + `'), false)
+	  AS credential_resolver_operator_is_reachable,
+	coalesce(bool_or(role.rolname = '` + handoffOperatorRole + `'), false)
+	  AS handoff_operator_is_reachable,
     EXISTS (
       SELECT 1
       FROM pg_catalog.pg_auth_members AS membership
@@ -104,7 +138,12 @@ stable_role_facts AS (
     '` + migrationOwnerRole + `',
     '` + gcOperatorRole + `',
 	'` + goldenFaultRole + `',
-	'` + promotionOperatorRole + `'
+	'` + promotionOperatorRole + `',
+	'` + policyOperatorRole + `',
+	'` + inputPrecommitOperatorRole + `',
+	'` + sourceVerifierOperatorRole + `',
+	'` + credentialResolverOperatorRole + `'
+	,'` + handoffOperatorRole + `'
   )
 ),
 database_facts AS (
@@ -153,6 +192,109 @@ schema_facts AS (
   FROM stable_role_facts AS stable
   LEFT JOIN pg_catalog.pg_namespace AS namespace ON namespace.nspname = $1
 ),
+schema_object_owner_facts AS (
+  SELECT count(*)::integer AS reachable_owned_object_count
+  FROM schema_facts AS schema_state
+  JOIN pg_catalog.pg_namespace AS namespace
+    ON namespace.oid = schema_state.schema_oid
+  CROSS JOIN LATERAL (
+    SELECT relation.oid
+    FROM pg_catalog.pg_class AS relation
+    WHERE relation.relnamespace = namespace.oid
+      AND EXISTS (
+        SELECT 1 FROM session_reachable_roles AS reachable
+        WHERE reachable.role_oid = relation.relowner
+      )
+    UNION ALL
+    SELECT routine.oid
+    FROM pg_catalog.pg_proc AS routine
+    WHERE routine.pronamespace = namespace.oid
+      AND EXISTS (
+        SELECT 1 FROM session_reachable_roles AS reachable
+        WHERE reachable.role_oid = routine.proowner
+      )
+    UNION ALL
+    SELECT catalog_type.oid
+    FROM pg_catalog.pg_type AS catalog_type
+    WHERE catalog_type.typnamespace = namespace.oid
+      AND EXISTS (
+        SELECT 1 FROM session_reachable_roles AS reachable
+        WHERE reachable.role_oid = catalog_type.typowner
+      )
+    UNION ALL
+    SELECT catalog_collation.oid
+    FROM pg_catalog.pg_collation AS catalog_collation
+    WHERE catalog_collation.collnamespace = namespace.oid
+      AND EXISTS (
+        SELECT 1 FROM session_reachable_roles AS reachable
+        WHERE reachable.role_oid = catalog_collation.collowner
+      )
+    UNION ALL
+    SELECT catalog_conversion.oid
+    FROM pg_catalog.pg_conversion AS catalog_conversion
+    WHERE catalog_conversion.connamespace = namespace.oid
+      AND EXISTS (
+        SELECT 1 FROM session_reachable_roles AS reachable
+        WHERE reachable.role_oid = catalog_conversion.conowner
+      )
+    UNION ALL
+    SELECT catalog_operator.oid
+    FROM pg_catalog.pg_operator AS catalog_operator
+    WHERE catalog_operator.oprnamespace = namespace.oid
+      AND EXISTS (
+        SELECT 1 FROM session_reachable_roles AS reachable
+        WHERE reachable.role_oid = catalog_operator.oprowner
+      )
+    UNION ALL
+    SELECT operator_class.oid
+    FROM pg_catalog.pg_opclass AS operator_class
+    WHERE operator_class.opcnamespace = namespace.oid
+      AND EXISTS (
+        SELECT 1 FROM session_reachable_roles AS reachable
+        WHERE reachable.role_oid = operator_class.opcowner
+      )
+    UNION ALL
+    SELECT operator_family.oid
+    FROM pg_catalog.pg_opfamily AS operator_family
+    WHERE operator_family.opfnamespace = namespace.oid
+      AND EXISTS (
+        SELECT 1 FROM session_reachable_roles AS reachable
+        WHERE reachable.role_oid = operator_family.opfowner
+      )
+    UNION ALL
+    SELECT catalog_configuration.oid
+    FROM pg_catalog.pg_ts_config AS catalog_configuration
+    WHERE catalog_configuration.cfgnamespace = namespace.oid
+      AND EXISTS (
+        SELECT 1 FROM session_reachable_roles AS reachable
+        WHERE reachable.role_oid = catalog_configuration.cfgowner
+      )
+    UNION ALL
+    SELECT catalog_dictionary.oid
+    FROM pg_catalog.pg_ts_dict AS catalog_dictionary
+    WHERE catalog_dictionary.dictnamespace = namespace.oid
+      AND EXISTS (
+        SELECT 1 FROM session_reachable_roles AS reachable
+        WHERE reachable.role_oid = catalog_dictionary.dictowner
+      )
+    UNION ALL
+    SELECT statistic.oid
+    FROM pg_catalog.pg_statistic_ext AS statistic
+    WHERE statistic.stxnamespace = namespace.oid
+      AND EXISTS (
+        SELECT 1 FROM session_reachable_roles AS reachable
+        WHERE reachable.role_oid = statistic.stxowner
+      )
+    UNION ALL
+    SELECT catalog_extension.oid
+    FROM pg_catalog.pg_extension AS catalog_extension
+    WHERE catalog_extension.extnamespace = namespace.oid
+      AND EXISTS (
+        SELECT 1 FROM session_reachable_roles AS reachable
+        WHERE reachable.role_oid = catalog_extension.extowner
+      )
+  ) AS owned_object
+),
 relation_facts AS (
   SELECT
     count(*) FILTER (WHERE relation.relkind IN ('r', 'p', 'S', 'v', 'm', 'f', 'i', 'I'))::integer
@@ -177,22 +319,25 @@ relation_facts AS (
       WHERE relation.relkind IN ('r', 'p')
         AND relation.relname IN (
           'qualification_promotion_consumptions',
-          'qualification_promotion_handoffs'
+          'qualification_promotion_handoffs',
+          'artifact_revision_identity_reservations',
+          'qualification_promotion_v2_independent_receipts',
+          'qualification_promotion_v2_consumptions',
+          'qualification_promotion_v2_consumption_independent_receipts',
+          'qualification_promotion_v2_handoffs',
+          'qualification_promotion_v2_identity_reservations'
         )
         AND EXISTS (
           SELECT 1 FROM session_reachable_roles AS reachable
           WHERE pg_catalog.has_table_privilege(reachable.role_oid, relation.oid, 'SELECT')
-        )
-        AND NOT EXISTS (
-          SELECT 1 FROM session_reachable_roles AS reachable
-          WHERE pg_catalog.has_table_privilege(reachable.role_oid, relation.oid, 'INSERT')
+            OR pg_catalog.has_table_privilege(reachable.role_oid, relation.oid, 'INSERT')
             OR pg_catalog.has_table_privilege(reachable.role_oid, relation.oid, 'UPDATE')
             OR pg_catalog.has_table_privilege(reachable.role_oid, relation.oid, 'DELETE')
             OR pg_catalog.has_table_privilege(reachable.role_oid, relation.oid, 'TRUNCATE')
             OR pg_catalog.has_table_privilege(reachable.role_oid, relation.oid, 'REFERENCES')
             OR pg_catalog.has_table_privilege(reachable.role_oid, relation.oid, 'TRIGGER')
         )
-    )::integer AS promotion_exact_table_select_count,
+    )::integer AS promotion_boundary_table_privilege_count,
     count(*) FILTER (
       WHERE relation.relkind IN ('r', 'p', 'v', 'm', 'f')
         AND EXISTS (
@@ -208,16 +353,13 @@ relation_facts AS (
         AND (
           relation.relname NOT IN (
             'qualification_promotion_consumptions',
-            'qualification_promotion_handoffs'
-          )
-          OR EXISTS (
-            SELECT 1 FROM session_reachable_roles AS reachable
-            WHERE pg_catalog.has_table_privilege(reachable.role_oid, relation.oid, 'INSERT')
-              OR pg_catalog.has_table_privilege(reachable.role_oid, relation.oid, 'UPDATE')
-              OR pg_catalog.has_table_privilege(reachable.role_oid, relation.oid, 'DELETE')
-              OR pg_catalog.has_table_privilege(reachable.role_oid, relation.oid, 'TRUNCATE')
-              OR pg_catalog.has_table_privilege(reachable.role_oid, relation.oid, 'REFERENCES')
-              OR pg_catalog.has_table_privilege(reachable.role_oid, relation.oid, 'TRIGGER')
+            'qualification_promotion_handoffs',
+            'artifact_revision_identity_reservations',
+            'qualification_promotion_v2_independent_receipts',
+            'qualification_promotion_v2_consumptions',
+            'qualification_promotion_v2_consumption_independent_receipts',
+            'qualification_promotion_v2_handoffs',
+            'qualification_promotion_v2_identity_reservations'
           )
         )
     )::integer AS promotion_unexpected_table_privilege_count,
@@ -268,23 +410,13 @@ column_facts AS (
       )
     )::integer AS direct_column_acl_count,
     count(*) FILTER (
-      WHERE (
-        relation.relname NOT IN (
-          'qualification_promotion_consumptions',
-          'qualification_promotion_handoffs'
-        )
-        AND EXISTS (
-          SELECT 1 FROM session_reachable_roles AS reachable
-          WHERE pg_catalog.has_column_privilege(reachable.role_oid, relation.oid, attribute.attnum, 'SELECT')
-            OR pg_catalog.has_column_privilege(reachable.role_oid, relation.oid, attribute.attnum, 'INSERT')
-            OR pg_catalog.has_column_privilege(reachable.role_oid, relation.oid, attribute.attnum, 'UPDATE')
-            OR pg_catalog.has_column_privilege(reachable.role_oid, relation.oid, attribute.attnum, 'REFERENCES')
-        )
-      )
-      OR EXISTS (
+      WHERE EXISTS (
         SELECT 1
-        FROM pg_catalog.aclexplode(attribute.attacl) AS acl
-        JOIN session_reachable_roles AS reachable ON reachable.role_oid = acl.grantee
+        FROM session_reachable_roles AS reachable
+        WHERE pg_catalog.has_column_privilege(reachable.role_oid, relation.oid, attribute.attnum, 'SELECT')
+          OR pg_catalog.has_column_privilege(reachable.role_oid, relation.oid, attribute.attnum, 'INSERT')
+          OR pg_catalog.has_column_privilege(reachable.role_oid, relation.oid, attribute.attnum, 'UPDATE')
+          OR pg_catalog.has_column_privilege(reachable.role_oid, relation.oid, attribute.attnum, 'REFERENCES')
       )
     )::integer AS promotion_unexpected_column_privilege_count
   FROM schema_facts AS schema_state
@@ -297,10 +429,51 @@ column_facts AS (
    AND attribute.attnum > 0
    AND NOT attribute.attisdropped
 ),
+expected_runtime_routines(role_kind, function_name, identity_arguments) AS (
+  VALUES
+    ('promotion'::text, 'consume_qualification_promotion_v2'::text,
+     'uuid, uuid, uuid, uuid, uuid'::text),
+    ('promotion'::text, 'inspect_qualification_promotion_v2_operation'::text,
+     'uuid'::text),
+    ('promotion'::text, 'inspect_historical_qualification_promotion_v1_operation'::text,
+     'uuid'::text),
+    ('promotion'::text, 'resolve_qualification_input_precommit_for_promotion_v1'::text,
+     'uuid, uuid'::text),
+    ('policy'::text, 'issue_qualification_policy_authority_v1'::text,
+     'uuid, uuid, text, text, uuid, text, text, bigint, text, timestamp with time zone, text, text, text, bytea, jsonb, text, bytea, jsonb, text, bytea, jsonb, text, bytea, jsonb'::text),
+    ('policy'::text, 'inspect_qualification_policy_operation_v1'::text,
+     'uuid'::text),
+    ('policy'::text, 'resolve_qualification_policy_authority_v1'::text,
+     'uuid'::text),
+    ('policy'::text, 'resolve_current_qualification_policy_authority_v1'::text,
+     'uuid, text, text'::text),
+    ('input_precommit'::text, 'issue_qualification_input_precommit_v1'::text,
+     'uuid, uuid, uuid, uuid, uuid, text, bytea, jsonb, text, bytea, jsonb, text, bytea, jsonb, text, bytea, jsonb'::text),
+    ('input_precommit'::text, 'inspect_qualification_input_precommit_operation_v1'::text,
+     'uuid'::text),
+    ('input_precommit'::text, 'resolve_qualification_input_precommit_authority_v1'::text,
+     'uuid'::text),
+    ('source_verifier'::text, 'admit_qualification_input_source_receipt_v1'::text,
+     'text, bytea, jsonb, text, bytea, jsonb'::text),
+    ('source_verifier'::text, 'inspect_qualification_input_source_receipt_v1'::text,
+     'text'::text),
+    ('source_verifier'::text, 'resolve_qualification_input_source_receipt_admission_v1'::text,
+     'text'::text),
+    ('credential_resolver'::text, 'admit_qualification_input_credential_receipt_v1'::text,
+     'text, bytea, jsonb, text, bytea, jsonb'::text),
+    ('credential_resolver'::text, 'inspect_qualification_input_credential_receipt_v1'::text,
+     'text'::text),
+    ('credential_resolver'::text, 'resolve_qualification_input_credential_receipt_admission_v1'::text,
+     'text'::text),
+	('handoff'::text, 'complete_qualification_promotion_v2_handoff'::text,
+	 'uuid'::text),
+	('handoff'::text, 'inspect_qualification_promotion_v2_handoff_completion'::text,
+	 'uuid'::text)
+),
 routine_facts AS (
   SELECT
     count(routine.oid)::integer AS routine_count,
-    count(routine.oid) FILTER (
+	count(routine.oid) FILTER (
       WHERE routine.proowner = stable.migration_owner_oid
     )::integer AS migration_owned_routine_count,
     count(routine.oid) FILTER (
@@ -309,26 +482,138 @@ routine_facts AS (
         WHERE pg_catalog.has_function_privilege(reachable.role_oid, routine.oid, 'EXECUTE')
       )
     )::integer AS reachable_execute_count,
-    count(routine.oid) FILTER (
-      WHERE routine.proname = 'consume_verified_qualification_promotion'
-        AND pg_catalog.oidvectortypes(routine.proargtypes) =
-          'uuid, text, bytea, jsonb, text, text, bytea, jsonb, uuid, uuid, text, bytea, jsonb'
-        AND EXISTS (
-          SELECT 1 FROM session_reachable_roles AS reachable
-          WHERE pg_catalog.has_function_privilege(reachable.role_oid, routine.oid, 'EXECUTE')
-        )
-    )::integer AS promotion_exact_routine_execute_count,
-    count(routine.oid) FILTER (
-      WHERE EXISTS (
-        SELECT 1 FROM session_reachable_roles AS reachable
-        WHERE pg_catalog.has_function_privilege(reachable.role_oid, routine.oid, 'EXECUTE')
-      )
-        AND (
-          routine.proname <> 'consume_verified_qualification_promotion'
-          OR pg_catalog.oidvectortypes(routine.proargtypes) <>
-            'uuid, text, bytea, jsonb, text, text, bytea, jsonb, uuid, uuid, text, bytea, jsonb'
-        )
-    )::integer AS promotion_unexpected_routine_execute_count,
+	count(routine.oid) FILTER (
+	  WHERE EXISTS (
+	    SELECT 1 FROM expected_runtime_routines AS expected
+	    WHERE expected.role_kind = 'promotion'
+	      AND expected.function_name = routine.proname
+	      AND expected.identity_arguments = pg_catalog.oidvectortypes(routine.proargtypes)
+	  ) AND EXISTS (
+	    SELECT 1 FROM session_reachable_roles AS reachable
+	    WHERE pg_catalog.has_function_privilege(reachable.role_oid, routine.oid, 'EXECUTE')
+	  )
+	)::integer AS promotion_exact_routine_execute_count,
+	count(routine.oid) FILTER (
+	  WHERE EXISTS (
+	    SELECT 1 FROM session_reachable_roles AS reachable
+	    WHERE pg_catalog.has_function_privilege(reachable.role_oid, routine.oid, 'EXECUTE')
+	  ) AND NOT EXISTS (
+	    SELECT 1 FROM expected_runtime_routines AS expected
+	    WHERE expected.role_kind = 'promotion'
+	      AND expected.function_name = routine.proname
+	      AND expected.identity_arguments = pg_catalog.oidvectortypes(routine.proargtypes)
+	  )
+	)::integer AS promotion_unexpected_routine_execute_count,
+	count(routine.oid) FILTER (
+	  WHERE EXISTS (
+	    SELECT 1 FROM expected_runtime_routines AS expected
+	    WHERE expected.role_kind = 'policy'
+	      AND expected.function_name = routine.proname
+	      AND expected.identity_arguments = pg_catalog.oidvectortypes(routine.proargtypes)
+	  ) AND EXISTS (
+	    SELECT 1 FROM session_reachable_roles AS reachable
+	    WHERE pg_catalog.has_function_privilege(reachable.role_oid, routine.oid, 'EXECUTE')
+	  )
+	)::integer AS policy_exact_routine_execute_count,
+	count(routine.oid) FILTER (
+	  WHERE EXISTS (
+	    SELECT 1 FROM session_reachable_roles AS reachable
+	    WHERE pg_catalog.has_function_privilege(reachable.role_oid, routine.oid, 'EXECUTE')
+	  ) AND NOT EXISTS (
+	    SELECT 1 FROM expected_runtime_routines AS expected
+	    WHERE expected.role_kind = 'policy'
+	      AND expected.function_name = routine.proname
+	      AND expected.identity_arguments = pg_catalog.oidvectortypes(routine.proargtypes)
+	  )
+	)::integer AS policy_unexpected_routine_execute_count,
+	count(routine.oid) FILTER (
+	  WHERE EXISTS (
+	    SELECT 1 FROM expected_runtime_routines AS expected
+	    WHERE expected.role_kind = 'input_precommit'
+	      AND expected.function_name = routine.proname
+	      AND expected.identity_arguments = pg_catalog.oidvectortypes(routine.proargtypes)
+	  ) AND EXISTS (
+	    SELECT 1 FROM session_reachable_roles AS reachable
+	    WHERE pg_catalog.has_function_privilege(reachable.role_oid, routine.oid, 'EXECUTE')
+	  )
+	)::integer AS input_precommit_exact_routine_execute_count,
+	count(routine.oid) FILTER (
+	  WHERE EXISTS (
+	    SELECT 1 FROM session_reachable_roles AS reachable
+	    WHERE pg_catalog.has_function_privilege(reachable.role_oid, routine.oid, 'EXECUTE')
+	  ) AND NOT EXISTS (
+	    SELECT 1 FROM expected_runtime_routines AS expected
+	    WHERE expected.role_kind = 'input_precommit'
+	      AND expected.function_name = routine.proname
+	      AND expected.identity_arguments = pg_catalog.oidvectortypes(routine.proargtypes)
+	  )
+	)::integer AS input_precommit_unexpected_routine_execute_count,
+	count(routine.oid) FILTER (
+	  WHERE EXISTS (
+	    SELECT 1 FROM expected_runtime_routines AS expected
+	    WHERE expected.role_kind = 'source_verifier'
+	      AND expected.function_name = routine.proname
+	      AND expected.identity_arguments = pg_catalog.oidvectortypes(routine.proargtypes)
+	  ) AND EXISTS (
+	    SELECT 1 FROM session_reachable_roles AS reachable
+	    WHERE pg_catalog.has_function_privilege(reachable.role_oid, routine.oid, 'EXECUTE')
+	  )
+	)::integer AS source_verifier_exact_routine_execute_count,
+	count(routine.oid) FILTER (
+	  WHERE EXISTS (
+	    SELECT 1 FROM session_reachable_roles AS reachable
+	    WHERE pg_catalog.has_function_privilege(reachable.role_oid, routine.oid, 'EXECUTE')
+	  ) AND NOT EXISTS (
+	    SELECT 1 FROM expected_runtime_routines AS expected
+	    WHERE expected.role_kind = 'source_verifier'
+	      AND expected.function_name = routine.proname
+	      AND expected.identity_arguments = pg_catalog.oidvectortypes(routine.proargtypes)
+	  )
+	)::integer AS source_verifier_unexpected_routine_execute_count,
+	count(routine.oid) FILTER (
+	  WHERE EXISTS (
+	    SELECT 1 FROM expected_runtime_routines AS expected
+	    WHERE expected.role_kind = 'credential_resolver'
+	      AND expected.function_name = routine.proname
+	      AND expected.identity_arguments = pg_catalog.oidvectortypes(routine.proargtypes)
+	  ) AND EXISTS (
+	    SELECT 1 FROM session_reachable_roles AS reachable
+	    WHERE pg_catalog.has_function_privilege(reachable.role_oid, routine.oid, 'EXECUTE')
+	  )
+	)::integer AS credential_resolver_exact_routine_execute_count,
+	count(routine.oid) FILTER (
+	  WHERE EXISTS (
+	    SELECT 1 FROM session_reachable_roles AS reachable
+	    WHERE pg_catalog.has_function_privilege(reachable.role_oid, routine.oid, 'EXECUTE')
+	  ) AND NOT EXISTS (
+	    SELECT 1 FROM expected_runtime_routines AS expected
+	    WHERE expected.role_kind = 'credential_resolver'
+	      AND expected.function_name = routine.proname
+	      AND expected.identity_arguments = pg_catalog.oidvectortypes(routine.proargtypes)
+	  )
+	)::integer AS credential_resolver_unexpected_routine_execute_count,
+	count(routine.oid) FILTER (
+	  WHERE EXISTS (
+	    SELECT 1 FROM expected_runtime_routines AS expected
+	    WHERE expected.role_kind = 'handoff'
+	      AND expected.function_name = routine.proname
+	      AND expected.identity_arguments = pg_catalog.oidvectortypes(routine.proargtypes)
+	  ) AND EXISTS (
+	    SELECT 1 FROM session_reachable_roles AS reachable
+	    WHERE pg_catalog.has_function_privilege(reachable.role_oid, routine.oid, 'EXECUTE')
+	  )
+	)::integer AS handoff_exact_routine_execute_count,
+	count(routine.oid) FILTER (
+	  WHERE EXISTS (
+	    SELECT 1 FROM session_reachable_roles AS reachable
+	    WHERE pg_catalog.has_function_privilege(reachable.role_oid, routine.oid, 'EXECUTE')
+	  ) AND NOT EXISTS (
+	    SELECT 1 FROM expected_runtime_routines AS expected
+	    WHERE expected.role_kind = 'handoff'
+	      AND expected.function_name = routine.proname
+	      AND expected.identity_arguments = pg_catalog.oidvectortypes(routine.proargtypes)
+	  )
+	)::integer AS handoff_unexpected_routine_execute_count,
     count(routine.oid) FILTER (
       WHERE EXISTS (
         SELECT 1 FROM session_reachable_roles AS reachable
@@ -361,14 +646,24 @@ SELECT
   role_state.role_name,
   role_state.session_role_name,
   role_state.can_login,
+	role_state.role_inherits,
+	role_state.role_setting_is_none,
   role_state.has_cluster_authority,
+	direct_memberships.membership_count,
+	direct_memberships.exact_inherit_only_membership_count,
+	direct_memberships.membership_group_member_count,
   reachable.role_count,
   reachable.has_cluster_authority,
   reachable.application_is_reachable,
   reachable.migration_owner_is_reachable,
   reachable.gc_operator_is_reachable,
   reachable.golden_fault_operator_is_reachable,
-  reachable.promotion_operator_is_reachable,
+	reachable.promotion_operator_is_reachable,
+	reachable.policy_operator_is_reachable,
+	reachable.input_precommit_operator_is_reachable,
+	reachable.source_verifier_operator_is_reachable,
+	reachable.credential_resolver_operator_is_reachable,
+	reachable.handoff_operator_is_reachable,
   reachable.has_admin_option,
   stable.role_count,
   stable.unsafe_role_count,
@@ -386,10 +681,11 @@ SELECT
   schema_state.reachable_owns_schema,
   schema_state.reachable_has_usage,
   schema_state.reachable_can_create,
+  schema_owners.reachable_owned_object_count,
   relations.owned_boundary_count,
   relations.migration_owned_boundary_count,
   relations.reachable_table_privilege_count,
-  relations.promotion_exact_table_select_count,
+	relations.promotion_boundary_table_privilege_count,
   relations.promotion_unexpected_table_privilege_count,
   relations.reachable_sequence_privilege_count,
   relations.reachable_owned_relation_count,
@@ -401,15 +697,27 @@ SELECT
   routines.migration_owned_routine_count,
   routines.reachable_execute_count,
   routines.promotion_exact_routine_execute_count,
-  routines.promotion_unexpected_routine_execute_count,
+	routines.promotion_unexpected_routine_execute_count,
+	routines.policy_exact_routine_execute_count,
+	routines.policy_unexpected_routine_execute_count,
+	routines.input_precommit_exact_routine_execute_count,
+	routines.input_precommit_unexpected_routine_execute_count,
+	routines.source_verifier_exact_routine_execute_count,
+	routines.source_verifier_unexpected_routine_execute_count,
+	routines.credential_resolver_exact_routine_execute_count,
+	routines.credential_resolver_unexpected_routine_execute_count,
+	routines.handoff_exact_routine_execute_count,
+	routines.handoff_unexpected_routine_execute_count,
   routines.reachable_owned_routine_count,
   routines.direct_routine_acl_count,
   schema_direct.direct_acl_count
 FROM current_role_facts AS role_state
+CROSS JOIN direct_membership_facts AS direct_memberships
 CROSS JOIN reachable_role_facts AS reachable
 CROSS JOIN stable_role_facts AS stable
 CROSS JOIN database_facts AS database_state
 CROSS JOIN schema_facts AS schema_state
+CROSS JOIN schema_object_owner_facts AS schema_owners
 CROSS JOIN relation_facts AS relations
 CROSS JOIN column_facts AS columns
 CROSS JOIN routine_facts AS routines
@@ -430,54 +738,75 @@ func (q sqlQueryer) QueryRowContext(ctx context.Context, query string, args ...a
 }
 
 type sessionFacts struct {
-	roleCount                               int
-	roleName                                string
-	sessionRoleName                         string
-	canLogin                                bool
-	hasClusterAuthority                     bool
-	reachableRoleCount                      int
-	reachableHasClusterAuthority            bool
-	applicationReachable                    bool
-	migrationOwnerReachable                 bool
-	gcOperatorReachable                     bool
-	goldenFaultOperatorReachable            bool
-	promotionOperatorReachable              bool
-	hasAdminOption                          bool
-	stableRoleCount                         int
-	unsafeStableRoleCount                   int
-	stableOutgoingMembershipCount           int
-	stableAdministeredRoleCount             int
-	databaseCount                           int
-	databaseName                            string
-	transportUsesTLS                        bool
-	primaryIsReadWrite                      bool
-	reachableOwnsDatabase                   bool
-	reachableCanCreateDatabaseObjects       bool
-	schemaCount                             int
-	schemaName                              string
-	schemaOwnedByMigrationOwner             bool
-	reachableOwnsSchema                     bool
-	reachableHasSchemaUsage                 bool
-	reachableCanCreateInSchema              bool
-	ownedBoundaryRelationCount              int
-	migrationOwnedBoundaryCount             int
-	reachableTablePrivilegeCount            int
-	promotionExactTableSelectCount          int
-	promotionUnexpectedTablePrivilegeCount  int
-	reachableSequencePrivilegeCount         int
-	reachableOwnedRelationCount             int
-	directRelationACLCount                  int
-	reachableColumnPrivilegeCount           int
-	directColumnACLCount                    int
-	promotionUnexpectedColumnPrivilegeCount int
-	routineCount                            int
-	migrationOwnedRoutineCount              int
-	reachableRoutineExecuteCount            int
-	promotionExactRoutineExecuteCount       int
-	promotionUnexpectedRoutineExecuteCount  int
-	reachableOwnedRoutineCount              int
-	directRoutineACLCount                   int
-	directSchemaACLCount                    int
+	roleCount                                       int
+	roleName                                        string
+	sessionRoleName                                 string
+	canLogin                                        bool
+	roleInherits                                    bool
+	roleSettingIsNone                               bool
+	hasClusterAuthority                             bool
+	directMembershipCount                           int
+	exactInheritOnlyDirectMembershipCount           int
+	directMembershipGroupMemberCount                int
+	reachableRoleCount                              int
+	reachableHasClusterAuthority                    bool
+	applicationReachable                            bool
+	migrationOwnerReachable                         bool
+	gcOperatorReachable                             bool
+	goldenFaultOperatorReachable                    bool
+	promotionOperatorReachable                      bool
+	policyOperatorReachable                         bool
+	inputPrecommitOperatorReachable                 bool
+	sourceVerifierOperatorReachable                 bool
+	credentialResolverOperatorReachable             bool
+	handoffOperatorReachable                        bool
+	hasAdminOption                                  bool
+	stableRoleCount                                 int
+	unsafeStableRoleCount                           int
+	stableOutgoingMembershipCount                   int
+	stableAdministeredRoleCount                     int
+	databaseCount                                   int
+	databaseName                                    string
+	transportUsesTLS                                bool
+	primaryIsReadWrite                              bool
+	reachableOwnsDatabase                           bool
+	reachableCanCreateDatabaseObjects               bool
+	schemaCount                                     int
+	schemaName                                      string
+	schemaOwnedByMigrationOwner                     bool
+	reachableOwnsSchema                             bool
+	reachableHasSchemaUsage                         bool
+	reachableCanCreateInSchema                      bool
+	reachableOwnedSchemaObjectCount                 int
+	ownedBoundaryRelationCount                      int
+	migrationOwnedBoundaryCount                     int
+	reachableTablePrivilegeCount                    int
+	promotionBoundaryTablePrivilegeCount            int
+	promotionUnexpectedTablePrivilegeCount          int
+	reachableSequencePrivilegeCount                 int
+	reachableOwnedRelationCount                     int
+	directRelationACLCount                          int
+	reachableColumnPrivilegeCount                   int
+	directColumnACLCount                            int
+	promotionUnexpectedColumnPrivilegeCount         int
+	routineCount                                    int
+	migrationOwnedRoutineCount                      int
+	reachableRoutineExecuteCount                    int
+	promotionExactRoutineExecuteCount               int
+	promotionUnexpectedRoutineExecuteCount          int
+	policyExactRoutineExecuteCount                  int
+	policyUnexpectedRoutineExecuteCount             int
+	inputPrecommitExactRoutineExecuteCount          int
+	inputPrecommitUnexpectedRoutineExecuteCount     int
+	sourceVerifierExactRoutineExecuteCount          int
+	sourceVerifierUnexpectedRoutineExecuteCount     int
+	credentialResolverExactRoutineExecuteCount      int
+	credentialResolverUnexpectedRoutineExecuteCount int
+	handoffExactRoutineExecuteCount                 int
+	handoffUnexpectedRoutineExecuteCount            int
+	reachableOwnedRoutineCount                      int
+	directRoutineACLCount                           int
+	directSchemaACLCount                            int
 }
 
 type databaseHandle struct {
@@ -518,7 +847,7 @@ func defaultVerificationDependencies() verificationDependencies {
 	}
 }
 
-// Verify checks four concurrently held, distinct production identities within
+// Verify checks nine concurrently held, distinct production identities within
 // one bounded call. Their catalog queries cannot share a transaction, so this
 // is not an atomic cross-identity snapshot and does not issue or consume
 // qualification/promotion authority.
@@ -544,6 +873,12 @@ func verifyWithDependencies(
 		return result, fail(&result, ErrInvalidConfiguration, FailureConfigurationInvalid, "")
 	}
 	result.Schema = validated.schema
+	result.PromotionSessionAffinity = validated.promotionSessionAffinity
+	result.PromotionRuntimeGate = configuration.PromotionRuntimeGate
+	result.InputPrecommitSessionAffinity = validated.inputPrecommitSessionAffinity
+	result.SourceVerifierSessionAffinity = validated.sourceVerifierSessionAffinity
+	result.CredentialResolverSessionAffinity = validated.credentialResolverSessionAffinity
+	result.HandoffSessionAffinity = validated.handoffSessionAffinity
 	if err := dependencies.verifyTrustAnchor(validated.application.rootCertificate); err != nil {
 		return result, fail(&result, ErrInvalidConfiguration, FailureConfigurationInvalid, "")
 	}
@@ -560,6 +895,11 @@ func verifyWithDependencies(
 		{kind: RoleMigrator, expected: validated.migrator.username, dsn: validated.migrator.scoped},
 		{kind: RoleQualification, expected: validated.qualification.username, dsn: validated.qualification.scoped},
 		{kind: RolePromotion, expected: validated.promotion.username, dsn: validated.promotion.scoped},
+		{kind: RolePolicy, expected: validated.policy.username, dsn: validated.policy.scoped},
+		{kind: RoleInputPrecommit, expected: validated.inputPrecommit.username, dsn: validated.inputPrecommit.scoped},
+		{kind: RoleSourceVerifier, expected: validated.sourceVerifier.username, dsn: validated.sourceVerifier.scoped},
+		{kind: RoleCredentialResolver, expected: validated.credentialResolver.username, dsn: validated.credentialResolver.scoped},
+		{kind: RoleHandoff, expected: validated.handoff.username, dsn: validated.handoff.scoped},
 	}
 	defer func() {
 		for index := range connections {
@@ -605,6 +945,16 @@ func verifyWithDependencies(
 				code = FailureAuditorPostureUnsafe
 			} else if connection.kind == RolePromotion {
 				code = FailurePromotionPostureUnsafe
+			} else if connection.kind == RolePolicy {
+				code = FailurePolicyPostureUnsafe
+			} else if connection.kind == RoleInputPrecommit {
+				code = FailureInputPrecommitPostureUnsafe
+			} else if connection.kind == RoleSourceVerifier {
+				code = FailureSourceVerifierPostureUnsafe
+			} else if connection.kind == RoleCredentialResolver {
+				code = FailureCredentialResolverPostureUnsafe
+			} else if connection.kind == RoleHandoff {
+				code = FailureHandoffPostureUnsafe
 			}
 			return result, fail(&result, ErrUnsafePosture, code, connection.kind)
 		}
@@ -642,7 +992,12 @@ func inspectSession(ctx context.Context, queryer sessionQueryer, schema string) 
 		&facts.roleName,
 		&facts.sessionRoleName,
 		&facts.canLogin,
+		&facts.roleInherits,
+		&facts.roleSettingIsNone,
 		&facts.hasClusterAuthority,
+		&facts.directMembershipCount,
+		&facts.exactInheritOnlyDirectMembershipCount,
+		&facts.directMembershipGroupMemberCount,
 		&facts.reachableRoleCount,
 		&facts.reachableHasClusterAuthority,
 		&facts.applicationReachable,
@@ -650,6 +1005,11 @@ func inspectSession(ctx context.Context, queryer sessionQueryer, schema string) 
 		&facts.gcOperatorReachable,
 		&facts.goldenFaultOperatorReachable,
 		&facts.promotionOperatorReachable,
+		&facts.policyOperatorReachable,
+		&facts.inputPrecommitOperatorReachable,
+		&facts.sourceVerifierOperatorReachable,
+		&facts.credentialResolverOperatorReachable,
+		&facts.handoffOperatorReachable,
 		&facts.hasAdminOption,
 		&facts.stableRoleCount,
 		&facts.unsafeStableRoleCount,
@@ -667,10 +1027,11 @@ func inspectSession(ctx context.Context, queryer sessionQueryer, schema string) 
 		&facts.reachableOwnsSchema,
 		&facts.reachableHasSchemaUsage,
 		&facts.reachableCanCreateInSchema,
+		&facts.reachableOwnedSchemaObjectCount,
 		&facts.ownedBoundaryRelationCount,
 		&facts.migrationOwnedBoundaryCount,
 		&facts.reachableTablePrivilegeCount,
-		&facts.promotionExactTableSelectCount,
+		&facts.promotionBoundaryTablePrivilegeCount,
 		&facts.promotionUnexpectedTablePrivilegeCount,
 		&facts.reachableSequencePrivilegeCount,
 		&facts.reachableOwnedRelationCount,
@@ -683,6 +1044,16 @@ func inspectSession(ctx context.Context, queryer sessionQueryer, schema string) 
 		&facts.reachableRoutineExecuteCount,
 		&facts.promotionExactRoutineExecuteCount,
 		&facts.promotionUnexpectedRoutineExecuteCount,
+		&facts.policyExactRoutineExecuteCount,
+		&facts.policyUnexpectedRoutineExecuteCount,
+		&facts.inputPrecommitExactRoutineExecuteCount,
+		&facts.inputPrecommitUnexpectedRoutineExecuteCount,
+		&facts.sourceVerifierExactRoutineExecuteCount,
+		&facts.sourceVerifierUnexpectedRoutineExecuteCount,
+		&facts.credentialResolverExactRoutineExecuteCount,
+		&facts.credentialResolverUnexpectedRoutineExecuteCount,
+		&facts.handoffExactRoutineExecuteCount,
+		&facts.handoffUnexpectedRoutineExecuteCount,
 		&facts.reachableOwnedRoutineCount,
 		&facts.directRoutineACLCount,
 		&facts.directSchemaACLCount,
@@ -696,13 +1067,14 @@ func inspectSession(ctx context.Context, queryer sessionQueryer, schema string) 
 func validateSessionFacts(kind RoleKind, expectedRole, schema string, facts sessionFacts) []string {
 	violations := make([]string, 0, 16)
 	if facts.roleCount != 1 || facts.roleName == "" || facts.roleName != expectedRole ||
-		facts.sessionRoleName != facts.roleName || !facts.canLogin {
+		facts.sessionRoleName != facts.roleName || !facts.canLogin ||
+		!facts.roleSettingIsNone {
 		violations = append(violations, "login identity is not exact")
 	}
 	if facts.hasClusterAuthority || facts.reachableHasClusterAuthority || facts.hasAdminOption {
 		violations = append(violations, "login can reach cluster or role administration authority")
 	}
-	if facts.stableRoleCount != 5 || facts.unsafeStableRoleCount != 0 ||
+	if facts.stableRoleCount != 10 || facts.unsafeStableRoleCount != 0 ||
 		facts.stableOutgoingMembershipCount != 0 || facts.stableAdministeredRoleCount != 0 {
 		violations = append(violations, "stable group role boundary is unsafe")
 	}
@@ -718,11 +1090,33 @@ func validateSessionFacts(kind RoleKind, expectedRole, schema string, facts sess
 		facts.directColumnACLCount != 0 || facts.directRoutineACLCount != 0 {
 		violations = append(violations, "login has direct trusted-schema ACLs outside its group boundary")
 	}
+	if kind != RoleMigrator && facts.reachableOwnedSchemaObjectCount != 0 {
+		violations = append(violations, "login or its reachable group owns trusted-schema objects")
+	}
+	if kind == RoleQualification {
+		if facts.directMembershipCount != 0 ||
+			facts.exactInheritOnlyDirectMembershipCount != 0 {
+			violations = append(violations, "qualification auditor has a direct role membership")
+		}
+	} else if kind == RolePromotion || kind == RoleInputPrecommit ||
+		kind == RoleSourceVerifier || kind == RoleCredentialResolver || kind == RoleHandoff {
+		if !facts.roleInherits || facts.directMembershipCount != 1 ||
+			facts.exactInheritOnlyDirectMembershipCount != 1 ||
+			facts.directMembershipGroupMemberCount != 1 {
+			violations = append(violations, "runtime login does not have one inherited, non-settable, non-admin operator membership")
+		}
+	}
+	if kind != RoleHandoff && facts.handoffOperatorReachable {
+		violations = append(violations, "login can reach the private qualification-handoff operator")
+	}
 
 	switch kind {
 	case RoleApplication:
 		if facts.reachableRoleCount != 2 || !facts.applicationReachable ||
-			facts.migrationOwnerReachable || facts.gcOperatorReachable || facts.goldenFaultOperatorReachable || facts.promotionOperatorReachable {
+			facts.migrationOwnerReachable || facts.gcOperatorReachable || facts.goldenFaultOperatorReachable ||
+			facts.promotionOperatorReachable || facts.policyOperatorReachable ||
+			facts.inputPrecommitOperatorReachable || facts.sourceVerifierOperatorReachable ||
+			facts.credentialResolverOperatorReachable {
 			violations = append(violations, "application login does not have exactly one application-group path")
 		}
 		if facts.reachableOwnsSchema || !facts.reachableHasSchemaUsage || facts.reachableCanCreateInSchema ||
@@ -731,7 +1125,10 @@ func validateSessionFacts(kind RoleKind, expectedRole, schema string, facts sess
 		}
 	case RoleMigrator:
 		if facts.reachableRoleCount != 2 || facts.applicationReachable ||
-			!facts.migrationOwnerReachable || facts.gcOperatorReachable || facts.goldenFaultOperatorReachable || facts.promotionOperatorReachable {
+			!facts.migrationOwnerReachable || facts.gcOperatorReachable || facts.goldenFaultOperatorReachable ||
+			facts.promotionOperatorReachable || facts.policyOperatorReachable ||
+			facts.inputPrecommitOperatorReachable || facts.sourceVerifierOperatorReachable ||
+			facts.credentialResolverOperatorReachable {
 			violations = append(violations, "migrator login does not have exactly one migration-owner path")
 		}
 		if !facts.reachableOwnsSchema || !facts.reachableHasSchemaUsage || !facts.reachableCanCreateInSchema {
@@ -746,7 +1143,10 @@ func validateSessionFacts(kind RoleKind, expectedRole, schema string, facts sess
 		}
 	case RoleQualification:
 		if facts.reachableRoleCount != 1 || facts.applicationReachable ||
-			facts.migrationOwnerReachable || facts.gcOperatorReachable || facts.goldenFaultOperatorReachable || facts.promotionOperatorReachable {
+			facts.migrationOwnerReachable || facts.gcOperatorReachable || facts.goldenFaultOperatorReachable ||
+			facts.promotionOperatorReachable || facts.policyOperatorReachable ||
+			facts.inputPrecommitOperatorReachable || facts.sourceVerifierOperatorReachable ||
+			facts.credentialResolverOperatorReachable {
 			violations = append(violations, "qualification auditor can inherit or SET ROLE into a stable group")
 		}
 		if facts.reachableOwnsSchema || facts.reachableHasSchemaUsage || facts.reachableCanCreateInSchema ||
@@ -757,17 +1157,90 @@ func validateSessionFacts(kind RoleKind, expectedRole, schema string, facts sess
 		}
 	case RolePromotion:
 		if facts.reachableRoleCount != 2 || facts.applicationReachable || facts.migrationOwnerReachable ||
-			facts.gcOperatorReachable || facts.goldenFaultOperatorReachable || !facts.promotionOperatorReachable {
+			facts.gcOperatorReachable || facts.goldenFaultOperatorReachable || !facts.promotionOperatorReachable ||
+			facts.policyOperatorReachable || facts.inputPrecommitOperatorReachable ||
+			facts.sourceVerifierOperatorReachable || facts.credentialResolverOperatorReachable {
 			violations = append(violations, "promotion login does not have exactly one qualification-promotion-operator path")
 		}
 		if facts.reachableOwnsSchema || !facts.reachableHasSchemaUsage || facts.reachableCanCreateInSchema ||
-			facts.reachableTablePrivilegeCount != 2 || facts.reachableSequencePrivilegeCount != 0 ||
-			facts.promotionExactTableSelectCount != 2 || facts.promotionUnexpectedTablePrivilegeCount != 0 ||
-			facts.reachableColumnPrivilegeCount < 1 || facts.promotionUnexpectedColumnPrivilegeCount != 0 ||
-			facts.reachableOwnedRelationCount != 0 || facts.reachableRoutineExecuteCount != 1 ||
-			facts.promotionExactRoutineExecuteCount != 1 || facts.promotionUnexpectedRoutineExecuteCount != 0 ||
+			facts.reachableTablePrivilegeCount != 0 || facts.reachableSequencePrivilegeCount != 0 ||
+			facts.promotionBoundaryTablePrivilegeCount != 0 || facts.promotionUnexpectedTablePrivilegeCount != 0 ||
+			facts.reachableColumnPrivilegeCount != 0 || facts.promotionUnexpectedColumnPrivilegeCount != 0 ||
+			facts.reachableOwnedRelationCount != 0 || facts.reachableRoutineExecuteCount != 4 ||
+			facts.promotionExactRoutineExecuteCount != 4 || facts.promotionUnexpectedRoutineExecuteCount != 0 ||
 			facts.reachableOwnedRoutineCount != 0 {
-			violations = append(violations, "promotion login does not have the exact two-table SELECT and one consume-routine contract")
+			violations = append(violations, "promotion login must have no data access and exactly consume/inspect/history plus the input-precommit resolver, without handoff authority")
+		}
+	case RolePolicy:
+		if facts.reachableRoleCount != 2 || facts.applicationReachable || facts.migrationOwnerReachable ||
+			facts.gcOperatorReachable || facts.goldenFaultOperatorReachable || facts.promotionOperatorReachable ||
+			!facts.policyOperatorReachable || facts.inputPrecommitOperatorReachable ||
+			facts.sourceVerifierOperatorReachable || facts.credentialResolverOperatorReachable {
+			violations = append(violations, "qualification-policy login does not have exactly one qualification-policy-operator path")
+		}
+		if facts.reachableOwnsSchema || !facts.reachableHasSchemaUsage || facts.reachableCanCreateInSchema ||
+			facts.reachableTablePrivilegeCount != 0 || facts.reachableColumnPrivilegeCount != 0 ||
+			facts.reachableSequencePrivilegeCount != 0 || facts.reachableOwnedRelationCount != 0 ||
+			facts.reachableRoutineExecuteCount != 4 || facts.policyExactRoutineExecuteCount != 4 ||
+			facts.policyUnexpectedRoutineExecuteCount != 0 || facts.reachableOwnedRoutineCount != 0 {
+			violations = append(violations, "qualification-policy login does not have the exact four-routine, no-data-access contract")
+		}
+	case RoleInputPrecommit:
+		if facts.reachableRoleCount != 2 || facts.applicationReachable || facts.migrationOwnerReachable ||
+			facts.gcOperatorReachable || facts.goldenFaultOperatorReachable || facts.promotionOperatorReachable ||
+			facts.policyOperatorReachable || !facts.inputPrecommitOperatorReachable ||
+			facts.sourceVerifierOperatorReachable || facts.credentialResolverOperatorReachable {
+			violations = append(violations, "qualification input-precommit login does not have exactly one input-precommit-operator path")
+		}
+		if facts.reachableOwnsSchema || !facts.reachableHasSchemaUsage || facts.reachableCanCreateInSchema ||
+			facts.reachableTablePrivilegeCount != 0 || facts.reachableColumnPrivilegeCount != 0 ||
+			facts.reachableSequencePrivilegeCount != 0 || facts.reachableOwnedRelationCount != 0 ||
+			facts.reachableRoutineExecuteCount != 3 || facts.inputPrecommitExactRoutineExecuteCount != 3 ||
+			facts.inputPrecommitUnexpectedRoutineExecuteCount != 0 || facts.reachableOwnedRoutineCount != 0 {
+			violations = append(violations, "qualification input-precommit login does not have the exact three-routine, no-data-access contract")
+		}
+	case RoleSourceVerifier:
+		if facts.reachableRoleCount != 2 || facts.applicationReachable || facts.migrationOwnerReachable ||
+			facts.gcOperatorReachable || facts.goldenFaultOperatorReachable || facts.promotionOperatorReachable ||
+			facts.policyOperatorReachable || facts.inputPrecommitOperatorReachable ||
+			!facts.sourceVerifierOperatorReachable || facts.credentialResolverOperatorReachable {
+			violations = append(violations, "qualification source-verifier login does not have exactly one source-verifier-operator path")
+		}
+		if facts.reachableOwnsSchema || !facts.reachableHasSchemaUsage || facts.reachableCanCreateInSchema ||
+			facts.reachableTablePrivilegeCount != 0 || facts.reachableColumnPrivilegeCount != 0 ||
+			facts.reachableSequencePrivilegeCount != 0 || facts.reachableOwnedRelationCount != 0 ||
+			facts.reachableRoutineExecuteCount != 3 || facts.sourceVerifierExactRoutineExecuteCount != 3 ||
+			facts.sourceVerifierUnexpectedRoutineExecuteCount != 0 || facts.reachableOwnedRoutineCount != 0 {
+			violations = append(violations, "qualification source-verifier login does not have the exact three-routine, no-data-access contract")
+		}
+	case RoleCredentialResolver:
+		if facts.reachableRoleCount != 2 || facts.applicationReachable || facts.migrationOwnerReachable ||
+			facts.gcOperatorReachable || facts.goldenFaultOperatorReachable || facts.promotionOperatorReachable ||
+			facts.policyOperatorReachable || facts.inputPrecommitOperatorReachable ||
+			facts.sourceVerifierOperatorReachable || !facts.credentialResolverOperatorReachable {
+			violations = append(violations, "qualification credential-resolver login does not have exactly one credential-resolver-operator path")
+		}
+		if facts.reachableOwnsSchema || !facts.reachableHasSchemaUsage || facts.reachableCanCreateInSchema ||
+			facts.reachableTablePrivilegeCount != 0 || facts.reachableColumnPrivilegeCount != 0 ||
+			facts.reachableSequencePrivilegeCount != 0 || facts.reachableOwnedRelationCount != 0 ||
+			facts.reachableRoutineExecuteCount != 3 || facts.credentialResolverExactRoutineExecuteCount != 3 ||
+			facts.credentialResolverUnexpectedRoutineExecuteCount != 0 || facts.reachableOwnedRoutineCount != 0 {
+			violations = append(violations, "qualification credential-resolver login does not have the exact three-routine, no-data-access contract")
+		}
+	case RoleHandoff:
+		if facts.reachableRoleCount != 2 || facts.applicationReachable || facts.migrationOwnerReachable ||
+			facts.gcOperatorReachable || facts.goldenFaultOperatorReachable || facts.promotionOperatorReachable ||
+			facts.policyOperatorReachable || facts.inputPrecommitOperatorReachable ||
+			facts.sourceVerifierOperatorReachable || facts.credentialResolverOperatorReachable ||
+			!facts.handoffOperatorReachable {
+			violations = append(violations, "qualification-handoff login does not have exactly one handoff-operator path")
+		}
+		if facts.reachableOwnsSchema || !facts.reachableHasSchemaUsage || facts.reachableCanCreateInSchema ||
+			facts.reachableTablePrivilegeCount != 0 || facts.reachableColumnPrivilegeCount != 0 ||
+			facts.reachableSequencePrivilegeCount != 0 || facts.reachableOwnedRelationCount != 0 ||
+			facts.reachableRoutineExecuteCount != 2 || facts.handoffExactRoutineExecuteCount != 2 ||
+			facts.handoffUnexpectedRoutineExecuteCount != 0 || facts.reachableOwnedRoutineCount != 0 {
+			violations = append(violations, "qualification-handoff login does not have the exact two-routine, no-data-access contract")
 		}
 	default:
 		violations = append(violations, "role kind is unsupported")

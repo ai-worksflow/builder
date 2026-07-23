@@ -6,6 +6,10 @@ test -w /workspace
 test -d "${CODEX_HOME:-/codex}"
 test -w "${CODEX_HOME:-/codex}"
 
+mkdir -p \
+  /workspace/.worksflow/dependencies/go/pkg/mod \
+  /workspace/.worksflow/dependencies/go/build-cache \
+  /workspace/.worksflow/dependencies/go/tmp
 mkdir -p "${HOME:-/tmp/home}"
 umask 077
 printf '%s\n' 'sandbox-runner/v1' > /tmp/worksflow-runner-ready

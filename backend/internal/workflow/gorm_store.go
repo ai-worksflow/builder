@@ -2,6 +2,7 @@ package workflow
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -28,12 +29,35 @@ type GORMStore struct {
 	ids     IDGenerator
 }
 
+const workflowInputAuthorityMigrationAdvisoryKey = "worksflow:workflow-input-authority-migration:v1"
+
+// lockWorkflowInputAuthorityMigrationRuntime joins the shared runtime side of
+// the Workflow Input rolling-migration fence. It must be the first database
+// statement in any workflow transaction that can acquire both project and run
+// locks; migrations 78/79 take the exclusive side before touching either
+// relation. Deploy this runtime fence before applying those migrations.
+func lockWorkflowInputAuthorityMigrationRuntime(transaction *gorm.DB) error {
+	if transaction == nil || transaction.Dialector == nil || transaction.Dialector.Name() != "postgres" {
+		return fmt.Errorf("workflow rolling-migration fence requires PostgreSQL")
+	}
+	return transaction.Exec(
+		"SELECT pg_catalog.pg_advisory_xact_lock_shared(pg_catalog.hashtextextended(CAST(? AS text), 0))",
+		workflowInputAuthorityMigrationAdvisoryKey,
+	).Error
+}
+
 const claimRunnableSQL = `WITH candidate AS (
   SELECT node.id FROM workflow_node_runs AS node
   JOIN workflow_runs AS run ON run.id = node.run_id
   JOIN jsonb_to_recordset(CAST(@profiles AS jsonb)) AS profile(version text, hash text)
     ON profile.version = run.execution_profile_version AND profile.hash = run.execution_profile_hash
 	WHERE run.status NOT IN ('completed', 'failed', 'cancelled', 'stale')
+	  AND node.node_type <> 'external_qualification_gate'
+	  AND NOT (
+	    run.execution_profile_version = '` + WorkflowExecutionProfileV3Version + `'
+	    AND run.execution_profile_hash = '` + WorkflowExecutionProfileV3Hash + `'
+	    AND node.node_type = 'publish'
+	  )
 	  AND (
 	    (node.status = 'ready' AND node.available_at <= @now)
 	    OR (node.status = 'running' AND node.lease_expires_at < @now)
@@ -48,6 +72,17 @@ SET status = 'running', attempt = attempt + 1, lease_owner = @owner,
 FROM candidate
 WHERE node.id = candidate.id
 RETURNING node.*`
+
+const renewLeaseWhereSQL = `id = ? AND run_id = ?
+AND node_type <> ? AND status = 'running' AND lease_owner = ? AND attempt = ? AND lease_expires_at >= ?
+AND NOT (
+  node_type = ? AND EXISTS (
+    SELECT 1 FROM workflow_runs AS run
+    WHERE run.id = workflow_node_runs.run_id
+      AND run.execution_profile_version = '` + WorkflowExecutionProfileV3Version + `'
+      AND run.execution_profile_hash = '` + WorkflowExecutionProfileV3Hash + `'
+  )
+)`
 
 func NewGORMStore(db *gorm.DB, content ContentStore, ids IDGenerator) (*GORMStore, error) {
 	if db == nil {
@@ -162,6 +197,10 @@ type nodeRunRow struct {
 	RunID            uuid.UUID `gorm:"type:uuid"`
 	NodeKey          string
 	NodeType         string
+	DefinitionNodeID *string
+	SliceKind        *string
+	SliceID          *uuid.UUID `gorm:"type:uuid"`
+	InputAuthorityID *uuid.UUID `gorm:"type:uuid"`
 	Status           string
 	Attempt          int
 	InputManifestID  *uuid.UUID `gorm:"type:uuid"`
@@ -680,17 +719,18 @@ func (s *GORMStore) CreateRun(ctx context.Context, run *RunRecord, events []Even
 	runModel.EventCursor = uint64(len(eventModels))
 	run.EventCursor = runModel.EventCursor
 	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		if run.GovernanceMode != "" {
-			var project struct {
-				GovernanceMode string `gorm:"column:governance_mode"`
-			}
-			if err := tx.Table("projects").Clauses(clause.Locking{Strength: "UPDATE"}).
-				Select("governance_mode").Where("id = ?", runModel.ProjectID).Take(&project).Error; err != nil {
-				return mapGORMError(err)
-			}
-			if project.GovernanceMode != string(run.GovernanceMode) {
-				return core.ErrConflict
-			}
+		if err := lockWorkflowInputAuthorityMigrationRuntime(tx); err != nil {
+			return err
+		}
+		var project struct {
+			GovernanceMode string `gorm:"column:governance_mode"`
+		}
+		if err := tx.Table("projects").Clauses(clause.Locking{Strength: "UPDATE"}).
+			Select("governance_mode").Where("id = ?", runModel.ProjectID).Take(&project).Error; err != nil {
+			return mapGORMError(err)
+		}
+		if project.GovernanceMode != runModel.GovernanceMode {
+			return core.ErrConflict
 		}
 		if err := tx.Create(&runModel).Error; err != nil {
 			return err
@@ -768,6 +808,28 @@ func nodeToRow(node *NodeRecord) (nodeRunRow, error) {
 	if err != nil {
 		return nodeRunRow{}, err
 	}
+	definitionNodeID := strings.TrimSpace(node.DefinitionNodeID)
+	if definitionNodeID == "" {
+		return nodeRunRow{}, fmt.Errorf("node definitionNodeId is required")
+	}
+	sliceKind := "root"
+	var sliceID *uuid.UUID
+	if node.SliceID != "" {
+		parsed, err := parseUUID("node.sliceId", node.SliceID)
+		if err != nil {
+			return nodeRunRow{}, err
+		}
+		sliceKind = "slice"
+		sliceID = &parsed
+	}
+	var inputAuthorityID *uuid.UUID
+	if node.InputAuthorityID != "" {
+		parsed, err := parseUUID("node.inputAuthorityId", node.InputAuthorityID)
+		if err != nil {
+			return nodeRunRow{}, err
+		}
+		inputAuthorityID = &parsed
+	}
 	var manifestID, proposalID, revisionID *uuid.UUID
 	if node.InputManifest != nil {
 		parsed, err := parseUUID("node.inputManifestId", node.InputManifest.ID)
@@ -795,7 +857,7 @@ func nodeToRow(node *NodeRecord) (nodeRunRow, error) {
 		value := node.LeaseOwner
 		owner = &value
 	}
-	return nodeRunRow{ID: id, RunID: runID, NodeKey: node.Key, NodeType: string(node.Type), Status: string(node.Status), Attempt: node.Attempt, InputManifestID: manifestID, OutputProposalID: proposalID, OutputRevisionID: revisionID, LeaseOwner: owner, LeaseExpiresAt: node.LeaseExpiresAt, AvailableAt: node.AvailableAt, StartedAt: node.StartedAt, CompletedAt: node.CompletedAt, Failure: node.Failure, CreatedAt: node.CreatedAt, UpdatedAt: node.UpdatedAt}, nil
+	return nodeRunRow{ID: id, RunID: runID, NodeKey: node.Key, NodeType: string(node.Type), DefinitionNodeID: &definitionNodeID, SliceKind: &sliceKind, SliceID: sliceID, InputAuthorityID: inputAuthorityID, Status: string(node.Status), Attempt: node.Attempt, InputManifestID: manifestID, OutputProposalID: proposalID, OutputRevisionID: revisionID, LeaseOwner: owner, LeaseExpiresAt: node.LeaseExpiresAt, AvailableAt: node.AvailableAt, StartedAt: node.StartedAt, CompletedAt: node.CompletedAt, Failure: node.Failure, CreatedAt: node.CreatedAt, UpdatedAt: node.UpdatedAt}, nil
 }
 
 func (s *GORMStore) GetRun(ctx context.Context, id string) (*RunRecord, error) {
@@ -910,7 +972,26 @@ func (s *GORMStore) ListActiveExecutionProfiles(ctx context.Context) ([]domain.W
 
 func (s *GORMStore) rowToNode(ctx context.Context, row nodeRunRow, runContext RunContext) (*NodeRecord, error) {
 	metadata := runContext.Nodes[row.NodeKey]
-	node := &NodeRecord{ID: row.ID.String(), RunID: row.RunID.String(), Key: row.NodeKey, DefinitionNodeID: metadata.DefinitionNodeID, SliceID: metadata.SliceID, Type: domain.WorkflowNodeType(row.NodeType), Status: NodeStatus(row.Status), Attempt: row.Attempt, AvailableAt: row.AvailableAt, LeaseExpiresAt: row.LeaseExpiresAt, StartedAt: row.StartedAt, CompletedAt: row.CompletedAt, Failure: row.Failure, CreatedAt: row.CreatedAt, UpdatedAt: row.UpdatedAt}
+	definitionNodeID, sliceID := metadata.DefinitionNodeID, metadata.SliceID
+	if row.DefinitionNodeID != nil || row.SliceKind != nil || row.SliceID != nil {
+		if row.DefinitionNodeID == nil || row.SliceKind == nil || strings.TrimSpace(*row.DefinitionNodeID) == "" ||
+			(*row.SliceKind != "root" && *row.SliceKind != "slice") ||
+			(*row.SliceKind == "root" && row.SliceID != nil) || (*row.SliceKind == "slice" && row.SliceID == nil) {
+			return nil, fmt.Errorf("workflow node stable identity is incomplete")
+		}
+		definitionNodeID = *row.DefinitionNodeID
+		sliceID = ""
+		if row.SliceID != nil {
+			sliceID = row.SliceID.String()
+		}
+		if metadata.DefinitionNodeID != definitionNodeID || metadata.SliceID != sliceID {
+			return nil, fmt.Errorf("workflow node stable identity differs from run context")
+		}
+	}
+	node := &NodeRecord{ID: row.ID.String(), RunID: row.RunID.String(), Key: row.NodeKey, DefinitionNodeID: definitionNodeID, SliceID: sliceID, Type: domain.WorkflowNodeType(row.NodeType), Status: NodeStatus(row.Status), Attempt: row.Attempt, AvailableAt: row.AvailableAt, LeaseExpiresAt: row.LeaseExpiresAt, StartedAt: row.StartedAt, CompletedAt: row.CompletedAt, Failure: row.Failure, CreatedAt: row.CreatedAt, UpdatedAt: row.UpdatedAt}
+	if row.InputAuthorityID != nil {
+		node.InputAuthorityID = row.InputAuthorityID.String()
+	}
 	if row.LeaseOwner != nil {
 		node.LeaseOwner = *row.LeaseOwner
 	}
@@ -976,7 +1057,9 @@ func (s *GORMStore) ClaimRunnable(ctx context.Context, workerID string, now time
 
 func (s *GORMStore) RenewLease(ctx context.Context, lease Lease, now time.Time, duration time.Duration) (Lease, error) {
 	expires := now.UTC().Add(duration)
-	result := s.db.WithContext(ctx).Model(&nodeRunRow{}).Where("id = ? AND run_id = ? AND status = 'running' AND lease_owner = ? AND lease_expires_at >= ?", lease.NodeID, lease.RunID, lease.WorkerID, now.UTC()).Updates(map[string]any{"lease_expires_at": expires, "updated_at": now.UTC()})
+	result := s.db.WithContext(ctx).Model(&nodeRunRow{}).
+		Where(renewLeaseWhereSQL, lease.NodeID, lease.RunID, domain.NodeExternalQualificationGate, lease.WorkerID, lease.Attempt, now.UTC(), domain.NodePublish).
+		Updates(map[string]any{"lease_expires_at": expires, "updated_at": now.UTC()})
 	if result.Error != nil {
 		return Lease{}, result.Error
 	}
@@ -991,6 +1074,30 @@ func (s *GORMStore) Commit(ctx context.Context, mutation RunMutation) error {
 	if len(mutation.Events) == 0 {
 		return fmt.Errorf("run mutation must emit at least one event")
 	}
+	if err := validateQualityCompletionRunMutation(mutation); err != nil {
+		return err
+	}
+	precommit := cloneQualityCompletionPrecommitMutation(mutation.QualityCompletionPrecommit)
+	var qualityMaterials qualityCompletionMaterialAdmission
+	if precommit != nil {
+		existing, inspectErr := s.inspectQualityCompletionPrecommit(ctx, precommit.PrecommitID)
+		switch {
+		case inspectErr == nil && existing.matches(precommit):
+			return nil
+		case inspectErr == nil:
+			return errors.Join(
+				ErrCASConflict, ErrQualityCompletionPrecommitCorrupt,
+				fmt.Errorf("Quality completion precommit %s already identifies different immutable bytes", precommit.PrecommitID),
+			)
+		case !errors.Is(inspectErr, sql.ErrNoRows):
+			return mapQualityCompletionPostgresError("inspect before commit", inspectErr)
+		}
+		var prefetchErr error
+		qualityMaterials, prefetchErr = s.prefetchQualityCompletionMaterials(ctx, precommit)
+		if prefetchErr != nil {
+			return prefetchErr
+		}
+	}
 	runID, err := parseUUID("run.id", mutation.RunID)
 	if err != nil {
 		return err
@@ -1000,7 +1107,32 @@ func (s *GORMStore) Commit(ctx context.Context, mutation RunMutation) error {
 	if err != nil {
 		return err
 	}
-	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	callbackCompleted := false
+	commitErr := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := lockWorkflowInputAuthorityMigrationRuntime(tx); err != nil {
+			return err
+		}
+		var identity struct {
+			ProjectID uuid.UUID
+		}
+		if err := tx.Model(&runRow{}).Select("project_id").Where("id = ?", runID).Take(&identity).Error; err != nil {
+			return mapGORMError(err)
+		}
+		if err := tx.Table("projects").Clauses(clause.Locking{Strength: "UPDATE"}).
+			Select("id").Where("id = ?", identity.ProjectID).Take(&struct{ ID uuid.UUID }{}).Error; err != nil {
+			return mapGORMError(err)
+		}
+		if precommit != nil {
+			if precommit.ProjectID != identity.ProjectID.String() {
+				return errors.Join(ErrCASConflict, ErrQualityCompletionPrecommitCorrupt)
+			}
+			if err := admitQualityCompletionMaterialsTx(tx, precommit, qualityMaterials); err != nil {
+				return err
+			}
+			if _, err := precommitQualityCompletionTx(tx, precommit); err != nil {
+				return err
+			}
+		}
 		if err := validateSoloSelfReviewMutationTx(ctx, tx, runID, mutation.Events); err != nil {
 			return err
 		}
@@ -1017,7 +1149,7 @@ func (s *GORMStore) Commit(ctx context.Context, mutation RunMutation) error {
 			if err != nil {
 				return err
 			}
-			updates := map[string]any{"status": row.Status, "attempt": row.Attempt, "input_manifest_id": row.InputManifestID, "output_proposal_id": row.OutputProposalID, "output_revision_id": row.OutputRevisionID, "lease_owner": nil, "lease_expires_at": nil, "available_at": row.AvailableAt, "started_at": row.StartedAt, "completed_at": row.CompletedAt, "failure": nullableJSON(row.Failure), "updated_at": row.UpdatedAt}
+			updates := map[string]any{"status": row.Status, "attempt": row.Attempt, "input_authority_id": row.InputAuthorityID, "input_manifest_id": row.InputManifestID, "output_proposal_id": row.OutputProposalID, "output_revision_id": row.OutputRevisionID, "lease_owner": nil, "lease_expires_at": nil, "available_at": row.AvailableAt, "started_at": row.StartedAt, "completed_at": row.CompletedAt, "failure": nullableJSON(row.Failure), "updated_at": row.UpdatedAt}
 			query := tx.Model(&nodeRunRow{}).Where("id = ? AND run_id = ? AND status = ?", row.ID, runID, nodeMutation.ExpectedStatus)
 			if nodeMutation.ExpectedOwner != "" {
 				query = query.Where("lease_owner = ? AND lease_expires_at >= ?", nodeMutation.ExpectedOwner, mutation.UpdatedAt)
@@ -1079,14 +1211,19 @@ func (s *GORMStore) Commit(ctx context.Context, mutation RunMutation) error {
 		if err := tx.Create(&events).Error; err != nil {
 			return err
 		}
-		var identity struct {
-			ProjectID uuid.UUID
-		}
-		if err := tx.Model(&runRow{}).Select("project_id").First(&identity, "id = ?", runID).Error; err != nil {
+		if err := s.enqueueEventRowsTx(tx, identity.ProjectID, runID, events); err != nil {
 			return err
 		}
-		return s.enqueueEventRowsTx(tx, identity.ProjectID, runID, events)
-	})
+		callbackCompleted = true
+		return nil
+	}, qualityCompletionSerializableOptions(precommit)...)
+	if commitErr == nil {
+		return nil
+	}
+	if callbackCompleted && precommit != nil {
+		return s.reconcileQualityCompletionCommitError(ctx, precommit, commitErr)
+	}
+	return mapWorkflowCommitPostgresError(precommit, commitErr)
 }
 
 func validateSoloSelfReviewMutationTx(ctx context.Context, transaction *gorm.DB, runID uuid.UUID, events []Event) error {

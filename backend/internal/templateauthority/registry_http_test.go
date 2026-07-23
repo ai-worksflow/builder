@@ -131,6 +131,12 @@ func httpRedirect(status int, location string, body io.ReadCloser) *http.Respons
 	return &http.Response{StatusCode: status, Header: header, Body: body}
 }
 
+func httpUnauthorized(challenge string, body io.ReadCloser) *http.Response {
+	header := make(http.Header)
+	header.Set("WWW-Authenticate", challenge)
+	return &http.Response{StatusCode: http.StatusUnauthorized, Header: header, Body: body}
+}
+
 func TestHTTPSRegistryClientBuildsDigestPinnedRequestsAndStreamsBodies(t *testing.T) {
 	resolver := newStaticRegistryResolver(httpTestOrigin)
 	client := newRegistryHTTPTestClient(t, resolver, RegistryHTTPOrigin{
@@ -176,6 +182,128 @@ func TestHTTPSRegistryClientBuildsDigestPinnedRequestsAndStreamsBodies(t *testin
 	}
 	if !body.closed.Load() {
 		t.Fatal("caller did not own the returned body")
+	}
+}
+
+func TestHTTPSRegistryClientExchangesBasicCredentialForExactBearerScope(t *testing.T) {
+	resolver := newStaticRegistryResolver(httpTestOrigin)
+	client := newRegistryHTTPTestClient(t, resolver, RegistryHTTPOrigin{
+		Host:          httpTestOrigin,
+		Authorization: "Basic server-owned-secret",
+	})
+	manifestURL := "https://" + httpTestOrigin + "/v2/" + httpTestRepo + "/manifests/" + httpTestManifestDigest
+	challenge := `Bearer realm="https://` + httpTestOrigin + `/token",service="` + httpTestOrigin + `",scope="repository:` + httpTestRepo + `:pull"`
+	var calls int
+	client.httpClient.Transport = registryRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+		calls++
+		switch calls {
+		case 1:
+			if request.URL.String() != manifestURL || request.Header.Get("Authorization") != "" {
+				t.Fatalf("unexpected initial registry request: %s authorization=%q", request.URL, request.Header.Get("Authorization"))
+			}
+			return httpUnauthorized(challenge, io.NopCloser(strings.NewReader("challenge"))), nil
+		case 2:
+			if request.URL.Scheme != "https" || request.URL.Host != httpTestOrigin || request.URL.Path != "/token" {
+				t.Fatalf("unexpected token endpoint: %s", request.URL)
+			}
+			if request.URL.Query().Get("service") != httpTestOrigin || request.URL.Query().Get("scope") != "repository:"+httpTestRepo+":pull" {
+				t.Fatalf("unexpected token query: %s", request.URL.RawQuery)
+			}
+			if request.Header.Get("Authorization") != "Basic server-owned-secret" || request.Header.Get("Accept") != "application/json" {
+				t.Fatal("token request did not carry only the server-owned Basic credential and JSON accept header")
+			}
+			return httpOK(io.NopCloser(strings.NewReader(`{"token":"registry-access-token","expires_in":300,"issued_at":"2026-07-20T00:00:00Z"}`))), nil
+		case 3:
+			if request.URL.String() != manifestURL || request.Header.Get("Authorization") != "Bearer registry-access-token" {
+				t.Fatalf("unexpected authenticated registry retry: %s authorization=%q", request.URL, request.Header.Get("Authorization"))
+			}
+			return httpOK(io.NopCloser(strings.NewReader("manifest"))), nil
+		default:
+			t.Fatalf("unexpected request %d", calls)
+			return nil, nil
+		}
+	})
+
+	read, err := client.FetchManifest(context.Background(), httpTestReference(httpTestOrigin))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer read.Body.Close()
+	if calls != 3 || read.ServingHost != httpTestOrigin {
+		t.Fatalf("calls/read = %d/%#v", calls, read)
+	}
+}
+
+func TestHTTPSRegistryClientRejectsBearerChallengePolicyEscapes(t *testing.T) {
+	tests := []struct {
+		name      string
+		challenge string
+	}{
+		{
+			name:      "cross-origin realm",
+			challenge: `Bearer realm="https://auth.example.com/token",service="registry.example.com",scope="repository:worksflow/templates:pull"`,
+		},
+		{
+			name:      "wrong repository scope",
+			challenge: `Bearer realm="https://registry.example.com/token",service="registry.example.com",scope="repository:other/templates:pull"`,
+		},
+		{
+			name:      "realm query injection",
+			challenge: `Bearer realm="https://registry.example.com/token?account=attacker",service="registry.example.com"`,
+		},
+		{
+			name:      "missing service",
+			challenge: `Bearer realm="https://registry.example.com/token"`,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			resolver := newStaticRegistryResolver(httpTestOrigin, "auth.example.com")
+			client := newRegistryHTTPTestClient(t, resolver, RegistryHTTPOrigin{
+				Host: httpTestOrigin, Authorization: "Basic confidential-value",
+			})
+			var calls atomic.Int32
+			client.httpClient.Transport = registryRoundTripFunc(func(_ *http.Request) (*http.Response, error) {
+				if calls.Add(1) != 1 {
+					t.Fatal("client sent a token request after challenge escaped policy")
+				}
+				return httpUnauthorized(test.challenge, io.NopCloser(strings.NewReader("challenge"))), nil
+			})
+
+			_, err := client.FetchManifest(context.Background(), httpTestReference(httpTestOrigin))
+			if err == nil {
+				t.Fatal("unsafe challenge was accepted")
+			}
+			if calls.Load() != 1 || strings.Contains(err.Error(), "confidential-value") {
+				t.Fatalf("unsafe challenge calls/error = %d/%v", calls.Load(), err)
+			}
+		})
+	}
+}
+
+func TestHTTPSRegistryClientRejectsInvalidBearerTokenResponse(t *testing.T) {
+	resolver := newStaticRegistryResolver(httpTestOrigin)
+	client := newRegistryHTTPTestClient(t, resolver, RegistryHTTPOrigin{
+		Host: httpTestOrigin, Authorization: "Basic confidential-value",
+	})
+	challenge := `Bearer realm="https://registry.example.com/token",service="registry.example.com"`
+	var calls atomic.Int32
+	client.httpClient.Transport = registryRoundTripFunc(func(_ *http.Request) (*http.Response, error) {
+		switch calls.Add(1) {
+		case 1:
+			return httpUnauthorized(challenge, io.NopCloser(strings.NewReader("challenge"))), nil
+		case 2:
+			return httpOK(io.NopCloser(strings.NewReader(`{"token":"first","access_token":"different"}`))), nil
+		default:
+			t.Fatal("invalid token response caused a registry retry")
+			return nil, nil
+		}
+	})
+
+	_, err := client.FetchManifest(context.Background(), httpTestReference(httpTestOrigin))
+	requireCode(t, err, CodeRegistryFetchFailed)
+	if calls.Load() != 2 || strings.Contains(err.Error(), "confidential-value") || strings.Contains(err.Error(), "different") {
+		t.Fatalf("token response calls/error = %d/%v", calls.Load(), err)
 	}
 }
 
@@ -358,7 +486,7 @@ func TestHTTPSRegistryClientRejectsRedirectEscapesBeforeSendingNextHop(t *testin
 	}{
 		{name: "plain HTTP", location: "http://" + httpTestCDN + "/object"},
 		{name: "userinfo", location: "https://user@" + httpTestCDN + "/object"},
-		{name: "query", location: "https://" + httpTestCDN + "/object?token=attacker"},
+		{name: "same-origin query", location: "https://" + httpTestOrigin + "/object?token=attacker"},
 		{name: "fragment", location: "https://" + httpTestCDN + "/object#part"},
 		{name: "port", location: "https://" + httpTestCDN + ":444/object"},
 		{name: "unallowlisted host", location: "https://escape.example.com/object"},
@@ -398,6 +526,49 @@ func TestHTTPSRegistryClientRejectsRedirectEscapesBeforeSendingNextHop(t *testin
 				t.Fatal("credential appeared in an error")
 			}
 		})
+	}
+}
+
+func TestHTTPSRegistryClientAllowsSignedQueryOnlyOnAllowlistedCredentialFreeContentRedirect(t *testing.T) {
+	resolver := newStaticRegistryResolver(httpTestOrigin, httpTestCDN)
+	client := newRegistryHTTPTestClient(t, resolver, RegistryHTTPOrigin{
+		Host: httpTestOrigin, Authorization: "Bearer must-not-leak",
+		RedirectHosts: []string{httpTestCDN},
+	})
+	var calls atomic.Int32
+	client.httpClient.Transport = registryRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+		switch calls.Add(1) {
+		case 1:
+			if request.URL.Host != httpTestOrigin || request.Header.Get("Authorization") != "Bearer must-not-leak" {
+				t.Fatal("origin request did not carry the configured credential")
+			}
+			return httpRedirect(
+				http.StatusTemporaryRedirect,
+				"https://"+httpTestCDN+"/objects/manifest?signature=registry-issued&expires=1784544000",
+				io.NopCloser(strings.NewReader("redirect")),
+			), nil
+		case 2:
+			if request.URL.Host != httpTestCDN || request.URL.Query().Get("signature") != "registry-issued" ||
+				request.URL.Query().Get("expires") != "1784544000" {
+				t.Fatalf("signed content redirect was not preserved: %s", request.URL)
+			}
+			if request.Header.Get("Authorization") != "" {
+				t.Fatal("origin credential leaked to signed content redirect")
+			}
+			return httpOK(io.NopCloser(strings.NewReader("manifest"))), nil
+		default:
+			t.Fatalf("unexpected request %d", calls.Load())
+			return nil, nil
+		}
+	})
+
+	read, err := client.FetchManifest(context.Background(), httpTestReference(httpTestOrigin))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer read.Body.Close()
+	if read.ServingHost != httpTestCDN || calls.Load() != 2 {
+		t.Fatalf("signed redirect result = %#v, calls=%d", read, calls.Load())
 	}
 }
 

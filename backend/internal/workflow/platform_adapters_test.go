@@ -571,9 +571,11 @@ func TestCoreTargetArtifactInitializerPinsGovernedLineage(t *testing.T) {
 		input := artifacts.createdInputs[0]
 		var content struct {
 			BlueprintPageNodeID string `json:"blueprintPageNodeId"`
+			Title               string `json:"title"`
 			Route               string `json:"route"`
 		}
-		if json.Unmarshal(input.Content, &content) != nil || content.BlueprintPageNodeID != pageAnchor || content.Route != "/orders" ||
+		if json.Unmarshal(input.Content, &content) != nil || content.BlueprintPageNodeID != pageAnchor ||
+			content.Title != "Orders" || content.Route != "/orders" || input.Title != "PageSpec · Orders" ||
 			len(input.SourceVersions) != 1 || !sameCoreVersionRef(input.SourceVersions[0].Ref, blueprint) {
 			t.Fatalf("PageSpec target lost exact anchored Blueprint lineage: input=%+v content=%s", input, input.Content)
 		}

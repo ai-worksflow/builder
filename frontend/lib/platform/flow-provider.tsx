@@ -20,9 +20,9 @@ import { PlatformFlowClient } from './flow-client'
 import {
   projectBriefEntryAction,
   projectBriefWorkflowManifestInput,
+  workflowDefinitionAcceptsProjectBriefStart,
 } from './workflow-entry'
-import { reviewGateApprovalReadiness } from './workflow-ui-contract'
-import { PlatformHttpError } from './http'
+import { canUseGenericWorkflowExecutionAuthorization } from './workflow-ui-contract'
 import { wireVersionRef } from './wire-version-ref'
 import {
   appliedWorkbenchProposalIds,
@@ -248,9 +248,14 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
     [t],
   )
 
-  const fail = useCallback((cause: unknown, fallback: MessageKey, values?: MessageValues) => {
+  const fail = useCallback((
+    cause: unknown,
+    fallback: MessageKey,
+    values?: MessageValues,
+    fatal = false,
+  ) => {
     setError(collaborationErrorMessage(cause, flowMessage(fallback, values)))
-    if (!(cause instanceof PlatformHttpError && [403, 409, 412, 422].includes(cause.status))) {
+    if (fatal) {
       setStatus('error')
     }
   }, [flowMessage])
@@ -273,8 +278,12 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
     setBundle(bundleValue)
     setProposal(proposalValue)
     if (updateQuery) {
-      setQueryReference('bundleId', item?.bundleId)
-      setQueryReference('proposalId', proposalValue?.id)
+      const artifactScoped = typeof window !== 'undefined'
+        && new URLSearchParams(window.location.search).has('artifactId')
+      if (!artifactScoped) {
+        setQueryReference('bundleId', item?.bundleId)
+        setQueryReference('proposalId', proposalValue?.id)
+      }
     }
   }, [])
 
@@ -354,7 +363,9 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
       }
       setStatus('ready')
     } catch (cause) {
-      if (requestId === requestCounter.current) fail(cause, 'runtime.flow.serviceUnavailable')
+      if (requestId === requestCounter.current) {
+        fail(cause, 'runtime.flow.serviceUnavailable', undefined, true)
+      }
     }
   }, [client, fail, projectId, session.signedIn])
 
@@ -710,9 +721,12 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
     }
   }, [client, fail, flowMessage, hydrateRunOutputs, projectId])
 
-  const loadRun = useCallback((runId: string): Promise<WorkflowRunDto | null> => {
+  const loadRun = useCallback((
+    runId: string,
+    options: { readonly fresh?: boolean } = {},
+  ): Promise<WorkflowRunDto | null> => {
     const inFlight = runLoadRef.current
-    if (inFlight?.runId === runId) return inFlight.promise
+    if (!options.fresh && inFlight?.runId === runId) return inFlight.promise
     const promise = performLoadRun(runId)
     runLoadRef.current = { runId, promise }
     void promise.then(
@@ -940,6 +954,13 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
         setError(flowMessage('runtime.flow.definitionNotLoaded', { version: effectiveDefinitionVersionId }))
         return null
       }
+      if (
+        requestedDefinition
+        && !workflowDefinitionAcceptsProjectBriefStart(requestedDefinition.definition)
+      ) {
+        effectiveDefinitionVersionId = undefined
+        requestedDefinition = undefined
+      }
       if (!effectiveDefinitionVersionId) {
         const minimumDefinition = definitions.find((item) => item.key === 'minimum-product-loop')
         if (minimumDefinition) {
@@ -1075,7 +1096,7 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
       ])
       setEvents([])
       setQueryReference('runId', result.data.id)
-      await loadRun(result.data.id)
+      await loadRun(result.data.id, { fresh: true })
       return result.data
     } catch (cause) {
       fail(cause, 'runtime.flow.startSelectionFailed')
@@ -1090,7 +1111,8 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
     revision: ExactArtifactRefDto,
     workflowContext?: Readonly<Record<string, unknown>>,
   ) => {
-    if (!projectId || !run || !can('edit')) return false
+    if (!projectId || !run || !can('edit')
+      || !node.allowedActions?.includes('submit_input')) return false
     setBusy(true)
     setError(null)
     try {
@@ -1098,7 +1120,7 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
         artifactRevision: wireVersionRef(revision),
         ...(workflowContext ? { workflowContext } : {}),
       })
-      await loadRun(run.id)
+      await loadRun(run.id, { fresh: true })
       return true
     } catch (cause) {
       fail(cause, 'runtime.flow.submitRevisionFailed')
@@ -1114,13 +1136,13 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
       !projectId
       || !run
       || !can(permission)
-      || (node.type !== 'quality_gate' && node.type !== 'publish')
+      || !canUseGenericWorkflowExecutionAuthorization(run, node)
     ) return false
     setBusy(true)
     setError(null)
     try {
       await client.authorizeExecution(projectId, run.id, node.key)
-      await loadRun(run.id)
+      await loadRun(run.id, { fresh: true })
       return true
     } catch (cause) {
       fail(cause, 'runtime.flow.authorizeOperationFailed')
@@ -1137,10 +1159,12 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
     soloReviewConfirmed = false,
   ) => {
     if (!projectId || !run) return false
-    if (
-      resolution === 'approve'
-      && !reviewGateApprovalReadiness(runDefinition?.definition, node, run, artifacts).ready
-    ) {
+    const projectedAction = resolution === 'approve'
+      ? 'approve_review'
+      : resolution === 'changes_requested'
+        ? 'request_review_changes'
+        : 'waive_review'
+    if (!node.allowedActions?.includes(projectedAction)) {
       setError(flowMessage('runtime.flow.reviewGateFailed'))
       return false
     }
@@ -1155,7 +1179,7 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
         reason,
         soloReviewConfirmed,
       )
-      await loadRun(run.id)
+      await loadRun(run.id, { fresh: true })
       return true
     } catch (cause) {
       fail(cause, 'runtime.flow.reviewGateFailed')
@@ -1163,10 +1187,11 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
     } finally {
       setBusy(false)
     }
-  }, [artifacts, client, fail, flowMessage, loadRun, projectId, run, runDefinition?.definition])
+  }, [client, fail, flowMessage, loadRun, projectId, run])
 
   const retryNode = useCallback(async (node: WorkflowNodeRunDto, reason?: string) => {
-    if (!projectId || !run || !can('edit')) return false
+    if (!projectId || !run || !can('edit')
+      || !node.allowedActions?.includes('retry')) return false
     const retryReason = reason?.trim() || flowMessage('runtime.flow.retryReason')
     setBusy(true)
     try {
@@ -1176,7 +1201,7 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
         node.key,
         retryReason,
       )
-      await loadRun(run.id)
+      await loadRun(run.id, { fresh: true })
       return true
     } catch (cause) {
       fail(cause, 'runtime.flow.retryNodeFailed')
@@ -1195,7 +1220,7 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
         run.id,
         reason ?? flowMessage('runtime.flow.cancelReason'),
       )
-      await loadRun(run.id)
+      await loadRun(run.id, { fresh: true })
       return true
     } catch (cause) {
       fail(cause, 'runtime.flow.cancelRunFailed')
@@ -1415,6 +1440,10 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
         && node.type === 'workbench_build'
         && node.status === 'waiting_input',
     )
+    if (!workbenchNode?.allowedActions?.includes('submit_input')) {
+      setError(flowMessage('runtime.flow.notReadyApply'))
+      return null
+    }
     const alreadyAppliedProposalIds = appliedWorkbenchProposalIds(queue)
     if (
       alreadyAppliedProposalIds
@@ -1433,7 +1462,7 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
           alreadyAppliedProposalIds,
           revisionRef(workspaceRevision),
         )
-        await loadRun(run.id)
+        await loadRun(run.id, { fresh: true })
         return workspaceRevision
       } catch (cause) {
         fail(cause, 'runtime.flow.recordCompletionFailed')
@@ -1481,7 +1510,7 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
           completedProposalIds,
           revisionRef(result.data),
         )
-        await loadRun(run.id)
+        await loadRun(run.id, { fresh: true })
       } else {
         const pendingIndex = nextPendingWorkbenchQueueIndex(nextQueue)
         const active = pendingIndex >= 0
@@ -1593,16 +1622,22 @@ export function PlatformFlowProvider({ children }: { children: ReactNode }) {
   }), [workbenchQueue])
   const requiresWorkbenchRebase = !proposalIsApplied(proposal)
     && workbenchBundleNeedsRebase(bundle, workspaceRevision)
-  const canApplyProposal = !requiresWorkbenchRebase
+  const selectedWorkbenchNode = run?.nodes.find(
+    (node) => node.key === selectedWorkbenchNodeKey
+      && node.type === 'workbench_build'
+      && node.status === 'waiting_input',
+  )
+  const canSubmitWorkbench = Boolean(
+    selectedWorkbenchNode?.allowedActions?.includes('submit_input'),
+  )
+  const canApplyProposal = canSubmitWorkbench
+    && !requiresWorkbenchRebase
     && canApplyWorkbenchQueueItem(workbenchQueue, selectedQueueIndex)
   const canCompleteWorkbench = Boolean(
-    appliedWorkbenchProposalIds(workbenchQueue)
+    canSubmitWorkbench
+    && appliedWorkbenchProposalIds(workbenchQueue)
     && workspaceRevision
-    && run?.nodes.some(
-      (node) => node.key === selectedWorkbenchNodeKey
-        && node.type === 'workbench_build'
-        && node.status === 'waiting_input',
-    ),
+    && selectedWorkbenchNode,
   )
 
   const value = useMemo<PlatformFlowContextState>(() => ({

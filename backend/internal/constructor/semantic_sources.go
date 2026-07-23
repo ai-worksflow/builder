@@ -45,14 +45,14 @@ type pageSpecSemanticSource struct {
 // lineage before PageSpec constraints can enter a ready BuildContract.
 func validateSemanticSources(
 	sources map[string][]PinnedBuildSource,
-	deliverySliceID string,
+	deliverySlicePageNodeID string,
 	contractFacts map[string]contracts.Facts,
 	diagnostics *diagnosticBuilder,
 ) semanticSourceValidation {
 	blueprint := validateBlueprintSemanticSource(sources["blueprint"], diagnostics)
 	pageSpec := validatePageSpecSemanticSource(sources["page_spec"], blueprint, diagnostics)
 	prototypeValid := validatePrototypeSemanticSource(sources["prototype"], blueprint, pageSpec, diagnostics)
-	deliverySliceValid := validateDeliverySlicePage(deliverySliceID, pageSpec, diagnostics)
+	deliverySliceValid := validateDeliverySlicePage(deliverySlicePageNodeID, pageSpec, diagnostics)
 	authority, authorityValid := validateExactSemanticAuthoritySources(sources, diagnostics)
 	apiClosureValid := false
 	if authorityValid {
@@ -71,14 +71,14 @@ func validateSemanticSources(
 }
 
 func validateDeliverySlicePage(
-	deliverySliceID string,
+	deliverySlicePageNodeID string,
 	pageSpec pageSpecSemanticSource,
 	diagnostics *diagnosticBuilder,
 ) bool {
-	if strings.TrimSpace(deliverySliceID) == "" || strings.TrimSpace(deliverySliceID) != pageSpec.pageNodeID {
+	if strings.TrimSpace(deliverySlicePageNodeID) == "" || strings.TrimSpace(deliverySlicePageNodeID) != pageSpec.pageNodeID {
 		diagnostics.gap(
 			"semantic-authority", "delivery_slice_page_mismatch", "$.deliverySliceId",
-			"Delivery slice ID must exactly equal the PageSpec blueprintPageNodeId.",
+			"Delivery slice Blueprint anchor must exactly equal the PageSpec blueprintPageNodeId.",
 			pageSpec.ref.RevisionID, nil,
 		)
 		return false

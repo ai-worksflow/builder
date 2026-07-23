@@ -3,6 +3,8 @@ package workflow
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"slices"
 	"testing"
 	"time"
 
@@ -184,6 +186,108 @@ func TestListRunsUsesStableOpaqueCursorAndProjectScope(t *testing.T) {
 	}
 	if _, err := facade.ListRuns(context.Background(), projectID, actorID, RunListOptions{Cursor: "not-a-cursor"}); err == nil {
 		t.Fatal("invalid cursor was accepted")
+	}
+}
+
+func TestProjectRunNodeActionsUsesCanonicalReviewAuthority(t *testing.T) {
+	schema := engineSchema()
+	ownerID := uuid.NewString()
+	nodes := []domain.NodeDefinition{
+		{
+			ID: "input", Name: "Input", Type: domain.NodeArtifactInput,
+			InputSchema: schema, OutputSchema: schema,
+			ArtifactInput: &domain.ArtifactInputNodeConfig{
+				AllowedTypes:     []domain.ArtifactType{domain.ArtifactDocument},
+				MinimumArtifacts: 1,
+			},
+		},
+		{
+			ID: "review", Name: "Review", Type: domain.NodeReviewGate,
+			InputSchema: schema, OutputSchema: schema,
+			ReviewGate: &domain.ReviewGateNodeConfig{
+				RequiredRole: "owner", MinimumApprovals: 1,
+				ProhibitSelfReview: true, AllowWaiver: true,
+			},
+		},
+	}
+	definition, err := domain.NewWorkflowDefinition(
+		uuid.NewString(), 1, "Projected review", "2", nodes,
+		[]domain.WorkflowEdge{{ID: "input-review", From: "input", To: "review"}},
+		ownerID, time.Now().UTC(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	engine, store, _, record, manifest, projectID, startedBy := newTestEngine(
+		t, definition, NewMapRegistry(),
+	)
+	canonicalApproved := false
+	engine.ReviewGate = ReviewGateVerifierFunc(func(
+		context.Context,
+		string,
+		[]domain.ArtifactRef,
+		domain.ReviewGateNodeConfig,
+	) error {
+		if canonicalApproved {
+			return nil
+		}
+		return &domain.DomainError{
+			Kind: domain.ErrInvalidTransition, Field: "review",
+			Message: "exact upstream revision is not canonically approved",
+		}
+	})
+	run, err := engine.Start(context.Background(), StartRequest{
+		RunID: uuid.NewString(), ProjectID: projectID,
+		DefinitionVersionID: record.VersionID, InputManifest: manifest.Ref(),
+		StartedBy: startedBy,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		if err := engine.ClaimAndExecute(context.Background(), "worker"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	waiting, err := store.GetRun(context.Background(), run.ID)
+	if err != nil || waiting.Nodes["review"].Status != NodeWaitingReview {
+		t.Fatalf("review did not enter waiting_review: run=%+v err=%v", waiting, err)
+	}
+	facade := Facade{
+		Engine: engine, Store: store,
+		Access: fixedWorkflowAccess{role: core.RoleOwner},
+	}
+	if _, err := facade.ProjectRunNodeActions(
+		context.Background(), projectID, run.ID, ownerID, waiting.EventCursor+1,
+	); !errors.Is(err, ErrCASConflict) {
+		t.Fatalf("stale action projection error = %v, want ErrCASConflict", err)
+	}
+	blocked, err := facade.ProjectRunNodeActions(
+		context.Background(), projectID, run.ID, ownerID, waiting.EventCursor,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	review := blocked["review"]
+	if slices.Contains(review.AllowedActions, WorkflowNodeActionApproveReview) ||
+		!slices.Contains(review.AllowedActions, WorkflowNodeActionRequestReviewChanges) ||
+		!slices.Contains(review.AllowedActions, WorkflowNodeActionWaiveReview) ||
+		len(review.BlockingReasons) != 1 ||
+		review.BlockingReasons[0].Code != "canonical_review_gate_blocked" {
+		t.Fatalf("blocked review actions = %+v", review)
+	}
+
+	canonicalApproved = true
+	allowed, err := facade.ProjectRunNodeActions(
+		context.Background(), projectID, run.ID, ownerID, waiting.EventCursor,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	review = allowed["review"]
+	if !slices.Contains(review.AllowedActions, WorkflowNodeActionApproveReview) ||
+		len(review.BlockingReasons) != 0 {
+		t.Fatalf("approved review actions = %+v", review)
 	}
 }
 

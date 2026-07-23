@@ -45,6 +45,7 @@ type sandboxAPIFake struct {
 	controlInput    sandbox.SessionControlInput
 	terminateInput  sandbox.TerminateSessionInput
 	startProcess    sandbox.StartProcessInput
+	startProcessErr error
 	signalProcess   sandbox.SignalProcessInput
 	createTerminal  sandbox.CreateTerminalInput
 	previewInput    sandbox.IssuePreviewInput
@@ -96,9 +97,15 @@ func (api *sandboxAPIFake) TerminateSession(_ context.Context, input sandbox.Ter
 
 func (api *sandboxAPIFake) StartProcess(_ context.Context, input sandbox.StartProcessInput) (sandbox.ProcessResult, error) {
 	api.startProcess = input
-	return sandbox.ProcessResult{
+	result := sandbox.ProcessResult{
 		Session: sandboxTransportView(3, 2), Process: sandboxTransportProcessView(1, sandbox.ProcessRunning),
-	}, nil
+	}
+	if api.startProcessErr != nil {
+		return result, &sandbox.ProcessControlError{
+			Session: result.Session, Process: result.Process, Cause: api.startProcessErr,
+		}
+	}
+	return result, nil
 }
 
 func (api *sandboxAPIFake) GetProcess(context.Context, string, string, string, string) (sandbox.ProcessResult, error) {
@@ -662,6 +669,35 @@ func TestSandboxTransportStartsOnlyNamedTemplateProcess(t *testing.T) {
 		response.Header().Get("X-Sandbox-Session-ETag") != `"sandbox:`+sandboxTransportSession+`:3"` ||
 		response.Header().Get("Location") != "/v1/sandbox-sessions/"+sandboxTransportSession+"/processes/"+sandboxTransportProcess {
 		t.Fatalf("process response fences = %#v", response.Header())
+	}
+}
+
+func TestSandboxTransportSeparatesStaleRuntimeFromProjectionRefresh(t *testing.T) {
+	api := &sandboxAPIFake{startProcessErr: sandbox.ErrRuntimeConflict}
+	router := sandboxTransportRouter(t, api)
+	request := httptest.NewRequest(
+		http.MethodPost,
+		"/sandbox-sessions/"+sandboxTransportSession+"/processes",
+		bytes.NewBufferString(`{"serviceId":"web-ui","commandId":"dev"}`),
+	)
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("If-Match", `"sandbox:`+sandboxTransportSession+`:3"`)
+	request.Header.Set("X-Sandbox-Session-Epoch", "1")
+	request.Header.Set("Idempotency-Key", "start-template-process-stale-runtime")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+
+	if response.Code != http.StatusConflict {
+		t.Fatalf("POST process status=%d body=%s", response.Code, response.Body.String())
+	}
+	var details map[string]any
+	if err := json.Unmarshal(response.Body.Bytes(), &details); err != nil ||
+		details["code"] != "sandbox_runtime_stale" {
+		t.Fatalf("stale runtime problem = %#v err=%v", details, err)
+	}
+	if response.Header().Get("ETag") != `"sandbox-process:`+sandboxTransportProcess+`:1"` ||
+		response.Header().Get("X-Sandbox-Session-ETag") != `"sandbox:`+sandboxTransportSession+`:3"` {
+		t.Fatalf("stale runtime fences = %#v", response.Header())
 	}
 }
 

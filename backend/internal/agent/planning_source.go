@@ -187,7 +187,7 @@ func (source *PostgresPlanningSource) LoadPlanningFacts(
 	if err := source.validateObligationProjections(ctx, row, contract); err != nil {
 		return PlanningFacts{}, err
 	}
-	obligationIDs, acceptanceIDs, commandIDs, err := planningObligations(contract)
+	obligationIDs, acceptanceIDs, commandIDs, dependencies, err := planningTask(contract, taskKey)
 	if err != nil {
 		return PlanningFacts{}, err
 	}
@@ -213,9 +213,19 @@ func (source *PostgresPlanningSource) LoadPlanningFacts(
 		append([]string{}, policy.ExtensionPaths...), policy.ProtectedPaths...,
 	))
 	objective := fmt.Sprintf(
-		"Implement the exact ready Must obligations for BuildContract %s as one bounded vertical task. Satisfy %d acceptance criteria using only the declared write-set and verification commands.",
-		row.BuildContractID, len(acceptanceIDs),
+		"Implement task %s as one complete vertical slice for BuildContract %s. Close all %d bound Must obligations and all %d acceptance criteria using only the declared write-set and verification commands.",
+		taskKey, row.BuildContractID, len(obligationIDs), len(acceptanceIDs),
 	)
+	preconditions := []string{
+		"The exact SandboxSession is ready and matches the active Candidate tree.",
+		"The exact BuildContract is ready with every Must obligation backed by an Oracle.",
+		"The exact TemplateRelease path policy is unchanged.",
+	}
+	if len(dependencies) > 0 {
+		preconditions = append(preconditions,
+			"Every dependency task has an applied, non-undone Agent merge: "+strings.Join(dependencies, ", "),
+		)
+	}
 	return PlanningFacts{
 		ProjectID: row.ProjectID, SandboxSessionID: row.SessionID, CandidateID: row.CandidateID,
 		CandidateVersion:          uint64(row.CandidateVersion),
@@ -227,11 +237,7 @@ func (source *PostgresPlanningSource) LoadPlanningFacts(
 		ObligationIDs: obligationIDs, AcceptanceCriterionIDs: acceptanceIDs,
 		ReadSet: readSet, WriteSet: append([]string{}, policy.ExtensionPaths...),
 		ProtectedPaths: append([]string{}, policy.ProtectedPaths...), ContextItems: items,
-		Preconditions: []string{
-			"The exact SandboxSession is ready and matches the active Candidate tree.",
-			"The exact BuildContract is ready with every Must obligation backed by an Oracle.",
-			"The exact TemplateRelease path policy is unchanged.",
-		},
+		Preconditions: preconditions,
 		Postconditions: []string{
 			"Every bound Must obligation has platform-collected verification evidence.",
 			"The platform-captured Patch changes only declared write-set paths and no protected path.",
@@ -240,6 +246,32 @@ func (source *PostgresPlanningSource) LoadPlanningFacts(
 		NetworkPolicy: NetworkPolicy{Mode: "none", AllowedHosts: []string{}},
 		Budgets:       source.config.Budgets, OutputSchemaHash: source.config.OutputSchemaHash,
 	}, nil
+}
+
+func (source *PostgresPlanningSource) LoadTaskGraph(
+	ctx context.Context,
+	projectID, sessionID string,
+) (TaskGraph, error) {
+	if ctx == nil || !validUUIDs(projectID, sessionID) {
+		return TaskGraph{}, fmt.Errorf("%w: project or SandboxSession identity", ErrTaskGraphBlocked)
+	}
+	row, err := source.loadExactSession(ctx, projectID, sessionID)
+	if err != nil {
+		return TaskGraph{}, err
+	}
+	contract, _, err := source.loadBuildContract(ctx, row)
+	if err != nil {
+		return TaskGraph{}, err
+	}
+	if err := source.validateObligationProjections(ctx, row, contract); err != nil {
+		return TaskGraph{}, err
+	}
+	return buildTaskGraph(
+		projectID,
+		sessionID,
+		repository.ExactReference{ID: row.BuildContractID, ContentHash: row.BuildContractHash},
+		contract,
+	)
 }
 
 func (source *PostgresPlanningSource) loadExactSession(
@@ -593,6 +625,29 @@ func planningObligations(
 	return obligationIDs, sortedSet(acceptanceSet), sortedSet(commandSet), nil
 }
 
+func planningTask(
+	contract constructor.ContractContent,
+	taskKey string,
+) ([]string, []string, []string, []string, error) {
+	if !strings.HasPrefix(taskKey, TaskKeyPrefix) {
+		obligations, criteria, commands, err := planningObligations(contract)
+		return obligations, criteria, commands, []string{}, err
+	}
+	tasks, err := buildTaskGraphTasks(contract)
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+	for _, task := range tasks {
+		if task.Key == taskKey {
+			return append([]string(nil), task.ObligationIDs...),
+				append([]string(nil), task.AcceptanceCriterionIDs...),
+				append([]string(nil), task.VerificationCommandIDs...),
+				append([]string(nil), task.DependsOn...), nil
+		}
+	}
+	return nil, nil, nil, nil, fmt.Errorf("%w: task key %s is outside the exact BuildContract graph", ErrTaskGraphBlocked, taskKey)
+}
+
 func matchPlanningCandidate(row planningSessionRow, candidate repository.CandidateWorkspace) error {
 	if candidate.ProjectID != row.ProjectID || candidate.ID != row.CandidateID ||
 		candidate.Status != repository.CandidateActive || candidate.Conflicted || candidate.Stale || candidate.RebaseRequired ||
@@ -636,3 +691,4 @@ func sortedSet(values map[string]bool) []string {
 }
 
 var _ PlanningSource = (*PostgresPlanningSource)(nil)
+var _ TaskGraphPlanningSource = (*PostgresPlanningSource)(nil)

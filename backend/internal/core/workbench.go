@@ -1781,7 +1781,7 @@ func (s *WorkbenchService) classifyAndValidateRefs(ctx context.Context, projectI
 		case "project_brief", "product_requirements", "requirement_baseline":
 			result.requirements = appendUniqueRef(result.requirements, ref)
 		case "blueprint":
-			result.blueprints = appendUniqueRef(result.blueprints, ref)
+			result.blueprints = appendUniqueBlueprintAuthorityRef(result.blueprints, ref)
 		case "page_spec":
 			result.pageSpecs = appendUniqueRef(result.pageSpecs, ref)
 		case "api_contract", "data_contract", "permission_contract", "ai_runtime_contract", "deployment_contract", "verification_contract":
@@ -2190,6 +2190,31 @@ func versionRefFromValue(value any) (VersionRef, bool) {
 func appendUniqueRef(values []VersionRef, value VersionRef) []VersionRef {
 	for _, existing := range values {
 		if existing.ArtifactID == value.ArtifactID && existing.RevisionID == value.RevisionID && stringPointerEqual(existing.AnchorID, value.AnchorID) {
+			return values
+		}
+	}
+	return append(values, value)
+}
+
+// appendUniqueBlueprintAuthorityRef treats an unanchored reference and an
+// anchored reference to the same immutable Blueprint revision as one authority.
+// The anchored reference is the narrower delivery-slice authority, so it wins.
+// Distinct anchors remain distinct and are rejected by the single-Blueprint
+// Workbench gate instead of being silently merged.
+func appendUniqueBlueprintAuthorityRef(values []VersionRef, value VersionRef) []VersionRef {
+	for index, existing := range values {
+		if existing.ArtifactID != value.ArtifactID || existing.RevisionID != value.RevisionID ||
+			existing.ContentHash != value.ContentHash {
+			continue
+		}
+		if stringPointerEqual(existing.AnchorID, value.AnchorID) {
+			return values
+		}
+		if existing.AnchorID == nil && value.AnchorID != nil {
+			values[index] = value
+			return values
+		}
+		if existing.AnchorID != nil && value.AnchorID == nil {
 			return values
 		}
 	}

@@ -1,4 +1,4 @@
-export type GitHubConnectionSource = 'session' | 'environment'
+export type GitHubConnectionSource = 'platform' | 'user' | 'session' | 'environment'
 
 export interface GitHubUser {
   readonly id: number
@@ -11,6 +11,7 @@ export interface GitHubUser {
 export interface GitHubConnectionStatus {
   readonly connected: boolean
   readonly source?: GitHubConnectionSource
+  readonly organization?: string
   readonly user?: GitHubUser
   readonly expiresAt?: string
 }
@@ -30,6 +31,22 @@ export interface GitHubRepository {
     readonly push: boolean
     readonly admin: boolean
   }
+}
+
+export interface GitHubCreateRepositoryInput {
+  readonly owner?: string
+  readonly name: string
+  readonly description?: string
+  readonly private: boolean
+  readonly files: readonly GitHubWorkspaceFile[]
+  readonly commitMessage: string
+  readonly confirm: true
+}
+
+export interface GitHubCreateRepositoryResult {
+  readonly repository: GitHubRepository
+  readonly commitSha: string
+  readonly commitUrl: string
 }
 
 export interface GitHubBranch {

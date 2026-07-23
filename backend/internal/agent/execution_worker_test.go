@@ -192,7 +192,11 @@ func (files *executionFilesFake) Put(
 
 type executionRunnerFake struct {
 	protected bool
+	noChange  bool
+	result    []byte
 }
+
+const testedPath = "apps/web/features/conversation/page.tsx"
 
 func (runner executionRunnerFake) Run(
 	_ context.Context,
@@ -205,7 +209,22 @@ func (runner executionRunnerFake) Run(
 	if len(prompt) == 0 || rawWorktreeHash(schema) != capsule.OutputSchemaHash {
 		return CodexRunnerResult{}, ErrExecutionDrift
 	}
-	target := filepath.Join(lease.Workspace, "apps", "web", "features", "conversation", "page.tsx")
+	structured := completeRunnerResult(testedPath, capsule)
+	if runner.result != nil {
+		structured = runner.result
+	}
+	if runner.noChange {
+		return CodexRunnerResult{
+			StructuredResult: structured,
+			Events:           []byte("{\"type\":\"turn.completed\"}\n"),
+			Stderr:           []byte{},
+			Record: RunnerExecutionRecord{
+				SchemaVersion: RunnerExecutionSchema, AttemptID: attempt.ID,
+				OutputSchemaHash: capsule.OutputSchemaHash, ExitCode: 0, ResultValidJSON: true,
+			},
+		}, nil
+	}
+	target := filepath.Join(lease.Workspace, filepath.FromSlash(testedPath))
 	if runner.protected {
 		target = filepath.Join(lease.Workspace, ".github", "workflows", "escape.yml")
 	}
@@ -215,7 +234,6 @@ func (runner executionRunnerFake) Run(
 	if err := os.WriteFile(target, []byte("export const result = 'implemented'\n"), 0o600); err != nil {
 		return CodexRunnerResult{}, err
 	}
-	structured := []byte(`{"summary":"Implemented the exact task.","changedPaths":["apps/web/features/conversation/page.tsx"],"verification":[],"blockers":[]}`)
 	return CodexRunnerResult{
 		StructuredResult: structured,
 		Events:           []byte("{\"type\":\"turn.completed\"}\n"),
@@ -225,6 +243,39 @@ func (runner executionRunnerFake) Run(
 			OutputSchemaHash: capsule.OutputSchemaHash, ExitCode: 0, ResultValidJSON: true,
 		},
 	}, nil
+}
+
+func completeRunnerResult(path string, capsule TaskCapsule) []byte {
+	result := runnerStructuredResult{
+		Summary:      "Implemented the complete exact task.",
+		ChangedPaths: []string{path},
+		ResourceGraph: runnerResourceGraph{
+			Applicable: frontendResourceSourcePath(path),
+			Nodes:      []runnerResourceNode{},
+			Edges:      []runnerResourceEdge{},
+		},
+		Blockers: []string{},
+	}
+	for _, id := range capsule.ObligationIDs {
+		result.Obligations = append(result.Obligations, runnerCoverageResult{
+			ID: id, Status: "satisfied", Note: "Implemented and wired.",
+		})
+	}
+	for _, id := range capsule.AcceptanceCriterionIDs {
+		result.AcceptanceCriteria = append(result.AcceptanceCriteria, runnerCoverageResult{
+			ID: id, Status: "satisfied", Note: "Implementation satisfies the criterion.",
+		})
+	}
+	for _, id := range capsule.VerificationCommandIDs {
+		result.Verification = append(result.Verification, runnerVerificationResult{
+			CommandID: id, Status: "passed", Note: "Passed.",
+		})
+	}
+	payload, err := json.Marshal(result)
+	if err != nil {
+		panic(err)
+	}
+	return payload
 }
 
 type executionWorkerFixture struct {
@@ -293,6 +344,52 @@ func TestExecutionWorkerRejectsProtectedWorktreeChangeWithoutPatch(t *testing.T)
 	attempt, _ := fixture.control.GetAttempt(context.Background(), "", "")
 	if attempt.State != AttemptFailed || attempt.Evidence.Patch != nil || attempt.ExitReason == "" {
 		t.Fatalf("protected-path Attempt = %#v", attempt)
+	}
+}
+
+func TestExecutionWorkerPersistsSuccessfulRunnerEvidenceWhenPatchIsEmpty(t *testing.T) {
+	fixture := newExecutionWorkerFixture(t, false)
+	fixture.worker.runner = executionRunnerFake{noChange: true}
+	processed, err := fixture.worker.RunOnce(context.Background())
+	if err != nil || !processed {
+		t.Fatalf("RunOnce processed=%t err=%v", processed, err)
+	}
+	attempt, _ := fixture.control.GetAttempt(context.Background(), "", "")
+	if attempt.State != AttemptFailed || attempt.Evidence.Patch != nil ||
+		attempt.Evidence.StructuredResult == nil || attempt.Evidence.Stdout == nil ||
+		attempt.Evidence.Stderr == nil || attempt.ExitReason == "" {
+		t.Fatalf("empty-patch Attempt = %#v", attempt)
+	}
+	for _, reference := range []*BlobReference{
+		attempt.Evidence.StructuredResult, attempt.Evidence.Stdout, attempt.Evidence.Stderr,
+	} {
+		if fixture.contents.items[reference.Ref].State != content.StateFinalized {
+			t.Fatalf("failure evidence was not finalized: %#v", reference)
+		}
+	}
+}
+
+func TestExecutionWorkerRejectsPartialRunnerCoverageWithoutReviewablePatch(t *testing.T) {
+	fixture := newExecutionWorkerFixture(t, false)
+	result := completeRunnerResult(testedPath, fixture.control.capsule)
+	var partial runnerStructuredResult
+	if err := json.Unmarshal(result, &partial); err != nil {
+		t.Fatal(err)
+	}
+	partial.AcceptanceCriteria = partial.AcceptanceCriteria[:1]
+	result, err := json.Marshal(partial)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.worker.runner = executionRunnerFake{result: result}
+	processed, err := fixture.worker.RunOnce(context.Background())
+	if err != nil || !processed {
+		t.Fatalf("RunOnce processed=%t err=%v", processed, err)
+	}
+	attempt, _ := fixture.control.GetAttempt(context.Background(), "", "")
+	if attempt.State != AttemptFailed || attempt.Evidence.Patch != nil ||
+		attempt.Evidence.StructuredResult == nil || attempt.ExitReason == "" {
+		t.Fatalf("partial-coverage Attempt = %#v", attempt)
 	}
 }
 

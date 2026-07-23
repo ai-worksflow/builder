@@ -281,6 +281,22 @@ func TestTerminalOutputRedactionDoesNotExposeCredentialValue(t *testing.T) {
 	}
 }
 
+func TestCurrentSessionTerminalsExcludeHistoricalEpochs(t *testing.T) {
+	values := []TerminalView{
+		{ID: "current-1", SessionEpoch: 2},
+		{ID: "historical", SessionEpoch: 1},
+		{ID: "current-2", SessionEpoch: 2},
+	}
+	current := currentSessionTerminals(values, 2, 1)
+	if len(current) != 1 || current[0].ID != "current-1" {
+		t.Fatalf("current terminal projection = %#v", current)
+	}
+	current = currentSessionTerminals(values, 2, 0)
+	if len(current) != 2 || current[0].ID != "current-1" || current[1].ID != "current-2" {
+		t.Fatalf("default current terminal projection = %#v", current)
+	}
+}
+
 var _ SandboxTerminalStore = (*terminalStoreFake)(nil)
 var _ RuntimeTerminalManager = (*terminalRuntimeFake)(nil)
 var _ RuntimeTerminal = (*runtimeTerminalFake)(nil)

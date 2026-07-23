@@ -3,6 +3,7 @@ package agent
 import (
 	"bytes"
 	"context"
+	_ "embed"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -19,8 +20,13 @@ import (
 
 const (
 	MaterializedContextSchemaVersion = "agent-materialized-context/v1"
-	qualifiedPromptTemplateVersion   = "worksflow-agent-prompt/v1"
+	qualifiedPromptTemplateVersion   = "worksflow-agent-prompt/v3"
 )
+
+//go:embed skills/frontend-resource-graph/SKILL.md
+var frontendResourceGraphSkill string
+
+const qualifiedSkillEnvelope = "\n\nPlatform-qualified skill: frontend-resource-graph\n\n"
 
 const qualifiedPromptTemplate = `Worksflow platform authority (%s)
 
@@ -34,6 +40,12 @@ Hard rules:
 4. Do not approve, merge, apply, publish, deploy, access platform data planes, or seek secrets.
 5. Platform-captured filesystem differences and independent verification are authoritative; your summary is not execution evidence.
 6. If exact constraints conflict or required context is absent, stop and report a blocker in the required structured output.
+7. This is an implementation task, not a sketch or example. Implement the complete TaskCapsule across every required layer, including integration wiring and tests that belong in the write set. Do not leave placeholders, TODOs, mocked production paths, omitted branches, or "follow-up" work for any bound obligation or acceptance criterion.
+8. Before editing, build a private closure checklist from every obligation ID, acceptance criterion ID, BuildContract binding, route, state, and Oracle. Inspect the existing repository and implement the smallest coherent full-stack change that closes the entire checklist.
+9. Run every declared verification command that the exact context makes executable. A missing command mapping, unavailable required tool, failed or skipped verification, unsatisfied obligation, unsatisfied acceptance criterion, or incomplete integration is a blocker; never report the task as complete in that case.
+10. The structured result must list every obligation ID, acceptance criterion ID, verification command ID, and actual changed path exactly once. Mark an item satisfied/passed only when the worktree implementation supports that claim. An incomplete result is rejected by the platform.
+11. For frontend UI or content work, apply the platform-qualified frontend-resource-graph skill appended below. Derive required assets from exact requirements, implement every resolvable graph node, and never use emoji, Unicode glyphs, text placeholders, or arbitrary remote assets as interface icons or resource substitutes.
+12. Always return resourceGraph. Set applicable=false only when the TaskCapsule and actual changes contain no frontend visual resource consumer. When applicable=true, every required resource and consumer edge must be present and resolved; an unresolved required resource is a blocker.
 
 Exact task capsule: %s (%s)
 Exact context pack: %s (%s)
@@ -55,8 +67,8 @@ Verification command IDs: %s
 Allowed tools: %s
 Network policy: %s
 
-Read /input/context/index.json first. Entries with inputPath contain exact immutable JSON under /input/context/items. Entries with workspacePath already exist in /workspace and were hash-verified by the platform.
-Return only output conforming to /input/output.schema.json.`
+Read /input/context/index.json first, but do not print the whole canonical one-line document. Use jq to list only each entry's key, kind, inputPath, and workspacePath, then read only the relevant immutable JSON under /input/context/items. Entries with workspacePath already exist in /workspace and were hash-verified by the platform.
+Return only output conforming to /input/output.schema.json. Keep obligations, acceptanceCriteria, verification, and changedPaths in the exact order supplied by the TaskCapsule or by the final sorted worktree diff.`
 
 type ContextContentReader interface {
 	Get(context.Context, string, string) (content.StoredContent, error)
@@ -291,8 +303,12 @@ func (materializer *ContextMaterializer) materializeItem(
 }
 
 func QualifiedPromptTemplate() ([]byte, string) {
-	value := []byte(qualifiedPromptTemplate)
+	value := qualifiedPromptTemplateBytes()
 	return append([]byte(nil), value...), rawWorktreeHash(value)
+}
+
+func qualifiedPromptTemplateBytes() []byte {
+	return []byte(qualifiedPromptTemplate + qualifiedSkillEnvelope + strings.TrimSpace(frontendResourceGraphSkill) + "\n")
 }
 
 func CompileAgentPrompt(
@@ -334,6 +350,7 @@ func CompileAgentPrompt(
 		strings.Join(capsule.AllowedTools, ", "),
 		string(network),
 	)
+	prompt += qualifiedSkillEnvelope + strings.TrimSpace(frontendResourceGraphSkill) + "\n"
 	if len(prompt) == 0 || len(prompt) > 4<<20 {
 		return nil, fmt.Errorf("%w: compiled prompt exceeds its bound", ErrExecutionBlocked)
 	}

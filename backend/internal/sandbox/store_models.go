@@ -194,9 +194,7 @@ func hydrateSandboxSession(database *gorm.DB, row sandboxSessionRow) (SandboxSes
 	if activityQuery.Error != nil {
 		return SandboxSession{}, integrityError("load SandboxSession activity", activityQuery.Error)
 	}
-	if activity.SessionID != row.ID || activity.SessionEpoch != row.SessionEpoch ||
-		activity.LastActivityAt.Before(row.UpdatedAt) || activity.IdleDeadline.Before(activity.LastActivityAt) ||
-		activity.IdleDeadline.After(row.ExpiresAt) {
+	if !sandboxActivityProjectionMatches(row, activity) {
 		return SandboxSession{}, integrityError("validate SandboxSession activity", ErrStoreIntegrity)
 	}
 	row.IdleDeadline = activity.IdleDeadline.UTC()
@@ -284,6 +282,20 @@ func hydrateSandboxSession(database *gorm.DB, row sandboxSessionRow) (SandboxSes
 		return SandboxSession{}, integrityError("validate hydrated SandboxSession", err)
 	}
 	return SandboxSession{document: cloneDocument(document)}, nil
+}
+
+func sandboxActivityProjectionMatches(row sandboxSessionRow, activity sandboxSessionActivityRow) bool {
+	if activity.SessionID != row.ID || activity.SessionEpoch != row.SessionEpoch ||
+		activity.IdleDeadline.Before(activity.LastActivityAt) || activity.IdleDeadline.After(row.ExpiresAt) {
+		return false
+	}
+	if row.UpdatedAt.Before(row.ExpiresAt) {
+		return !activity.LastActivityAt.Before(row.UpdatedAt)
+	}
+	// Projection reconciliation and terminal transitions may commit after the
+	// hard absolute TTL. They must not extend activity beyond that boundary;
+	// the capped exact expiry is the only valid operational projection.
+	return activity.LastActivityAt.Equal(row.ExpiresAt)
 }
 
 func loadSandboxConfiguration(

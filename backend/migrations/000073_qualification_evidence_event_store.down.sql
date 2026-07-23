@@ -1,3 +1,10 @@
+-- Promotion v2 takes the shared side before its first authority-plane read.
+-- Acquire the exclusive side before any Evidence relation so a rolling
+-- rollback cannot deadlock with project-first promotion composition.
+SELECT pg_catalog.pg_advisory_xact_lock(
+  pg_catalog.hashtextextended('worksflow:workflow-input-authority-migration:v1', 0)
+);
+
 DO $qualification_evidence_down_guard$
 BEGIN
   -- Fence concurrent appends before observing emptiness. A clean observation

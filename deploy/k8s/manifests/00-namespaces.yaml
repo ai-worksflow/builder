@@ -1,0 +1,32 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: worksflow-gateway
+  labels:
+    worksflow.dev/component: gateway-authority
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: wf-p-a7f3c2
+  labels: &projectLabelsA
+    worksflow.dev/managed: "true"
+    worksflow.dev/gateway-attach: enabled
+    worksflow.dev/project-key: a7f3c2
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: wf-p-b9d4e1
+  labels:
+    worksflow.dev/managed: "true"
+    worksflow.dev/gateway-attach: enabled
+    worksflow.dev/project-key: b9d4e1
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted

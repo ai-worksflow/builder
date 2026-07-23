@@ -28,6 +28,7 @@ import {
   normalizeWorkbenchBundle,
   normalizeWorkbenchLineageState,
 } from './workbench-normalization'
+import { normalizeWorkflowRun } from './workflow-run-normalization'
 
 function segment(value: string) {
   return encodeURIComponent(value)
@@ -150,12 +151,13 @@ export class PlatformFlowClient {
     )
   }
 
-  startRun(projectId: string, input: StartWorkflowRunInputDto, options?: ClientMutationOptions) {
-    return this.http.post<WorkflowRunDto, StartWorkflowRunInputDto>(
+  async startRun(projectId: string, input: StartWorkflowRunInputDto, options?: ClientMutationOptions) {
+    const result = await this.http.post<WorkflowRunDto, StartWorkflowRunInputDto>(
       `/v1/projects/${segment(projectId)}/workflow-runs`,
       input,
       mutationOptions(options),
     )
+    return { ...result, data: normalizeWorkflowRun(result.data) }
   }
 
   listRuns(
@@ -176,11 +178,12 @@ export class PlatformFlowClient {
     )
   }
 
-  getRun(projectId: string, runId: string, options?: ClientRequestOptions) {
-    return this.http.get<WorkflowRunDto>(
+  async getRun(projectId: string, runId: string, options?: ClientRequestOptions) {
+    const result = await this.http.get<WorkflowRunDto>(
       `/v1/projects/${segment(projectId)}/workflow-runs/${segment(runId)}`,
       requestOptions(options),
     )
+    return { ...result, data: normalizeWorkflowRun(result.data) }
   }
 
   listRunEvents(

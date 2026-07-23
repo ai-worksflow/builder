@@ -8,6 +8,8 @@ import type {
   GitHubBranch,
   GitHubChangesPreview,
   GitHubConnectionStatus,
+  GitHubCreateRepositoryInput,
+  GitHubCreateRepositoryResult,
   GitHubPullRequestInput,
   GitHubPullRequestResult,
   GitHubPushInput,
@@ -108,6 +110,20 @@ export async function listGitHubRepositories(http: HttpClient, projectId: string
       githubPath(projectId, 'repositories'),
     )
   ).repositories
+}
+
+export async function createGitHubRepository(
+  http: HttpClient,
+  projectId: string,
+  input: GitHubCreateRepositoryInput,
+) {
+  return (
+    await githubRequest<{ result: GitHubCreateRepositoryResult }>(
+      http,
+      githubPath(projectId, 'repositories'),
+      { method: 'POST', body: input },
+    )
+  ).result
 }
 
 export async function listGitHubBranches(

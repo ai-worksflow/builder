@@ -43,6 +43,16 @@ type agentControlAPIFake struct {
 	create      agent.TaskAttemptResult
 	createErr   error
 
+	graphProjectID string
+	graphSessionID string
+	graphActorID   string
+	graph          agent.TaskGraph
+	graphErr       error
+
+	advanceInput agent.AdvanceTaskGraphInput
+	advance      agent.TaskGraphAdvanceResult
+	advanceErr   error
+
 	retryInput agent.RetryAttemptInput
 	retry      agent.TaskAttemptResult
 	retryErr   error
@@ -107,6 +117,22 @@ func (api *agentControlAPIFake) CreateTaskAttempt(
 ) (agent.TaskAttemptResult, error) {
 	api.createInput = input
 	return api.create, api.createErr
+}
+
+func (api *agentControlAPIFake) GetTaskGraph(
+	_ context.Context,
+	projectID, sessionID, actorID string,
+) (agent.TaskGraph, error) {
+	api.graphProjectID, api.graphSessionID, api.graphActorID = projectID, sessionID, actorID
+	return api.graph, api.graphErr
+}
+
+func (api *agentControlAPIFake) AdvanceTaskGraph(
+	_ context.Context,
+	input agent.AdvanceTaskGraphInput,
+) (agent.TaskGraphAdvanceResult, error) {
+	api.advanceInput = input
+	return api.advance, api.advanceErr
 }
 
 func (api *agentControlAPIFake) RetryAttempt(
@@ -245,6 +271,62 @@ func TestAgentCreateRequiresIdempotencyAndDerivesProjectFromSession(t *testing.T
 	}
 }
 
+func TestAgentTaskGraphIsSessionScopedAndAdvancesNextTask(t *testing.T) {
+	graph := agent.TaskGraph{
+		SchemaVersion: agent.TaskGraphSchemaVersion,
+		ProjectID:     agentTransportProject, SandboxSessionID: agentTransportSession,
+		State: agent.TaskGraphReady, NextTaskKey: agent.TaskKeyPrefix + "must-1",
+		Tasks: []agent.TaskGraphTask{{
+			Key: agent.TaskKeyPrefix + "must-1", State: agent.TaskGraphTaskPending,
+		}},
+		TotalCount: 1,
+	}
+	attemptResult := agent.TaskAttemptResult{
+		Attempt: agentTransportAttemptView(agentTransportAttempt, 3, agent.AttemptQueued),
+	}
+	api := &agentControlAPIFake{
+		graph: graph,
+		advance: agent.TaskGraphAdvanceResult{
+			Graph: graph, Attempt: &attemptResult,
+			Disposition: agent.TaskGraphAdvanceStarted,
+		},
+	}
+	resolver := &agentSessionResolverFake{projectID: agentTransportProject}
+	router := agentTransportRouter(t, api, resolver)
+
+	getRequest := httptest.NewRequest(
+		http.MethodGet,
+		"/sandbox-sessions/"+agentTransportSession+"/agent-task-graph",
+		nil,
+	)
+	getResponse := httptest.NewRecorder()
+	router.ServeHTTP(getResponse, getRequest)
+	if getResponse.Code != http.StatusOK || api.graphProjectID != agentTransportProject ||
+		api.graphSessionID != agentTransportSession || api.graphActorID != agentTransportActor {
+		t.Fatalf("graph status=%d body=%s api=%#v", getResponse.Code, getResponse.Body.String(), api)
+	}
+
+	advanceRequest := httptest.NewRequest(
+		http.MethodPost,
+		"/sandbox-sessions/"+agentTransportSession+"/agent-task-graph/advance",
+		bytes.NewBufferString(`{"instruction":"Implement the complete scope.","executorProfile":"codex-default"}`),
+	)
+	advanceRequest.Header.Set("Content-Type", "application/json")
+	advanceRequest.Header.Set("Idempotency-Key", "agent-graph-advance-one")
+	advanceResponse := httptest.NewRecorder()
+	router.ServeHTTP(advanceResponse, advanceRequest)
+	if advanceResponse.Code != http.StatusCreated ||
+		advanceResponse.Header().Get("Location") != agentAttemptLocation(agentTransportAttempt) ||
+		api.advanceInput.ProjectID != agentTransportProject ||
+		api.advanceInput.SandboxSessionID != agentTransportSession ||
+		api.advanceInput.ActorID != agentTransportActor ||
+		api.advanceInput.OperationID != "agent-graph-advance-one" ||
+		api.advanceInput.Instruction != "Implement the complete scope." ||
+		api.advanceInput.ExecutorProfile != "codex-default" {
+		t.Fatalf("advance status=%d headers=%v body=%s input=%#v", advanceResponse.Code, advanceResponse.Header(), advanceResponse.Body.String(), api.advanceInput)
+	}
+}
+
 func TestAgentRetryRequiresExactETagAndForwardsImmutableParent(t *testing.T) {
 	current := agentTransportAttemptView(agentTransportAttempt, 7, agent.AttemptFailed)
 	api := &agentControlAPIFake{
@@ -265,7 +347,9 @@ func TestAgentRetryRequiresExactETagAndForwardsImmutableParent(t *testing.T) {
 	stale.Header.Set("If-Match", `"agent-attempt:`+agentTransportAttempt+`:6"`)
 	staleResponse := httptest.NewRecorder()
 	router.ServeHTTP(staleResponse, stale)
-	if staleResponse.Code != http.StatusPreconditionFailed || api.retryInput.OperationID != "" {
+	if staleResponse.Code != http.StatusPreconditionFailed ||
+		staleResponse.Header().Get("ETag") != `"agent-attempt:`+agentTransportAttempt+`:7"` ||
+		api.retryInput.OperationID != "" {
 		t.Fatalf("stale retry status=%d body=%s input=%#v", staleResponse.Code, staleResponse.Body.String(), api.retryInput)
 	}
 

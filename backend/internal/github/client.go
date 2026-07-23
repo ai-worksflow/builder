@@ -246,7 +246,7 @@ func (c *APIClient) Repositories(ctx context.Context, token string) ([]Repositor
 			if value.ID < 1 || value.Name == "" || value.FullName == "" || value.Owner.Login == "" {
 				return nil, upstream("upstream_error", http.StatusBadGateway, "GitHub returned an invalid repository", nil)
 			}
-			result = append(result, Repository{ID: value.ID, Name: value.Name, FullName: value.FullName, Owner: value.Owner.Login, Private: value.Private, Archived: value.Archived, HTMLURL: value.HTMLURL, DefaultBranch: value.DefaultBranch, UpdatedAt: value.UpdatedAt, Permissions: value.Permissions})
+			result = append(result, repositoryFromAPI(value))
 		}
 		if len(values) < 100 {
 			break
@@ -254,6 +254,52 @@ func (c *APIClient) Repositories(ctx context.Context, token string) ([]Repositor
 	}
 	return result, nil
 }
+
+func (c *APIClient) InstallationRepositories(ctx context.Context, token string) ([]Repository, error) {
+	result := make([]Repository, 0)
+	for page := 1; page <= 5; page++ {
+		var response struct {
+			Repositories []apiRepository `json:"repositories"`
+		}
+		endpoint := fmt.Sprintf("/installation/repositories?per_page=100&page=%d", page)
+		if err := c.request(ctx, token, http.MethodGet, endpoint, nil, &response); err != nil {
+			return nil, err
+		}
+		for _, value := range response.Repositories {
+			if value.ID < 1 || value.Name == "" || value.FullName == "" || value.Owner.Login == "" {
+				return nil, upstream("upstream_error", http.StatusBadGateway, "GitHub returned an invalid repository", nil)
+			}
+			result = append(result, repositoryFromAPI(value))
+		}
+		if len(response.Repositories) < 100 {
+			break
+		}
+	}
+	return result, nil
+}
+
+func (c *APIClient) CreateRepository(ctx context.Context, token string, input RepositoryCreateOptions) (Repository, error) {
+	endpoint := "/user/repos"
+	if input.Owner != "" {
+		endpoint = "/orgs/" + url.PathEscape(input.Owner) + "/repos"
+	}
+	var value apiRepository
+	err := c.request(ctx, token, http.MethodPost, endpoint, map[string]any{
+		"name":        input.Name,
+		"description": input.Description,
+		"private":     input.Private,
+		"auto_init":   true,
+	}, &value)
+	if err != nil {
+		return Repository{}, err
+	}
+	if value.ID < 1 || value.Name == "" || value.FullName == "" || value.Owner.Login == "" ||
+		value.HTMLURL == "" || value.DefaultBranch == "" {
+		return Repository{}, upstream("upstream_error", http.StatusBadGateway, "GitHub returned an invalid repository", nil)
+	}
+	return repositoryFromAPI(value), nil
+}
+
 func (c *APIClient) Branches(ctx context.Context, token, owner, repo string) ([]Branch, error) {
 	result := make([]Branch, 0)
 	for page := 1; page <= 5; page++ {
@@ -269,6 +315,14 @@ func (c *APIClient) Branches(ctx context.Context, token, owner, repo string) ([]
 		}
 	}
 	return result, nil
+}
+
+func repositoryFromAPI(value apiRepository) Repository {
+	return Repository{
+		ID: value.ID, Name: value.Name, FullName: value.FullName, Owner: value.Owner.Login,
+		Private: value.Private, Archived: value.Archived, HTMLURL: value.HTMLURL,
+		DefaultBranch: value.DefaultBranch, UpdatedAt: value.UpdatedAt, Permissions: value.Permissions,
+	}
 }
 func (c *APIClient) Reference(ctx context.Context, token, owner, repo, branch string) (gitReference, error) {
 	var result gitReference

@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import {
   appendPairedFanOutSubgraph,
   parseEditableDefinition,
+  resolveWorkflowProposalReference,
   starterWorkflowDefinition,
 } from '../lib/platform/workflow-ui-contract'
 
@@ -63,5 +64,20 @@ for (const fanOut of addedFanOuts) {
   assert.equal(secondPair.definition.edges.filter((edge) => edge.from === branch?.id && edge.to === merge?.id).length, 1)
 }
 assert.notEqual(firstPair.selectedNodeId, secondPair.selectedNodeId)
+
+assert.equal(
+  resolveWorkflowProposalReference('run-1', 'proposal-1', ''),
+  'proposal-1',
+  'completed workflow nodes retain their exact proposal deep link for canonical review',
+)
+assert.equal(
+  resolveWorkflowProposalReference('run-1', 'stale-proposal', 'active-proposal'),
+  '',
+  'an active server-derived proposal rejects a conflicting query pin',
+)
+assert.equal(
+  resolveWorkflowProposalReference('run-1', '', 'active-proposal'),
+  'active-proposal',
+)
 
 console.log('✓ workflow fan-out uses exact resolvers and atomically creates unique reciprocal merge pairs')

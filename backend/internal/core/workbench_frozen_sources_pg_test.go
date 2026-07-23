@@ -94,3 +94,61 @@ func containsFrozenWorkbenchRevision(sources []frozenWorkbenchSource, revisionID
 	}
 	return false
 }
+
+func TestWorkbenchBlueprintAuthorityPrefersDeliverySliceAnchorPostgres(t *testing.T) {
+	database, cleanup := baselinePostgresDatabase(t)
+	defer cleanup()
+
+	store, _, projectID, ownerID := newArtifactLineageFixture(t, database)
+	access, err := NewAccessControl(database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	workbench, err := NewWorkbenchService(database, store, access)
+	if err != nil {
+		t.Fatal(err)
+	}
+	blueprint := seedArtifactLineageRevision(
+		t, database, store, projectID, ownerID, "blueprint", "approved", "current",
+		json.RawMessage(`{"title":"Blueprint"}`),
+	)
+	pageSpec := seedArtifactLineageRevision(
+		t, database, store, projectID, ownerID, "page_spec", "approved", "current",
+		json.RawMessage(`{"title":"Page"}`),
+	)
+	contract := seedArtifactLineageRevision(
+		t, database, store, projectID, ownerID, "api_contract", "approved", "current",
+		json.RawMessage(`{"openapi":"3.1.0"}`),
+	)
+	prototype := seedArtifactLineageRevision(
+		t, database, store, projectID, ownerID, "prototype", "approved", "current",
+		json.RawMessage(`{"title":"Prototype"}`),
+	)
+	pageAnchor := "node-page-video-list"
+	seedArtifactLineageRevisionSource(t, database, pageSpec, blueprint, "blueprint", true, &pageAnchor, ownerID)
+	seedArtifactLineageRevisionSource(t, database, contract, blueprint, "architecture-authority", true, nil, ownerID)
+	seedArtifactLineageRevisionSource(t, database, prototype, pageSpec, "page_spec", true, nil, ownerID)
+	seedArtifactLineageRevisionSource(t, database, prototype, contract, "api_contract", true, nil, ownerID)
+
+	sources, err := workbench.collectFrozenRevisionSources(
+		context.Background(), projectID, uuid.MustParse(prototype.RevisionID),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	classified, err := workbench.classifyAndValidateRefs(
+		context.Background(), projectID, frozenWorkbenchSourceRefs(sources),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(classified.blueprints) != 1 {
+		t.Fatalf("same immutable Blueprint revision produced %d authorities: %+v", len(classified.blueprints), classified.blueprints)
+	}
+	if classified.blueprints[0].AnchorID == nil || *classified.blueprints[0].AnchorID != pageAnchor {
+		t.Fatalf("delivery-slice Blueprint anchor was not retained: %+v", classified.blueprints[0])
+	}
+	if len(classified.contracts) != 1 || !exactWorkbenchVersionRef(classified.contracts[0], contract) {
+		t.Fatalf("direct machine contract was not retained: %+v", classified.contracts)
+	}
+}

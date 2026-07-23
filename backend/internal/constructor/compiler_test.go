@@ -279,7 +279,7 @@ func TestCompilerBindsDeliverySliceToPageSpecBlueprintPage(t *testing.T) {
 	t.Parallel()
 
 	input := readyCompileInput(t)
-	input.DeliverySliceID = "page-other"
+	input.DeliverySlicePageNodeID = "page-other"
 	compiled, err := (Compiler{}).Compile(input)
 	if err != nil {
 		t.Fatal(err)
@@ -696,6 +696,25 @@ func TestCompilerRejectsProseAndSourceHashDrift(t *testing.T) {
 	}
 	if compiled.Content.Status != StatusBlocked || !containsGap(compiled.Content.Gaps, "source_content_hash_mismatch", "") || !containsGap(compiled.Content.Gaps, "contract_schema_invalid", "") {
 		t.Fatalf("gaps = %#v", compiled.Content.Gaps)
+	}
+}
+
+func TestCompilerAcceptsStoragePrefixedSourceHashes(t *testing.T) {
+	t.Parallel()
+
+	input := readyCompileInput(t)
+	for index := range input.Sources {
+		if input.Sources[index].Ref.Kind == "requirement_baseline" {
+			input.Sources[index].Ref.ContentHash = "sha256:" + input.Sources[index].Ref.ContentHash
+			break
+		}
+	}
+	compiled, err := (Compiler{}).Compile(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if compiled.Content.Status != StatusReady || containsGap(compiled.Content.Gaps, "source_content_hash_mismatch", "") {
+		t.Fatalf("status = %s, gaps = %#v", compiled.Content.Status, compiled.Content.Gaps)
 	}
 }
 
@@ -1166,7 +1185,7 @@ func readyCompileInput(t *testing.T) CompileInput {
     }`)
 	prototype := readyPrototypeSource(t, pageSpec)
 	input := CompileInput{
-		ProjectID: "project-1", DeliverySliceID: "page-messages",
+		ProjectID: "project-1", DeliverySliceID: "page-messages", DeliverySlicePageNodeID: "page-messages",
 		BuildManifest: BuildManifestRef{ID: "manifest-1", ContentHash: testHash(t, map[string]any{"manifest": 1})},
 		Sources: []PinnedBuildSource{
 			baseline,

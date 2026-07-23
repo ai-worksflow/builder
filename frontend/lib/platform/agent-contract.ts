@@ -127,6 +127,53 @@ export interface AgentTaskAttemptResultDto {
   readonly replayed: boolean
 }
 
+export type AgentTaskGraphTaskState =
+  | 'pending'
+  | 'blocked'
+  | 'running'
+  | 'review_ready'
+  | 'failed'
+  | 'completed'
+
+export type AgentTaskGraphState =
+  | 'ready'
+  | 'running'
+  | 'awaiting_review'
+  | 'failed'
+  | 'completed'
+  | 'blocked'
+
+export interface AgentTaskGraphTaskDto {
+  readonly key: string
+  readonly title: string
+  readonly obligationIds: readonly string[]
+  readonly acceptanceCriterionIds: readonly string[]
+  readonly verificationCommandIds: readonly string[]
+  readonly dependsOn: readonly string[]
+  readonly state: AgentTaskGraphTaskState
+  readonly latestAttemptId?: string
+  readonly latestAttemptState?: AgentAttemptState
+}
+
+export interface AgentTaskGraphDto {
+  readonly schemaVersion: 'agent-task-graph/v1'
+  readonly projectId: string
+  readonly sandboxSessionId: string
+  readonly buildContract: AgentExactReferenceDto
+  readonly state: AgentTaskGraphState
+  readonly tasks: readonly AgentTaskGraphTaskDto[]
+  readonly nextTaskKey?: string
+  readonly completedCount: number
+  readonly totalCount: number
+}
+
+export interface AgentTaskGraphAdvanceResultDto {
+  readonly graph: AgentTaskGraphDto
+  readonly attempt?: AgentTaskAttemptResultDto
+  readonly disposition: 'started' | 'waiting' | 'completed' | 'blocked'
+  readonly replayed: boolean
+}
+
 export interface AgentAttemptEventDto {
   readonly schemaVersion: string
   readonly attemptId: string
@@ -175,11 +222,40 @@ export interface AgentPlatformPatchDto {
 export interface AgentStructuredResultDto {
   readonly summary: string
   readonly changedPaths: readonly string[]
+  readonly obligations: readonly {
+    readonly id: string
+    readonly status: 'satisfied' | 'blocked'
+    readonly note: string
+  }[]
+  readonly acceptanceCriteria: readonly {
+    readonly id: string
+    readonly status: 'satisfied' | 'blocked'
+    readonly note: string
+  }[]
   readonly verification: readonly {
     readonly commandId: string
     readonly status: 'not_run' | 'passed' | 'failed'
     readonly note: string
   }[]
+  readonly resourceGraph: {
+    readonly applicable: boolean
+    readonly nodes: readonly {
+      readonly id: string
+      readonly kind: 'icon' | 'image' | 'illustration' | 'logo' | 'font' | 'video' | 'animation' | 'pattern'
+      readonly purpose: string
+      readonly requirementIds: readonly string[]
+      readonly consumers: readonly string[]
+      readonly source: 'authoritative_input' | 'existing_asset' | 'icon_library' | 'css_primitive' | 'generated_svg' | 'generated_raster'
+      readonly reference: string
+      readonly accessibility: string
+      readonly status: 'resolved' | 'blocked'
+    }[]
+    readonly edges: readonly {
+      readonly from: string
+      readonly to: string
+      readonly relation: 'supports' | 'consumed_by' | 'variant_of'
+    }[]
+  }
   readonly blockers: readonly string[]
 }
 
@@ -334,6 +410,7 @@ export class AgentContractError extends Error {
 }
 
 const sha256Pattern = /^sha256:[0-9a-f]{64}$/
+const exactHashPattern = /^(?:sha256:)?[0-9a-f]{64}$/
 const attemptStates = new Set<AgentAttemptState>([
   'pending', 'ready', 'queued', 'claimed', 'running', 'patch_ready', 'validating',
   'review_ready', 'verification_failed', 'failed', 'timed_out', 'cancelled', 'stale',
@@ -384,6 +461,12 @@ function digest(value: unknown, detail: string) {
   return result
 }
 
+function buildContractDigest(value: unknown, detail: string) {
+  const result = text(value, detail, true)
+  if (!exactHashPattern.test(result)) return invalid(`${detail} must be an exact BuildContract sha256 hash`)
+  return result
+}
+
 function integer(value: unknown, detail: string, minimum = 0) {
   if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < minimum) {
     return invalid(`${detail} must be a safe integer greater than or equal to ${minimum}`)
@@ -414,6 +497,14 @@ function timestamp(value: unknown, detail: string) {
 function exactReference(value: unknown, detail: string): AgentExactReferenceDto {
   const source = exactRecord(value, detail, ['id', 'contentHash'])
   return { id: text(source.id, `${detail}.id`, true), contentHash: digest(source.contentHash, `${detail}.contentHash`) }
+}
+
+function buildContractReference(value: unknown, detail: string): AgentExactReferenceDto {
+  const source = exactRecord(value, detail, ['id', 'contentHash'])
+  return {
+    id: text(source.id, `${detail}.id`, true),
+    contentHash: buildContractDigest(source.contentHash, `${detail}.contentHash`),
+  }
 }
 
 function blobReference(value: unknown, detail: string): AgentBlobReferenceDto {
@@ -481,7 +572,7 @@ export function normalizeAgentAttempt(value: unknown): AgentAttemptDto {
     taskCapsule: exactReference(source.taskCapsule, `${detail}.taskCapsule`),
     contextPack: exactReference(source.contextPack, `${detail}.contextPack`),
     baseCandidateTreeHash: digest(source.baseCandidateTreeHash, `${detail}.baseCandidateTreeHash`),
-    buildContractHash: digest(source.buildContractHash, `${detail}.buildContractHash`),
+    buildContractHash: buildContractDigest(source.buildContractHash, `${detail}.buildContractHash`),
     templateReleaseHashes: array(source.templateReleaseHashes, `${detail}.templateReleaseHashes`).map(
       (entry, index) => digest(entry, `${detail}.templateReleaseHashes[${index}]`),
     ),
@@ -517,10 +608,13 @@ export function normalizeAgentAttempt(value: unknown): AgentAttemptDto {
 function contextItem(value: unknown, detail: string) {
   const source = exactRecord(value, detail, ['key', 'kind', 'content', 'required'], ['source', 'path'])
   text(source.key, `${detail}.key`, true)
-  text(source.kind, `${detail}.kind`, true)
+  const kind = text(source.kind, `${detail}.kind`, true)
   blobReference(source.content, `${detail}.content`)
   truth(source.required, `${detail}.required`)
-  if (has(source, 'source')) exactReference(source.source, `${detail}.source`)
+  if (has(source, 'source')) {
+    if (kind === 'build_contract') buildContractReference(source.source, `${detail}.source`)
+    else exactReference(source.source, `${detail}.source`)
+  }
   if (has(source, 'path')) text(source.path, `${detail}.path`, true)
 }
 
@@ -538,7 +632,7 @@ function normalizeContextPack(value: unknown) {
     projectId: text(source.projectId, `${detail}.projectId`, true),
     candidateId: text(source.candidateId, `${detail}.candidateId`, true),
     baseCandidateTreeHash: digest(source.baseCandidateTreeHash, `${detail}.baseCandidateTreeHash`),
-    buildContract: exactReference(source.buildContract, `${detail}.buildContract`),
+    buildContract: buildContractReference(source.buildContract, `${detail}.buildContract`),
     contentHash: digest(source.contentHash, `${detail}.contentHash`),
     itemCount: items.length,
   }
@@ -578,7 +672,7 @@ function normalizeTaskCapsule(value: unknown): AgentTaskCapsuleDto & {
     candidateSessionEpoch: integer(source.candidateSessionEpoch, `${detail}.candidateSessionEpoch`, 1),
     candidateWriterLeaseEpoch: integer(source.candidateWriterLeaseEpoch, `${detail}.candidateWriterLeaseEpoch`),
     baseCandidateTreeHash: digest(source.baseCandidateTreeHash, `${detail}.baseCandidateTreeHash`),
-    buildContract: exactReference(source.buildContract, `${detail}.buildContract`),
+    buildContract: buildContractReference(source.buildContract, `${detail}.buildContract`),
     templateReleases: array(source.templateReleases, `${detail}.templateReleases`).map(
       (entry, index) => exactReference(entry, `${detail}.templateReleases[${index}]`),
     ),
@@ -629,6 +723,128 @@ export function normalizeAgentTaskAttemptResult(value: unknown): AgentTaskAttemp
     taskCapsule,
     attempt,
     replayed: truth(source.replayed, 'taskAttemptResult.replayed'),
+  }
+}
+
+export function normalizeAgentTaskGraph(value: unknown): AgentTaskGraphDto {
+  const detail = 'taskGraph'
+  const source = exactRecord(value, detail, [
+    'schemaVersion', 'projectId', 'sandboxSessionId', 'buildContract', 'state',
+    'tasks', 'completedCount', 'totalCount',
+  ], ['nextTaskKey'])
+  if (source.schemaVersion !== 'agent-task-graph/v1') {
+    return invalid(`${detail}.schemaVersion is unsupported`)
+  }
+  const graphStates = new Set<AgentTaskGraphState>([
+    'ready', 'running', 'awaiting_review', 'failed', 'completed', 'blocked',
+  ])
+  const taskStates = new Set<AgentTaskGraphTaskState>([
+    'pending', 'blocked', 'running', 'review_ready', 'failed', 'completed',
+  ])
+  const graphState = text(source.state, `${detail}.state`, true) as AgentTaskGraphState
+  if (!graphStates.has(graphState)) return invalid(`${detail}.state is unsupported`)
+  const tasks = array(source.tasks, `${detail}.tasks`).map((value, index) => {
+    const taskDetail = `${detail}.tasks[${index}]`
+    const task = exactRecord(value, taskDetail, [
+      'key', 'title', 'obligationIds', 'acceptanceCriterionIds',
+      'verificationCommandIds', 'dependsOn', 'state',
+    ], ['latestAttemptId', 'latestAttemptState'])
+    const taskState = text(task.state, `${taskDetail}.state`, true) as AgentTaskGraphTaskState
+    if (!taskStates.has(taskState)) return invalid(`${taskDetail}.state is unsupported`)
+    const latestAttemptId = optional(
+      task, 'latestAttemptId', (entry, name) => text(entry, name, true), taskDetail,
+    )
+    const latestAttemptState = optional(task, 'latestAttemptState', state, taskDetail)
+    if ((latestAttemptId === undefined) !== (latestAttemptState === undefined)) {
+      return invalid(`${taskDetail} must bind the latest Attempt identity and state together`)
+    }
+    return {
+      key: text(task.key, `${taskDetail}.key`, true),
+      title: text(task.title, `${taskDetail}.title`, true),
+      obligationIds: textList(task.obligationIds, `${taskDetail}.obligationIds`),
+      acceptanceCriterionIds: textList(
+        task.acceptanceCriterionIds, `${taskDetail}.acceptanceCriterionIds`,
+      ),
+      verificationCommandIds: textList(
+        task.verificationCommandIds, `${taskDetail}.verificationCommandIds`,
+      ),
+      dependsOn: textList(task.dependsOn, `${taskDetail}.dependsOn`),
+      state: taskState,
+      latestAttemptId,
+      latestAttemptState,
+    }
+  })
+  const keys = new Set(tasks.map((task) => task.key))
+  if (keys.size !== tasks.length || tasks.length < 1 || tasks.length > 100) {
+    return invalid(`${detail}.tasks must contain one to 100 unique task keys`)
+  }
+  const taskPositions = new Map(tasks.map((task, index) => [task.key, index]))
+  for (const [index, task] of tasks.entries()) {
+    if (!task.key.startsWith('obligation/') || task.obligationIds.length < 1 ||
+      task.acceptanceCriterionIds.length < 1 || task.verificationCommandIds.length < 1 ||
+      task.dependsOn.some((dependency) => (
+        dependency === task.key || !keys.has(dependency) || (taskPositions.get(dependency) ?? index) >= index
+      ))) {
+      return invalid(`${detail}.tasks do not form a closed executable obligation graph`)
+    }
+  }
+  const completedCount = integer(source.completedCount, `${detail}.completedCount`)
+  const totalCount = integer(source.totalCount, `${detail}.totalCount`, 1)
+  if (totalCount !== tasks.length || completedCount !== tasks.filter((task) => task.state === 'completed').length) {
+    return invalid(`${detail} progress counts do not match its tasks`)
+  }
+  const nextTaskKey = optional(
+    source, 'nextTaskKey', (entry, name) => text(entry, name, true), detail,
+  )
+  if (nextTaskKey !== undefined && !keys.has(nextTaskKey)) {
+    return invalid(`${detail}.nextTaskKey is outside the exact graph`)
+  }
+  const shouldExposeNext = graphState === 'ready' || graphState === 'failed'
+  if (shouldExposeNext !== (nextTaskKey !== undefined) ||
+    (graphState === 'completed') !== (completedCount === totalCount)) {
+    return invalid(`${detail}.state does not match its next task or completion count`)
+  }
+  return {
+    schemaVersion: 'agent-task-graph/v1',
+    projectId: text(source.projectId, `${detail}.projectId`, true),
+    sandboxSessionId: text(source.sandboxSessionId, `${detail}.sandboxSessionId`, true),
+    buildContract: buildContractReference(source.buildContract, `${detail}.buildContract`),
+    state: graphState,
+    tasks,
+    nextTaskKey,
+    completedCount,
+    totalCount,
+  }
+}
+
+export function normalizeAgentTaskGraphAdvanceResult(
+  value: unknown,
+): AgentTaskGraphAdvanceResultDto {
+  const detail = 'taskGraphAdvanceResult'
+  const source = exactRecord(
+    value, detail, ['graph', 'disposition', 'replayed'], ['attempt'],
+  )
+  const graph = normalizeAgentTaskGraph(source.graph)
+  const disposition = text(source.disposition, `${detail}.disposition`, true)
+  if (!['started', 'waiting', 'completed', 'blocked'].includes(disposition)) {
+    return invalid(`${detail}.disposition is unsupported`)
+  }
+  const attempt = optional(source, 'attempt', normalizeAgentTaskAttemptResult, detail)
+  if ((disposition === 'started') !== (attempt !== undefined)) {
+    return invalid(`${detail}.attempt does not match its disposition`)
+  }
+  if (attempt && (
+    attempt.attempt.projectId !== graph.projectId ||
+    attempt.attempt.sandboxSessionId !== graph.sandboxSessionId ||
+    !graph.tasks.some((task) => task.key === attempt.taskCapsule.taskKey)
+  )) {
+    return invalid(`${detail}.attempt is outside the exact task graph`)
+  }
+  return {
+    graph,
+    attempt,
+    disposition: disposition as AgentTaskGraphAdvanceResultDto['disposition'],
+    replayed: truth(source.replayed, `${detail}.replayed`),
   }
 }
 
@@ -743,10 +959,77 @@ export function normalizeAgentPlatformPatch(value: unknown): AgentPlatformPatchD
 
 export function normalizeAgentStructuredResult(value: unknown): AgentStructuredResultDto {
   const detail = 'structuredResult'
-  const source = exactRecord(value, detail, ['summary', 'changedPaths', 'verification', 'blockers'])
+  const source = exactRecord(value, detail, [
+    'summary', 'changedPaths', 'obligations', 'acceptanceCriteria', 'verification', 'resourceGraph', 'blockers',
+  ])
+  const coverage = (value: unknown, name: string) => array(value, name).map((entry, index) => {
+    const itemDetail = `${name}[${index}]`
+    const item = exactRecord(entry, itemDetail, ['id', 'status', 'note'])
+    const status = text(item.status, `${itemDetail}.status`, true)
+    if (status !== 'satisfied' && status !== 'blocked') {
+      return invalid(`${itemDetail}.status is unsupported`)
+    }
+    const normalizedStatus: 'satisfied' | 'blocked' = status
+    return {
+      id: text(item.id, `${itemDetail}.id`, true),
+      status: normalizedStatus,
+      note: text(item.note, `${itemDetail}.note`, true),
+    }
+  })
+  const graphDetail = `${detail}.resourceGraph`
+  const graph = exactRecord(source.resourceGraph, graphDetail, ['applicable', 'nodes', 'edges'])
+  const nodeKinds = new Set(['icon', 'image', 'illustration', 'logo', 'font', 'video', 'animation', 'pattern'])
+  const nodeSources = new Set([
+    'authoritative_input', 'existing_asset', 'icon_library', 'css_primitive',
+    'generated_svg', 'generated_raster',
+  ])
+  const nodes = array(graph.nodes, `${graphDetail}.nodes`).map((entry, index) => {
+    const nodeDetail = `${graphDetail}.nodes[${index}]`
+    const node = exactRecord(entry, nodeDetail, [
+      'id', 'kind', 'purpose', 'requirementIds', 'consumers', 'source',
+      'reference', 'accessibility', 'status',
+    ])
+    const kind = text(node.kind, `${nodeDetail}.kind`, true)
+    const nodeSource = text(node.source, `${nodeDetail}.source`, true)
+    const status = text(node.status, `${nodeDetail}.status`, true)
+    if (!nodeKinds.has(kind) || !nodeSources.has(nodeSource) ||
+      (status !== 'resolved' && status !== 'blocked')) {
+      return invalid(`${nodeDetail} has an unsupported kind, source, or status`)
+    }
+    return {
+      id: text(node.id, `${nodeDetail}.id`, true),
+      kind: kind as AgentStructuredResultDto['resourceGraph']['nodes'][number]['kind'],
+      purpose: text(node.purpose, `${nodeDetail}.purpose`, true),
+      requirementIds: textList(node.requirementIds, `${nodeDetail}.requirementIds`),
+      consumers: textList(node.consumers, `${nodeDetail}.consumers`),
+      source: nodeSource as AgentStructuredResultDto['resourceGraph']['nodes'][number]['source'],
+      reference: text(node.reference, `${nodeDetail}.reference`, true),
+      accessibility: text(node.accessibility, `${nodeDetail}.accessibility`, true),
+      status: status as 'resolved' | 'blocked',
+    }
+  })
+  const edges = array(graph.edges, `${graphDetail}.edges`).map((entry, index) => {
+    const edgeDetail = `${graphDetail}.edges[${index}]`
+    const edge = exactRecord(entry, edgeDetail, ['from', 'to', 'relation'])
+    const relation = text(edge.relation, `${edgeDetail}.relation`, true)
+    if (!['supports', 'consumed_by', 'variant_of'].includes(relation)) {
+      return invalid(`${edgeDetail}.relation is unsupported`)
+    }
+    return {
+      from: text(edge.from, `${edgeDetail}.from`, true),
+      to: text(edge.to, `${edgeDetail}.to`, true),
+      relation: relation as 'supports' | 'consumed_by' | 'variant_of',
+    }
+  })
+  const applicable = truth(graph.applicable, `${graphDetail}.applicable`)
+  if (!applicable && (nodes.length !== 0 || edges.length !== 0)) {
+    return invalid(`${graphDetail} must be empty when it is not applicable`)
+  }
   return {
     summary: text(source.summary, `${detail}.summary`),
     changedPaths: textList(source.changedPaths, `${detail}.changedPaths`),
+    obligations: coverage(source.obligations, `${detail}.obligations`),
+    acceptanceCriteria: coverage(source.acceptanceCriteria, `${detail}.acceptanceCriteria`),
     verification: array(source.verification, `${detail}.verification`).map((entry, index) => {
       const checkDetail = `${detail}.verification[${index}]`
       const check = exactRecord(entry, checkDetail, ['commandId', 'status', 'note'])
@@ -759,6 +1042,7 @@ export function normalizeAgentStructuredResult(value: unknown): AgentStructuredR
         note: text(check.note, `${checkDetail}.note`),
       }
     }),
+    resourceGraph: { applicable, nodes, edges },
     blockers: textList(source.blockers, `${detail}.blockers`),
   }
 }

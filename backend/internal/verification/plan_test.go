@@ -60,6 +60,38 @@ func TestPlanCompilerProducesDeterministicExactRequiredChecks(t *testing.T) {
 	}
 }
 
+func TestPlanCompilerSupportsGoAPIReleaseDependencies(t *testing.T) {
+	input := validCandidatePlanInput()
+	input.Profile.VerifierImages[1] = VerifierImage{
+		Role: "go", Image: "registry.example/quality-go@sha256:" + strings.Repeat("b", 64),
+	}
+	input.Profile.CommandImageRoles["api"] = "go"
+	input.TemplateReleases[0].Manifest.Toolchains = []templates.Toolchain{{
+		Name: "go", Version: "1.25.12",
+		Image: "registry.example/go@sha256:" + strings.Repeat("c", 64),
+	}}
+	input.TemplateReleases[0].Manifest.Lockfiles = []templates.Lockfile{{
+		Path: "go.sum", Digest: hashFixture("plan-api-go-sum"), Registry: "https://proxy.golang.org",
+	}}
+	input.TemplateReleases[0].Manifest.Commands["test-contract"] = templates.Command{
+		WorkingDirectory: ".", Argv: []string{"go", "test", "./..."},
+	}
+
+	compiled, err := (PlanCompiler{}).Compile(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dependency := compiled.Content.Dependencies[0]
+	if dependency.ServiceID != "api" || dependency.Ecosystem != "go" ||
+		!equalStrings(dependency.ManifestPaths, []string{"apps/api/go.mod"}) ||
+		!equalStrings(dependency.ResolverArgv, []string{"go", "mod", "download"}) {
+		t.Fatalf("compiled Go dependency = %#v", dependency)
+	}
+	if _, err := ParsePlan(compiled.Content, compiled.PlanHash); err != nil {
+		t.Fatalf("parse Go dependency plan: %v", err)
+	}
+}
+
 func TestPlanCompilerFailsClosedForAmbiguousOrUnqualifiedCommands(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -124,6 +156,12 @@ func TestPlanCompilerFailsClosedForAmbiguousOrUnqualifiedCommands(t *testing.T) 
 				AcceptanceCriterionIDs: []string{"AC-ui"}, TimeoutSeconds: 120,
 			}}
 		}},
+		{name: "built-in service image role mismatch", mutate: func(input *CompileCandidatePlanInput) {
+			input.Profile.BuiltInChecks = []ProfileBuiltInCheck{{
+				ID: "api-security", Kind: "security", ImageRole: "node", ServiceID: "api",
+				Argv: []string{"npm", "audit"}, WorkingDirectory: "apps/api", TimeoutSeconds: 120,
+			}}
+		}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -185,6 +223,26 @@ func TestPlanCompilerAllowsProfileOwnedBuiltInOracleWithoutClientCommand(t *test
 	input := validCandidatePlanInput()
 	input.Oracles[0].CommandID = ""
 	input.Profile.BuiltInChecks = []ProfileBuiltInCheck{{
+		ID: "hidden-contract", Kind: "hidden", ImageRole: "python", ServiceID: "api",
+		Argv: []string{"quality-verifier", "hidden-contract"}, WorkingDirectory: ".",
+		OracleIDs: []string{"oracle-contract"}, ObligationIDs: []string{"OBL-contract"},
+		AcceptanceCriterionIDs: []string{"AC-contract"}, TimeoutSeconds: 120,
+	}}
+	compiled, err := (PlanCompiler{}).Compile(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(compiled.Content.Checks) != 2 || compiled.Content.Checks[0].ID != "hidden-contract" ||
+		!compiled.Content.Checks[0].Required || compiled.Content.Checks[0].WorkingDirectory != "." ||
+		compiled.Content.Checks[0].ServiceID != "api" {
+		t.Fatalf("built-in Must Oracle check = %#v", compiled.Content.Checks)
+	}
+}
+
+func TestPlanCompilerAllowsProfileOwnedBuiltInOracleWithUnmatchedStableCommandID(t *testing.T) {
+	input := validCandidatePlanInput()
+	input.Oracles[0].CommandID = "test-production-contract"
+	input.Profile.BuiltInChecks = []ProfileBuiltInCheck{{
 		ID: "hidden-contract", Kind: "hidden", ImageRole: "python",
 		Argv: []string{"quality-verifier", "hidden-contract"}, WorkingDirectory: ".",
 		OracleIDs: []string{"oracle-contract"}, ObligationIDs: []string{"OBL-contract"},
@@ -195,8 +253,8 @@ func TestPlanCompilerAllowsProfileOwnedBuiltInOracleWithoutClientCommand(t *test
 		t.Fatal(err)
 	}
 	if len(compiled.Content.Checks) != 2 || compiled.Content.Checks[0].ID != "hidden-contract" ||
-		!compiled.Content.Checks[0].Required || compiled.Content.Checks[0].WorkingDirectory != "." {
-		t.Fatalf("built-in Must Oracle check = %#v", compiled.Content.Checks)
+		!compiled.Content.Checks[0].Required {
+		t.Fatalf("built-in unmatched-command coverage = %#v", compiled.Content.Checks)
 	}
 }
 

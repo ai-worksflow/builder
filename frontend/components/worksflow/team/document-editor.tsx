@@ -55,6 +55,7 @@ export function DocumentEditor() {
   const collaboration = useCollaboration()
   const [tab, setTab] = useState<EditorTab>('content')
   const [content, setContent] = useState<DocumentContentDto | null>(null)
+  const [dirty, setDirty] = useState(false)
   const [saving, setSaving] = useState(false)
   const [savedAt, setSavedAt] = useState<string | null>(null)
   const [localError, setLocalError] = useState<string | null>(null)
@@ -82,12 +83,13 @@ export function DocumentEditor() {
   const bindingsRequest = useRef(0)
   const bindingsReloadTimer = useRef<number | null>(null)
   const bindingsDirtyRef = useRef(false)
+  const activeArtifactRef = useRef('')
+  const localEditVersionRef = useRef(0)
 
   const resource = workspace.documents.find((item) => item.artifact.id === selectedDocId)
     ?? workspace.documents[0]
   const serverContent = resource?.draft?.content ?? resource?.latestRevision?.content
   const serverEtag = resource?.draft?.etag ?? resource?.artifact.etag
-  const dirty = Boolean(content && serverContent && JSON.stringify(content) !== JSON.stringify(serverContent))
   const displayContent = useMemo(
     () => content ? normalizeDocumentContent(content) : null,
     [content],
@@ -146,12 +148,24 @@ export function DocumentEditor() {
 
   useEffect(() => {
     if (!resource) {
+      activeArtifactRef.current = ''
+      localEditVersionRef.current = 0
       setContent(null)
+      setDirty(false)
       return
     }
-    if (!conflict) setContent(serverContent ?? null)
+    const switched = activeArtifactRef.current !== resource.artifact.id
+    if (switched) {
+      activeArtifactRef.current = resource.artifact.id
+      localEditVersionRef.current = 0
+      setContent(serverContent ?? null)
+      setDirty(false)
+      setConflict(false)
+    } else if (!conflict && !dirty && !saving) {
+      setContent(serverContent ?? null)
+    }
     if (selectedDocId !== resource.artifact.id) setSelectedDocId(resource.artifact.id)
-  }, [conflict, resource, selectedDocId, serverContent, setSelectedDocId])
+  }, [conflict, dirty, resource, saving, selectedDocId, serverContent, setSelectedDocId])
 
   useEffect(() => {
     if (!resource) {
@@ -199,14 +213,16 @@ export function DocumentEditor() {
   }, [bindingUserId, collaboration.members])
 
   useEffect(() => {
-    if (!resource || !content || !serverEtag || !dirty || conflict) return
+    if (!resource || !content || !serverEtag || !dirty || conflict || saving) return
     const timer = window.setTimeout(() => {
+      const localEditVersion = localEditVersionRef.current
       setSaving(true)
       setLocalError(null)
       void workspace.saveDocumentDraft(resource.artifact.id, content, serverEtag)
         .then(() => {
           setSavedAt(new Date().toLocaleTimeString(locale))
           setConflict(false)
+          if (localEditVersionRef.current === localEditVersion) setDirty(false)
         })
         .catch((error) => {
           if (error instanceof ArtifactWorkspaceConflictError) setConflict(true)
@@ -215,7 +231,7 @@ export function DocumentEditor() {
         .finally(() => setSaving(false))
     }, 700)
     return () => window.clearTimeout(timer)
-  }, [conflict, content, dirty, locale, resource, serverEtag, t, workspace.saveDocumentDraft])
+  }, [conflict, content, dirty, locale, resource, saving, serverEtag, t, workspace.saveDocumentDraft])
 
   if (!collaboration.session.signedIn) {
     return <Unavailable title={t('teamPlatform.editor.signInTitle')} detail={t('teamPlatform.editor.signInDetail')} />
@@ -235,6 +251,8 @@ export function DocumentEditor() {
   }
 
   function updateContent(patch: Partial<DocumentContentDto>) {
+    localEditVersionRef.current += 1
+    setDirty(true)
     setContent((current) => current ? { ...current, ...patch } : current)
     setConflict(false)
   }

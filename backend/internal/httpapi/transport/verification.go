@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
@@ -537,6 +538,7 @@ func writeVerificationRunHeaders(c *gin.Context, view verification.RunView) {
 }
 
 func writeVerificationProblem(c *gin.Context, err error) {
+	slog.ErrorContext(c.Request.Context(), "verification request failed", "error", err)
 	switch {
 	case errors.Is(err, verification.ErrRunNotFound),
 		errors.Is(err, verification.ErrPlanNotFound),
@@ -577,11 +579,15 @@ func writeVerificationProblem(c *gin.Context, err error) {
 			"The verification request conflicts with committed state.",
 		))
 	case errors.Is(err, verification.ErrCandidatePlanningBlocked):
+		detail := "The exact Candidate checkpoint or its required canonical inputs are not ready."
+		if strings.Contains(err.Error(), "compile exact VerificationPlan:") {
+			detail = "The exact inputs are ready, but the VerificationPlan cannot be compiled from the frozen contract, template releases, and profile."
+		}
 		problem.Write(c, problem.New(
 			http.StatusConflict,
 			"verification_planning_blocked",
 			"Verification planning is blocked",
-			"The exact Candidate checkpoint or its required canonical inputs are not ready.",
+			detail,
 		))
 	case errors.Is(err, verification.ErrCandidatePlanningDrift):
 		problem.Write(c, problem.New(

@@ -314,6 +314,33 @@ func (store *PostgresStore) CreateAttempt(
 			}
 			return fmt.Errorf("%w: Attempt does not bind its exact persisted plan", ErrInvalidAttempt)
 		}
+		if strings.HasPrefix(capsule.TaskKey, TaskKeyPrefix) {
+			var active struct {
+				Exists bool `gorm:"column:exists"`
+			}
+			activeResult := transaction.Raw(`
+SELECT EXISTS (
+  SELECT 1
+  FROM agent_attempts AS other_attempt
+  JOIN agent_task_capsules AS other_capsule
+    ON other_capsule.id = other_attempt.task_capsule_id
+   AND other_capsule.project_id = other_attempt.project_id
+  WHERE other_attempt.project_id = ?
+    AND other_attempt.sandbox_session_id = ?
+    AND other_capsule.task_key = ?
+    AND other_attempt.state IN (
+      'pending', 'ready', 'queued', 'claimed', 'running',
+      'patch_ready', 'validating', 'review_ready'
+    )
+) AS exists
+`, attempt.ProjectID, attempt.SandboxSessionID, capsule.TaskKey).Scan(&active)
+			if activeResult.Error != nil {
+				return activeResult.Error
+			}
+			if active.Exists {
+				return fmt.Errorf("%w: task %s already has an active or reviewable Attempt", ErrTaskGraphBlocked, capsule.TaskKey)
+			}
+		}
 
 		executor, marshalErr := json.Marshal(attempt.Executor)
 		if marshalErr != nil {
@@ -476,6 +503,77 @@ func (store *PostgresStore) ListAttempts(
 	}
 	return values, nil
 }
+
+func (store *PostgresStore) ListTaskAttemptProgress(
+	ctx context.Context,
+	projectID, sessionID string,
+) ([]TaskAttemptProgress, error) {
+	if err := validateIDs(ctx, projectID, sessionID); err != nil {
+		return nil, err
+	}
+	var rows []struct {
+		AttemptID string `gorm:"column:attempt_id"`
+		TaskKey   string `gorm:"column:task_key"`
+		Applied   bool   `gorm:"column:applied"`
+	}
+	result := store.database.WithContext(ctx).Raw(`
+SELECT
+  attempt.id::text AS attempt_id,
+  capsule.task_key,
+  EXISTS (
+    SELECT 1
+    FROM agent_patch_merge_plans AS merge_plan
+    LEFT JOIN agent_patch_merge_applications AS merge_application
+      ON merge_application.merge_id = merge_plan.id
+     AND merge_application.project_id = merge_plan.project_id
+    WHERE merge_plan.project_id = attempt.project_id
+      AND merge_plan.attempt_id = attempt.id
+      AND (
+        merge_plan.disposition = 'noop'
+        OR (merge_plan.disposition = 'planned' AND merge_application.merge_id IS NOT NULL)
+      )
+      AND NOT EXISTS (
+        SELECT 1
+        FROM agent_patch_undo_plans AS undo_plan
+        JOIN agent_patch_undo_applications AS undo_application
+          ON undo_application.undo_id = undo_plan.id
+         AND undo_application.project_id = undo_plan.project_id
+        WHERE undo_plan.project_id = merge_plan.project_id
+          AND undo_plan.merge_id = merge_plan.id
+          AND undo_plan.disposition = 'planned'
+      )
+  ) AS applied
+FROM agent_attempts AS attempt
+JOIN agent_task_capsules AS capsule
+  ON capsule.id = attempt.task_capsule_id
+ AND capsule.project_id = attempt.project_id
+WHERE attempt.project_id = ?
+  AND attempt.sandbox_session_id = ?
+ORDER BY attempt.updated_at DESC, attempt.id DESC
+LIMIT ?
+`, projectID, sessionID, 1001).Scan(&rows)
+	if result.Error != nil {
+		return nil, mapAgentStoreError("list task graph Attempt progress", result.Error)
+	}
+	if len(rows) > 1000 {
+		return nil, fmt.Errorf("%w: task graph Attempt history exceeds 1000 entries", ErrAgentStoreIntegrity)
+	}
+	progress := make([]TaskAttemptProgress, 0, len(rows))
+	for _, row := range rows {
+		attempt, err := store.GetAttempt(ctx, projectID, row.AttemptID)
+		if err != nil {
+			return nil, mapAgentStoreError("hydrate task graph Attempt progress", err)
+		}
+		progress = append(progress, TaskAttemptProgress{
+			Attempt: attempt,
+			TaskKey: row.TaskKey,
+			Applied: row.Applied,
+		})
+	}
+	return progress, nil
+}
+
+var _ TaskGraphProgressStore = (*PostgresStore)(nil)
 
 // ListClaimable returns immutable projections that are either newly queued or
 // have an expired worker lease. Claim remains the authoritative CAS, so two
@@ -1122,7 +1220,7 @@ func mapAgentStoreError(operation string, err error) error {
 	for _, known := range []error{
 		ErrInvalidContextPack, ErrInvalidTaskCapsule, ErrInvalidAttempt, ErrAttemptState,
 		ErrAttemptFenced, ErrAttemptLease, ErrPlanNotFound, ErrAttemptNotFound,
-		ErrAgentOperationReplay, ErrAttemptVersionConflict,
+		ErrAgentOperationReplay, ErrAttemptVersionConflict, ErrTaskGraphBlocked,
 	} {
 		if errors.Is(err, known) {
 			return err

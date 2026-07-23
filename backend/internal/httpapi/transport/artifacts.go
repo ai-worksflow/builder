@@ -395,7 +395,10 @@ func collectionArtifactInput(collection string, input createCollectionArtifactIn
 		return core.CreateArtifactInput{}, err
 	}
 	sources := sourceInputs(input.SourceVersions, "source")
-	sources = append(sources, sourceInputs(input.RequirementVersions, "requirements")...)
+	// Blueprints consume the compiled Requirement Baseline as one whole,
+	// immutable source. The core gate intentionally distinguishes this from
+	// ordinary requirement-document lineage.
+	sources = append(sources, sourceInputs(input.RequirementVersions, "requirement_baseline")...)
 	if input.BlueprintRevision != nil {
 		sources = append(sources, core.ArtifactSourceInput{Ref: *input.BlueprintRevision, Purpose: "blueprint", Required: true})
 	}

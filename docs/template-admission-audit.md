@@ -1,7 +1,9 @@
 # `ai-worksflow/templates` 准入审计
 
-状态：`candidate / blocked`  
-审计日期：2026-07-18  
+状态：`candidate / blocked`
+
+审计日期：2026-07-19
+
 目标仓库：`https://github.com/ai-worksflow/templates.git`
 
 本文记录 Stage 0 对用户指定模板仓库的精确审计事实。它不是
@@ -51,8 +53,9 @@ sha256(git ls-tree -r --full-tree -z <exact-commit> 的原始字节)
 | API | `python-fastapi-template` | `1721440b33563b45192ffbb15da724d11f5f158f` | `sha256:a2c5d0be6b5f4d18bdde462f98c66440215131cb4ebfea5d5a4e7658d4ae8610` |
 
 这些坐标只证明本次审计查看了哪个 Git tree，不证明 tree 安全、可构建或已批准。
-2026-07-18 的复核中，三个分支头均与表中坐标一致；`main` 的
-`TEMPLATE_INDEX.json` 仍声明 `jfcwrlight/templates.git`，阻塞结论未变化。
+2026-07-19 的远端复核中，三个分支头仍与表中坐标一致，远端没有 tag，
+GitHub 也没有发布 Release；`main` 的 `TEMPLATE_INDEX.json` 仍声明
+`jfcwrlight/templates.git`，阻塞结论未变化。
 
 ## 进入 approved 的修复清单
 

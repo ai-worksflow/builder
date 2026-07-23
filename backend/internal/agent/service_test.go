@@ -32,6 +32,7 @@ type controlStoreFake struct {
 	operations map[string]string
 	events     map[string][]AttemptEvent
 	now        time.Time
+	applied    map[string]bool
 }
 
 func newControlStoreFake(now time.Time) *controlStoreFake {
@@ -39,7 +40,25 @@ func newControlStoreFake(now time.Time) *controlStoreFake {
 		packs: map[string]ContextPack{}, capsules: map[string]TaskCapsule{},
 		attempts: map[string]AgentAttempt{}, operations: map[string]string{},
 		events: map[string][]AttemptEvent{}, now: now,
+		applied: map[string]bool{},
 	}
+}
+
+func (store *controlStoreFake) ListTaskAttemptProgress(
+	_ context.Context,
+	projectID, sessionID string,
+) ([]TaskAttemptProgress, error) {
+	values := []TaskAttemptProgress{}
+	for _, attempt := range store.attempts {
+		if attempt.ProjectID != projectID || attempt.SandboxSessionID != sessionID {
+			continue
+		}
+		capsule := store.capsules[attempt.TaskCapsule.ID]
+		values = append(values, TaskAttemptProgress{
+			Attempt: attempt, TaskKey: capsule.TaskKey, Applied: store.applied[attempt.ID],
+		})
+	}
+	return values, nil
 }
 
 func (store *controlStoreFake) SavePlan(_ context.Context, pack ContextPack, capsule TaskCapsule) (TaskPlan, error) {
@@ -257,6 +276,82 @@ func (store *controlStoreFake) MarkStale(
 	store.attempts[attemptID] = next
 	store.events[attemptID] = append(store.events[attemptID], event)
 	return next, nil
+}
+
+func TestControlServiceAdvancesDerivedTaskGraphSequentially(t *testing.T) {
+	fixture := newAgentFixture(t)
+	facts := planningFactsFromFixture(fixture)
+	facts.TaskKey = TaskKeyPrefix + "OBL-1"
+	source := &planningSourceFake{
+		facts: facts,
+		graph: TaskGraph{
+			SchemaVersion:    TaskGraphSchemaVersion,
+			ProjectID:        fixture.taskInput.ProjectID,
+			SandboxSessionID: fixture.taskInput.SandboxSessionID,
+			BuildContract:    fixture.taskInput.BuildContract,
+			State:            TaskGraphReady,
+			Tasks: []TaskGraphTask{{
+				Key: facts.TaskKey, Title: "Implement the first obligation",
+				ObligationIDs:          facts.ObligationIDs,
+				AcceptanceCriterionIDs: facts.AcceptanceCriterionIDs,
+				VerificationCommandIDs: facts.VerificationCommandIDs,
+				State:                  TaskGraphTaskPending,
+			}},
+			TotalCount: 1,
+		},
+	}
+	planner, err := NewDeterministicPlanner(source, func() time.Time { return fixture.now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	profiles, err := NewStaticExecutorProfiles(map[string]ExecutorIdentity{"codex-default": testExecutor()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := newControlStoreFake(fixture.now.Add(10 * time.Second))
+	service, err := NewControlService(
+		store, planner, profiles, &agentAccessFake{},
+		func() time.Time { return fixture.now.Add(2 * time.Second) },
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	input := AdvanceTaskGraphInput{
+		ProjectID:        fixture.taskInput.ProjectID,
+		SandboxSessionID: fixture.taskInput.SandboxSessionID,
+		Instruction:      "Implement the complete contract.",
+		ExecutorProfile:  "codex-default",
+		ActorID:          fixture.actorID,
+		OperationID:      "advance-complete-implementation-1",
+	}
+	result, err := service.AdvanceTaskGraph(context.Background(), input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Disposition != TaskGraphAdvanceStarted || result.Attempt == nil ||
+		result.Attempt.TaskCapsule.TaskKey != facts.TaskKey ||
+		result.Attempt.Attempt.State != AttemptQueued || result.Graph.State != TaskGraphRunning {
+		t.Fatalf("advance result = %#v", result)
+	}
+
+	store.applied[result.Attempt.Attempt.ID] = true
+	completed, err := service.GetTaskGraph(
+		context.Background(), input.ProjectID, input.SandboxSessionID, input.ActorID,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if completed.State != TaskGraphCompleted || completed.CompletedCount != 1 || completed.NextTaskKey != "" {
+		t.Fatalf("completed graph = %#v", completed)
+	}
+	input.OperationID = "advance-complete-implementation-2"
+	noMoreWork, err := service.AdvanceTaskGraph(context.Background(), input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if noMoreWork.Disposition != TaskGraphAdvanceCompleted || noMoreWork.Attempt != nil {
+		t.Fatalf("completed advance = %#v", noMoreWork)
+	}
 }
 
 func TestControlServiceCreatesQueuesRecoversAndRetriesExactAttempt(t *testing.T) {

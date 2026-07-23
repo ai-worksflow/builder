@@ -253,7 +253,7 @@ func (s *Service) generateValidatedArtifactOutput(
 
 func supportsArtifactProposalRepair(jobType string) bool {
 	switch jobType {
-	case "decompose_pages", "generate_page_spec":
+	case "decompose_pages", "generate_page_spec", "generate_prototype":
 		return true
 	default:
 		return false
@@ -261,15 +261,25 @@ func supportsArtifactProposalRepair(jobType string) bool {
 }
 
 func (s *Service) artifactPreflightSources(ctx context.Context, manifest domain.InputManifest) ([]json.RawMessage, error) {
-	if manifest.JobType != "decompose_pages" {
+	if manifest.JobType != "decompose_pages" && manifest.JobType != "generate_prototype" {
 		return nil, nil
 	}
-	if len(manifest.Sources) != 1 || strings.TrimSpace(manifest.Sources[0].Purpose) != "requirement_baseline" {
-		return nil, fmt.Errorf("decompose_pages requires exactly one frozen Requirement Baseline source")
+	wantedPurpose := "requirement_baseline"
+	if manifest.JobType == "generate_prototype" {
+		wantedPurpose = "delivery_slice_page_spec"
 	}
-	source := manifest.Sources[0]
+	matching := make([]domain.ManifestSource, 0, 1)
+	for _, source := range manifest.Sources {
+		if strings.TrimSpace(source.Purpose) == wantedPurpose {
+			matching = append(matching, source)
+		}
+	}
+	if len(matching) != 1 {
+		return nil, fmt.Errorf("%s requires exactly one frozen %s source", manifest.JobType, wantedPurpose)
+	}
+	source := matching[0]
 	if strings.TrimSpace(source.Ref.AnchorID) != "" {
-		return nil, fmt.Errorf("decompose_pages requires a whole Requirement Baseline source")
+		return nil, fmt.Errorf("%s requires a whole %s source", manifest.JobType, wantedPurpose)
 	}
 	payload, err := s.revisionContent(
 		ctx, source.Ref.ArtifactID, source.Ref.RevisionID, source.Ref.ContentHash,
@@ -377,6 +387,14 @@ func preflightGeneratedArtifactProposal(
 		}
 		if err := core.ValidateBlueprintAgainstRequirementBaseline(candidate, preflightSources[0], true); err != nil {
 			return fmt.Errorf("%w: decompose_pages requirement trace: %v", ai.ErrInvalidOutput, err)
+		}
+	}
+	if jobType == "generate_prototype" && len(preflightSources) > 0 {
+		if len(preflightSources) != 1 {
+			return fmt.Errorf("%w: generate_prototype requires exactly one PageSpec for semantic trace validation", ai.ErrInvalidOutput)
+		}
+		if err := core.ValidatePrototypeAgainstPageSpec(candidate, preflightSources[0], true); err != nil {
+			return fmt.Errorf("%w: generate_prototype PageSpec trace: %v", ai.ErrInvalidOutput, err)
 		}
 	}
 	return nil
@@ -1636,7 +1654,7 @@ func artifactProposalJobContract(jobType string) string {
 	case "generate_page_spec":
 		return "The fully applied PageSpec must preserve the exact blueprintPageNodeId, title, absolute route, and userGoal from baseContent. Populate the top-level acceptanceCriterionIds array with exact IDs copied from the frozen Product Requirements source: include every acceptance criterion linked to every requirementId on this Blueprint Page and never invent or abbreviate an ID. Use this canonical state shape for all four required states: {\"id\":\"state-ready\",\"key\":\"ready\",\"title\":\"Ready\",\"required\":true}; declare ready, loading, empty, and error with unique stable IDs and keys, non-empty titles, and required set to true. Keep dataBindings and interactions as empty arrays unless immutable sources justify complete records. Every data binding must use {\"id\":\"stable-id\",\"name\":\"Name\",\"source\":\"api|database|fixture|local\"}; an api source also requires operationId copied exactly from a permission-protected Blueprint API operation owned by this Page, while non-api bindings must omit operationId. Every interaction must use {\"id\":\"stable-id\",\"trigger\":\"explicit trigger\",\"outcome\":\"explicit outcome\"}."
 	case "generate_prototype":
-		return "The fully applied Prototype must preserve the exact pageSpecRevision, set exploratory to false, and use this complete canonical top-level shape: {\"pageSpecRevision\":{\"artifactId\":\"exact-id\",\"revisionId\":\"exact-id\",\"contentHash\":\"sha256:...\"},\"exploratory\":false,\"states\":[],\"breakpoints\":[],\"layers\":{},\"frames\":[],\"overrides\":[],\"interactions\":[],\"fixtures\":[],\"tokenBindings\":[],\"componentBindings\":[],\"assets\":[],\"traceLinks\":[]}. Every named collection must be present even when empty, and layers must always be an object record, never an array or scene alias. Reproduce the PageSpec state set exactly with identical stable IDs and keys, non-empty titles, explicit required flags, and fixtureIds arrays that exactly match each source state. Never invent a fixture or interaction: copy only fixtures and interactions declared by the PageSpec, and emit empty fixtures and interactions arrays when their PageSpec collections are empty. Every fixture must preserve its PageSpec state ownership and declare a name, response, integer HTTP statusCode from 100 through 599, nonnegative integer latencyMs, sanitized true, and a canonical sha256 contentHash; operationId is allowed only when it names the exact PageSpec API binding operation. Every interaction must preserve its PageSpec ID and trigger, reference an existing sourceLayerId, and contain at least one declarative action using only navigate, setState, openOverlay, closeOverlay, updateBinding, or submitFixture with exact declared references. Provide exactly the desktop, tablet, and mobile breakpoints using {\"id\":\"stable-id\",\"name\":\"Desktop|Tablet|Mobile\",\"minWidth\":0,\"viewportWidth\":390,\"viewportHeight\":844}; maxWidth is optional but must be an integer not below minWidth. Use a stable semantic layer object record keyed by layer ID; every record value must repeat its matching id and declare childIds, one supported kind, a non-empty name, layout, style, properties, requirementIds, acceptanceCriterionIds, and fieldMetadata, while using only valid parentId and childIds references. Every layout must contain nonnegative integer x and y plus positive integer width and height values; place visible layers at distinct, non-overlapping positions inside their frame instead of emitting empty layout objects. Every frame must use {\"id\":\"stable-id\",\"stateId\":\"exact-state-id\",\"breakpointId\":\"exact-breakpoint-id\",\"rootLayerId\":\"exact-layer-id\",\"title\":\"State · Breakpoint\"}; provide exactly one valid frame for every required state and breakpoint pair. Do not invent componentRef, traceLinks, assets, overrides, tokenBindings, or componentBindings; keep those collections empty unless an immutable source supplies every exact governed reference."
+		return "The fully applied Prototype must preserve the exact pageSpecRevision, set exploratory to false, and use this complete canonical top-level shape: {\"pageSpecRevision\":{\"artifactId\":\"exact-id\",\"revisionId\":\"exact-id\",\"contentHash\":\"sha256:...\"},\"exploratory\":false,\"states\":[],\"breakpoints\":[],\"layers\":{},\"frames\":[],\"overrides\":[],\"interactions\":[],\"fixtures\":[],\"tokenBindings\":[],\"componentBindings\":[],\"assets\":[],\"traceLinks\":[]}. Every named collection must be present even when empty, and layers must always be an object record, never an array or scene alias. Reproduce the PageSpec state set exactly with identical stable IDs and keys, non-empty titles, explicit required flags, and fixtureIds arrays that exactly match each source state. Never invent a fixture or interaction: copy only fixtures and interactions declared by the PageSpec, and emit empty fixtures and interactions arrays when their PageSpec collections are empty. Every fixture must preserve its PageSpec state ownership and declare a name, response, integer HTTP statusCode from 100 through 599, nonnegative integer latencyMs, sanitized true, and a canonical sha256 contentHash; operationId is allowed only when it names the exact PageSpec API binding operation. Every interaction must preserve its PageSpec ID and trigger, reference an existing sourceLayerId, and contain at least one declarative action using only navigate, setState, openOverlay, closeOverlay, updateBinding, or submitFixture with exact declared references. Provide exactly the desktop, tablet, and mobile breakpoints using {\"id\":\"stable-id\",\"name\":\"Desktop|Tablet|Mobile\",\"minWidth\":0,\"viewportWidth\":390,\"viewportHeight\":844}; maxWidth is optional but must be an integer not below minWidth. Use a stable semantic layer object record keyed by layer ID. The only supported layer kinds are frame, group, text, image, componentInstance, input, button, list, overlay, and slot. Every layer must use this complete record shape (with values adapted per layer): {\"layer-root\":{\"id\":\"layer-root\",\"kind\":\"frame\",\"name\":\"Ready desktop root\",\"childIds\":[],\"layout\":{\"x\":0,\"y\":0,\"width\":1200,\"height\":800},\"style\":{},\"properties\":{},\"requirementIds\":[],\"acceptanceCriterionIds\":[],\"fieldMetadata\":{}}}. Never omit kind, name, or fieldMetadata and never encode fieldMetadata as null or an array; an empty object is valid when no governed field metadata exists. Every layer requirementIds value must be copied exactly from the frozen PageSpec top-level requirementIds, and every acceptanceCriterionIds value must be copied exactly from that PageSpec top-level acceptanceCriterionIds; never copy a global requirement that is not owned by this Page. Use only valid parentId and childIds references. Every layout must contain nonnegative integer x and y plus positive integer width and height values; place visible layers at distinct, non-overlapping positions inside their frame instead of emitting empty layout objects. Every frame must use {\"id\":\"stable-id\",\"stateId\":\"exact-state-id\",\"breakpointId\":\"exact-breakpoint-id\",\"rootLayerId\":\"exact-layer-id\",\"title\":\"State · Breakpoint\"}; provide exactly one valid frame for every required state and breakpoint pair. Do not invent componentRef, traceLinks, assets, overrides, tokenBindings, or componentBindings; keep those collections empty unless an immutable source supplies every exact governed reference."
 	default:
 		return ""
 	}

@@ -120,8 +120,9 @@ func (s *Service) CompileForManifest(ctx context.Context, buildManifestID, actor
 func compileInputForManifest(bundle core.WorkbenchBundle, sources []PinnedBuildSource, resolved ResolvedFullStackTemplate) CompileInput {
 	return CompileInput{
 		ProjectID: bundle.ProjectID, DeliverySliceID: stringPointerValue(bundle.DeliverySliceID),
-		BuildManifest: BuildManifestRef{ID: bundle.ID, ContentHash: bundle.ManifestHash},
-		BaseWorkspace: workspaceRef(bundle.CurrentWorkspaceRevision), Sources: sources,
+		DeliverySlicePageNodeID: stringPointerValue(bundle.BlueprintRevision.AnchorID),
+		BuildManifest:           BuildManifestRef{ID: bundle.ID, ContentHash: bundle.ManifestHash},
+		BaseWorkspace:           workspaceRef(bundle.CurrentWorkspaceRevision), Sources: sources,
 		FullStackTemplate: resolved.Template, TemplateReleaseRefs: resolved.Releases,
 		TemplateRuntime: resolved.Runtime,
 	}

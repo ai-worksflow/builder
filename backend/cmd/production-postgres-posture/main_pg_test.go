@@ -10,13 +10,24 @@ import (
 )
 
 // This canary is opt-in and produces no qualification or promotion receipt.
-// It uses the same four permission-checked credential files as the binary.
+// It uses the same nine permission-checked credential files as the binary.
 func TestProductionPostgresPostureExternal(t *testing.T) {
 	for _, key := range []string{
 		applicationDSNFileEnvironment,
 		migratorDSNFileEnvironment,
 		qualificationDSNFileEnvironment,
 		promotionDSNFileEnvironment,
+		promotionSessionAffinityEnvironment,
+		promotionRuntimeGateEnvironment,
+		policyDSNFileEnvironment,
+		inputPrecommitDSNFileEnvironment,
+		inputPrecommitSessionAffinityEnvironment,
+		sourceVerifierDSNFileEnvironment,
+		sourceVerifierSessionAffinityEnvironment,
+		credentialResolverDSNFileEnvironment,
+		credentialResolverSessionAffinityEnvironment,
+		handoffDSNFileEnvironment,
+		handoffSessionAffinityEnvironment,
 		schemaEnvironment,
 	} {
 		if _, present := os.LookupEnv(key); !present {

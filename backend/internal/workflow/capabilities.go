@@ -56,6 +56,9 @@ type WorkflowCapabilities struct {
 	PublishEnvironments     []string                        `json:"publishEnvironments"`
 	WorkbenchSchemaVersions []int                           `json:"workbenchSchemaVersions"`
 	AnalysisLimits          WorkflowAnalysisLimits          `json:"analysisLimits"`
+	// ExternalQualificationGate is omitted from the frozen v0-v2 canonical
+	// descriptors. Profile v3 pins the one closed, non-waivable declaration.
+	ExternalQualificationGate *domain.ExternalQualificationGateNodeConfig `json:"externalQualificationGate,omitempty"`
 }
 
 func PlatformWorkflowCapabilities(quality, publish bool) WorkflowCapabilities {
@@ -144,6 +147,11 @@ func ApplicationOutputContract() domain.WorkflowOutputContract {
 }
 
 func (c WorkflowCapabilities) ValidateDefinition(definition domain.WorkflowDefinition) error {
+	if c.Version >= 5 {
+		if c.ExternalQualificationGate == nil || !c.ExternalQualificationGate.IsExact() {
+			return capabilityError("workflow.capabilities.externalQualificationGate", "capability schema v5 requires the exact closed non-waivable declaration")
+		}
+	}
 	if definition.InputContract == nil || definition.OutputContract == nil {
 		return capabilityError("workflow.contracts", "new workflow versions require inputContract and outputContract")
 	}
@@ -243,6 +251,11 @@ func (c WorkflowCapabilities) ValidateDefinition(definition domain.WorkflowDefin
 			hasPublish = true
 			if node.Publish == nil || !containsString(c.PublishEnvironments, node.Publish.Environment) {
 				return capabilityError("workflow.nodes."+node.ID+".publish", "environment is not registered by this server")
+			}
+		case domain.NodeExternalQualificationGate:
+			if node.ExternalQualificationGate == nil || c.ExternalQualificationGate == nil ||
+				*node.ExternalQualificationGate != *c.ExternalQualificationGate || !node.ExternalQualificationGate.IsExact() {
+				return capabilityError("workflow.nodes."+node.ID+".externalQualificationGate", "config must exactly match the closed non-waivable capability declaration")
 			}
 		case domain.NodeTransform:
 			if node.Transform == nil || !containsString(c.Transforms, node.Transform.Transform) {
@@ -625,6 +638,10 @@ type capabilityPathState struct {
 
 func (c WorkflowCapabilities) validateApplicationDeliveryTopology(definition domain.WorkflowDefinition) error {
 	budget := c.semanticPathStateBudget()
+	terminalDeliveryStage := 4
+	if c.ExternalQualificationGate != nil {
+		terminalDeliveryStage = 5
+	}
 	entryID, err := definition.EntryNodeID()
 	if err != nil {
 		return err
@@ -723,7 +740,7 @@ func (c WorkflowCapabilities) validateApplicationDeliveryTopology(definition dom
 	}
 	terminalStates := after[terminalID]
 	for _, state := range terminalStates {
-		if state.deliveryStage != 4 {
+		if state.deliveryStage != terminalDeliveryStage {
 			return capabilityError("workflow.outputContract", "every successful path must end in a verified deployment")
 		}
 	}
@@ -738,7 +755,11 @@ func (c WorkflowCapabilities) transitionCapabilityState(
 	terminalID string,
 ) (capabilityPathState, error) {
 	next := cloneCapabilityPathState(state)
-	if next.deliveryStage == 4 && node.ID != terminalID {
+	terminalDeliveryStage := 4
+	if c.ExternalQualificationGate != nil {
+		terminalDeliveryStage = 5
+	}
+	if next.deliveryStage == terminalDeliveryStage && node.ID != terminalID {
 		return state, capabilityError("workflow.nodes."+node.ID, "cannot execute after publish")
 	}
 	switch node.Type {
@@ -918,16 +939,38 @@ func (c WorkflowCapabilities) transitionCapabilityState(
 			}
 		}
 		next.deliveryStage = 3
+	case domain.NodeExternalQualificationGate:
+		parents := predecessors[node.ID]
+		if c.ExternalQualificationGate == nil || node.ExternalQualificationGate == nil ||
+			*node.ExternalQualificationGate != *c.ExternalQualificationGate || len(parents) != 1 || next.deliveryStage != 3 {
+			return state, capabilityError("workflow.nodes."+node.ID, "external qualification must consume one exact blocking release quality result")
+		}
+		parent, _ := definition.FindNode(parents[0])
+		if parent.Type != domain.NodeQualityGate || parent.QualityGate == nil ||
+			parent.QualityGate.GateName != "release" || !parent.QualityGate.Blocking {
+			return state, capabilityError("workflow.nodes."+node.ID, "external qualification must directly follow the blocking release quality gate")
+		}
+		next.deliveryStage = 4
 	case domain.NodePublish:
 		parents := predecessors[node.ID]
-		if node.ID != terminalID || len(parents) != 1 || next.deliveryStage != 3 {
+		expectedStage := 3
+		expectedParentType := domain.NodeQualityGate
+		if c.ExternalQualificationGate != nil {
+			expectedStage = 4
+			expectedParentType = domain.NodeExternalQualificationGate
+		}
+		if node.ID != terminalID || len(parents) != 1 || next.deliveryStage != expectedStage {
 			return state, capabilityError("workflow.nodes."+node.ID, "publish must be the terminal consumer of one exact quality result")
 		}
 		parent, _ := definition.FindNode(parents[0])
-		if parent.Type != domain.NodeQualityGate {
-			return state, capabilityError("workflow.nodes."+node.ID, "publish must directly follow the blocking release quality gate")
+		if parent.Type != expectedParentType {
+			message := "publish must directly follow the blocking release quality gate"
+			if c.ExternalQualificationGate != nil {
+				message = "publish must directly follow the dedicated external qualification gate"
+			}
+			return state, capabilityError("workflow.nodes."+node.ID, message)
 		}
-		next.deliveryStage = 4
+		next.deliveryStage = terminalDeliveryStage
 	}
 	return next, nil
 }

@@ -483,7 +483,7 @@ export function PreviewPanel() {
                   className="h-full w-full border-0 bg-white"
                   title={t('preview.generatedTitle')}
                 />
-                <span className="sr-only">Taskflow</span>
+                <span className="sr-only">Worksflow preview</span>
                 <footer className="sr-only">{t('preview.madeIn')}</footer>
                 {loading && (
                   <div className="absolute inset-0 grid place-items-center bg-background/70 backdrop-blur-sm" role="status" aria-label={t('preview.loading')}>

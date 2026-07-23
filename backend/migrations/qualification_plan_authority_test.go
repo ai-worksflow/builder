@@ -15,6 +15,7 @@ import (
 
 	"github.com/google/uuid"
 	_ "github.com/jackc/pgx/v5/stdlib"
+	qualificationreceipt "github.com/worksflow/builder/backend/internal/qualificationreceipt"
 )
 
 func TestQualificationPlanAuthorityMigrationIsCanonicalImmutableAndOwnerOnly(t *testing.T) {
@@ -119,6 +120,7 @@ func TestQualificationPlanAuthorityMigrationIsCanonicalImmutableAndOwnerOnly(t *
 		"LOCK TABLE qualification_plan_identity_reservations IN SHARE ROW EXCLUSIVE MODE",
 	})
 	downText := string(down)
+	assertQualificationRollbackFencePrecedesRelations(t, downText)
 	for _, expected := range []string{
 		"LOCK TABLE qualification_evidence_events IN ACCESS EXCLUSIVE MODE",
 		"LOCK TABLE qualification_evidence_operations IN ACCESS EXCLUSIVE MODE",
@@ -388,6 +390,96 @@ func TestQualificationPlanAuthorityRollbackWriterFencingPostgres(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	t.Run("shared promotion fence blocks rollback before relation locks", func(t *testing.T) {
+		database := qualificationPlanMigrationDatabase(t, ctx, base, dsn, "qualification_plan_rollout_fence_")
+		applyQualificationPlanMigrations(t, ctx, database)
+
+		promotionTransaction, err := database.BeginTx(ctx, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer promotionTransaction.Rollback()
+		if _, err := promotionTransaction.ExecContext(ctx, `
+SELECT pg_catalog.pg_advisory_xact_lock_shared(
+  pg_catalog.hashtextextended('worksflow:workflow-input-authority-migration:v1', 0)
+)
+`); err != nil {
+			t.Fatal(err)
+		}
+		var ignored int
+		if err := promotionTransaction.QueryRowContext(ctx,
+			`SELECT count(*) FROM qualification_plan_authorities`).Scan(&ignored); err != nil {
+			t.Fatal(err)
+		}
+
+		downConnection, err := database.Conn(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer downConnection.Close()
+		var downPID int
+		if err := downConnection.QueryRowContext(ctx, `SELECT pg_catalog.pg_backend_pid()`).Scan(&downPID); err != nil {
+			t.Fatal(err)
+		}
+		downCtx, downCancel := context.WithCancel(ctx)
+		defer downCancel()
+		downFinished := make(chan error, 1)
+		go func() {
+			_, executeErr := downConnection.ExecContext(downCtx, string(down))
+			downFinished <- executeErr
+		}()
+
+		lockCtx, lockCancel := context.WithTimeout(ctx, 5*time.Second)
+		defer lockCancel()
+		if err := waitForQualificationPlanAdvisoryLock(
+			lockCtx, database, downPID, "ExclusiveLock", false, downFinished,
+		); err != nil {
+			t.Fatal(err)
+		}
+		var prematureRelationLocks int
+		if err := database.QueryRowContext(lockCtx, `
+SELECT count(*)
+FROM pg_catalog.pg_locks
+WHERE pid = $1
+  AND relation IN (
+    pg_catalog.to_regclass('qualification_evidence_events'),
+    pg_catalog.to_regclass('qualification_evidence_operations'),
+    pg_catalog.to_regclass('qualification_evidence_heads'),
+    pg_catalog.to_regclass('qualification_plan_authorities'),
+    pg_catalog.to_regclass('qualification_plan_identity_reservations')
+  )
+`, downPID).Scan(&prematureRelationLocks); err != nil {
+			t.Fatal(err)
+		}
+		if prematureRelationLocks != 0 {
+			t.Fatalf("rollback acquired %d relation locks before the rollout fence", prematureRelationLocks)
+		}
+
+		if err := promotionTransaction.Rollback(); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case downErr := <-downFinished:
+			if downErr != nil {
+				t.Fatalf("rollback after shared fence release: %v", downErr)
+			}
+		case <-ctx.Done():
+			t.Fatalf("rollback did not finish after shared fence release: %v", ctx.Err())
+		}
+		var planRemoved, evidenceRetained bool
+		if err := database.QueryRowContext(ctx, `
+SELECT
+  pg_catalog.to_regclass(pg_catalog.current_schema() || '.qualification_plan_authorities') IS NULL,
+  pg_catalog.to_regclass(pg_catalog.current_schema() || '.qualification_evidence_events') IS NOT NULL
+`).Scan(&planRemoved, &evidenceRetained); err != nil {
+			t.Fatal(err)
+		}
+		if !planRemoved || !evidenceRetained {
+			t.Fatalf("released rollback planRemoved=%t evidenceRetained=%t, want true/true",
+				planRemoved, evidenceRetained)
+		}
+	})
+
 	t.Run("writer lock order commits before waiting rollback observes state", func(t *testing.T) {
 		database := qualificationPlanMigrationDatabase(t, ctx, base, dsn, "qualification_plan_freeze_first_")
 		applyQualificationPlanMigrations(t, ctx, database)
@@ -617,6 +709,40 @@ SELECT EXISTS (
 	}
 }
 
+func waitForQualificationPlanAdvisoryLock(
+	ctx context.Context,
+	database *sql.DB,
+	backendPID int,
+	mode string,
+	granted bool,
+	finished <-chan error,
+) error {
+	for {
+		var found bool
+		if err := database.QueryRowContext(ctx, `
+SELECT EXISTS (
+  SELECT 1 FROM pg_catalog.pg_locks
+  WHERE pid = $1 AND locktype = 'advisory'
+    AND mode = $2 AND granted = $3
+)
+`, backendPID, mode, granted).Scan(&found); err != nil {
+			return err
+		}
+		if found {
+			return nil
+		}
+		select {
+		case operationErr := <-finished:
+			return fmt.Errorf("operation finished before advisory %s granted=%t was observable: %v",
+				mode, granted, operationErr)
+		case <-ctx.Done():
+			return fmt.Errorf("waiting for advisory %s granted=%t: %w", mode, granted, ctx.Err())
+		default:
+			runtime.Gosched()
+		}
+	}
+}
+
 type qualificationPlanMigrationFixtureOptions struct {
 	inputAuthorityID  uuid.UUID
 	fixtureID         uuid.UUID
@@ -740,7 +866,7 @@ func newQualificationPlanMigrationFixture(t *testing.T, options qualificationPla
 		"credential":     credential,
 		"goldenRuntime": map[string]any{
 			"authorityDocumentArtifactId": "golden-authority", "authorityDocumentDigest": qualificationPlanMigrationDigest("golden-authority"),
-			"faultOperationSetDigest": qualificationPlanMigrationDigest("fault-operation-set"), "fixtureDocumentArtifactId": "golden-fixture",
+			"faultOperationSetDigest": qualificationreceipt.GoldenFaultOperationSetDigestV1, "fixtureDocumentArtifactId": "golden-fixture",
 			"fixtureDocumentDigest": qualificationPlanMigrationDigest("golden-fixture"), "fixtureId": fixtureID.String(),
 		},
 		"outputs": outputs,

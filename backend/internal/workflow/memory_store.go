@@ -3,6 +3,7 @@ package workflow
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"sort"
 	"sync"
 	"time"
@@ -13,22 +14,33 @@ import (
 // MemoryStore implements the same CAS and lease rules as GORMStore. It is useful
 // for deterministic engine tests and local single-process deployments.
 type MemoryStore struct {
-	mu                 sync.Mutex
-	ids                IDGenerator
-	definitions        map[string]map[int]DefinitionRecord
-	definitionVersions map[string]DefinitionRecord
-	manifests          map[string]domain.InputManifest
-	proposals          map[string]*domain.OutputProposal
-	runs               map[string]*RunRecord
-	events             map[string][]Event
-	slices             map[string]SliceRecord
+	mu                                   sync.Mutex
+	ids                                  IDGenerator
+	definitions                          map[string]map[int]DefinitionRecord
+	definitionVersions                   map[string]DefinitionRecord
+	manifests                            map[string]domain.InputManifest
+	proposals                            map[string]*domain.OutputProposal
+	runs                                 map[string]*RunRecord
+	events                               map[string][]Event
+	slices                               map[string]SliceRecord
+	qualityCompletionPrecommits          map[string]*QualityCompletionPrecommitMutation
+	qualityCompletionPrecommitByQuality  map[string]string
+	qualityCompletionPrecommitByGate     map[string]string
+	qualityCompletionPrecommitByIdentity map[string]string
 }
 
 func NewMemoryStore(ids IDGenerator) *MemoryStore {
 	if ids == nil {
 		ids = UUIDGenerator{}
 	}
-	return &MemoryStore{ids: ids, definitions: map[string]map[int]DefinitionRecord{}, definitionVersions: map[string]DefinitionRecord{}, manifests: map[string]domain.InputManifest{}, proposals: map[string]*domain.OutputProposal{}, runs: map[string]*RunRecord{}, events: map[string][]Event{}, slices: map[string]SliceRecord{}}
+	return &MemoryStore{
+		ids: ids, definitions: map[string]map[int]DefinitionRecord{}, definitionVersions: map[string]DefinitionRecord{},
+		manifests: map[string]domain.InputManifest{}, proposals: map[string]*domain.OutputProposal{},
+		runs: map[string]*RunRecord{}, events: map[string][]Event{}, slices: map[string]SliceRecord{},
+		qualityCompletionPrecommits:         map[string]*QualityCompletionPrecommitMutation{},
+		qualityCompletionPrecommitByQuality: map[string]string{}, qualityCompletionPrecommitByGate: map[string]string{},
+		qualityCompletionPrecommitByIdentity: map[string]string{},
+	}
 }
 
 func (s *MemoryStore) SaveDefinition(_ context.Context, record DefinitionRecord) error {
@@ -333,6 +345,9 @@ func (s *MemoryStore) ClaimRunnable(_ context.Context, workerID string, now time
 			continue
 		}
 		for _, node := range run.Nodes {
+			if sharedWorkerLeaseForbidden(run, node) {
+				continue
+			}
 			ready := node.Status == NodeReady && !node.AvailableAt.After(now)
 			expired := node.Status == NodeRunning && node.LeaseExpiresAt != nil && node.LeaseExpiresAt.Before(now)
 			if ready || expired {
@@ -376,7 +391,8 @@ func (s *MemoryStore) RenewLease(_ context.Context, lease Lease, now time.Time, 
 		return Lease{}, domain.ErrNotFound
 	}
 	node := findNodeByID(run, lease.NodeID)
-	if node == nil || node.Status != NodeRunning || node.LeaseOwner != lease.WorkerID || node.LeaseExpiresAt == nil || node.LeaseExpiresAt.Before(now) {
+	if node == nil || sharedWorkerLeaseForbidden(run, node) || node.Status != NodeRunning || node.Attempt != lease.Attempt ||
+		node.LeaseOwner != lease.WorkerID || node.LeaseExpiresAt == nil || node.LeaseExpiresAt.Before(now) {
 		return Lease{}, ErrLeaseLost
 	}
 	expires := now.UTC().Add(duration)
@@ -384,6 +400,13 @@ func (s *MemoryStore) RenewLease(_ context.Context, lease Lease, now time.Time, 
 	node.UpdatedAt = now.UTC()
 	lease.LeaseExpiresAt = expires
 	return lease, nil
+}
+
+func sharedWorkerLeaseForbidden(run *RunRecord, node *NodeRecord) bool {
+	if node == nil || node.Type == domain.NodeExternalQualificationGate {
+		return true
+	}
+	return run != nil && run.ExecutionProfile == WorkflowExecutionProfileV3Ref() && node.Type == domain.NodePublish
 }
 
 func (s *MemoryStore) Commit(_ context.Context, mutation RunMutation) error {
@@ -399,6 +422,12 @@ func (s *MemoryStore) Commit(_ context.Context, mutation RunMutation) error {
 	if len(mutation.Events) == 0 {
 		return domain.ErrInvalidArgument
 	}
+	if err := validateQualityCompletionRunMutation(mutation); err != nil {
+		return err
+	}
+	if err := s.validateQualityCompletionPrecommitLocked(run, mutation); err != nil {
+		return err
+	}
 	for _, nodeMutation := range mutation.Nodes {
 		current := findNodeByID(run, nodeMutation.Node.ID)
 		if current == nil || current.Status != nodeMutation.ExpectedStatus {
@@ -413,6 +442,15 @@ func (s *MemoryStore) Commit(_ context.Context, mutation RunMutation) error {
 	for _, node := range mutation.NewNodes {
 		if _, exists := run.Nodes[node.Key]; exists {
 			return ErrCASConflict
+		}
+	}
+	if precommit := mutation.QualityCompletionPrecommit; precommit != nil {
+		clone := cloneQualityCompletionPrecommitMutation(precommit)
+		s.qualityCompletionPrecommits[clone.PrecommitID] = clone
+		s.qualityCompletionPrecommitByQuality[qualityCompletionNodeMapKey(clone.WorkflowRunID, clone.QualityNodeRunID)] = clone.PrecommitID
+		s.qualityCompletionPrecommitByGate[qualityCompletionNodeMapKey(clone.WorkflowRunID, clone.GateNodeRunID)] = clone.PrecommitID
+		for _, identity := range qualityCompletionActivationIdentities(clone) {
+			s.qualityCompletionPrecommitByIdentity[identity] = clone.PrecommitID
 		}
 	}
 	run.Status = mutation.Status
@@ -440,6 +478,73 @@ func (s *MemoryStore) Commit(_ context.Context, mutation RunMutation) error {
 	}
 	run.EventCursor += uint64(len(mutation.Events))
 	return nil
+}
+
+func (s *MemoryStore) validateQualityCompletionPrecommitLocked(run *RunRecord, mutation RunMutation) error {
+	required := false
+	for _, nodeMutation := range mutation.Nodes {
+		current := findNodeByID(run, nodeMutation.Node.ID)
+		if run.ExecutionProfile == WorkflowExecutionProfileV3Ref() && current != nil &&
+			current.Type == domain.NodeQualityGate && current.Status == NodeRunning && nodeMutation.Node.Status == NodeCompleted {
+			required = true
+		}
+	}
+	precommit := mutation.QualityCompletionPrecommit
+	if required && precommit == nil {
+		return ErrQualityCompletionPrecommitClosure
+	}
+	if precommit == nil {
+		return nil
+	}
+	// MemoryStore mirrors set-once and aggregate atomicity only. It has no
+	// Workspace/QualityRun/BuildManifest/BuildContract database and therefore
+	// makes no claim that those external facts were authoritatively verified.
+	if !required || run.ExecutionProfile != WorkflowExecutionProfileV3Ref() || run.ProjectID != precommit.ProjectID {
+		return ErrQualityCompletionPrecommitClosure
+	}
+	quality := findNodeByID(run, precommit.QualityNodeRunID)
+	gate := findNodeByID(run, precommit.GateNodeRunID)
+	qualityMetadata, qualityMetadataExists := run.Context.Nodes[precommit.QualityNodeKey]
+	gateMetadata, gateMetadataExists := run.Context.Nodes[precommit.GateNodeKey]
+	if quality == nil || quality.Key != precommit.QualityNodeKey || quality.Type != domain.NodeQualityGate ||
+		quality.Status != NodeRunning || quality.Attempt != precommit.LeaseAttempt || quality.LeaseOwner != precommit.LeaseOwner ||
+		quality.LeaseExpiresAt == nil || quality.LeaseExpiresAt.Before(mutation.UpdatedAt) || quality.OutputRevisionID != "" ||
+		quality.CompletedAt != nil || len(quality.Failure) != 0 || !qualityMetadataExists || len(qualityMetadata.Output) != 0 ||
+		gate == nil || gate.Key != precommit.GateNodeKey || gate.Type != domain.NodeExternalQualificationGate ||
+		gate.Status != NodePending || gate.Attempt != 0 || gate.InputAuthorityID != "" || gate.LeaseOwner != "" ||
+		gate.LeaseExpiresAt != nil || gate.StartedAt != nil || gate.CompletedAt != nil || gate.OutputRevisionID != "" ||
+		gate.InputManifest != nil || gate.OutputProposal != nil || len(gate.Failure) != 0 || !gateMetadataExists ||
+		len(gateMetadata.Input) != 0 || len(gateMetadata.Output) != 0 || gateMetadata.Waived || gateMetadata.WaiverReason != "" ||
+		gateMetadata.SelectedBranch != "" || len(gateMetadata.FanOutOutputs) != 0 || gateMetadata.ExecutionActor != nil ||
+		gateMetadata.ReviewDecisionActor != nil {
+		return errors.Join(ErrCASConflict, ErrQualityCompletionPrecommitStale)
+	}
+	for _, event := range s.events[run.ID] {
+		if event.ID == precommit.CompletionEventID {
+			return errors.Join(ErrCASConflict, ErrQualityCompletionPrecommitCorrupt)
+		}
+	}
+	if existing := s.qualityCompletionPrecommits[precommit.PrecommitID]; existing != nil && !sameQualityCompletionPrecommit(existing, precommit) {
+		return errors.Join(ErrCASConflict, ErrQualityCompletionPrecommitCorrupt)
+	}
+	for _, key := range []string{
+		s.qualityCompletionPrecommitByQuality[qualityCompletionNodeMapKey(precommit.WorkflowRunID, precommit.QualityNodeRunID)],
+		s.qualityCompletionPrecommitByGate[qualityCompletionNodeMapKey(precommit.WorkflowRunID, precommit.GateNodeRunID)],
+	} {
+		if key != "" && key != precommit.PrecommitID {
+			return errors.Join(ErrCASConflict, ErrQualityCompletionPrecommitCorrupt)
+		}
+	}
+	for _, identity := range qualityCompletionActivationIdentities(precommit) {
+		if key := s.qualityCompletionPrecommitByIdentity[identity]; key != "" && key != precommit.PrecommitID {
+			return errors.Join(ErrCASConflict, ErrQualityCompletionPrecommitCorrupt)
+		}
+	}
+	return nil
+}
+
+func qualityCompletionNodeMapKey(runID, nodeID string) string {
+	return runID + "\x00" + nodeID
 }
 
 func (s *MemoryStore) ListEvents(_ context.Context, runID string, after uint64, limit int) ([]Event, error) {

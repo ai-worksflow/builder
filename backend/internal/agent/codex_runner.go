@@ -434,6 +434,7 @@ func (runner *DockerCodexRunner) dockerArguments(containerName string, lease Wor
 	}
 	args := []string{"run", "--rm", "--name", containerName, "--pull", "never", "--network", runner.config.Network,
 		"--read-only", "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
+		"--security-opt", "seccomp=unconfined",
 		"--pids-limit", strconv.Itoa(runner.config.PIDs), "--memory", runner.config.Memory,
 		"--cpus", runner.config.CPUs, "--user", runner.config.User,
 		"--tmpfs", "/tmp:rw,noexec,nosuid,nodev,size=268435456,uid=10001,gid=10001,mode=0700",

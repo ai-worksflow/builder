@@ -119,6 +119,22 @@ SHA-256 checksum in `schema_migrations`. Changing an already applied migration
 is an error; add a new migration instead. Production and staging must run this
 one-shot process before starting or rolling API instances.
 
+The Workflow Input/profile-v3 migrations `000078`/`000079` additionally
+require the two-phase advisory-fence rollout documented in
+`docs/workflow-input-authority.md` section 8.1.1. Either deploy the fence-only
+runtime and drain old writers before migrating, or quiesce all workflow
+writers for the migration window; do not combine an unfenced rolling API with
+those migrations.
+
+The next qualification rollout has one fixed dependency order:
+`000080` Qualification Input Precommit Authority, then `000081` Promotion v2,
+then `000082` private Handoff. Migration `000081` must retain the full typed
+input-precommit `PromotionBinding` as a required canonical closure member,
+separate from Policy-configured independent authorities. The Promotion worker
+remains disabled until migration `000080`'s SQL/role/no-bypass canary and the
+updated migration `000081` consume canary both pass; passing either migration
+or posture check alone is not runtime activation.
+
 The API does not treat a successful ping as schema compatibility. Before
 constructing services it reads `schema_migrations` with the application
 credential and verifies the exact ordered set of embedded versions and
@@ -168,13 +184,31 @@ The current migration chain is:
 | `000072_credential_set_event_store` | owner-only, non-secret CredentialSet event/operation/head store with exact append CAS and guarded projection |
 | `000073_qualification_evidence_event_store` | owner-only Qualification Evidence event/operation/head store with globally reserved identities, exact append CAS, guarded projection and trusted database time |
 | `000074_qualification_plan_authority` | owner-only immutable Qualification Plan authority/identity reservations, exact canonical material freeze/resolve and the Evidence reservation authority guard |
+| `000075_qualification_receipt_v3_store` | owner-only snapshot-first Receipt v3 request/observation/completion ledgers, atomic signer-request freeze, authenticated retry generations, exact DSSE completion and v1 history guards |
+| `000076_canonical_review_approval_receipt_authority` | database-authored immutable Canonical Review approval receipts, permanent v0 history marking, atomic version-1 close/receipt binding, exact issuer/resolver/probe, source immutability and application ACL boundary |
+| `000077_canonical_review_authority_hardening` | append-only review decisions, exact optimistic-concurrency predecessor chain, canonical non-zero UUID/Unicode-trim parity, causal closure and Solo Owner/current-authority hardening |
+| `000078_workflow_input_authority` | append-only project/profile Qualification Policy generations plus immutable, raw-byte-retaining Workflow Input freeze/resolve/current-assertion authority with policy-derived revision/review rules, exact activation-event/outbox closure and rolling migration fence |
+| `000079_workflow_execution_profile_v3_external_qualification_gate` | frozen workflow-engine/v3 topology and a non-waivable private external-qualification gate; completion remains disabled through the 80→81→82 authority chain |
+| `000080_qualification_input_precommit_authority` | append-only source/credential input-composition authority plus owner-reviewed executable heads, distinct verifier/resolver admissions, exact WIA+Policy+Plan binding and an isolated no-bypass role boundary |
+| `000081_qualification_promotion_v2` | single-use Receipt-v3 consumption whose canonical closure requires the complete typed migration-80 `inputPrecommit` binding, separate from policy-configured independent authorities; runtime remains disabled pending canaries |
+| `000082_qualification_handoff_v1` | private pending-Promotion consumer that creates the same-content immutable output Revision and performs the guarded workflow transition |
+| `000083_canonical_review_authority_forward_equivalence` | Canonical Review timestamp/decision forward-equivalence hardening and exact legacy Release helper ACL provenance required by qualified release |
+| `000084_workflow_execution_profile_v3_qualified_release` | immutable Controller bootstrap, same-content equivalence, authenticated publish authorization, lease/replay, terminal result and exact healthy-result apply authority |
+| `000085_workflow_v3_quality_completion_precommit` | same-transaction v3 Quality completion material, immutable activation Candidate snapshot and WIA precommit boundary |
+| `000086_candidate_sandbox_lifecycle_write_gate_v2` | Candidate journal writes require the exact ready SandboxSession projection without allowing stale suspended history to fence a successor Session |
+| `000087_sandbox_absolute_ttl_reconciliation` | absolute-TTL reconciliation may append terminal lifecycle evidence without extending operational activity beyond the hard deadline |
+| `000088_sandbox_absolute_ttl_transition_boundary` | exact system-owned absolute-TTL cleanup transition and frozen-Candidate authority boundary |
+| `000089_sandbox_absolute_ttl_checkpoint_guard` | checkpoint-aware terminal transition guard for absolute-TTL cleanup |
 
 ### Production PostgreSQL identities and schema
 
 Production and staging need the original three stable group roles before
-migration `000066`, the fourth Golden fault group before `000068`, and the
-fifth qualification-promotion group before `000071`. New installations should
-provision all five up front:
+migration `000066`, the fourth Golden fault group before `000068`, the fifth
+qualification-promotion group before `000071`, and the sixth
+qualification-policy group before `000078`. Migration `000080` adds three
+isolated Qualification Input groups for composition, source verification, and
+credential resolution, and migration `000082` adds the independent Handoff
+group. New installations should provision all ten up front:
 
 ```sql
 -- Run through the platform's privileged PostgreSQL provisioning channel.
@@ -188,29 +222,56 @@ CREATE ROLE worksflow_golden_fault_operator NOLOGIN NOSUPERUSER
   NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
 CREATE ROLE worksflow_qualification_promotion_operator NOLOGIN NOSUPERUSER
   NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
+CREATE ROLE worksflow_qualification_policy_operator NOLOGIN NOSUPERUSER
+  NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
+CREATE ROLE worksflow_qualification_input_precommit_operator NOLOGIN
+  NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
+CREATE ROLE worksflow_qualification_source_verifier_operator NOLOGIN
+  NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
+CREATE ROLE worksflow_qualification_credential_resolver_operator NOLOGIN
+  NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
+CREATE ROLE worksflow_qualification_handoff_operator NOLOGIN
+  NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
 
--- The secret/IAM provisioner must create these five real low-privilege
+-- The secret/IAM provisioner must create these ten real low-privilege
 -- LOGIN identities first; this SQL does not create or set their credentials.
 GRANT worksflow_migration_owner TO worksflow_migrator_login;
 GRANT worksflow_application TO worksflow_api_login;
 GRANT worksflow_repository_index_gc_operator TO worksflow_gc_login;
 GRANT worksflow_golden_fault_operator TO worksflow_golden_fault_login;
 GRANT worksflow_qualification_promotion_operator
-  TO worksflow_qualification_promotion_login;
+  TO worksflow_qualification_promotion_login
+  WITH INHERIT TRUE, SET FALSE, ADMIN FALSE;
+GRANT worksflow_qualification_policy_operator
+  TO worksflow_qualification_policy_login;
+GRANT worksflow_qualification_input_precommit_operator
+  TO worksflow_qualification_input_precommit_login
+  WITH INHERIT TRUE, SET FALSE, ADMIN FALSE;
+GRANT worksflow_qualification_source_verifier_operator
+  TO worksflow_qualification_source_verifier_login
+  WITH INHERIT TRUE, SET FALSE, ADMIN FALSE;
+GRANT worksflow_qualification_credential_resolver_operator
+  TO worksflow_qualification_credential_resolver_login
+  WITH INHERIT TRUE, SET FALSE, ADMIN FALSE;
+GRANT worksflow_qualification_handoff_operator
+  TO worksflow_qualification_handoff_login
+  WITH INHERIT TRUE, SET FALSE, ADMIN FALSE;
 
 REVOKE CREATE ON DATABASE worksflow FROM PUBLIC;
 CREATE SCHEMA worksflow AUTHORIZATION worksflow_migration_owner;
 REVOKE ALL ON SCHEMA worksflow FROM PUBLIC;
 ```
 
-Use deployment-specific LOGIN names where required, but preserve the five exact
+Use deployment-specific LOGIN names where required, but preserve the ten exact
 group-role names because migration/readiness contracts use them. Do not grant
 one group to another, and do not make a LOGIN a member of more than its one
-group. None of the five LOGINs may own the database, inherit its owner, create
-objects in the database/schema, or reach superuser, `BYPASSRLS`, role/database
-creation or replication authority. The migrator's membership is used only by
-the one-shot migration process; the API and operator must never receive it.
-No membership into one of the five stable groups may use `ADMIN OPTION`, and
+group. None of the ten LOGINs may own the database, inherit its owner, create
+schemas in the database, or reach superuser, `BYPASSRLS`, role/database
+creation or replication authority. Only the one-shot migrator may, through
+`worksflow_migration_owner`, own and create objects in the trusted schema; the
+other nine LOGINs must not. The API and operators must never receive the
+migration-owner membership.
+No membership into one of the ten stable groups may use `ADMIN OPTION`, and
 the stable groups must not themselves be members of any other role. Before
 `000066`, convert or revoke every explicit column-level ACL in the trusted
 schema through a reviewed provisioning change; table-level grants are the only
@@ -327,6 +388,105 @@ contract remains four functions and three triggers. Owner, ACL, index state,
 trigger enablement, result type, search path, security-mode or extra named
 routine drift blocks production startup.
 
+After migration `000075`, the real migrated baseline is 31 protected tables,
+30 owned boundary tables, 81 owned indexes, 53 owned routines, 27 owner-only
+internal routines and exactly 30 `SECURITY DEFINER` routines. Receipt v3 adds
+three migration-owner-only ledgers, fourteen exact indexes, seven owner-only
+routines and five enabled user triggers, including the Evidence-v1 Receipt-tail
+and Promotion-v1 history-only guards. Exactly the start/append/complete writers
+are definers pinned to `pg_catalog, <schema>, pg_temp`; the hash, immutable
+reject and two history guards are invokers with their narrower fixed paths.
+No application or existing operator receives table or routine access, and no
+sixth stable role or fifth posture DSN is introduced. The owner-only
+`PostgresStore` is therefore an internal durable adapter, not a production
+Receipt operator identity. Catalog posture rejects owner/ACL/mode/result/path,
+index-key/constraint, unconditional-trigger, or extra named-object drift.
+
+After migrations `000076` and `000077`, that historical migrated baseline is
+32 protected tables, 31 owned boundary tables, 86 owned indexes, 64 owned
+routines, 36 owner-only internal routines and exactly 34 `SECURITY DEFINER`
+routines. Canonical Review adds one owner-controlled receipt table, five exact
+indexes, four enabled triggers (three ordinary plus one deferred constraint
+trigger), twelve functions and four definers. The application has no receipt
+table access and can execute only the exact issuer and Boolean probe; the
+owner-side resolver and all internal helpers remain owner-only. Migration
+`000077` adds three owner-only `IMMUTABLE STRICT PARALLEL SAFE SECURITY
+INVOKER` helpers (two SQL predicates plus the PL/pgSQL exact-timestamp
+round-trip predicate) and the single append-only decision trigger. Catalog posture
+rejects extra objects, overloads, non-owner ACL, result/mode/path drift,
+disabled triggers, wrong index bindings, or a changed deferred-trigger
+contract. See `docs/canonical-review-approval-authority.md` for the wire,
+recovery, rollback, and downstream-consumption contract.
+
+At current head through `000079`, the catalog posture pins 32 protected-table
+ACL entries, 31 legacy named owner-boundary tables, 87 named owner-boundary
+indexes, 69 named owner-boundary routines, 36 named owner-only internal
+routines and exactly 52 `SECURITY DEFINER` routines. Migration `000078`
+requires the sixth
+stable `worksflow_qualification_policy_operator` role to exist before its
+conditional grants run. Its four Qualification Policy and six Workflow Input
+tables are an exact migration-owner-only boundary with no non-owner table or
+column ACL. The application executable boundary is now exactly 15 functions:
+the prior twelve plus Workflow Input freeze, operation inspection and
+node-scoped resolution; those three routines also have exact composite/JSONB
+set results, volatility, language, strictness, parallel-safety and search-path
+contracts. The qualification-promotion boundary is exactly
+the consume routine plus the Qualification Policy and Workflow Input
+current-authority assertions. The qualification-policy boundary is exactly
+the issue, operation-inspection, authority-resolution and current-resolution
+routines documented below; it has no relation, column or sequence access and
+cannot execute the current-authority assertion. Migration `000079` keeps its
+new workflow-engine/v3 guards owner-only. Production posture exact-catalogs
+all 23 migration `000078` triggers (12 ordinary and 11 deferred constraint
+triggers), all five migration `000079` triggers (three ordinary and two
+deferred constraint triggers), and their ten trigger functions. It pins the
+enabled/internal state, `tgtype`, exact `UPDATE OF` column ordinals, zero
+arguments, function binding, constraint binding/validation/deferral flags and
+the complete named inventory; every trigger on the ten dedicated Policy/WIA
+tables is counted, even when it has an unrelated name. The functions are
+independently pinned to the migration owner, owner-only ACL, zero-argument
+trigger signature, PL/pgSQL, exact invoker/definer mode, volatility,
+strictness, parallel safety and fixed search path. Any role, owner, ACL,
+signature, result, security mode, search-path or total-inventory drift blocks
+startup. A second allowlist counts every user trigger on the four shared
+`workflow_definition_versions`, `workflow_runs`, `workflow_node_runs` and
+`workflow_run_events` tables: its exact total is twelve, including the three
+legacy profile/governance triggers from migrations `000016`/`000019`. Those
+legacy triggers use the same exact table/name/function/type/column/enablement/
+argument/`WHEN` evaluator, and their three invoker functions have independent
+signature, language, execution-attribute, path, unreachable-owner and
+exact historical owner-plus-application, non-grantable ACL contracts with no
+third-party grantee.
+
+At current head through `000082`, the exhaustive baseline is 50 protected
+table ACL entries, 49 owned boundary tables, 157 owned boundary indexes, 115
+owned boundary routines, 36 owner-only internal routines, and exactly 81
+`SECURITY DEFINER` routines. Migration `000080` is independently pinned to
+eight tables, 28 indexes, eleven triggers, 24 functions, and eighteen
+definers. Migration `000081` retains its frozen eight-table, seven-trigger,
+sixteen-function Promotion subset; after `000082`, the total Promotion-named
+inventory is twelve tables, eight triggers, and nineteen functions.
+Migration `000082` is separately pinned to four owner-only tables, nineteen
+exact valid indexes (including PostgreSQL's canonical truncated constraint
+index names), seventeen ordinary/deferred triggers, and ten functions. Its
+table contract pins every column ordinal/type/nullability/default/collation,
+including the explicit top-level creation transaction ID on the binding,
+lineage member and completion, plus each exact canonical transaction-ID check
+constraint. Exactly
+five Handoff functions are definers: mutation rejection, pending dispatch,
+completion, inspection, and deferred closure validation. Only completion and
+inspection have non-grantable `EXECUTE` for the Handoff group; its other eight
+functions are owner-only. The shared Workflow relation trigger allowlist is
+therefore fifteen at current head, including the three Handoff closure
+triggers on run, node, and event tables.
+
+The startup posture also pins five profile-v3 hash-bearing contracts: the
+Workflow Input freeze routine, three profile-v3 enforcement trigger routines,
+and the Workflow Input authority table check constraint must contain
+`854312ee02ea7a39219e9a2f011b801abe5f03cfb0dac05e04199295f965a104`
+and must not retain the pre-activation draft hash. This source cascade does not
+authorize rewriting migrations already applied in an environment.
+
 The index-specific boundary is exact:
 
 - `PUBLIC` has no trusted-schema table, sequence or routine privilege. Existing
@@ -337,7 +497,10 @@ The index-specific boundary is exact:
   tables and read-only `schema_migrations`. It has no GC-private table access
   or Golden fault, CredentialSet, Qualification Evidence, or Qualification
   Plan ledger access and cannot execute a GC or internal trigger/guard
-  function.
+  function. The index-specific executable `SECURITY DEFINER` inventory remains
+  exactly ten Candidate/claim functions. At current head `000079`, the two
+  narrowly granted Canonical Review functions and three Workflow Input
+  functions yield the application posture total of fifteen.
 - The operator group has no direct privilege on the index, Candidate or six
   GC-private tables. It can execute only the four GC plan/execute/inspect/
   readiness functions.
@@ -347,8 +510,8 @@ The index-specific boundary is exact:
 - The trusted schema has no explicit column ACL. API and operator startup also
   reject any `ADMIN OPTION` held by the session or a reachable role, so neither
   process can delegate its stable group authority.
-- All fourteen exposed functions are `SECURITY DEFINER`, owned by the exact
-  `worksflow_migration_owner` role, pinned to the exact trusted search path
+- All fourteen index/GC exposed functions are `SECURITY DEFINER`, owned by the
+  exact `worksflow_migration_owner` role, pinned to the exact trusted search path
   `pg_catalog, <schema>, pg_temp`, and revoked from `PUBLIC`.
 - The exact-signature `sandbox_checkpoint_is_exact` dependency is separately
   constrained to SQL/STABLE `SECURITY INVOKER`, a scalar Boolean result, the
@@ -362,15 +525,20 @@ The index-specific boundary is exact:
   authority, broad table/function grants and a non-exact function result
   contract.
 
-The migration ledger preserves the historical up checksum and records a
-separate SHA-256 for every canonical down file. On upgrade, the migrator may
-establish a missing down checksum only for an exact, ordered, up-checksum-
-matching legacy prefix; it rejects unknown versions, gaps and existing down
-drift before applying a new migration. The API's `VerifyCurrent` path is
-read-only: an old ledger without `down_checksum`, a `NULL` digest, an orphaned
-pair or any digest mismatch blocks startup until the migrator is run. The
-first trusted upgrade necessarily establishes the baseline for old down files
-because no historical down digest existed before this feature.
+The migration ledger records separate SHA-256 identities for every canonical
+up/down pair. General checksum or version drift is never accepted. The
+migrator has a narrow, audited recovery table for exact historical identities:
+down-only hardening for `000073`–`000075`; the reviewed `000077` repair only
+after exact repaired `000083`; old `000082` only after current `000084` is
+physically applied; and exact old `000083` only by replaying the complete
+current `000083` Up plus the ledger compare-and-swap in one transaction. That
+repair requires an owner/grant-option credential and fails closed before DDL
+when its catalog preflight is not exact. An earlier byte-identical Candidate
+sandbox gate recorded as `000084` may be compare-and-swap relocated to
+`000086`; only the temporary states `1..83/84/85 + exact 86` are recoverable.
+Unknown versions, other gaps, intermediate `000083` identities, missing down
+digests and any checksum drift remain blocking. The API's `VerifyCurrent` path
+is read-only and accepts only the complete current head.
 
 Apply the schema with only the migrator identity, then start the API with its
 own schema and DSN:
@@ -393,33 +561,74 @@ password overrides are rejected; schema selection is injected programmatically.
 ### Standalone production PostgreSQL posture check
 
 `cmd/production-postgres-posture` is an independent, read-only posture checker
-for four concurrently held connections inspected within one bounded check
+for nine concurrently held connections inspected within one bounded check
 window: the application LOGIN, the one-shot migrator LOGIN, a separate
-qualification/auditor LOGIN, and the dedicated qualification-promotion LOGIN.
+qualification/auditor LOGIN, the qualification-promotion and
+qualification-policy LOGINs, the three isolated Qualification Input LOGINs,
+and the independent Handoff LOGIN.
 Each connection's catalog query takes its own PostgreSQL snapshot; the result
 is not an atomic cross-identity snapshot. The auditor is not an operator. It
-must have only database
-connectivity and catalog visibility: no membership or `SET ROLE` path to
-`worksflow_application`, `worksflow_migration_owner`,
-`worksflow_repository_index_gc_operator`,
-`worksflow_golden_fault_operator`, or
-`worksflow_qualification_promotion_operator`; no trusted-schema `USAGE`,
-data/column/sequence privilege, function execution, or object ownership. The
-promotion LOGIN reaches only `worksflow_qualification_promotion_operator`, has
-schema `USAGE` without `CREATE`, effective `SELECT` on exactly
-`qualification_promotion_consumptions` and
-`qualification_promotion_handoffs`, and `EXECUTE` on exactly the canonical
-`consume_verified_qualification_promotion(...)` routine. It has no direct
-LOGIN ACL, column-only grant, sequence access, ownership, or other routine or
-relation privilege.
-These four audited LOGINs are distinct from the five stable `NOLOGIN` group
-roles; application and migrator each reach exactly their one intended group,
-the promotion identity reaches exactly its operator group, and the auditor
-reaches none of the five.
+must have only database connectivity and catalog visibility: no membership or
+`SET ROLE` path to any of the ten stable groups; no trusted-schema `USAGE`,
+data/column/sequence privilege, function execution, or object ownership.
+
+The promotion LOGIN reaches only
+`worksflow_qualification_promotion_operator`, has schema `USAGE` without
+`CREATE`, no table, column, or sequence access, and `EXECUTE` on exactly
+`consume_qualification_promotion_v2(uuid,uuid,uuid,uuid,uuid)`,
+`inspect_qualification_promotion_v2_operation(uuid)`,
+`inspect_historical_qualification_promotion_v1_operation(uuid)`, and the exact
+migration-80 resolver
+`resolve_qualification_input_precommit_for_promotion_v1(uuid,uuid)`. The
+historical v1 consume and direct WIA/Policy assertions are owner-only. The
+handoff resolver/assertion functions are also owner-only and belong to
+migration `000082`'s separately postured Handoff identity; the Promotion LOGIN
+cannot use them or own any trusted-schema object.
+
+The policy LOGIN reaches only `worksflow_qualification_policy_operator`, has
+schema `USAGE` without `CREATE`, and can execute exactly
+`issue_qualification_policy_authority_v1(...)`,
+`inspect_qualification_policy_operation_v1(uuid)`,
+`resolve_qualification_policy_authority_v1(uuid)`, and
+`resolve_current_qualification_policy_authority_v1(uuid,text,text)`. It cannot
+execute the owner-only
+`assert_current_qualification_policy_authority_v1(uuid)`, and has no table,
+column, sequence, ownership, other routine, or direct LOGIN ACL.
+
+The input-precommit LOGIN can execute only
+`issue_qualification_input_precommit_v1(...)`,
+`inspect_qualification_input_precommit_operation_v1(uuid)`, and
+`resolve_qualification_input_precommit_authority_v1(uuid)`. The source-verifier
+LOGIN can execute only source receipt admit, inspect, and exact-admission
+resolve; the credential-resolver LOGIN has the corresponding three credential
+receipt routines. None of these three has table, column, sequence, ownership,
+or cross-operator routine authority.
+
+The Handoff LOGIN reaches only
+`worksflow_qualification_handoff_operator`, has schema `USAGE` without
+`CREATE`, no table, column, sequence, ownership, direct LOGIN ACL, Promotion
+resolver, or WIA assertion authority, and can execute exactly
+`complete_qualification_promotion_v2_handoff(uuid)` and
+`inspect_qualification_promotion_v2_handoff_completion(uuid)`. The other
+eight Handoff functions are owner-only. No other audited identity may reach
+the Handoff group or either runtime routine.
+
+The Promotion, three Qualification Input, and Handoff LOGINs must be
+`ROLINHERIT` identities with one direct membership using
+`INHERIT TRUE, SET FALSE, ADMIN FALSE`; their functions authenticate the
+original `session_user` while requiring `current_setting('role') = 'none'`.
+The checker rejects an extra membership, `SET ROLE` path, or substituted
+operator grant. Application, migrator, auditor, policy, and Promotion cannot
+inherit any Qualification Input or Handoff group.
+
+These nine audited LOGINs are distinct from the ten stable `NOLOGIN` group
+roles. The runtime gate remains
+`disabled-pending-input-precommit-authority-canary`; a passing posture result is
+not activation authority.
 
 Each DSN is loaded from a different absolute credential file. Credential files
 must be single-link, non-symlinked, owned by the checker process, and mode
-`0400` or `0600`. The four URLs must name different LOGINs and different
+`0400` or `0600`. The nine URLs must name different LOGINs and different
 passwords while targeting the same host, port, database, schema and TLS trust
 anchor. Production URLs must use `sslmode=verify-full`, one common absolute
 `sslrootcert`, and `target_session_attrs=read-write`; client certificate/key
@@ -434,6 +643,17 @@ export WORKSFLOW_PRODUCTION_POSTGRES_APP_DSN_FILE=/run/worksflow-secrets/posture
 export WORKSFLOW_PRODUCTION_POSTGRES_MIGRATOR_DSN_FILE=/run/worksflow-secrets/posture-migrator.dsn
 export WORKSFLOW_PRODUCTION_POSTGRES_QUALIFICATION_DSN_FILE=/run/worksflow-secrets/posture-auditor.dsn
 export WORKSFLOW_PRODUCTION_POSTGRES_PROMOTION_DSN_FILE=/run/worksflow-secrets/posture-promotion.dsn
+export WORKSFLOW_PRODUCTION_POSTGRES_PROMOTION_SESSION_AFFINITY=direct
+export WORKSFLOW_PRODUCTION_POSTGRES_PROMOTION_RUNTIME_GATE=disabled-pending-input-precommit-authority-canary
+export WORKSFLOW_PRODUCTION_POSTGRES_POLICY_DSN_FILE=/run/worksflow-secrets/posture-policy.dsn
+export WORKSFLOW_PRODUCTION_POSTGRES_INPUT_PRECOMMIT_DSN_FILE=/run/worksflow-secrets/posture-input-precommit.dsn
+export WORKSFLOW_PRODUCTION_POSTGRES_INPUT_PRECOMMIT_SESSION_AFFINITY=direct
+export WORKSFLOW_PRODUCTION_POSTGRES_SOURCE_VERIFIER_DSN_FILE=/run/worksflow-secrets/posture-source-verifier.dsn
+export WORKSFLOW_PRODUCTION_POSTGRES_SOURCE_VERIFIER_SESSION_AFFINITY=direct
+export WORKSFLOW_PRODUCTION_POSTGRES_CREDENTIAL_RESOLVER_DSN_FILE=/run/worksflow-secrets/posture-credential-resolver.dsn
+export WORKSFLOW_PRODUCTION_POSTGRES_CREDENTIAL_RESOLVER_SESSION_AFFINITY=direct
+export WORKSFLOW_PRODUCTION_POSTGRES_HANDOFF_DSN_FILE=/run/worksflow-secrets/posture-handoff.dsn
+export WORKSFLOW_PRODUCTION_POSTGRES_HANDOFF_SESSION_AFFINITY=direct
 export WORKSFLOW_PRODUCTION_POSTGRES_SCHEMA=worksflow
 export WORKSFLOW_PRODUCTION_POSTGRES_POSTURE_TIMEOUT=30s
 
@@ -441,22 +661,42 @@ go run ./cmd/production-postgres-posture > posture-result.json
 ```
 
 The checker dynamically closes over every trusted-schema table, partition,
-sequence, view, index, column ACL and routine, so new migration/governance
-objects do not disappear behind the older exact-tree static counts. It reuses
-the API's exhaustive production posture and additionally requires migrator
-authority to come only through `worksflow_migration_owner`; the auditor must
-remain entirely outside the trusted data plane; and the promotion identity's
-effective table, column, sequence, function and ownership closure must match
-its exact consume-only boundary. It never prints DSNs, secret
+sequence, view, index, column ACL, routine and ownable schema object, so new
+migration/governance objects do not disappear behind the older exact-tree
+static counts. It reuses the API's exhaustive production posture and
+additionally requires migrator authority to come only through
+`worksflow_migration_owner`; the auditor must remain entirely outside the
+trusted data plane; the promotion identity must match its no-data-access,
+exact four-routine Promotion-v2-plus-input-resolver boundary; the policy
+identity must match its exact four-routine boundary; and each Qualification
+Input identity must match its exact three-routine boundary with no data access.
+The Handoff identity must match its exact two-routine, no-data-access boundary
+and sole direct group membership. No non-migrator identity or reachable group
+may own a trusted-schema relation, routine, type,
+collation, conversion, operator, operator class/family, text-search object,
+extended statistic or extension. It never prints DSNs, secret
 values, credential paths, endpoints, or driver errors. Exit `0` means this
 standalone posture passed; `2` is invalid configuration/trust material, `3` is
 an unsafe privilege posture, and `4` is an operational/inconclusive check.
 
-The JSON always declares
+The JSON uses
+`worksflow-production-postgresql-posture-result/v2` and always declares
 `evidenceClass=standalone-point-in-time-posture-check` for compatibility and
 excludes
-`external-qualification-receipt`, `gc-scheduler-qualification`, and
-`promotion-authority`. A successful check is therefore not the planned
+`external-qualification-receipt`, `gc-scheduler-qualification`,
+`promotion-authority`, `promotion-runtime-activation`, and
+`input-precommit-authority-canary`. The Promotion, input-precommit,
+source-verifier, credential-resolver, and Handoff DSNs must each be declared
+as a direct connection or a pool in session-pooling mode; `transaction-pool`
+and missing or unknown affinity values fail configuration validation because
+the authority flows require physical-session continuity. The only accepted
+runtime gate is
+`disabled-pending-input-precommit-authority-canary`. This checker does not
+start, register, or authorize a Promotion worker or trigger; changing that
+gate requires migration `000080`'s precommit-authority rollout/canary,
+migration `000081`'s updated consume canary, and a separate activation review.
+A successful
+check is therefore not the planned
 production PostgreSQL qualification artifact, is not an atomic global
 snapshot, does not test the GC scheduler's same-run recovery, and is not
 consumed by Qualification Receipt or promotion. External composition must

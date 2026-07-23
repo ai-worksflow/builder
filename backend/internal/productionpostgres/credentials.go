@@ -32,11 +32,21 @@ type validatedDSN struct {
 }
 
 type validatedConfig struct {
-	schema        string
-	application   validatedDSN
-	migrator      validatedDSN
-	qualification validatedDSN
-	promotion     validatedDSN
+	schema                            string
+	application                       validatedDSN
+	migrator                          validatedDSN
+	qualification                     validatedDSN
+	promotion                         validatedDSN
+	promotionSessionAffinity          PromotionSessionAffinity
+	policy                            validatedDSN
+	inputPrecommit                    validatedDSN
+	inputPrecommitSessionAffinity     PromotionSessionAffinity
+	sourceVerifier                    validatedDSN
+	sourceVerifierSessionAffinity     PromotionSessionAffinity
+	credentialResolver                validatedDSN
+	credentialResolverSessionAffinity PromotionSessionAffinity
+	handoff                           validatedDSN
+	handoffSessionAffinity            PromotionSessionAffinity
 }
 
 // ReadCredentialFile reads one DSN from an absolute, non-symlinked,
@@ -192,6 +202,23 @@ func validateConfig(config Config) (validatedConfig, error) {
 	if !validSchema(config.Schema) {
 		return validatedConfig{}, errors.New("trusted schema is invalid")
 	}
+	if config.PromotionSessionAffinity != PromotionSessionAffinityDirect &&
+		config.PromotionSessionAffinity != PromotionSessionAffinitySessionPool {
+		return validatedConfig{}, errors.New("promotion DSN requires direct or session-pool affinity")
+	}
+	if config.PromotionRuntimeGate != PromotionRuntimeGateDisabledPendingInputPrecommitAuthorityCanary {
+		return validatedConfig{}, errors.New("promotion runtime must remain disabled pending the input-precommit authority canary")
+	}
+	for _, affinity := range []PromotionSessionAffinity{
+		config.InputPrecommitSessionAffinity,
+		config.SourceVerifierSessionAffinity,
+		config.CredentialResolverSessionAffinity,
+		config.HandoffSessionAffinity,
+	} {
+		if affinity != PromotionSessionAffinityDirect && affinity != PromotionSessionAffinitySessionPool {
+			return validatedConfig{}, errors.New("authority runtime DSNs require direct or session-pool affinity")
+		}
+	}
 	application, err := validateDSN(config.ApplicationDSN, config.Schema)
 	if err != nil {
 		return validatedConfig{}, errors.New("application DSN is invalid")
@@ -208,7 +235,37 @@ func validateConfig(config Config) (validatedConfig, error) {
 	if err != nil {
 		return validatedConfig{}, errors.New("promotion DSN is invalid")
 	}
-	all := []validatedDSN{application, migrator, qualification, promotion}
+	policy, err := validateDSN(config.PolicyDSN, config.Schema)
+	if err != nil {
+		return validatedConfig{}, errors.New("qualification-policy DSN is invalid")
+	}
+	inputPrecommit, err := validateDSN(config.InputPrecommitDSN, config.Schema)
+	if err != nil {
+		return validatedConfig{}, errors.New("qualification input-precommit DSN is invalid")
+	}
+	sourceVerifier, err := validateDSN(config.SourceVerifierDSN, config.Schema)
+	if err != nil {
+		return validatedConfig{}, errors.New("qualification source-verifier DSN is invalid")
+	}
+	credentialResolver, err := validateDSN(config.CredentialResolverDSN, config.Schema)
+	if err != nil {
+		return validatedConfig{}, errors.New("qualification credential-resolver DSN is invalid")
+	}
+	handoff, err := validateDSN(config.HandoffDSN, config.Schema)
+	if err != nil {
+		return validatedConfig{}, errors.New("qualification handoff DSN is invalid")
+	}
+	all := []validatedDSN{
+		application,
+		migrator,
+		qualification,
+		promotion,
+		policy,
+		inputPrecommit,
+		sourceVerifier,
+		credentialResolver,
+		handoff,
+	}
 	for left := 0; left < len(all); left++ {
 		for right := left + 1; right < len(all); right++ {
 			if all[left].username == all[right].username {
@@ -227,11 +284,21 @@ func validateConfig(config Config) (validatedConfig, error) {
 		}
 	}
 	return validatedConfig{
-		schema:        config.Schema,
-		application:   application,
-		migrator:      migrator,
-		qualification: qualification,
-		promotion:     promotion,
+		schema:                            config.Schema,
+		application:                       application,
+		migrator:                          migrator,
+		qualification:                     qualification,
+		promotion:                         promotion,
+		promotionSessionAffinity:          config.PromotionSessionAffinity,
+		policy:                            policy,
+		inputPrecommit:                    inputPrecommit,
+		inputPrecommitSessionAffinity:     config.InputPrecommitSessionAffinity,
+		sourceVerifier:                    sourceVerifier,
+		sourceVerifierSessionAffinity:     config.SourceVerifierSessionAffinity,
+		credentialResolver:                credentialResolver,
+		credentialResolverSessionAffinity: config.CredentialResolverSessionAffinity,
+		handoff:                           handoff,
+		handoffSessionAffinity:            config.HandoffSessionAffinity,
 	}, nil
 }
 

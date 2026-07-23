@@ -11,9 +11,11 @@ import (
 )
 
 const (
+	WorkflowExecutionProfileV3Version     = "workflow-engine/v3"
 	WorkflowExecutionProfileV2Version     = "workflow-engine/v2"
 	WorkflowExecutionProfileV1Version     = "workflow-engine/v1"
 	LegacyWorkflowExecutionProfileVersion = "legacy-pre-pin/v0"
+	WorkflowExecutionProfileV3Hash        = "854312ee02ea7a39219e9a2f011b801abe5f03cfb0dac05e04199295f965a104"
 	WorkflowExecutionProfileV2Hash        = "dd247a77ce3cfa1095a575a238b93c4bd41dd991eac07e8b62ec170864470da1"
 	WorkflowExecutionProfileV1Hash        = "648034d2edc8f82ac2b2959b89e181b8b67db80dadbfcd354672f386d81cbdc1"
 	LegacyWorkflowExecutionProfileHash    = "bee729c4921a93fd2e229cd610314359ca420610c195ada00a201507bfd7a14c"
@@ -57,6 +59,24 @@ func (d WorkflowExecutionProfileDescriptor) Ref() (domain.WorkflowExecutionProfi
 
 func CurrentWorkflowExecutionProfileDescriptor() WorkflowExecutionProfileDescriptor {
 	return WorkflowExecutionProfileV2Descriptor()
+}
+
+// WorkflowExecutionProfileV3Descriptor is a separately frozen descriptor for
+// the dedicated non-waivable external-qualification topology. It is not the
+// Current alias and is not registered by the built-in runtime until the
+// authority and handoff implementation is sealed.
+func WorkflowExecutionProfileV3Descriptor() WorkflowExecutionProfileDescriptor {
+	return WorkflowExecutionProfileDescriptor{
+		Version:      WorkflowExecutionProfileV3Version,
+		Capabilities: workflowCapabilitiesV3Snapshot(),
+		Components: WorkflowExecutionComponents{
+			CoreInterpreterID: "typed-dag-interpreter/v3", InputBuilderID: "typed-input-envelope/v3",
+			ResultValidatorID: "typed-result-validator/v3", ResultApplyID: "cas-result-apply/v3",
+			ReconcileID: "typed-dag-reconcile/v3", RunnerDispatchID: "qualified-release-controller-dispatch/v1",
+			ManifestCompilerID: "application-manifest-dispatch/v1", ConditionAnalysisID: "condition-path-analysis/v2",
+			ProposalAnalysisID: "proposal-lineage-analysis/v2",
+		},
+	}
 }
 
 // WorkflowExecutionProfileV2Descriptor is the literal immutable descriptor
@@ -214,8 +234,64 @@ func workflowCapabilitiesV2Snapshot() WorkflowCapabilities {
 	}
 }
 
+// workflowCapabilitiesV3Snapshot is intentionally literal and independent
+// from both historical snapshots and the mutable authoring factory.
+func workflowCapabilitiesV3Snapshot() WorkflowCapabilities {
+	externalQualification := domain.ExternalQualificationGateNodeConfig{
+		Blocking:             true,
+		GateName:             "external-qualification",
+		InputAuthoritySchema: "worksflow-workflow-input-authority/v1",
+		PromotionProtocol:    "worksflow-qualification-promotion-consume/v2",
+		ReceiptSchema:        "worksflow-qualification-receipt/v3",
+		WaiverPolicy:         "never",
+	}
+	return WorkflowCapabilities{
+		Version: 5,
+		NodeTypes: []domain.WorkflowNodeType{
+			domain.NodeAITransform, domain.NodeArtifactInput, domain.NodeCondition, domain.NodeExternalQualificationGate,
+			domain.NodeFanOut, domain.NodeHumanEdit, domain.NodeManifestCompiler, domain.NodeMerge,
+			domain.NodePublish, domain.NodeQualityGate, domain.NodeReviewGate, domain.NodeTransform,
+			domain.NodeWorkbenchBuild,
+		},
+		InputContracts: []domain.WorkflowInputContract{
+			{Capability: domain.WorkflowInputProjectBrief, ManifestJobTypes: []string{"conversation.workflow_intent", "workflow_start"}, ArtifactKinds: []string{"project_brief"}, MinimumArtifacts: 1, MaximumArtifacts: 1, RequiredSourcePurposes: []string{"project_brief"}, ManifestSchemaContracts: map[string]string{"conversation.workflow_intent": "workflow-intent-input/v1", "workflow_start": "workflow-input/v1"}},
+			{Capability: domain.WorkflowInputBlueprintSelection, ManifestJobTypes: []string{"blueprint.selection"}, ArtifactKinds: []string{"blueprint"}, MinimumArtifacts: 2, MaximumArtifacts: 101, RequireApproved: true, RequiredSourcePurposes: []string{"blueprint_selection_node", "blueprint_selection_root"}, ManifestSchemaContracts: map[string]string{"blueprint.selection": "blueprint-selection/v1"}},
+		},
+		OutputContracts: []domain.WorkflowOutputContract{{Capability: domain.WorkflowOutputApplication, ProducedArtifactKinds: []string{"workspace"}, TerminalOutcome: domain.WorkflowOutcomeDeployment, TerminalNodeType: domain.NodePublish}},
+		AITransforms: []AITransformCapability{
+			{JobType: "refine_project_brief", OutputSchemaVersion: "project-brief-proposal/v1", ModelPolicies: []string{"project-default"}, RequiredArtifactKinds: []string{"project_brief"}, ProducedArtifactKinds: []string{"project_brief"}},
+			{JobType: "derive_requirements", OutputSchemaVersion: "requirements-proposal/v1", ModelPolicies: []string{"project-default"}, RequiredArtifactKinds: []string{"project_brief"}, RequiredApprovedKinds: []string{"project_brief"}, ProducedArtifactKinds: []string{"product_requirements"}},
+			{JobType: "decompose_pages", OutputSchemaVersion: "blueprint-proposal/v1", ModelPolicies: []string{"project-default"}, RequiredArtifactKinds: []string{"product_requirements"}, RequiredApprovedKinds: []string{"product_requirements"}, ProducedArtifactKinds: []string{"blueprint"}},
+			{JobType: "generate_page_spec", OutputSchemaVersion: "page-spec-proposal/v1", ModelPolicies: []string{"project-default"}, RequiredArtifactKinds: []string{"blueprint"}, RequiredApprovedKinds: []string{"blueprint"}, ProducedArtifactKinds: []string{"page_spec"}},
+			{JobType: "generate_prototype", OutputSchemaVersion: "prototype-proposal/v1", ModelPolicies: []string{"project-default"}, RequiredArtifactKinds: []string{"page_spec"}, RequiredApprovedKinds: []string{"page_spec"}, ProducedArtifactKinds: []string{"prototype"}},
+		},
+		ManifestCompilers: []ManifestCompilerCapability{{
+			ManifestKind: "application_build", SchemaVersion: 1, Hook: "application-build-manifest/v1",
+			RequiredArtifactKinds: []string{"blueprint", "page_spec", "prototype"}, RequiredApprovedKinds: []string{"blueprint", "page_spec", "prototype"}, RequiresMergedSlices: true,
+			ProducedSemanticKinds: []string{"application_build_manifest"}, AllowedContextArtifactKinds: []string{"project_brief", "product_requirements", "decision_record", "glossary_policy", "reference_source", "change_request", "requirement_baseline", "blueprint", "page_spec", "prototype", "prototype_flow", "fixture_bundle", "api_contract", "data_contract", "permission_contract", "design_system", "token_set", "component_registry"},
+		}},
+		Transforms: []string{"selection_passthrough"}, FanOutItemKinds: []string{"blueprint_page", "blueprint_selection_page"},
+		FanOutMaximumItems: map[string]int{"blueprint_page": domain.MaximumWorkflowFanOutItems, "blueprint_selection_page": domain.MaximumWorkflowFanOutItems},
+		QualityGates:       []string{"release"}, PublishEnvironments: []string{"production"}, WorkbenchSchemaVersions: []int{1},
+		AnalysisLimits:            WorkflowAnalysisLimits{MaximumDefinitionNodes: 200, MaximumDefinitionEdges: 1000, MaxSemanticPathStates: 256, MaximumConditionExpression: 8 << 10},
+		ExternalQualificationGate: &externalQualification,
+	}
+}
+
 func CurrentWorkflowExecutionProfileRef() domain.WorkflowExecutionProfileRef {
 	return WorkflowExecutionProfileV2Ref()
+}
+
+func WorkflowExecutionProfileV3Ref() domain.WorkflowExecutionProfileRef {
+	ref, err := WorkflowExecutionProfileV3Descriptor().Ref()
+	if err != nil {
+		panic(err)
+	}
+	expected := domain.WorkflowExecutionProfileRef{Version: WorkflowExecutionProfileV3Version, Hash: WorkflowExecutionProfileV3Hash}
+	if ref != expected {
+		panic("workflow-engine/v3 execution profile descriptor drifted from its frozen snapshot")
+	}
+	return expected
 }
 
 func WorkflowExecutionProfileV2Ref() domain.WorkflowExecutionProfileRef {
@@ -335,6 +411,30 @@ func frozenV0V1NodeDispatchOwnership(descriptor WorkflowExecutionProfileDescript
 		}
 	}
 	return result
+}
+
+// workflowExecutionProfileV3DispatchOwnership is deliberately literal. The
+// external qualification gate is owned by the interpreter only so it can be
+// observed but never dispatched, while Publish is runner-owned and is further
+// restricted by sealRuntimeV3 to the qualified release controller identity.
+// Adding a v3 capability without updating this table therefore fails profile
+// registration instead of falling through to a mutable runner registry.
+func workflowExecutionProfileV3DispatchOwnership() map[domain.WorkflowNodeType]workflowNodeDispatchOwner {
+	return map[domain.WorkflowNodeType]workflowNodeDispatchOwner{
+		domain.NodeAITransform:               workflowNodeDispatchInterpreter,
+		domain.NodeArtifactInput:             workflowNodeDispatchInterpreter,
+		domain.NodeCondition:                 workflowNodeDispatchInterpreter,
+		domain.NodeExternalQualificationGate: workflowNodeDispatchInterpreter,
+		domain.NodeFanOut:                    workflowNodeDispatchRunner,
+		domain.NodeHumanEdit:                 workflowNodeDispatchInterpreter,
+		domain.NodeManifestCompiler:          workflowNodeDispatchInterpreter,
+		domain.NodeMerge:                     workflowNodeDispatchInterpreter,
+		domain.NodePublish:                   workflowNodeDispatchRunner,
+		domain.NodeQualityGate:               workflowNodeDispatchRunner,
+		domain.NodeReviewGate:                workflowNodeDispatchInterpreter,
+		domain.NodeTransform:                 workflowNodeDispatchRunner,
+		domain.NodeWorkbenchBuild:            workflowNodeDispatchRunner,
+	}
 }
 
 func (e *Engine) captureExecutionRuntime() workflowExecutionRuntime {
@@ -490,6 +590,21 @@ func workflowExecutionProfileV1Bundle() WorkflowExecutionProfileBundle {
 	}
 }
 
+// workflowExecutionProfileV3Bundle remains private during Phase A. It gives
+// focused tests and the future activation bootstrap an exact runtime bundle,
+// but NewBuiltinWorkflowExecutionProfileRegistry intentionally does not
+// register it and Current continues to resolve to workflow-engine/v2.
+func workflowExecutionProfileV3Bundle() WorkflowExecutionProfileBundle {
+	descriptor := WorkflowExecutionProfileV3Descriptor()
+	return WorkflowExecutionProfileBundle{
+		Descriptor: descriptor, componentIdentity: descriptor.Components,
+		nodeDispatch:   workflowExecutionProfileV3DispatchOwnership(),
+		runtimeFactory: sealRuntimeV3,
+		buildInputs:    buildNodeInputEnvelopeV3, executeNodeFn: executeNodeV3,
+		validateResultFn: validateResultV3, applyResultFn: applyResultV3, reconcileFn: reconcileV3,
+	}
+}
+
 func (r *WorkflowExecutionProfileRegistry) Register(bundle WorkflowExecutionProfileBundle) error {
 	if r == nil || bundle.runtime != nil || bundle.runtimeFactory == nil || bundle.buildInputs == nil || bundle.executeNodeFn == nil || bundle.validateResultFn == nil || bundle.applyResultFn == nil || bundle.reconcileFn == nil {
 		return fmt.Errorf("complete workflow execution profile bundle is required")
@@ -539,9 +654,14 @@ func (r *WorkflowExecutionProfileRegistry) Seal(runtime workflowExecutionRuntime
 		if err != nil || computed != ref || bundle.componentIdentity != bundle.Descriptor.Components {
 			return fmt.Errorf("workflow execution profile bundle identity mismatch")
 		}
-		copyRuntime, err := bundle.runtimeFactory(cloneExecutionRuntime(runtime), bundle.Descriptor)
-		if err != nil {
-			return fmt.Errorf("seal workflow execution profile %s/%s: %w", ref.Version, ref.Hash, err)
+		var copyRuntime workflowExecutionRuntime
+		if bundle.runtime != nil {
+			copyRuntime = cloneExecutionRuntime(*bundle.runtime)
+		} else {
+			copyRuntime, err = bundle.runtimeFactory(cloneExecutionRuntime(runtime), bundle.Descriptor)
+			if err != nil {
+				return fmt.Errorf("seal workflow execution profile %s/%s: %w", ref.Version, ref.Hash, err)
+			}
 		}
 		if err := validateExecutionProfileRuntime(bundle, copyRuntime); err != nil {
 			return fmt.Errorf("seal workflow execution profile %s/%s: %w", ref.Version, ref.Hash, err)
@@ -575,7 +695,10 @@ func (r *WorkflowExecutionProfileRegistry) SealProfile(ref domain.WorkflowExecut
 	if bundle.componentIdentity != components || bundle.Descriptor.Components != components {
 		return fmt.Errorf("workflow execution profile component identity mismatch")
 	}
-	copyRuntime := cloneExecutionRuntime(runtime)
+	copyRuntime, err := bundle.runtimeFactory(cloneExecutionRuntime(runtime), bundle.Descriptor)
+	if err != nil {
+		return fmt.Errorf("seal workflow execution profile %s/%s: %w", ref.Version, ref.Hash, err)
+	}
 	if err := validateExecutionProfileRuntime(bundle, copyRuntime); err != nil {
 		return fmt.Errorf("seal workflow execution profile %s/%s: %w", ref.Version, ref.Hash, err)
 	}
@@ -676,10 +799,12 @@ func validateNodeDispatchOwnership(
 			return fmt.Errorf("workflow execution profile dispatch ownership includes undeclared node type %s", nodeType)
 		}
 	}
-	runnerDispatchID := descriptor.Components.RunnerDispatchID
-	if runnerDispatchID == LegacyWorkflowExecutionProfileDescriptor().Components.RunnerDispatchID ||
-		runnerDispatchID == WorkflowExecutionProfileV1Descriptor().Components.RunnerDispatchID ||
-		runnerDispatchID == WorkflowExecutionProfileV2Descriptor().Components.RunnerDispatchID {
+	// A descriptor retaining a historical dispatch component must retain that
+	// component's exact ownership set. Profile v3 uses a new dispatch identity,
+	// so its independently frozen literal ownership map is checked above.
+	if descriptor.Components.RunnerDispatchID == LegacyWorkflowExecutionProfileDescriptor().Components.RunnerDispatchID ||
+		descriptor.Components.RunnerDispatchID == WorkflowExecutionProfileV1Descriptor().Components.RunnerDispatchID ||
+		descriptor.Components.RunnerDispatchID == WorkflowExecutionProfileV2Descriptor().Components.RunnerDispatchID {
 		expected := frozenV0V1NodeDispatchOwnership(descriptor)
 		if len(expected) != len(ownership) {
 			return fmt.Errorf("workflow execution profile changed its frozen dispatch ownership set")

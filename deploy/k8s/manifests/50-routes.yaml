@@ -1,0 +1,41 @@
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: project-a-app
+  namespace: wf-p-a7f3c2
+  labels: {worksflow.dev/managed: "true", worksflow.dev/project-key: a7f3c2}
+spec:
+  parentRefs:
+    - {name: public, namespace: worksflow-gateway, sectionName: http-apps}
+    - {name: public, namespace: worksflow-gateway, sectionName: https-apps}
+  hostnames: [project-a.apps.worksflow.localhost]
+  rules:
+    - backendRefs: [{name: route-probe, port: 8080}]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: project-a-preview
+  namespace: wf-p-a7f3c2
+  labels: {worksflow.dev/managed: "true", worksflow.dev/project-key: a7f3c2}
+spec:
+  parentRefs:
+    - {name: public, namespace: worksflow-gateway, sectionName: http-preview}
+    - {name: public, namespace: worksflow-gateway, sectionName: https-preview}
+  hostnames: [4f0c2e8a.preview.worksflow.localhost]
+  rules:
+    - backendRefs: [{name: route-probe, port: 8080}]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: project-b-app
+  namespace: wf-p-b9d4e1
+  labels: {worksflow.dev/managed: "true", worksflow.dev/project-key: b9d4e1}
+spec:
+  parentRefs:
+    - {name: public, namespace: worksflow-gateway, sectionName: http-apps}
+    - {name: public, namespace: worksflow-gateway, sectionName: https-apps}
+  hostnames: [project-b.apps.worksflow.localhost]
+  rules:
+    - backendRefs: [{name: route-probe, port: 8080}]

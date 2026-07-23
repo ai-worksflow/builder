@@ -46,6 +46,10 @@ services:
 
   postgres:
     image: postgres:16-alpine
+    # PostgreSQL uses dynamic shared memory for parallel query execution.
+    # Docker's 64 MiB default is too small for canonical review receipt
+    # issuance once the audit tables contain realistic project history.
+    shm_size: ${POSTGRES_SHM_SIZE:-512mb}
     environment:
       POSTGRES_DB: worksflow
       POSTGRES_USER: worksflow
@@ -341,8 +345,12 @@ services:
       LSP_ENABLED: ${LSP_ENABLED:-false}
       LSP_RUNTIME_BINARY: /usr/bin/docker
       LSP_DAEMON_HOST: unix:///var/run/worksflow-sandbox/docker.sock
-      LSP_ALLOWED_ORIGINS: ${PLATFORM_ALLOWED_ORIGINS:-http://localhost:${NGINX_PORT:-10000},http://127.0.0.1:${NGINX_PORT:-10000}}
-      LSP_REQUIRE_TLS: "false"
+      # LSP browser origins are stricter than ordinary API CORS origins:
+      # cleartext is accepted only for loopback development. Keep this list
+      # independent so a remote HTTP API origin cannot prevent startup while
+      # LSP is disabled; shared deployments must inject HTTPS origins and TLS.
+      LSP_ALLOWED_ORIGINS: ${LSP_ALLOWED_ORIGINS:-http://localhost:${NGINX_PORT:-10000},http://127.0.0.1:${NGINX_PORT:-10000}}
+      LSP_REQUIRE_TLS: ${LSP_REQUIRE_TLS:-false}
       LSP_TICKET_TTL: ${LSP_TICKET_TTL:-20s}
       LSP_BIND_TIMEOUT: ${LSP_BIND_TIMEOUT:-5s}
       LSP_WRITE_WAIT: ${LSP_WRITE_WAIT:-2s}
@@ -411,6 +419,15 @@ services:
       AI_MAX_RETRIES: ${AI_MAX_RETRIES:-0}
       OPENAI_ORGANIZATION: ${OPENAI_ORGANIZATION:-}
       OPENAI_PROJECT: ${OPENAI_PROJECT:-}
+      # Optional platform-managed GitHub App. When enabled, generated projects
+      # are created in the configured organization. A user PAT remains the
+      # advanced fallback for non-platform repository owners.
+      GITHUB_APP_ID: ${GITHUB_APP_ID:-}
+      GITHUB_APP_INSTALLATION_ID: ${GITHUB_APP_INSTALLATION_ID:-}
+      GITHUB_APP_ORGANIZATION: ${GITHUB_APP_ORGANIZATION:-}
+      GITHUB_APP_PRIVATE_KEY_FILE: ${GITHUB_APP_ID:+/run/secrets/github_app_private_key}
+    secrets:
+      - github_app_private_key
     volumes:
       - quality-workspaces:/var/lib/worksflow/quality
       - verification-workspaces:/var/lib/worksflow/verification
@@ -447,6 +464,10 @@ services:
       start_period: 10s
     init: true
     restart: unless-stopped
+
+secrets:
+  github_app_private_key:
+    file: ${GITHUB_APP_PRIVATE_KEY_HOST_FILE:-/dev/null}
 
 volumes:
   postgres-data:

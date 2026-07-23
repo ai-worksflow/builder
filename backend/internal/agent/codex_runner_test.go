@@ -65,7 +65,7 @@ func (executor *codexContainerExecutorFake) Run(
 	}
 	result := executor.structuredResult
 	if result == nil {
-		result = []byte(`{"summary":"Implemented the exact task.","changedPaths":[],"verification":[],"blockers":[]}`)
+		result = []byte(`{"summary":"Implemented the exact task.","changedPaths":[],"obligations":[{"id":"OBL-1","status":"satisfied","note":"Implemented."},{"id":"OBL-2","status":"satisfied","note":"Implemented."}],"acceptanceCriteria":[{"id":"AC-1","status":"satisfied","note":"Satisfied."},{"id":"AC-2","status":"satisfied","note":"Satisfied."}],"verification":[{"commandId":"test-contract","status":"passed","note":"Passed."},{"commandId":"typecheck-web","status":"passed","note":"Passed."}],"resourceGraph":{"applicable":false,"nodes":[],"edges":[]},"blockers":[]}`)
 	}
 	for name, value := range map[string][]byte{
 		"result.json":  result,
@@ -141,7 +141,7 @@ func TestDockerCodexRunnerUsesDigestPinnedLeastPrivilegeContainer(t *testing.T) 
 	run := strings.Join(executor.commands[1], "\n")
 	for _, required := range []string{
 		"--pull", "never", "--read-only", "--cap-drop", "ALL",
-		"no-new-privileges", "--network", "worksflow-agent-model",
+		"no-new-privileges", "seccomp=unconfined", "--network", "worksflow-agent-model",
 		"--user", "10001:10001", "--env-file",
 		"/tmp:rw,noexec,nosuid,nodev,size=268435456,uid=10001,gid=10001,mode=0700",
 	} {

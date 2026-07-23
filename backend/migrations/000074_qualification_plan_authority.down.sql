@@ -1,3 +1,9 @@
+-- Promotion v2 may read the immutable Plan locator before locking Evidence in
+-- the established Evidence -> Plan order. Fence it before either relation.
+SELECT pg_catalog.pg_advisory_xact_lock(
+  pg_catalog.hashtextextended('worksflow:workflow-input-authority-migration:v1', 0)
+);
+
 DO $qualification_plan_authority_down_guard$
 BEGIN
   -- Fence migration-73 writers in their established order before observing

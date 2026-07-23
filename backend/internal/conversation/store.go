@@ -66,7 +66,7 @@ type intentGenerationContext struct {
 	WorkbenchTargets []intentWorkbenchTargetContext `json:"workbenchTargets"`
 }
 
-var activeWorkbenchRunStatuses = []string{"running", "waiting_input", "waiting_review"}
+var activeWorkbenchRunStatuses = []string{"running", "waiting_input", "waiting_review", "waiting_qualification"}
 
 var executableImplementationProposalStatuses = []string{"open", "reviewing", "ready"}
 

@@ -18,9 +18,12 @@ default_config=$(mktemp)
 enabled_config=$(mktemp)
 trap 'rm -f "$default_config" "$enabled_config"' EXIT HUP INT TERM
 
-docker compose config --quiet
-APP_ENV=production docker compose --profile maintenance config --quiet
-docker compose --profile maintenance config --format json >"$default_config"
+# Contract checks must not inherit the developer's ignored .env file. The
+# default case validates repository defaults; the enabled case below supplies
+# every deliberate override through its command environment.
+docker compose --env-file /dev/null config --quiet
+APP_ENV=production docker compose --env-file /dev/null --profile maintenance config --quiet
+docker compose --env-file /dev/null --profile maintenance config --format json >"$default_config"
 
 grep -F -- '--tmpfs /tmp:rw,nosuid,nodev,noexec,size=16777216,uid=10001,gid=10001,mode=0700' \
   deploy/prepare-sandbox-runtime.sh >/dev/null
@@ -83,7 +86,7 @@ AGENT_OUTPUT_SCHEMA_HASH="$qualified_hash" \
 AGENT_TOOLCHAIN_HASH="$qualified_hash" \
 AGENT_WALL_TIME=6m \
 HTTP_WRITE_TIMEOUT=7m \
-docker compose config --format json >"$enabled_config"
+docker compose --env-file /dev/null config --format json >"$enabled_config"
 
 jq -e --arg hash "$qualified_hash" --arg image "$qualified_image" '
   .services.api.environment.RELEASE_DELIVERY_WORKER_ENABLED == "true" and

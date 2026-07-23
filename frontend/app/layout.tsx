@@ -19,7 +19,6 @@ const firaCode = Fira_Code({
 export const metadata: Metadata = {
   title: messages[defaultLocale]['meta.title'],
   description: messages[defaultLocale]['meta.description'],
-  generator: 'v0.app',
 }
 
 export const viewport: Viewport = {

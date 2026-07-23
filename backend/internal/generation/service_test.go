@@ -599,6 +599,9 @@ func TestArtifactProposalInstructionsIncludeCanonicalReviewContracts(t *testing.
 			"desktop, tablet, and mobile", "every required state and breakpoint pair", "Every named collection must be present",
 			"\"layers\":{}", "\"tokenBindings\":[]", "viewportWidth", "fieldMetadata", "nonnegative integer x and y",
 			"distinct, non-overlapping positions", "\"title\":\"State · Breakpoint\"",
+			"The only supported layer kinds are", "\"kind\":\"frame\"", "\"fieldMetadata\":{}",
+			"Never omit kind, name, or fieldMetadata", "copied exactly from the frozen PageSpec top-level requirementIds",
+			"never copy a global requirement that is not owned by this Page",
 		},
 	}
 	for jobType, required := range tests {

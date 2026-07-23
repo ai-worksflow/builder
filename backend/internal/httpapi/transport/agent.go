@@ -23,6 +23,8 @@ const defaultAgentMaxJSONBodyBytes int64 = 1 << 20
 // Worker lease and lifecycle methods intentionally are not exposed here.
 type AgentControlAPI interface {
 	CreateTaskAttempt(context.Context, agent.CreateTaskAttemptInput) (agent.TaskAttemptResult, error)
+	GetTaskGraph(context.Context, string, string, string) (agent.TaskGraph, error)
+	AdvanceTaskGraph(context.Context, agent.AdvanceTaskGraphInput) (agent.TaskGraphAdvanceResult, error)
 	RetryAttempt(context.Context, agent.RetryAttemptInput) (agent.TaskAttemptResult, error)
 	GetAttempt(context.Context, string, string) (agent.TaskAttemptResult, error)
 	ListAttempts(context.Context, string, string, string, int) ([]agent.AgentAttempt, error)
@@ -108,6 +110,11 @@ func RegisterAgentRoutes(
 		agentNoStore,
 		handler.listAttempts,
 	)
+	routes.GET(
+		"/sandbox-sessions/:sessionId/agent-task-graph",
+		agentNoStore,
+		handler.getTaskGraph,
+	)
 	routes.GET("/agent-attempts/:attemptId", agentNoStore, handler.getAttempt)
 	routes.GET("/agent-attempts/:attemptId/events", agentNoStore, handler.listEvents)
 	routes.GET("/agent-attempts/:attemptId/merges", agentNoStore, handler.listMerges)
@@ -118,6 +125,8 @@ func RegisterAgentRoutes(
 	mutation = append(mutation, mutationMiddleware...)
 	create := append(append([]gin.HandlerFunc(nil), mutation...), handler.createAttempt)
 	routes.POST("/sandbox-sessions/:sessionId/agent-attempts", create...)
+	advanceGraph := append(append([]gin.HandlerFunc(nil), mutation...), handler.advanceTaskGraph)
+	routes.POST("/sandbox-sessions/:sessionId/agent-task-graph/advance", advanceGraph...)
 	merge := []gin.HandlerFunc{agentNoStore, worksmiddleware.RequireIfMatch()}
 	merge = append(merge, mutationMiddleware...)
 	merge = append(merge, handler.mergePatch)
@@ -140,6 +149,56 @@ type createAgentAttemptRequest struct {
 	TaskKey         string `json:"taskKey"`
 	Instruction     string `json:"instruction"`
 	ExecutorProfile string `json:"executorProfile"`
+}
+
+type advanceAgentTaskGraphRequest struct {
+	Instruction     string `json:"instruction"`
+	ExecutorProfile string `json:"executorProfile"`
+}
+
+func (handler *AgentHandler) getTaskGraph(c *gin.Context) {
+	actor, projectID, ok := handler.sessionIdentity(c)
+	if !ok {
+		return
+	}
+	result, err := handler.service.GetTaskGraph(
+		c.Request.Context(), projectID, c.Param("sessionId"), actor,
+	)
+	if err != nil {
+		writeAgentProblem(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, result)
+}
+
+func (handler *AgentHandler) advanceTaskGraph(c *gin.Context) {
+	actor, projectID, ok := handler.sessionIdentity(c)
+	if !ok {
+		return
+	}
+	var request advanceAgentTaskGraphRequest
+	if err := DecodeJSON(c, &request, handler.maxJSON); err != nil {
+		WriteJSONError(c, err)
+		return
+	}
+	result, err := handler.service.AdvanceTaskGraph(c.Request.Context(), agent.AdvanceTaskGraphInput{
+		ProjectID: projectID, SandboxSessionID: c.Param("sessionId"),
+		Instruction: request.Instruction, ExecutorProfile: request.ExecutorProfile,
+		ActorID: actor, OperationID: worksmiddleware.IdempotencyKey(c),
+	})
+	if err != nil {
+		writeAgentProblem(c, err)
+		return
+	}
+	status := http.StatusOK
+	if result.Attempt != nil {
+		writeAgentAttemptHeaders(c, result.Attempt.Attempt)
+		c.Header("Location", agentAttemptLocation(result.Attempt.Attempt.ID))
+		if !result.Replayed {
+			status = http.StatusCreated
+		}
+	}
+	c.JSON(status, result)
 }
 
 func (handler *AgentHandler) createAttempt(c *gin.Context) {
@@ -438,6 +497,7 @@ func (handler *AgentHandler) controlAttempt(c *gin.Context) {
 		return
 	}
 	if expectedVersion != current.Attempt.Version {
+		writeAgentAttemptHeaders(c, current.Attempt)
 		preconditionFailed(c, "AgentAttempt")
 		return
 	}
@@ -653,7 +713,7 @@ func writeAgentProblem(c *gin.Context, err error) {
 			"Agent patch merge reconciliation is pending",
 			"Retry the same request with the same Idempotency-Key so the committed journal, workspace, Session, and immutable application receipt can converge.",
 		))
-	case errors.Is(err, agent.ErrPlanningBlocked):
+	case errors.Is(err, agent.ErrPlanningBlocked), errors.Is(err, agent.ErrTaskGraphBlocked):
 		problem.Write(c, problem.New(
 			http.StatusConflict,
 			"agent_planning_blocked",

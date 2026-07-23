@@ -29,7 +29,7 @@ const TEAM_VIEW_BY_SEGMENT: Record<string, TeamView> = {
 
 export type ParsedWorksflowRoute =
   | { surface: 'workbench'; phase: Phase; view: WorkbenchView }
-  | { surface: 'team'; projectId?: string; teamView: TeamView }
+  | { surface: 'team'; teamId?: string; projectId?: string; teamView: TeamView }
   | { surface: Exclude<Surface, 'workbench' | 'team'> }
   | { surface: null }
 
@@ -47,10 +47,12 @@ export function parseWorksflowRoute(pathname: string, search = ''): ParsedWorksf
   }
 
   if (segments[0] === 'team') {
+    const isProjectRoute = segments[2] === 'project'
     return {
       surface: 'team',
-      projectId: segments[3],
-      teamView: TEAM_VIEW_BY_SEGMENT[segments[4] ?? 'dashboard'] ?? 'dashboard',
+      teamId: isProjectRoute ? decodeRouteSegment(segments[1]) : undefined,
+      projectId: isProjectRoute ? decodeRouteSegment(segments[3]) : undefined,
+      teamView: TEAM_VIEW_BY_SEGMENT[isProjectRoute ? (segments[4] ?? 'dashboard') : 'dashboard'] ?? 'dashboard',
     }
   }
 
@@ -66,6 +68,15 @@ export function workbenchPathFor(phase: Phase, view: WorkbenchView) {
   return `/workbench/${WORKBENCH_SEGMENT_BY_PHASE[phase]}${query}`
 }
 
-export function teamPathFor(teamProjectId: string, teamView: TeamView) {
-  return `/team/acme/project/${teamProjectId}/${teamView}`
+export function teamPathFor(teamId: string, teamProjectId: string, teamView: TeamView) {
+  return `/team/${encodeURIComponent(teamId)}/project/${encodeURIComponent(teamProjectId)}/${teamView}`
+}
+
+function decodeRouteSegment(value: string | undefined) {
+  if (!value) return undefined
+  try {
+    return decodeURIComponent(value)
+  } catch {
+    return undefined
+  }
 }

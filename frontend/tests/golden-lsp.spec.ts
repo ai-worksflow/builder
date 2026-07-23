@@ -266,7 +266,7 @@ function workbenchURL() {
 async function openExactBrowserWorkspace(page: Page, prepared: PreparedLSP) {
   const subject = goldenSubject()
   await page.goto(
-    `${subject.platform.webOrigin}/team/acme/project/${prepared.sandbox.projectId}/dashboard`,
+    `${subject.platform.webOrigin}/team/${prepared.sandbox.projectId}/project/${prepared.sandbox.projectId}/dashboard`,
   )
   await page.goto(workbenchURL())
   await expect(page).toHaveURL(new RegExp(

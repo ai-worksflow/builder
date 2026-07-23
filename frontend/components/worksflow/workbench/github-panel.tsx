@@ -7,6 +7,7 @@ import { useCollaboration } from '@/lib/collaboration/provider'
 import { useI18n } from '@/lib/i18n'
 import {
   connectGitHub,
+  createGitHubRepository,
   createGitHubPullRequest,
   disconnectGitHub,
   getGitHubStatus,
@@ -19,6 +20,7 @@ import type {
   GitHubBranch,
   GitHubChangesPreview,
   GitHubConnectionStatus,
+  GitHubCreateRepositoryResult,
   GitHubPullRequestResult,
   GitHubPushResult,
   GitHubRepository,
@@ -32,18 +34,21 @@ import {
   GitPullRequest,
   Loader2,
   LogOut,
+  Plus,
   RefreshCw,
   ShieldCheck,
 } from 'lucide-react'
 
-type PendingMutation = 'push' | 'pull-request' | null
+type PendingMutation = 'create-repository' | 'push' | 'pull-request' | null
 
 interface GitHubPanelProps {
   readonly projectId?: string
   readonly files?: readonly { readonly path: string; readonly content: string }[]
+  readonly simple?: boolean
+  readonly onRepositoryCreated?: (result: GitHubCreateRepositoryResult) => void
 }
 
-export function GitHubPanel({ projectId, files }: GitHubPanelProps = {}) {
+export function GitHubPanel({ projectId, files, simple = false, onRepositoryCreated }: GitHubPanelProps = {}) {
   const { locale, t } = useI18n()
   const { platformClient } = useCollaboration()
   const {
@@ -65,6 +70,12 @@ export function GitHubPanel({ projectId, files }: GitHubPanelProps = {}) {
       : '',
   )
   const [baseBranch, setBaseBranch] = useState(productProject.githubSettings.defaultBranch ?? '')
+  const [showCreateRepository, setShowCreateRepository] = useState(false)
+  const [repositoryOwner, setRepositoryOwner] = useState('')
+  const [newRepositoryName, setNewRepositoryName] = useState(() => slug(projectName))
+  const [repositoryDescription, setRepositoryDescription] = useState('')
+  const [privateRepository, setPrivateRepository] = useState(true)
+  const [createdRepository, setCreatedRepository] = useState<GitHubCreateRepositoryResult | null>(null)
   const [createBranch, setCreateBranch] = useState(false)
   const [newBranch, setNewBranch] = useState(`worksflow/${slug(projectName)}`)
   const [commitMessage, setCommitMessage] = useState(() => t('github.default.commitMessage', { project: projectName }))
@@ -75,7 +86,7 @@ export function GitHubPanel({ projectId, files }: GitHubPanelProps = {}) {
   const [prBody, setPrBody] = useState(() => t('github.default.prBody'))
   const [prDraft, setPrDraft] = useState(true)
   const [pendingMutation, setPendingMutation] = useState<PendingMutation>(null)
-  const [loading, setLoading] = useState<'status' | 'connect' | 'repos' | 'branches' | 'preview' | 'push' | 'pr' | null>('status')
+  const [loading, setLoading] = useState<'status' | 'connect' | 'repos' | 'branches' | 'create' | 'preview' | 'push' | 'pr' | null>('status')
   const [error, setError] = useState<string | null>(null)
 
   const selectedRepository = useMemo(
@@ -130,6 +141,11 @@ export function GitHubPanel({ projectId, files }: GitHubPanelProps = {}) {
       active = false
     }
   }, [effectiveProjectId, loadRepositories, platformClient.http, t])
+
+  useEffect(() => {
+    const owner = connection.organization ?? connection.user?.login
+    if (owner) setRepositoryOwner(owner)
+  }, [connection.organization, connection.user?.login])
 
   useEffect(() => {
     if (!selectedRepository) {
@@ -224,6 +240,44 @@ export function GitHubPanel({ projectId, files }: GitHubPanelProps = {}) {
     }
   }
 
+  async function confirmCreateRepository() {
+    if (!effectiveProjectId || !newRepositoryName.trim() || effectiveFiles.length === 0) return
+    setLoading('create')
+    setError(null)
+    try {
+      const result = await createGitHubRepository(platformClient.http, effectiveProjectId, {
+        owner: repositoryOwner.trim() || undefined,
+        name: newRepositoryName.trim(),
+        description: repositoryDescription.trim() || undefined,
+        private: privateRepository,
+        files: effectiveFiles.map((file) => ({ path: file.path, content: file.content })),
+        commitMessage,
+        confirm: true,
+      })
+      setCreatedRepository(result)
+      onRepositoryCreated?.(result)
+      setShowCreateRepository(false)
+      setPendingMutation(null)
+      await loadRepositories()
+      setRepositoryName(result.repository.fullName)
+      setBaseBranch(result.repository.defaultBranch)
+      updateGithubProjectSettings({
+        status: 'connected',
+        host: 'github.com',
+        owner: result.repository.owner,
+        repository: result.repository.name,
+        defaultBranch: result.repository.defaultBranch,
+        lastCommitSha: result.commitSha,
+        connectedAt: new Date().toISOString(),
+        permissionScopes: ['administration:write', 'contents:write'],
+      })
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : t('github.error.createRepository'))
+    } finally {
+      setLoading(null)
+    }
+  }
+
   async function confirmPush() {
     if (!effectiveProjectId || !selectedRepository || !baseBranch || !targetBranch || !commitMessage.trim()) return
     setLoading('push')
@@ -305,20 +359,90 @@ export function GitHubPanel({ projectId, files }: GitHubPanelProps = {}) {
     )
   }
 
+  if (simple) {
+    const owner = connection.organization ?? connection.user?.login ?? ''
+    return (
+      <div className="space-y-3">
+        <div className="flex items-center gap-2 rounded-md border border-success/30 bg-success/10 px-3 py-2">
+          <ShieldCheck className="h-4 w-4 text-success" />
+          <span className="min-w-0 flex-1 text-[11px] text-success">
+            {t('github.connectedAs', { user: owner || t('github.environmentToken'), source: connection.source ?? 'environment' })}
+          </span>
+        </div>
+        <div className="space-y-3 rounded-md border border-border bg-card p-3">
+          <p className="text-[10px] leading-relaxed text-muted-foreground">{t('github.createRepositoryDescription')}</p>
+          <div className="grid gap-2 sm:grid-cols-2">
+            <label className="text-[10px] text-faint-foreground">
+              {t('github.repositoryOwner')}
+              <input value={owner} readOnly className="mt-1 h-9 w-full rounded-md border border-border bg-background px-3 text-[11px] text-muted-foreground outline-none" />
+            </label>
+            <label className="text-[10px] text-faint-foreground">
+              {t('github.repositoryName')}
+              <input value={newRepositoryName} onChange={(event) => setNewRepositoryName(event.target.value)} className="mt-1 h-9 w-full rounded-md border border-border bg-background px-3 font-mono text-[11px] text-foreground outline-none" />
+            </label>
+          </div>
+          <label className="block text-[10px] text-faint-foreground">
+            {t('github.repositoryDescription')}
+            <input value={repositoryDescription} onChange={(event) => setRepositoryDescription(event.target.value)} className="mt-1 h-9 w-full rounded-md border border-border bg-background px-3 text-[11px] text-foreground outline-none" />
+          </label>
+          <label className="flex items-center gap-2 text-[10px] text-muted-foreground">
+            <input type="checkbox" checked={privateRepository} onChange={(event) => setPrivateRepository(event.target.checked)} />
+            {t('github.createPrivateRepository')}
+          </label>
+          <button
+            type="button"
+            onClick={() => void confirmCreateRepository()}
+            disabled={!newRepositoryName.trim() || effectiveFiles.length === 0 || loading === 'create'}
+            className="inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-2 text-[10px] font-semibold text-primary-foreground disabled:opacity-50"
+          >
+            {loading === 'create' ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Plus className="h-3.5 w-3.5" />}
+            {t('github.confirmCreateRepository')}
+          </button>
+        </div>
+        {createdRepository && <a href={createdRepository.repository.htmlUrl} target="_blank" rel="noopener noreferrer" className="flex items-center gap-2 rounded-md border border-success/30 bg-success/10 px-3 py-2 text-[11px] text-success hover:underline"><CheckCircle2 className="h-3.5 w-3.5" />{t('github.repositoryCreated', { repository: createdRepository.repository.fullName, sha: createdRepository.commitSha.slice(0, 12) })}<ExternalLink className="ml-auto h-3 w-3" /></a>}
+        {error && <p role="alert" className="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-[10px] text-destructive">{error}</p>}
+      </div>
+    )
+  }
+
   return (
     <div className="space-y-3">
       <div className="flex items-center gap-2 rounded-md border border-success/30 bg-success/10 px-3 py-2">
         <CheckCircle2 className="h-4 w-4 text-success" />
         <span className="min-w-0 flex-1 text-[11px] text-success">
-          {t('github.connectedAs', { user: connection.user?.login ?? t('github.environmentToken'), source: connection.source ?? 'environment' })}
+          {t('github.connectedAs', { user: connection.organization ?? connection.user?.login ?? t('github.environmentToken'), source: connection.source ?? 'environment' })}
         </span>
-        <button type="button" onClick={() => void disconnect()} className="rounded p-1.5 text-success hover:bg-white/5" aria-label={t('github.disconnectAria')}><LogOut className="h-3.5 w-3.5" /></button>
+        {connection.source !== 'platform' && <button type="button" onClick={() => void disconnect()} className="rounded p-1.5 text-success hover:bg-white/5" aria-label={t('github.disconnectAria')}><LogOut className="h-3.5 w-3.5" /></button>}
       </div>
 
       <div className="grid gap-2 sm:grid-cols-2">
         <label className="text-[10px] text-faint-foreground">{t('github.repository')}<select value={repositoryName} onChange={(event) => setRepositoryName(event.target.value)} className="mt-1 h-9 w-full rounded-md border border-border bg-background px-2 text-[11px] text-foreground"><option value="">{t('github.selectRepository')}</option>{repositories.map((repository) => <option key={repository.id} value={repository.fullName}>{repository.fullName}{repository.private ? ` · ${t('github.private')}` : ''}</option>)}</select></label>
         <label className="text-[10px] text-faint-foreground">{t('github.baseBranch')}<select value={baseBranch} onChange={(event) => setBaseBranch(event.target.value)} className="mt-1 h-9 w-full rounded-md border border-border bg-background px-2 text-[11px] text-foreground"><option value="">{t('github.selectBranch')}</option>{branches.map((branch) => <option key={branch.name} value={branch.name}>{branch.name}{branch.protected ? ` · ${t('github.protected')}` : ''}</option>)}</select></label>
       </div>
+
+      <div className="rounded-md border border-border bg-card p-3">
+        <button type="button" onClick={() => { setShowCreateRepository((current) => !current); setPendingMutation(null) }} className="inline-flex items-center gap-1.5 text-[10px] font-medium text-primary-bright">
+          <Plus className="h-3.5 w-3.5" />{t('github.createRepository')}
+        </button>
+        {showCreateRepository && (
+          <div className="mt-3 space-y-2 border-t border-border pt-3">
+            <p className="text-[10px] leading-relaxed text-muted-foreground">{t('github.createRepositoryDescription')}</p>
+            <div className="grid gap-2 sm:grid-cols-2">
+              <label className="text-[10px] text-faint-foreground">{t('github.repositoryOwner')}<input value={repositoryOwner} readOnly={connection.source === 'platform'} onChange={(event) => setRepositoryOwner(event.target.value)} className="mt-1 h-9 w-full rounded-md border border-border bg-background px-3 text-[11px] text-foreground outline-none read-only:text-muted-foreground" /></label>
+              <label className="text-[10px] text-faint-foreground">{t('github.repositoryName')}<input value={newRepositoryName} onChange={(event) => setNewRepositoryName(event.target.value)} className="mt-1 h-9 w-full rounded-md border border-border bg-background px-3 font-mono text-[11px] text-foreground outline-none" /></label>
+            </div>
+            <label className="block text-[10px] text-faint-foreground">{t('github.repositoryDescription')}<input value={repositoryDescription} onChange={(event) => setRepositoryDescription(event.target.value)} className="mt-1 h-9 w-full rounded-md border border-border bg-background px-3 text-[11px] text-foreground outline-none" /></label>
+            <label className="flex items-center gap-2 text-[10px] text-muted-foreground"><input type="checkbox" checked={privateRepository} onChange={(event) => setPrivateRepository(event.target.checked)} />{t('github.createPrivateRepository')}</label>
+            {pendingMutation === 'create-repository' ? (
+              <Confirmation copy={t('github.createRepositoryConfirmation', { owner: repositoryOwner || connection.organization || connection.user?.login || '', repository: newRepositoryName, count: formatNumber(effectiveFiles.length, locale) })} loading={loading === 'create'} confirm={t('github.confirmCreateRepository')} onCancel={() => setPendingMutation(null)} onConfirm={() => void confirmCreateRepository()} />
+            ) : (
+              <button type="button" onClick={() => setPendingMutation('create-repository')} disabled={!newRepositoryName.trim() || effectiveFiles.length === 0 || !commitMessage.trim()} className="inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-2 text-[10px] font-semibold text-primary-foreground disabled:opacity-50"><Plus className="h-3.5 w-3.5" />{t('github.reviewCreateRepository')}</button>
+            )}
+          </div>
+        )}
+      </div>
+
+      {createdRepository && <a href={createdRepository.repository.htmlUrl} target="_blank" rel="noopener noreferrer" className="flex items-center gap-2 rounded-md border border-success/30 bg-success/10 px-3 py-2 text-[11px] text-success hover:underline"><CheckCircle2 className="h-3.5 w-3.5" />{t('github.repositoryCreated', { repository: createdRepository.repository.fullName, sha: createdRepository.commitSha.slice(0, 12) })}<ExternalLink className="ml-auto h-3 w-3" /></a>}
 
       <label className="flex items-center gap-2 rounded-md border border-border bg-card px-3 py-2 text-[10px] text-muted-foreground"><input type="checkbox" checked={createBranch} onChange={(event) => setCreateBranch(event.target.checked)} />{t('github.createBranch')}</label>
       {createBranch && <label className="block text-[10px] text-faint-foreground">{t('github.newBranch')}<input value={newBranch} onChange={(event) => setNewBranch(event.target.value)} className="mt-1 h-9 w-full rounded-md border border-border bg-background px-3 font-mono text-[11px] text-foreground outline-none" /></label>}

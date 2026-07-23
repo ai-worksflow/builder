@@ -28,6 +28,13 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.AI.Provider != "openai" || !cfg.Workflow.WorkerEnabled || cfg.Idempotency.TTL <= cfg.Idempotency.LockTTL {
 		t.Fatalf("platform runtime defaults = AI %#v, workflow %#v, idempotency %#v", cfg.AI, cfg.Workflow, cfg.Idempotency)
 	}
+	if cfg.WorkflowQualificationActivation.WorkerEnabled ||
+		cfg.WorkflowQualificationActivation.PostgresDSN != "" ||
+		cfg.WorkflowQualificationActivation.MaxTransactionRetries != 3 ||
+		cfg.WorkflowQualificationActivation.MaxOpenConns != 10 ||
+		cfg.WorkflowQualificationActivation.MaxIdleConns != 4 {
+		t.Fatalf("workflow qualification activation defaults must be bounded and disabled: %#v", cfg.WorkflowQualificationActivation)
+	}
 	if cfg.AI.Timeout != 12*time.Minute || cfg.AI.MaxRetries != 0 {
 		t.Fatalf("structured generation timeout/retry defaults = %#v", cfg.AI)
 	}
@@ -218,6 +225,154 @@ func TestReleaseDeliveryWorkerRejectsInsecureOrUnboundedControllerCalls(t *testi
 	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "RELEASE_DELIVERY_CONTROLLER_URL") ||
 		!strings.Contains(err.Error(), "request timeout") {
 		t.Fatalf("insecure or unbounded release controller was accepted: %v", err)
+	}
+}
+
+func TestQualificationReleasePublisherIsDefaultOffAndRequiresClosedUpstreamConfiguration(t *testing.T) {
+	clearConfigEnvironment(t)
+	defaultConfig, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if defaultConfig.Workflow.ProfileV3RuntimeEnabled || defaultConfig.QualificationRelease.Enabled ||
+		defaultConfig.QualificationRelease.PostgresDSN != "" {
+		t.Fatalf("qualified release defaults are not fail-closed: %#v", defaultConfig.QualificationRelease)
+	}
+
+	t.Setenv("QUALIFICATION_RELEASE_PUBLISHER_ENABLED", "true")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "WORKFLOW_PROFILE_V3_RUNTIME_ENABLED") ||
+		!strings.Contains(err.Error(), "RELEASE_DELIVERY_WORKER_ENABLED") ||
+		!strings.Contains(err.Error(), "QUALIFICATION_RELEASE_POSTGRES_DSN") {
+		t.Fatalf("incomplete qualified release chain was accepted: %v", err)
+	}
+
+	t.Setenv("WORKFLOW_PROFILE_V3_RUNTIME_ENABLED", "true")
+	t.Setenv("WORKFLOW_QUALIFICATION_ACTIVATION_WORKER_ENABLED", "true")
+	t.Setenv("WORKFLOW_INPUT_AUTHORITY_OPERATOR_POSTGRES_DSN", "postgres://workflow_input_operator:secret@localhost:5432/worksflow?sslmode=disable")
+	t.Setenv("RELEASE_DELIVERY_WORKER_ENABLED", "true")
+	t.Setenv("RELEASE_DELIVERY_CONTROLLER_URL", "https://delivery-controller.example.test")
+	t.Setenv("RELEASE_DELIVERY_CONTROLLER_TOKEN", strings.Repeat("secret", 8))
+	t.Setenv("RELEASE_DELIVERY_CONTROLLER_ID", "production-delivery-controller")
+	t.Setenv("RELEASE_DELIVERY_CONTROLLER_VERSION", "2026.07.20+qualified")
+	t.Setenv("RELEASE_DELIVERY_CONTROLLER_TRUST_KEY_DIGEST", "sha256:"+strings.Repeat("a", 64))
+	t.Setenv("QUALIFICATION_RELEASE_POSTGRES_DSN", "postgres://qualified_release:secret@localhost:5432/worksflow?sslmode=disable")
+	config, err := Load()
+	if err != nil {
+		t.Fatalf("closed qualified release chain was rejected: %v", err)
+	}
+	if !config.Workflow.ProfileV3RuntimeEnabled || !config.QualificationRelease.Enabled ||
+		config.QualificationRelease.WorkerConcurrency != 4 ||
+		config.QualificationRelease.LeaseDuration != 2*time.Minute ||
+		config.QualificationRelease.ControllerPollInterval != 2*time.Second {
+		t.Fatalf("qualified release config = %#v", config.QualificationRelease)
+	}
+}
+
+func TestQualificationReleasePublisherRejectsSharedCredentialAndUnboundedLease(t *testing.T) {
+	clearConfigEnvironment(t)
+	t.Setenv("QUALIFICATION_RELEASE_PUBLISHER_ENABLED", "true")
+	t.Setenv("WORKFLOW_PROFILE_V3_RUNTIME_ENABLED", "true")
+	t.Setenv("WORKFLOW_QUALIFICATION_ACTIVATION_WORKER_ENABLED", "true")
+	t.Setenv("WORKFLOW_INPUT_AUTHORITY_OPERATOR_POSTGRES_DSN", "postgres://workflow_input_operator:secret@localhost:5432/worksflow?sslmode=disable")
+	t.Setenv("RELEASE_DELIVERY_WORKER_ENABLED", "true")
+	t.Setenv("RELEASE_DELIVERY_CONTROLLER_URL", "https://delivery-controller.example.test")
+	t.Setenv("RELEASE_DELIVERY_CONTROLLER_TOKEN", strings.Repeat("secret", 8))
+	t.Setenv("RELEASE_DELIVERY_CONTROLLER_ID", "production-delivery-controller")
+	t.Setenv("RELEASE_DELIVERY_CONTROLLER_VERSION", "2026.07.20+qualified")
+	t.Setenv("RELEASE_DELIVERY_CONTROLLER_TRUST_KEY_DIGEST", "sha256:"+strings.Repeat("a", 64))
+	t.Setenv("QUALIFICATION_RELEASE_POSTGRES_DSN", "postgres://worksflow:worksflow@localhost:5432/worksflow?sslmode=disable")
+	t.Setenv("QUALIFICATION_RELEASE_LEASE_DURATION", "5m")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "credential distinct") ||
+		!strings.Contains(err.Error(), "concurrency, polling, lease") {
+		t.Fatalf("shared credential or unbounded lease was accepted: %v", err)
+	}
+}
+
+func TestWorkflowQualificationActivationRequiresDedicatedOperatorAndV3Runtime(t *testing.T) {
+	clearConfigEnvironment(t)
+	t.Setenv("WORKFLOW_QUALIFICATION_ACTIVATION_WORKER_ENABLED", "true")
+	if _, err := Load(); err == nil ||
+		!strings.Contains(err.Error(), "WORKFLOW_PROFILE_V3_RUNTIME_ENABLED") ||
+		!strings.Contains(err.Error(), "WORKFLOW_INPUT_AUTHORITY_OPERATOR_POSTGRES_DSN") {
+		t.Fatalf("incomplete workflow qualification activation was accepted: %v", err)
+	}
+
+	t.Setenv("WORKFLOW_PROFILE_V3_RUNTIME_ENABLED", "true")
+	t.Setenv("QUALIFICATION_RELEASE_PUBLISHER_ENABLED", "true")
+	t.Setenv("QUALIFICATION_RELEASE_POSTGRES_DSN", "postgres://qualified_release:secret@localhost:5432/worksflow?sslmode=disable")
+	t.Setenv("RELEASE_DELIVERY_WORKER_ENABLED", "true")
+	t.Setenv("RELEASE_DELIVERY_CONTROLLER_URL", "https://delivery-controller.example.test")
+	t.Setenv("RELEASE_DELIVERY_CONTROLLER_TOKEN", strings.Repeat("secret", 8))
+	t.Setenv("RELEASE_DELIVERY_CONTROLLER_ID", "production-delivery-controller")
+	t.Setenv("RELEASE_DELIVERY_CONTROLLER_VERSION", "2026.07.20+qualified")
+	t.Setenv("RELEASE_DELIVERY_CONTROLLER_TRUST_KEY_DIGEST", "sha256:"+strings.Repeat("a", 64))
+	t.Setenv("WORKFLOW_INPUT_AUTHORITY_OPERATOR_POSTGRES_DSN", "postgres://workflow_input_operator:secret@localhost:5432/worksflow?sslmode=disable")
+	loaded, err := Load()
+	if err != nil {
+		t.Fatalf("closed workflow qualification activation chain was rejected: %v", err)
+	}
+	if !loaded.WorkflowQualificationActivation.WorkerEnabled ||
+		loaded.WorkflowQualificationActivation.MaxOpenConns != 10 ||
+		loaded.WorkflowQualificationActivation.MaxIdleConns != 4 ||
+		loaded.WorkflowQualificationActivation.MaxTransactionRetries != 3 {
+		t.Fatalf("workflow qualification activation config = %#v", loaded.WorkflowQualificationActivation)
+	}
+}
+
+func TestWorkflowQualificationActivationRejectsSharedCredentialOrNarrowPool(t *testing.T) {
+	for name, configure := range map[string]func(*testing.T){
+		"shared credential": func(t *testing.T) {
+			t.Setenv("WORKFLOW_INPUT_AUTHORITY_OPERATOR_POSTGRES_DSN", "postgres://worksflow:worksflow@localhost:5432/worksflow?sslmode=disable")
+		},
+		"narrow pool": func(t *testing.T) {
+			t.Setenv("WORKFLOW_INPUT_AUTHORITY_OPERATOR_POSTGRES_DSN", "postgres://workflow_input_operator:secret@localhost:5432/worksflow?sslmode=disable")
+			t.Setenv("WORKFLOW_INPUT_AUTHORITY_OPERATOR_POSTGRES_MAX_OPEN_CONNS", "8")
+		},
+		"different authority database": func(t *testing.T) {
+			t.Setenv("WORKFLOW_INPUT_AUTHORITY_OPERATOR_POSTGRES_DSN", "postgres://workflow_input_operator:secret@localhost:5432/another?sslmode=disable")
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			clearConfigEnvironment(t)
+			t.Setenv("WORKFLOW_QUALIFICATION_ACTIVATION_WORKER_ENABLED", "true")
+			t.Setenv("WORKFLOW_PROFILE_V3_RUNTIME_ENABLED", "true")
+			t.Setenv("QUALIFICATION_RELEASE_PUBLISHER_ENABLED", "true")
+			t.Setenv("QUALIFICATION_RELEASE_POSTGRES_DSN", "postgres://qualified_release:secret@localhost:5432/worksflow?sslmode=disable")
+			t.Setenv("RELEASE_DELIVERY_WORKER_ENABLED", "true")
+			t.Setenv("RELEASE_DELIVERY_CONTROLLER_URL", "https://delivery-controller.example.test")
+			t.Setenv("RELEASE_DELIVERY_CONTROLLER_TOKEN", strings.Repeat("secret", 8))
+			t.Setenv("RELEASE_DELIVERY_CONTROLLER_ID", "production-delivery-controller")
+			t.Setenv("RELEASE_DELIVERY_CONTROLLER_VERSION", "2026.07.20+qualified")
+			t.Setenv("RELEASE_DELIVERY_CONTROLLER_TRUST_KEY_DIGEST", "sha256:"+strings.Repeat("a", 64))
+			configure(t)
+			if _, err := Load(); err == nil ||
+				(!strings.Contains(err.Error(), "credential distinct") &&
+					!strings.Contains(err.Error(), "pool limits") &&
+					!strings.Contains(err.Error(), "same PostgreSQL endpoint")) {
+				t.Fatalf("unsafe activation configuration was accepted: %v", err)
+			}
+		})
+	}
+}
+
+func TestSamePostgresAuthorityScopeIgnoresOnlyCredentialAndClientTuning(t *testing.T) {
+	application := "postgres://application:one@DB.EXAMPLE.test/worksflow?sslmode=verify-full&sslrootcert=%2Fetc%2Fca.pem&target_session_attrs=primary&application_name=api"
+	operator := "postgresql://operator:two@db.example.test:5432/worksflow?sslmode=verify-full&sslrootcert=%2Fetc%2Fca.pem&target_session_attrs=primary&application_name=activation&connect_timeout=5"
+	if !samePostgresAuthorityScope(application, operator) {
+		t.Fatal("credential-only PostgreSQL DSN variation changed the authority scope")
+	}
+	for name, candidate := range map[string]string{
+		"host":     "postgres://operator:two@other.example.test/worksflow?sslmode=verify-full&sslrootcert=%2Fetc%2Fca.pem&target_session_attrs=primary",
+		"database": "postgres://operator:two@db.example.test/other?sslmode=verify-full&sslrootcert=%2Fetc%2Fca.pem&target_session_attrs=primary",
+		"tls mode": "postgres://operator:two@db.example.test/worksflow?sslmode=require&sslrootcert=%2Fetc%2Fca.pem&target_session_attrs=primary",
+		"trust":    "postgres://operator:two@db.example.test/worksflow?sslmode=verify-full&sslrootcert=%2Fetc%2Fother.pem&target_session_attrs=primary",
+		"target":   "postgres://operator:two@db.example.test/worksflow?sslmode=verify-full&sslrootcert=%2Fetc%2Fca.pem&target_session_attrs=any",
+	} {
+		t.Run(name, func(t *testing.T) {
+			if samePostgresAuthorityScope(application, candidate) {
+				t.Fatal("different PostgreSQL authority scope was accepted")
+			}
+		})
 	}
 }
 
@@ -638,6 +793,25 @@ func TestLoadOpenAICompatibilityAliases(t *testing.T) {
 	}
 }
 
+func TestLoadValidatesGitHubAppConfigurationAsAUnit(t *testing.T) {
+	clearConfigEnvironment(t)
+	t.Setenv("GITHUB_APP_ID", "123")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "must be configured together") {
+		t.Fatalf("partial GitHub App configuration error = %v", err)
+	}
+
+	t.Setenv("GITHUB_APP_INSTALLATION_ID", "456")
+	t.Setenv("GITHUB_APP_ORGANIZATION", "ai-worksflow")
+	t.Setenv("GITHUB_APP_PRIVATE_KEY_FILE", "/run/secrets/github-app.pem")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.GitHub.PlatformAppEnabled() {
+		t.Fatalf("GitHub App configuration was not enabled: %#v", cfg.GitHub)
+	}
+}
+
 func clearConfigEnvironment(t *testing.T) {
 	t.Helper()
 	keys := []string{
@@ -666,8 +840,18 @@ func clearConfigEnvironment(t *testing.T) {
 		"AI_PROVIDER", "OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_RESPONSES_URL", "OPENAI_DEFAULT_MODEL", "AI_DEFAULT_MODEL", "AI_TIMEOUT",
 		"AI_MAX_INPUT_BYTES", "AI_MAX_OUTPUT_BYTES", "AI_MAX_RETRIES", "OPENAI_ORGANIZATION", "OPENAI_PROJECT",
 		"WORKFLOW_WORKER_ENABLED", "WORKFLOW_WORKER_ID", "WORKFLOW_POLL_INTERVAL", "WORKFLOW_LEASE_DURATION",
-		"WORKFLOW_HEARTBEAT",
+		"WORKFLOW_HEARTBEAT", "WORKFLOW_PROFILE_V3_RUNTIME_ENABLED",
+		"WORKFLOW_QUALIFICATION_ACTIVATION_WORKER_ENABLED", "WORKFLOW_INPUT_AUTHORITY_OPERATOR_POSTGRES_DSN",
+		"WORKFLOW_QUALIFICATION_ACTIVATION_MAX_TRANSACTION_RETRIES",
+		"WORKFLOW_INPUT_AUTHORITY_OPERATOR_POSTGRES_MAX_OPEN_CONNS",
+		"WORKFLOW_INPUT_AUTHORITY_OPERATOR_POSTGRES_MAX_IDLE_CONNS",
+		"QUALIFICATION_RELEASE_PUBLISHER_ENABLED", "QUALIFICATION_RELEASE_POSTGRES_DSN",
+		"QUALIFICATION_RELEASE_WORKER_ID", "QUALIFICATION_RELEASE_WORKER_CONCURRENCY",
+		"QUALIFICATION_RELEASE_SCHEDULER_POLL_INTERVAL", "QUALIFICATION_RELEASE_CONTROLLER_POLL_INTERVAL",
+		"QUALIFICATION_RELEASE_LEASE_DURATION", "QUALIFICATION_RELEASE_MAX_TRANSACTION_RETRIES",
+		"QUALIFICATION_RELEASE_POSTGRES_MAX_OPEN_CONNS", "QUALIFICATION_RELEASE_POSTGRES_MAX_IDLE_CONNS",
 		"PLATFORM_ENCRYPTION_KEY", "GITHUB_API_BASE_URL", "GITHUB_REQUEST_TIMEOUT", "GITHUB_CREDENTIAL_TTL", "GITHUB_REDIS_PREFIX",
+		"GITHUB_APP_ID", "GITHUB_APP_INSTALLATION_ID", "GITHUB_APP_ORGANIZATION", "GITHUB_APP_PRIVATE_KEY_FILE",
 		"TEMPLATE_SOURCE_GIT_BINARY", "TEMPLATE_SOURCE_CACHE_ROOT", "TEMPLATE_SOURCE_ALLOWED_HOSTS", "TEMPLATE_SOURCE_FETCH_TIMEOUT",
 		"REPOSITORY_SEARCH_INDEX_MAX_TREES", "REPOSITORY_SEARCH_INDEX_MAX_SOURCE_BYTES",
 		"REPOSITORY_SEARCH_INDEX_MAX_ACTIVE_BUILDS", "REPOSITORY_SEARCH_RATE_REDIS_PREFIX",

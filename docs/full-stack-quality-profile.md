@@ -1,8 +1,8 @@
 # Worksflow Full-stack Quality Profile 与 VerificationReceipt 实施规格
 
-版本：v0.1
+版本：v0.2
 
-日期：2026-07-18
+日期：2026-07-23
 
 状态：实施基线草案；Candidate/Canonical/Release 平台边界已分期落地，尚未构成 Stage 3/4 外部退出证据
 

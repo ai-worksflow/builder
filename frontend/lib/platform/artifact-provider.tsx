@@ -31,6 +31,7 @@ import {
   createEmptyPageSpecContent,
   createEmptyPrototypeContent,
   mergeArtifactWorkspaceProposalApply,
+  normalizeDocumentContent,
   replaceArtifactWorkspaceSnapshotResource,
   type ArtifactDetails,
   type CreateArtifactProposalInput,
@@ -794,8 +795,10 @@ function projectSnapshotAsLegacy(
 }
 
 function documentAsLegacy(resource: VersionedArtifactDto<DocumentContentDto>): TeamDocument {
-  const content = resource.draft?.content ?? resource.latestRevision?.content
-    ?? createEmptyDocumentContent('requirement')
+  const content = normalizeDocumentContent(
+    resource.draft?.content ?? resource.latestRevision?.content
+      ?? createEmptyDocumentContent('requirement'),
+  )
   return {
     id: resource.artifact.id,
     projectId: resource.artifact.projectId,

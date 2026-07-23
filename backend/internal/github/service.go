@@ -25,6 +25,7 @@ type Authorizer interface {
 type Client interface {
 	AuthenticatedUser(context.Context, string) (User, error)
 	Repositories(context.Context, string) ([]Repository, error)
+	CreateRepository(context.Context, string, RepositoryCreateOptions) (Repository, error)
 	Branches(context.Context, string, string, string) ([]Branch, error)
 	Reference(context.Context, string, string, string, string) (gitReference, error)
 	Commit(context.Context, string, string, string, string) (gitCommit, error)
@@ -41,6 +42,7 @@ type Client interface {
 type Service struct {
 	api      Client
 	store    CredentialStore
+	platform PlatformCredentialProvider
 	access   Authorizer
 	database *gorm.DB
 	logger   *slog.Logger
@@ -48,15 +50,20 @@ type Service struct {
 	now      func() time.Time
 }
 
-func NewService(api Client, store CredentialStore, access Authorizer, database *gorm.DB, logger *slog.Logger, ttl time.Duration) (*Service, error) {
-	if api == nil || store == nil || access == nil || database == nil || logger == nil || ttl <= 0 || ttl > 7*24*time.Hour {
+func NewService(api Client, store CredentialStore, access Authorizer, database *gorm.DB, logger *slog.Logger, ttl time.Duration, platform ...PlatformCredentialProvider) (*Service, error) {
+	if api == nil || store == nil || access == nil || database == nil || logger == nil || ttl <= 0 || ttl > 90*24*time.Hour ||
+		len(platform) > 1 || (len(platform) == 1 && platform[0] == nil) {
 		return nil, errors.New("GitHub API, credential store, access, database, logger and bounded TTL are required")
 	}
-	return &Service{api: api, store: store, access: access, database: database, logger: logger, ttl: ttl, now: time.Now}, nil
+	var platformCredential PlatformCredentialProvider
+	if len(platform) == 1 {
+		platformCredential = platform[0]
+	}
+	return &Service{api: api, store: store, platform: platformCredential, access: access, database: database, logger: logger, ttl: ttl, now: time.Now}, nil
 }
 
 func (s *Service) Connect(ctx context.Context, projectID, actorID, token string) (ConnectionStatus, error) {
-	if _, err := s.access.Authorize(ctx, projectID, actorID, core.ActionAdmin); err != nil {
+	if _, err := s.access.Authorize(ctx, projectID, actorID, core.ActionView); err != nil {
 		return ConnectionStatus{}, err
 	}
 	validated, err := validateToken(token)
@@ -76,7 +83,7 @@ func (s *Service) Connect(ctx context.Context, projectID, actorID, token string)
 		_ = s.store.Delete(context.WithoutCancel(ctx), actorID, projectID)
 		return ConnectionStatus{}, err
 	}
-	return ConnectionStatus{Connected: true, Source: "session", User: &user, ExpiresAt: &expires}, nil
+	return ConnectionStatus{Connected: true, Source: "user", User: &user, ExpiresAt: &expires}, nil
 }
 
 func (s *Service) Disconnect(ctx context.Context, projectID, actorID string) (ConnectionStatus, error) {
@@ -89,12 +96,18 @@ func (s *Service) Disconnect(ctx context.Context, projectID, actorID string) (Co
 	if err := s.record(ctx, projectID, actorID, "github.disconnected", nil); err != nil {
 		return ConnectionStatus{}, err
 	}
+	if s.platform != nil {
+		return s.platformStatus(ctx)
+	}
 	return ConnectionStatus{Connected: false}, nil
 }
 
 func (s *Service) Status(ctx context.Context, projectID, actorID string) (ConnectionStatus, error) {
 	if _, err := s.access.Authorize(ctx, projectID, actorID, core.ActionView); err != nil {
 		return ConnectionStatus{}, err
+	}
+	if s.platform != nil {
+		return s.platformStatus(ctx)
 	}
 	credential, err := s.store.Get(ctx, actorID, projectID)
 	if errors.Is(err, ErrCredentialNotFound) {
@@ -103,7 +116,48 @@ func (s *Service) Status(ctx context.Context, projectID, actorID string) (Connec
 	if err != nil {
 		return ConnectionStatus{}, err
 	}
-	return ConnectionStatus{Connected: true, Source: "session", User: &credential.User, ExpiresAt: &credential.ExpiresAt}, nil
+	return ConnectionStatus{Connected: true, Source: "user", User: &credential.User, ExpiresAt: &credential.ExpiresAt}, nil
+}
+
+func (s *Service) platformStatus(ctx context.Context) (ConnectionStatus, error) {
+	_, expiresAt, err := s.platform.Token(ctx)
+	if err != nil {
+		return ConnectionStatus{}, err
+	}
+	return ConnectionStatus{
+		Connected: true, Source: "platform", Organization: s.platform.Organization(), ExpiresAt: &expiresAt,
+	}, nil
+}
+
+type resolvedCredential struct {
+	Token        string
+	Organization string
+	UserLogin    string
+	Platform     bool
+}
+
+func (s *Service) resolveCredential(
+	ctx context.Context,
+	projectID, actorID string,
+	action core.Action,
+	owner string,
+) (resolvedCredential, error) {
+	if _, err := s.access.Authorize(ctx, projectID, actorID, action); err != nil {
+		return resolvedCredential{}, err
+	}
+	owner = strings.TrimSpace(owner)
+	if s.platform != nil && (owner == "" || strings.EqualFold(owner, s.platform.Organization())) {
+		token, _, err := s.platform.Token(ctx)
+		if err != nil {
+			return resolvedCredential{}, err
+		}
+		return resolvedCredential{Token: token, Organization: s.platform.Organization(), Platform: true}, nil
+	}
+	credential, err := s.store.Get(ctx, actorID, projectID)
+	if errors.Is(err, ErrCredentialNotFound) {
+		return resolvedCredential{}, &Error{Code: "authentication_required", Status: 401, Detail: "Connect GitHub before continuing"}
+	}
+	return resolvedCredential{Token: credential.Token, UserLogin: credential.User.Login}, err
 }
 
 func (s *Service) credential(ctx context.Context, projectID, actorID string, action core.Action) (Credential, error) {
@@ -118,14 +172,86 @@ func (s *Service) credential(ctx context.Context, projectID, actorID string, act
 }
 
 func (s *Service) Repositories(ctx context.Context, projectID, actorID string) ([]Repository, error) {
-	credential, err := s.credential(ctx, projectID, actorID, core.ActionView)
+	credential, err := s.resolveCredential(ctx, projectID, actorID, core.ActionView, "")
 	if err != nil {
 		return nil, err
 	}
+	if credential.Platform {
+		if client, ok := s.api.(interface {
+			InstallationRepositories(context.Context, string) ([]Repository, error)
+		}); ok {
+			return client.InstallationRepositories(ctx, credential.Token)
+		}
+	}
 	return s.api.Repositories(ctx, credential.Token)
 }
+
+func (s *Service) CreateRepository(ctx context.Context, projectID, actorID string, input CreateRepositoryInput) (CreateRepositoryResult, error) {
+	credential, err := s.resolveCredential(ctx, projectID, actorID, core.ActionPublish, input.Owner)
+	if err != nil {
+		return CreateRepositoryResult{}, err
+	}
+	if !input.Confirm {
+		return CreateRepositoryResult{}, &Error{Code: "confirmation_required", Status: 428, Detail: "confirm must be true before GitHub can create a repository"}
+	}
+	if input.Name, err = validateRepositoryPart(input.Name, "name"); err != nil {
+		return CreateRepositoryResult{}, err
+	}
+	input.Owner = strings.TrimSpace(input.Owner)
+	endpointOwner := input.Owner
+	if credential.Platform {
+		input.Owner, endpointOwner = credential.Organization, credential.Organization
+	} else if input.Owner == "" || strings.EqualFold(input.Owner, credential.UserLogin) {
+		input.Owner, endpointOwner = credential.UserLogin, ""
+	} else if input.Owner, err = validateRepositoryPart(input.Owner, "owner"); err != nil {
+		return CreateRepositoryResult{}, err
+	} else {
+		endpointOwner = input.Owner
+	}
+	input.Description = strings.TrimSpace(input.Description)
+	if len(input.Description) > 350 || containsCredential(input.Description) {
+		return CreateRepositoryResult{}, invalid("description must contain at most 350 safe characters")
+	}
+	input.CommitMessage = strings.TrimSpace(input.CommitMessage)
+	if input.CommitMessage == "" || len(input.CommitMessage) > 500 || containsCredential(input.CommitMessage) {
+		return CreateRepositoryResult{}, invalid("commitMessage must contain 1 to 500 safe characters")
+	}
+	input.Files, err = validateFiles(input.Files)
+	if err != nil {
+		return CreateRepositoryResult{}, err
+	}
+	repository, err := s.api.CreateRepository(ctx, credential.Token, RepositoryCreateOptions{
+		Owner: endpointOwner, Name: input.Name, Description: input.Description, Private: input.Private,
+	})
+	if err != nil {
+		return CreateRepositoryResult{}, err
+	}
+	if !strings.EqualFold(repository.Owner, input.Owner) || !strings.EqualFold(repository.Name, input.Name) {
+		return CreateRepositoryResult{}, upstream("upstream_error", 502, "GitHub created an unexpected repository", nil)
+	}
+	if err := s.record(ctx, projectID, actorID, "github.repository_created", map[string]any{
+		"repository": repository.FullName, "private": repository.Private, "url": repository.HTMLURL,
+	}); err != nil {
+		s.logger.Error("GitHub repository creation succeeded but audit persistence failed", "error", err, "project_id", projectID, "repository", repository.FullName)
+	}
+	push, err := s.Push(ctx, projectID, actorID, PushInput{
+		PreviewInput: PreviewInput{
+			Owner: repository.Owner, Repo: repository.Name, Branch: repository.DefaultBranch, Files: input.Files,
+		},
+		Message: input.CommitMessage, Confirm: true,
+	})
+	if err != nil {
+		return CreateRepositoryResult{}, &Error{
+			Code: "repository_initialization_failed", Status: 502,
+			Detail: "GitHub created " + repository.FullName + " but the generated code could not be initialized; select the repository and retry the push",
+			Cause:  err,
+		}
+	}
+	return CreateRepositoryResult{Repository: repository, CommitSHA: push.CommitSHA, CommitURL: push.CommitURL}, nil
+}
+
 func (s *Service) Branches(ctx context.Context, projectID, actorID, owner, repo string) ([]Branch, error) {
-	credential, err := s.credential(ctx, projectID, actorID, core.ActionView)
+	credential, err := s.resolveCredential(ctx, projectID, actorID, core.ActionView, owner)
 	if err != nil {
 		return nil, err
 	}
@@ -140,7 +266,7 @@ func (s *Service) Branches(ctx context.Context, projectID, actorID, owner, repo 
 	return s.api.Branches(ctx, credential.Token, owner, repo)
 }
 func (s *Service) Preview(ctx context.Context, projectID, actorID string, input PreviewInput) (ChangesPreview, error) {
-	credential, err := s.credential(ctx, projectID, actorID, core.ActionView)
+	credential, err := s.resolveCredential(ctx, projectID, actorID, core.ActionView, input.Owner)
 	if err != nil {
 		return ChangesPreview{}, err
 	}
@@ -220,7 +346,7 @@ func (s *Service) buildPreview(ctx context.Context, token string, input PreviewI
 }
 
 func (s *Service) Push(ctx context.Context, projectID, actorID string, input PushInput) (PushResult, error) {
-	credential, err := s.credential(ctx, projectID, actorID, core.ActionPublish)
+	credential, err := s.resolveCredential(ctx, projectID, actorID, core.ActionPublish, input.Owner)
 	if err != nil {
 		return PushResult{}, err
 	}
@@ -308,7 +434,7 @@ func (s *Service) Push(ctx context.Context, projectID, actorID string, input Pus
 }
 
 func (s *Service) CreatePullRequest(ctx context.Context, projectID, actorID string, input PullRequestInput) (PullRequestResult, error) {
-	credential, err := s.credential(ctx, projectID, actorID, core.ActionPublish)
+	credential, err := s.resolveCredential(ctx, projectID, actorID, core.ActionPublish, input.Owner)
 	if err != nil {
 		return PullRequestResult{}, err
 	}

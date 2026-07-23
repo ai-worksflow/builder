@@ -16,6 +16,8 @@ import {
   normalizeAgentPlatformPatch,
   normalizeAgentStructuredResult,
   normalizeAgentTaskAttemptResult,
+  normalizeAgentTaskGraph,
+  normalizeAgentTaskGraphAdvanceResult,
   AgentContractError,
   type AgentAttemptDto,
   type AgentAttemptEventDto,
@@ -28,10 +30,17 @@ import {
   type AgentPlatformPatchDto,
   type AgentStructuredResultDto,
   type AgentTaskAttemptResultDto,
+  type AgentTaskGraphAdvanceResultDto,
+  type AgentTaskGraphDto,
 } from './agent-contract'
 
 export interface AgentCreateAttemptInput {
   readonly taskKey: string
+  readonly instruction: string
+  readonly executorProfile: string
+}
+
+export interface AgentAdvanceTaskGraphInput {
   readonly instruction: string
   readonly executorProfile: string
 }
@@ -351,6 +360,46 @@ export class AgentClient {
       normalized.data.attempt.sandboxSessionId === sessionId,
       result,
       'The Agent attempt response does not belong to the requested SandboxSession.',
+    )
+    return normalized
+  }
+
+  async getTaskGraph(
+    sessionId: string,
+    options?: ClientRequestOptions,
+  ): Promise<HttpResult<AgentTaskGraphDto>> {
+    const result = await this.http.get<unknown>(
+      `/v1/sandbox-sessions/${segment(sessionId)}/agent-task-graph`,
+      requestOptions(options),
+    )
+    const normalized = normalizedResult(result, normalizeAgentTaskGraph)
+    exactIdentity(
+      normalized.data.sandboxSessionId === sessionId,
+      result,
+      'The Agent task graph does not belong to the requested SandboxSession.',
+    )
+    return normalized
+  }
+
+  async advanceTaskGraph(
+    sessionId: string,
+    input: AgentAdvanceTaskGraphInput,
+    options?: ClientMutationOptions,
+  ): Promise<HttpResult<AgentTaskGraphAdvanceResultDto>> {
+    const result = await this.http.post<unknown, AgentAdvanceTaskGraphInput>(
+      `/v1/sandbox-sessions/${segment(sessionId)}/agent-task-graph/advance`,
+      input,
+      {
+        signal: options?.signal,
+        requestId: options?.requestId,
+        idempotencyKey: options?.idempotencyKey ?? true,
+      },
+    )
+    const normalized = normalizedResult(result, normalizeAgentTaskGraphAdvanceResult)
+    exactIdentity(
+      normalized.data.graph.sandboxSessionId === sessionId,
+      result,
+      'The advanced Agent task graph does not belong to the requested SandboxSession.',
     )
     return normalized
   }

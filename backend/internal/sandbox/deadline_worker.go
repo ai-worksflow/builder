@@ -23,7 +23,6 @@ type deadlineSessionStore interface {
 
 type deadlineCandidateStore interface {
 	Get(context.Context, string, string) (repository.CandidateMutationRecord, error)
-	CreateCheckpoint(context.Context, repository.CreateCheckpointInput) (repository.CandidateSnapshot, error)
 }
 
 type deadlineController interface {
@@ -110,6 +109,21 @@ func (worker *DeadlineWorker) process(ctx context.Context, lease DeadlineLease) 
 	if action != lease.Action {
 		return fmt.Errorf("%w: claimed %s but exact Session now requires %s", ErrDeadlineLeaseLost, lease.Action, action)
 	}
+	// Absolute TTL owns only the disposable Sandbox runtime boundary. The
+	// Candidate tree is durable independently of a SandboxSession, so expiry
+	// must not acquire an editor lease, create a checkpoint, or wait for a
+	// Candidate projection reconciliation. Doing so would couple resource
+	// cleanup to an expired user writer lease and could retry forever.
+	if action == DeadlineTerminate {
+		_, err = worker.control.terminateDeadline(ctx, TerminateSessionInput{
+			SessionControlInput: SessionControlInput{
+				ProjectID: view.ProjectID, SessionID: view.ID, ActorID: SandboxLifecycleWorkerActorID,
+				ExpectedSessionVersion: view.Version, ExpectedSessionEpoch: view.SessionEpoch,
+			},
+			Reason: "SandboxSession absolute TTL elapsed; the durable Candidate is retained independently",
+		})
+		return err
+	}
 
 	record, err := worker.candidates.Get(ctx, view.ProjectID, view.Candidate.ID)
 	if err != nil {
@@ -121,43 +135,14 @@ func (worker *DeadlineWorker) process(ctx context.Context, lease DeadlineLease) 
 		}
 		// A concurrently committed Candidate mutation is activity. Reconcile it
 		// under CAS, then let the newly extended idle deadline win this cycle.
-		_, err := worker.sessions.SyncCandidate(
+		_, syncErr := worker.sessions.SyncCandidate(
 			ctx, view.ProjectID, view.ID, view.Version, view.SessionEpoch,
 			SandboxLifecycleWorkerActorID,
 		)
-		return err
-	}
-
-	if record.Candidate.Status == repository.CandidateActive && record.Candidate.Dirty && !exactCheckpointForView(view) {
-		if view.State != StateReady {
-			return ErrCheckpointRequired
+		if syncErr != nil {
+			return syncErr
 		}
-		checkpointID := worker.newID()
-		if !validUUID(checkpointID) {
-			return fmt.Errorf("%w: generated lifecycle checkpoint ID", ErrDeadlineWorkerInvalid)
-		}
-		checkpoint, checkpointErr := worker.candidates.CreateCheckpoint(ctx, repository.CreateCheckpointInput{
-			ID: checkpointID, ProjectID: view.ProjectID, CandidateID: record.Candidate.ID,
-			ExpectedCandidateVersion: record.Candidate.Version,
-			ExpectedSessionEpoch:     record.Candidate.SessionEpoch,
-			ExpectedWriterLeaseEpoch: record.Candidate.WriterLeaseEpoch,
-			ActorID:                  SandboxLifecycleWorkerActorID,
-			Reason:                   "automatic checkpoint before SandboxSession TTL lifecycle action",
-		})
-		if checkpointErr != nil {
-			return checkpointErr
-		}
-		attached, attachErr := worker.sessions.AttachCheckpoint(
-			ctx, view.ProjectID, view.ID, view.Version, view.SessionEpoch,
-			SandboxLifecycleWorkerActorID, checkpoint.ID,
-		)
-		if attachErr != nil {
-			return attachErr
-		}
-		view = attached.Snapshot()
-		if !exactCheckpointForView(view) {
-			return ErrCheckpointMismatch
-		}
+		return nil
 	}
 
 	control := SessionControlInput{
@@ -172,11 +157,7 @@ func (worker *DeadlineWorker) process(ctx context.Context, lease DeadlineLease) 
 		_, err = worker.control.suspendDeadline(ctx, control)
 		return err
 	}
-	_, err = worker.control.terminateDeadline(ctx, TerminateSessionInput{
-		SessionControlInput: control,
-		Reason:              "SandboxSession absolute TTL elapsed after preserving the exact Candidate",
-	})
-	return err
+	return fmt.Errorf("%w: unsupported lifecycle deadline action %s", ErrDeadlineWorkerInvalid, action)
 }
 
 func deadlineActionAt(view SessionView, observedAt time.Time) (DeadlineAction, bool) {

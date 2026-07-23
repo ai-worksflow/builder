@@ -89,7 +89,9 @@ func TestQualificationReceiptV3StoreMigrationIsSnapshotFirstImmutableAndOwnerOnl
 		}
 	}
 	assertQualificationReceiptV3LockOrder(t, upText, "SHARE ROW EXCLUSIVE")
-	assertQualificationReceiptV3LockOrder(t, string(down), "ACCESS EXCLUSIVE")
+	downText := string(down)
+	assertQualificationRollbackFencePrecedesRelations(t, downText)
+	assertQualificationReceiptV3LockOrder(t, downText, "ACCESS EXCLUSIVE")
 	for _, required := range []string{
 		"IF EXISTS (SELECT 1 FROM qualification_receipt_v3_requests)",
 		"OR EXISTS (SELECT 1 FROM qualification_receipt_v3_observations)",
@@ -101,7 +103,7 @@ func TestQualificationReceiptV3StoreMigrationIsSnapshotFirstImmutableAndOwnerOnl
 		"DROP TABLE IF EXISTS qualification_receipt_v3_observations",
 		"DROP TABLE IF EXISTS qualification_receipt_v3_requests",
 	} {
-		if !strings.Contains(string(down), required) {
+		if !strings.Contains(downText, required) {
 			t.Fatalf("Qualification Receipt v3 rollback is missing %q", required)
 		}
 	}
@@ -487,19 +489,127 @@ SELECT
 		qualificationReceiptV3Observation(t, driftSeal, 1, 1, "pending", nil, nil, nil, nil))
 	driftQualificationReceiptV3EvidenceHead(t, ctx, database, driftFixture, driftIndexed)
 	driftResult := qualificationReceiptV3Canonical(t, map[string]any{
-		"artifactIndexDigest": driftIndexed.indexDigest,
-		"authorityId": driftSeal.documentValue["operationalAuthorityId"],
+		"artifactIndexDigest":   driftIndexed.indexDigest,
+		"authorityId":           driftSeal.documentValue["operationalAuthorityId"],
 		"evidenceClosureDigest": driftIndexed.closureDigest, "mode": "immutable-filesystem",
 		"operationId": driftSeal.documentValue["operationId"], "requestDigest": driftSeal.material.hash,
-		"schemaVersion": "worksflow-qualification-pre-receipt-snapshot/v3",
-		"sealedAt": qualificationReceiptV3Time(time.Now()),
+		"schemaVersion":  "worksflow-qualification-pre-receipt-snapshot/v3",
+		"sealedAt":       qualificationReceiptV3Time(time.Now()),
 		"snapshotDigest": qualificationPlanMigrationDigest("drift-snapshot"),
-		"snapshotId": driftSeal.documentValue["snapshotId"], "stage": "committed",
+		"snapshotId":     driftSeal.documentValue["snapshotId"], "stage": "committed",
 	})
 	if _, err := appendQualificationReceiptV3Raw(ctx, database, qualificationReceiptV3Observation(
 		t, driftSeal, 2, 1, "committed", &driftResult, nil, nil, nil,
 	)); err == nil || !strings.Contains(err.Error(), "Evidence drifted") {
 		t.Fatalf("Evidence head drift append error = %v, want fail-closed conflict", err)
+	}
+
+	completionDriftFixture := newQualificationPlanMigrationFixture(t, qualificationPlanMigrationFixtureOptions{})
+	if err := freezeQualificationPlanMigrationFixture(ctx, database, completionDriftFixture); err != nil {
+		t.Fatalf("freeze completion-drift Plan Authority: %v", err)
+	}
+	completionDriftIndexed := seedQualificationReceiptV3IndexedEvidence(
+		t, ctx, database, completionDriftFixture,
+	)
+	completionDriftSeal := qualificationReceiptV3Request(
+		t, completionDriftFixture, completionDriftIndexed,
+		"snapshot-seal", "sealer", "", "", "", nil, "", nil,
+	)
+	if created, err := startQualificationReceiptV3(
+		ctx, database, completionDriftSeal, qualificationPlanMigrationMaterial{}, nil, nil,
+	); err != nil || !created {
+		t.Fatalf("start completion-drift seal created=%t error=%v", created, err)
+	}
+	appendQualificationReceiptV3(t, ctx, database, qualificationReceiptV3Observation(
+		t, completionDriftSeal, 1, 1, "pending", nil, nil, nil, nil,
+	))
+	completionDriftSnapshotDigest := qualificationPlanMigrationDigest("completion-drift-snapshot")
+	completionDriftSealResult := qualificationReceiptV3Canonical(t, map[string]any{
+		"artifactIndexDigest":   completionDriftIndexed.indexDigest,
+		"authorityId":           completionDriftSeal.documentValue["operationalAuthorityId"],
+		"evidenceClosureDigest": completionDriftIndexed.closureDigest,
+		"mode":                  "immutable-filesystem",
+		"operationId":           completionDriftSeal.documentValue["operationId"],
+		"requestDigest":         completionDriftSeal.material.hash,
+		"schemaVersion":         "worksflow-qualification-pre-receipt-snapshot/v3",
+		"sealedAt":              qualificationReceiptV3Time(time.Now()),
+		"snapshotDigest":        completionDriftSnapshotDigest,
+		"snapshotId":            completionDriftSeal.documentValue["snapshotId"],
+		"stage":                 "committed",
+	})
+	completionDriftSealRecord := appendQualificationReceiptV3(t, ctx, database,
+		qualificationReceiptV3Observation(
+			t, completionDriftSeal, 2, 1, "committed", &completionDriftSealResult, nil, nil, nil,
+		))
+	completionDriftVerification := qualificationReceiptV3Request(
+		t, completionDriftFixture, completionDriftIndexed,
+		"snapshot-verify", "verifier", completionDriftSnapshotDigest, "", "", nil, "", nil,
+	)
+	if created, err := startQualificationReceiptV3(
+		ctx, database, completionDriftVerification, qualificationPlanMigrationMaterial{}, nil, nil,
+	); err != nil || !created {
+		t.Fatalf("start completion-drift verification created=%t error=%v", created, err)
+	}
+	appendQualificationReceiptV3(t, ctx, database, qualificationReceiptV3Observation(
+		t, completionDriftVerification, 1, 1, "pending", nil, nil, nil, nil,
+	))
+	completionDriftVerificationResult := qualificationReceiptV3Canonical(t, map[string]any{
+		"artifactIndexDigest":   completionDriftIndexed.indexDigest,
+		"authorityId":           completionDriftVerification.documentValue["operationalAuthorityId"],
+		"evidenceClosureDigest": completionDriftIndexed.closureDigest,
+		"result":                "verified",
+		"schemaVersion":         "worksflow-qualification-snapshot-verification/v3",
+		"snapshotDigest":        completionDriftSnapshotDigest,
+		"snapshotId":            completionDriftVerification.documentValue["snapshotId"],
+		"verifiedAt":            qualificationReceiptV3Time(time.Now()),
+	})
+	completionDriftVerificationRecord := appendQualificationReceiptV3(t, ctx, database,
+		qualificationReceiptV3Observation(
+			t, completionDriftVerification, 2, 1, "committed",
+			&completionDriftVerificationResult, nil, nil, nil,
+		))
+	completionDriftPayload, completionDriftPAE := qualificationReceiptV3Payload(
+		t, completionDriftFixture, completionDriftIndexed,
+		completionDriftSealResult, completionDriftVerificationResult,
+	)
+	completionDriftRunner := qualificationReceiptV3Request(
+		t, completionDriftFixture, completionDriftIndexed, "receipt-sign", "qualification-runner",
+		completionDriftSnapshotDigest, "qualification-receipt", "runner-key",
+		completionDriftPayload.bytes, completionDriftPAE.hash, completionDriftPAE.bytes,
+	)
+	completionDriftApprover := qualificationReceiptV3Request(
+		t, completionDriftFixture, completionDriftIndexed, "receipt-sign", "release-approver",
+		completionDriftSnapshotDigest, "qualification-receipt", "approver-key",
+		completionDriftPayload.bytes, completionDriftPAE.hash, completionDriftPAE.bytes,
+	)
+	if created, err := startQualificationReceiptV3(
+		ctx, database, completionDriftRunner, completionDriftApprover.material,
+		completionDriftPayload.bytes, completionDriftPAE.bytes,
+	); err != nil || !created {
+		t.Fatalf("start completion-drift signing created=%t error=%v", created, err)
+	}
+	completionDriftRunnerRecord := qualificationReceiptV3CommitSigner(
+		t, ctx, database, completionDriftRunner, bytes.Repeat([]byte{0x63}, 64),
+	)
+	completionDriftApproverRecord := qualificationReceiptV3CommitSigner(
+		t, ctx, database, completionDriftApprover, bytes.Repeat([]byte{0x74}, 64),
+	)
+	completionDriftEnvelope := qualificationReceiptV3Envelope(
+		t, completionDriftPayload.bytes, completionDriftRunner, completionDriftRunnerRecord,
+		completionDriftApprover, completionDriftApproverRecord,
+	)
+	driftQualificationReceiptV3EvidenceHead(
+		t, ctx, database, completionDriftFixture, completionDriftIndexed,
+	)
+	if _, err := completeQualificationReceiptV3Raw(
+		ctx, database, completionDriftFixture,
+		completionDriftSeal, completionDriftSealRecord,
+		completionDriftVerification, completionDriftVerificationRecord,
+		completionDriftRunner, completionDriftRunnerRecord,
+		completionDriftApprover, completionDriftApproverRecord,
+		completionDriftPayload, completionDriftPAE, completionDriftEnvelope,
+	); err == nil || !strings.Contains(err.Error(), "current indexed Evidence drifted") {
+		t.Fatalf("completion-time Evidence drift error = %v, want fail-closed conflict", err)
 	}
 
 	late := qualificationReceiptV3Observation(t, runner, 3, 2, "pending", nil, nil, nil, nil)
@@ -526,6 +636,273 @@ SELECT
 		!strings.Contains(err.Error(), "immutable control state is nonempty") {
 		t.Fatalf("nonempty Receipt v3 rollback error = %v, want refusal", err)
 	}
+}
+
+func TestQualificationReceiptV3StoreMigrationRejectsPlanLinkedV1TailUpgrade(t *testing.T) {
+	ctx, base, dsn := qualificationReceiptV3Postgres(t)
+	database := qualificationPlanMigrationDatabase(t, ctx, base, dsn, "qualification_receipt_v3_upgrade_")
+	applyQualificationReceiptV3Migrations(t, ctx, database, false)
+	fixture := newQualificationPlanMigrationFixture(t, qualificationPlanMigrationFixtureOptions{})
+	if err := freezeQualificationPlanMigrationFixture(ctx, database, fixture); err != nil {
+		t.Fatal(err)
+	}
+	if err := insertQualificationReceiptV3LegacyTail(ctx, database, fixture, "snapshot-sealed"); err != nil {
+		t.Fatalf("seed Plan-linked v1 Receipt tail: %v", err)
+	}
+	up, err := files.ReadFile("000075_qualification_receipt_v3_store.up.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.ExecContext(ctx, string(up)); err == nil ||
+		!strings.Contains(err.Error(), "cannot activate Qualification Receipt v3") {
+		t.Fatalf("Plan-linked v1 tail activation error = %v, want fail-closed refusal", err)
+	}
+	var activationRolledBack bool
+	if err := database.QueryRowContext(ctx, `
+SELECT pg_catalog.to_regclass(
+  pg_catalog.current_schema() || '.qualification_receipt_v3_requests'
+) IS NULL
+`).Scan(&activationRolledBack); err != nil {
+		t.Fatal(err)
+	}
+	if !activationRolledBack {
+		t.Fatal("failed Receipt v3 activation left partially installed control tables")
+	}
+}
+
+func TestQualificationReceiptV3RollbackWriterFencingPostgres(t *testing.T) {
+	ctx, base, dsn := qualificationReceiptV3Postgres(t)
+	down, err := files.ReadFile("000075_qualification_receipt_v3_store.down.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("writer commits before waiting rollback observes nonempty state", func(t *testing.T) {
+		database := qualificationPlanMigrationDatabase(t, ctx, base, dsn, "qualification_receipt_v3_writer_first_")
+		applyQualificationReceiptV3Migrations(t, ctx, database, true)
+		fixture := newQualificationPlanMigrationFixture(t, qualificationPlanMigrationFixtureOptions{})
+		if err := freezeQualificationPlanMigrationFixture(ctx, database, fixture); err != nil {
+			t.Fatal(err)
+		}
+		indexed := seedQualificationReceiptV3IndexedEvidence(t, ctx, database, fixture)
+		request := qualificationReceiptV3Request(t, fixture, indexed,
+			"snapshot-seal", "sealer", "", "", "", nil, "", nil)
+
+		requestGate, err := database.BeginTx(ctx, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer requestGate.Rollback()
+		if _, err := requestGate.ExecContext(ctx,
+			`LOCK TABLE qualification_receipt_v3_requests IN ACCESS EXCLUSIVE MODE`); err != nil {
+			t.Fatal(err)
+		}
+
+		writerConnection, err := database.Conn(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer writerConnection.Close()
+		var writerPID int
+		if err := writerConnection.QueryRowContext(ctx, `SELECT pg_catalog.pg_backend_pid()`).Scan(&writerPID); err != nil {
+			t.Fatal(err)
+		}
+		writerTransaction, err := writerConnection.BeginTx(ctx, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer writerTransaction.Rollback()
+		writerLocksFinished := make(chan error, 1)
+		go func() {
+			_, lockErr := writerTransaction.ExecContext(ctx, `
+LOCK TABLE qualification_evidence_events IN SHARE ROW EXCLUSIVE MODE;
+LOCK TABLE qualification_evidence_operations IN SHARE ROW EXCLUSIVE MODE;
+LOCK TABLE qualification_evidence_heads IN SHARE ROW EXCLUSIVE MODE;
+LOCK TABLE qualification_plan_authorities IN SHARE ROW EXCLUSIVE MODE;
+LOCK TABLE qualification_plan_identity_reservations IN SHARE ROW EXCLUSIVE MODE;
+LOCK TABLE qualification_receipt_v3_requests IN SHARE ROW EXCLUSIVE MODE;
+LOCK TABLE qualification_receipt_v3_observations IN SHARE ROW EXCLUSIVE MODE;
+LOCK TABLE qualification_receipt_v3_receipts IN SHARE ROW EXCLUSIVE MODE;
+`)
+			writerLocksFinished <- lockErr
+		}()
+		lockCtx, lockCancel := context.WithTimeout(ctx, 5*time.Second)
+		defer lockCancel()
+		for _, relation := range []string{
+			"qualification_evidence_events", "qualification_evidence_operations",
+			"qualification_evidence_heads", "qualification_plan_authorities",
+			"qualification_plan_identity_reservations",
+		} {
+			if err := waitForQualificationReceiptV3Lock(
+				lockCtx, database, writerPID, relation, "ShareRowExclusiveLock", true, writerLocksFinished,
+			); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := waitForQualificationReceiptV3Lock(
+			lockCtx, database, writerPID, "qualification_receipt_v3_requests",
+			"ShareRowExclusiveLock", false, writerLocksFinished,
+		); err != nil {
+			t.Fatal(err)
+		}
+
+		downConnection, err := database.Conn(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer downConnection.Close()
+		var downPID int
+		if err := downConnection.QueryRowContext(ctx, `SELECT pg_catalog.pg_backend_pid()`).Scan(&downPID); err != nil {
+			t.Fatal(err)
+		}
+		downFinished := make(chan error, 1)
+		go func() {
+			_, downErr := downConnection.ExecContext(ctx, string(down))
+			downFinished <- downErr
+		}()
+		if err := waitForQualificationReceiptV3Lock(
+			lockCtx, database, downPID, "qualification_evidence_events",
+			"AccessExclusiveLock", false, downFinished,
+		); err != nil {
+			t.Fatal(err)
+		}
+		if err := requestGate.Rollback(); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case lockErr := <-writerLocksFinished:
+			if lockErr != nil {
+				t.Fatalf("writer ordered lock batch: %v", lockErr)
+			}
+		case <-ctx.Done():
+			t.Fatalf("writer locks did not finish: %v", ctx.Err())
+		}
+		created, err := startQualificationReceiptV3(
+			ctx, writerTransaction, request, qualificationPlanMigrationMaterial{}, nil, nil,
+		)
+		if err != nil || !created {
+			t.Fatalf("writer start after ordered locks created=%t error=%v", created, err)
+		}
+		if err := writerTransaction.Commit(); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case downErr := <-downFinished:
+			if downErr == nil || !strings.Contains(downErr.Error(), "immutable control state is nonempty") {
+				t.Fatalf("rollback after writer commit error = %v, want nonempty refusal", downErr)
+			}
+		case <-ctx.Done():
+			t.Fatalf("rollback did not finish after writer commit: %v", ctx.Err())
+		}
+		var rows int
+		if err := database.QueryRowContext(ctx,
+			`SELECT count(*) FROM qualification_receipt_v3_requests`).Scan(&rows); err != nil {
+			t.Fatal(err)
+		}
+		if rows != 1 {
+			t.Fatalf("failed rollback retained request rows=%d, want 1", rows)
+		}
+	})
+
+	t.Run("staged empty rollback blocks writer and abort releases it", func(t *testing.T) {
+		database := qualificationPlanMigrationDatabase(t, ctx, base, dsn, "qualification_receipt_v3_down_first_")
+		applyQualificationReceiptV3Migrations(t, ctx, database, true)
+		fixture := newQualificationPlanMigrationFixture(t, qualificationPlanMigrationFixtureOptions{})
+		if err := freezeQualificationPlanMigrationFixture(ctx, database, fixture); err != nil {
+			t.Fatal(err)
+		}
+		indexed := seedQualificationReceiptV3IndexedEvidence(t, ctx, database, fixture)
+		request := qualificationReceiptV3Request(t, fixture, indexed,
+			"snapshot-seal", "sealer", "", "", "", nil, "", nil)
+
+		downConnection, err := database.Conn(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer downConnection.Close()
+		downTransaction, err := downConnection.BeginTx(ctx, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer downTransaction.Rollback()
+		if _, err := downTransaction.ExecContext(ctx, string(down)); err != nil {
+			t.Fatalf("stage empty Receipt v3 rollback: %v", err)
+		}
+
+		writerConnection, err := database.Conn(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer writerConnection.Close()
+		var writerPID int
+		if err := writerConnection.QueryRowContext(ctx, `SELECT pg_catalog.pg_backend_pid()`).Scan(&writerPID); err != nil {
+			t.Fatal(err)
+		}
+		type stagedWriterResult struct {
+			created bool
+			err     error
+		}
+		writerFinished := make(chan stagedWriterResult, 1)
+		go func() {
+			created, writerErr := startQualificationReceiptV3(
+				ctx, writerConnection, request, qualificationPlanMigrationMaterial{}, nil, nil,
+			)
+			writerFinished <- stagedWriterResult{created: created, err: writerErr}
+		}()
+		lockCtx, lockCancel := context.WithTimeout(ctx, 5*time.Second)
+		defer lockCancel()
+		writerErrors := make(chan error, 1)
+		go func() {
+			result := <-writerFinished
+			writerErrors <- result.err
+			writerFinished <- result
+		}()
+		if err := waitForQualificationReceiptV3Lock(
+			lockCtx, database, writerPID, "qualification_receipt_v3_requests",
+			"AccessShareLock", false, writerErrors,
+		); err != nil {
+			t.Fatal(err)
+		}
+		if err := downTransaction.Rollback(); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case result := <-writerFinished:
+			if result.err != nil || !result.created {
+				t.Fatalf("writer after staged rollback created=%t error=%v", result.created, result.err)
+			}
+		case <-ctx.Done():
+			t.Fatalf("writer did not finish after staged rollback abort: %v", ctx.Err())
+		}
+	})
+
+	t.Run("empty rollback removes only Receipt v3 control objects", func(t *testing.T) {
+		database := qualificationPlanMigrationDatabase(t, ctx, base, dsn, "qualification_receipt_v3_empty_down_")
+		applyQualificationReceiptV3Migrations(t, ctx, database, true)
+		if _, err := database.ExecContext(ctx, string(down)); err != nil {
+			t.Fatalf("empty Receipt v3 rollback: %v", err)
+		}
+		var removed bool
+		if err := database.QueryRowContext(ctx, `
+SELECT pg_catalog.to_regclass(
+  pg_catalog.current_schema() || '.qualification_receipt_v3_requests'
+) IS NULL
+AND pg_catalog.to_regclass(
+  pg_catalog.current_schema() || '.qualification_receipt_v3_observations'
+) IS NULL
+AND pg_catalog.to_regclass(
+  pg_catalog.current_schema() || '.qualification_receipt_v3_receipts'
+) IS NULL
+AND pg_catalog.to_regclass(
+  pg_catalog.current_schema() || '.qualification_evidence_events'
+) IS NOT NULL
+`).Scan(&removed); err != nil {
+			t.Fatal(err)
+		}
+		if !removed {
+			t.Fatal("empty rollback did not remove exactly the Receipt v3 control objects")
+		}
+	})
 }
 
 type qualificationReceiptV3Indexed struct {
@@ -567,6 +944,10 @@ type qualificationReceiptV3Completion struct {
 	idempotent     bool
 }
 
+type qualificationReceiptV3Queryer interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+}
+
 func applyQualificationReceiptV3Migrations(
 	t *testing.T,
 	ctx context.Context,
@@ -591,6 +972,35 @@ func applyQualificationReceiptV3Migrations(
 			t.Fatalf("apply %s: %v", name, err)
 		}
 	}
+}
+
+func insertQualificationReceiptV3LegacyTail(
+	ctx context.Context,
+	database *sql.DB,
+	fixture qualificationPlanMigrationFixture,
+	kind string,
+) error {
+	operations, ok := fixture.evidenceDocument["operations"].(map[string]any)
+	if !ok {
+		return fmt.Errorf("fixture operations are absent")
+	}
+	operationID, err := uuid.Parse(operations["snapshotSeal"].(string))
+	if err != nil {
+		return err
+	}
+	empty := qualificationPlanMigrationCanonicalForHelper(map[string]any{})
+	_, err = database.ExecContext(ctx, `
+INSERT INTO qualification_evidence_events (
+  event_id, orchestration_id, version, expected_version, event_kind, operation_id,
+  active_artifact_id, event_at, requested_at,
+  request_hash, request_bytes, request_document, event_hash, event_bytes, event_document
+) VALUES (
+  $1,$2,1,0,$3,$4,'',date_trunc('milliseconds',clock_timestamp()),
+  date_trunc('milliseconds',clock_timestamp()),$5,$6,$7::jsonb,$5,$6,$7::jsonb
+)
+`, uuid.New(), fixture.orchestrationID, kind, operationID,
+		empty.hash, empty.bytes, empty.document)
+	return err
 }
 
 func seedQualificationReceiptV3IndexedEvidence(
@@ -746,7 +1156,7 @@ func qualificationReceiptV3Request(
 
 func startQualificationReceiptV3(
 	ctx context.Context,
-	database *sql.DB,
+	database qualificationReceiptV3Queryer,
 	primary qualificationReceiptV3RequestFixture,
 	secondary qualificationPlanMigrationMaterial,
 	payload []byte,
@@ -975,23 +1385,23 @@ func qualificationReceiptV3RecoveryMaterials(
 	t.Helper()
 	pendingPayload := qualificationReceiptV3DecodeMap(t, pending.authPayload.document)
 	claim := qualificationReceiptV3Canonical(t, map[string]any{
-		"claimId": claimID.String(),
-		"generation": pendingPayload["generation"],
-		"kind": request.documentValue["kind"],
-		"operationId": request.documentValue["operationId"],
+		"claimId":                claimID.String(),
+		"generation":             pendingPayload["generation"],
+		"kind":                   request.documentValue["kind"],
+		"operationId":            request.documentValue["operationId"],
 		"operationalAuthorityId": request.documentValue["operationalAuthorityId"],
-		"pendingEnvelopeHash": pending.authProof.hash,
-		"planAuthorityId": request.documentValue["planAuthorityId"],
-		"requestHash": request.material.hash,
-		"role": request.documentValue["role"],
-		"schemaVersion": "worksflow-qualification-receipt-control-claim/v1",
+		"pendingEnvelopeHash":    pending.authProof.hash,
+		"planAuthorityId":        request.documentValue["planAuthorityId"],
+		"requestHash":            request.material.hash,
+		"role":                   request.documentValue["role"],
+		"schemaVersion":          "worksflow-qualification-receipt-control-claim/v1",
 	})
 	acknowledgement := qualificationReceiptV3Canonical(t, map[string]any{
 		"acknowledgementId": acknowledgementID.String(),
-		"claimTokenHash": claim.hash,
-		"requestHash": request.material.hash,
-		"schemaVersion": "worksflow-qualification-receipt-control-acknowledgement/v1",
-		"status": "not-invoked",
+		"claimTokenHash":    claim.hash,
+		"requestHash":       request.material.hash,
+		"schemaVersion":     "worksflow-qualification-receipt-control-acknowledgement/v1",
+		"status":            "not-invoked",
 	})
 	return claim, acknowledgement
 }
@@ -1012,9 +1422,9 @@ func driftQualificationReceiptV3EvidenceHead(
 	eventID := uuid.New()
 	event := qualificationReceiptV3Canonical(t, map[string]any{
 		"artifactIndex": map[string]any{
-			"contentDigest": qualificationPlanMigrationDigest("drifted-artifact-index"),
+			"contentDigest":         qualificationPlanMigrationDigest("drifted-artifact-index"),
 			"evidenceClosureDigest": qualificationPlanMigrationDigest("drifted-evidence-closure"),
-			"stage": "committed",
+			"stage":                 "committed",
 		},
 	})
 	empty := qualificationReceiptV3Canonical(t, map[string]any{})
@@ -1072,35 +1482,58 @@ func qualificationReceiptV3Payload(
 	t.Helper()
 	target := qualificationReceiptV3DecodeMap(t, fixture.target.document)
 	trust := qualificationReceiptV3DecodeMap(t, fixture.trust.document)
+	input := qualificationReceiptV3DecodeMap(t, fixture.input.document)
+	credential := qualificationReceiptV3Map(t, input, "credential")
 	outputs := qualificationReceiptV3Map(t, fixture.evidenceDocument, "outputs")
 	operations := qualificationReceiptV3Map(t, fixture.evidenceDocument, "operations")
 	snapshot := qualificationReceiptV3DecodeMap(t, sealResult.document)
 	verification := qualificationReceiptV3DecodeMap(t, verificationResult.document)
 	receipt := map[string]any{
-		"artifactIndex": map[string]any{"contentDigest": indexed.indexDigest},
-		"build":         map[string]any{},
-		"completedAt":   qualificationReceiptV3Time(time.Now()),
-		"credentialSet": map[string]any{},
-		"decision":      "qualified",
+		"artifactIndex": map[string]any{
+			"contentDigest":         indexed.indexDigest,
+			"evidenceClosureDigest": indexed.closureDigest,
+			"stage":                 "committed",
+		},
+		"build": map[string]any{
+			"contract": input["buildContract"],
+			"manifest": input["buildManifest"],
+		},
+		"completedAt": qualificationReceiptV3Time(time.Now()),
+		"credentialSet": map[string]any{
+			"audience":             credential["audience"],
+			"issuance":             map[string]any{"artifactId": credential["issuanceArtifactId"]},
+			"issuer":               credential["issuer"],
+			"memberBindingsDigest": credential["memberBindingsDigest"],
+			"memberCount":          credential["memberCount"],
+			"revocation":           map[string]any{"artifactId": credential["revocationArtifactId"]},
+			"setHandleHash":        credential["setHandleHash"],
+			"setId":                credential["setId"],
+		},
+		"decision": "qualified",
 		"evidence": map[string]any{
 			"closureDigest":   indexed.closureDigest,
 			"orchestrationId": fixture.orchestrationID.String(),
+			"runId":           fixture.evidenceDocument["runId"],
 		},
 		"evidencePlan":  fixture.evidenceDocument,
-		"goldenRuntime": map[string]any{},
+		"goldenRuntime": input["goldenRuntime"],
 		"issuedAt":      qualificationReceiptV3Time(time.Now()),
 		"operationId":   operations["receiptSign"],
 		"planAuthority": map[string]any{
+			"artifactId":          fixture.evidenceDocument["qualificationPlanArtifactId"],
 			"authorityHash":       fixture.envelope.hash,
 			"authorityId":         fixture.authorityID.String(),
 			"evidencePlanHash":    fixture.evidencePlan.hash,
+			"freezeOperationId":   fixture.operationID.String(),
+			"inputAuthorityId":    fixture.inputAuthorityID.String(),
 			"inputHash":           fixture.input.hash,
+			"planDigest":          fixture.projection.hash,
 			"projectionHash":      fixture.projection.hash,
 			"targetHash":          fixture.target.hash,
 			"trustBindingsDigest": fixture.trustBindingsDigest,
 			"trustHash":           fixture.trust.hash,
 		},
-		"qualificationManifest":  map[string]any{},
+		"qualificationManifest":  input["qualificationManifest"],
 		"qualificationStartedAt": qualificationReceiptV3Time(time.Now()),
 		"receiptId":              outputs["receiptId"],
 		"schemaVersion":          "worksflow-qualification-receipt/v3",
@@ -1116,9 +1549,9 @@ func qualificationReceiptV3Payload(
 		},
 		"snapshot":             snapshot,
 		"snapshotVerification": verification,
-		"source":               map[string]any{},
+		"source":               input["source"],
 		"target":               target,
-		"templateRelease":      map[string]any{},
+		"templateRelease":      input["templateRelease"],
 		"trust":                trust,
 	}
 	payload := qualificationReceiptV3Canonical(t, map[string]any{
@@ -1180,9 +1613,36 @@ func completeQualificationReceiptV3(
 	envelope qualificationPlanMigrationMaterial,
 ) qualificationReceiptV3Completion {
 	t.Helper()
+	completion, err := completeQualificationReceiptV3Raw(
+		ctx, database, fixture,
+		seal, sealRecord, verification, verificationRecord, runner, runnerRecord, approver, approverRecord,
+		payload, pae, envelope,
+	)
+	if err != nil {
+		t.Fatalf("complete Receipt v3: %v", err)
+	}
+	return completion
+}
+
+func completeQualificationReceiptV3Raw(
+	ctx context.Context,
+	database *sql.DB,
+	fixture qualificationPlanMigrationFixture,
+	seal qualificationReceiptV3RequestFixture,
+	sealRecord qualificationReceiptV3Record,
+	verification qualificationReceiptV3RequestFixture,
+	verificationRecord qualificationReceiptV3Record,
+	runner qualificationReceiptV3RequestFixture,
+	runnerRecord qualificationReceiptV3Record,
+	approver qualificationReceiptV3RequestFixture,
+	approverRecord qualificationReceiptV3Record,
+	payload qualificationPlanMigrationMaterial,
+	pae qualificationPlanMigrationMaterial,
+	envelope qualificationPlanMigrationMaterial,
+) (qualificationReceiptV3Completion, error) {
 	// Completion time is Store-owned and must strictly follow every source row.
 	if _, err := database.ExecContext(ctx, `SELECT pg_catalog.pg_sleep(0.002)`); err != nil {
-		t.Fatal(err)
+		return qualificationReceiptV3Completion{}, err
 	}
 	completion := qualificationReceiptV3Completion{}
 	err := database.QueryRowContext(ctx, `
@@ -1199,10 +1659,7 @@ FROM complete_qualification_receipt_v3(
 		payload.hash, payload.bytes, payload.document, pae.hash, pae.bytes,
 		envelope.hash, envelope.bytes, envelope.document, envelope.hash,
 	).Scan(&completion.receiptID, &completion.completionHash, &completion.completedAt, &completion.idempotent)
-	if err != nil {
-		t.Fatalf("complete Receipt v3: %v", err)
-	}
-	return completion
+	return completion, err
 }
 
 func qualificationReceiptV3Canonical(t *testing.T, value any) qualificationPlanMigrationMaterial {

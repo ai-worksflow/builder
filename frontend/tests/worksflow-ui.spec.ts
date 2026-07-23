@@ -1,26 +1,52 @@
 import { expect, test, type Page, type Route } from '@playwright/test'
+import { createHash } from 'node:crypto'
 import type { PrototypeContentDto } from '../lib/platform/dto'
+import {
+  REPOSITORY_SNAPSHOT_RECEIPT_SCHEMA_VERSION,
+  REPOSITORY_SNAPSHOT_RECEIPT_SUBJECT_SCHEMA_VERSION,
+  REPOSITORY_SNAPSHOT_TREE_COMMITMENT_SCHEMA_VERSION,
+  computeRepositorySnapshotContentHash,
+  type RepositorySnapshotDto,
+} from '../lib/platform/repository-contract'
 
 const now = '2026-07-10T08:00:00Z'
 const hash = (character: string) => character.repeat(64)
+const contentHash = (value: string) => `sha256:${createHash('sha256').update(value).digest('hex')}`
+const fixtureUUIDPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
+
+function fixtureId(value: string) {
+  if (fixtureUUIDPattern.test(value)) return value
+  let state = 0x811c9dc5
+  let hexadecimal = ''
+  for (let index = 0; index < 32; index += 1) {
+    const code = value.charCodeAt(index % value.length)
+    state = Math.imul(state ^ code ^ index, 0x01000193) >>> 0
+    hexadecimal += (state & 0xf).toString(16)
+  }
+  hexadecimal = `${hexadecimal.slice(0, 12)}4${hexadecimal.slice(13, 16)}8${hexadecimal.slice(17)}`
+  return `${hexadecimal.slice(0, 8)}-${hexadecimal.slice(8, 12)}-${hexadecimal.slice(12, 16)}-${hexadecimal.slice(16, 20)}-${hexadecimal.slice(20)}`
+}
+
+const primaryBuildManifestId = fixtureId('build-1')
+const primaryProposalId = fixtureId('implementation-1')
 const workflowExecutionProfile = { version: 'workflow-engine/v2', hash: 'dd247a77ce3cfa1095a575a238b93c4bd41dd991eac07e8b62ec170864470da1' }
 
 const fullStackTemplateComponents = [
   {
     role: 'web',
     mountPath: 'frontend',
-    release: { id: 'template-release-web-e2e', contentHash: hash('d'), subjectHash: hash('e') },
+    release: { id: fixtureId('template-release-web-e2e'), contentHash: hash('d'), subjectHash: hash('e') },
   },
   {
     role: 'api',
     mountPath: 'backend',
-    release: { id: 'template-release-api-e2e', contentHash: hash('7'), subjectHash: hash('8') },
+    release: { id: fixtureId('template-release-api-e2e'), contentHash: hash('7'), subjectHash: hash('8') },
   },
 ]
 
 const fullStackTemplateRegistration = {
   template: {
-    id: 'full-stack-template-e2e',
+    id: fixtureId('full-stack-template-e2e'),
     schemaVersion: 'full-stack-template/v1',
     templateId: 'react-fastapi-postgres',
     version: '1.0.0',
@@ -88,7 +114,7 @@ const project = {
 
 function readyApplicationBuildContract(buildManifestId: string) {
   return {
-    id: `build-contract-${buildManifestId}`,
+    id: fixtureId(`build-contract-${buildManifestId}`),
     projectId: project.id,
     buildManifestId,
     status: 'ready',
@@ -780,7 +806,12 @@ async function handlePlatformRoute(
   const url = new URL(request.url())
   const path = url.pathname.replace(/^\/api\/platform/, '')
   const method = request.method()
-  const body = request.postDataJSON?.() ?? undefined
+  let body: unknown
+  try {
+    body = request.postDataJSON() ?? undefined
+  } catch {
+    body = request.postData() ?? undefined
+  }
   const headers = await request.allHeaders()
   state.requests.push({ method, path, body, headers })
   if (method === 'OPTIONS') {
@@ -1090,7 +1121,9 @@ async function handlePlatformRoute(
       ? {
           ...workbenchIntentProposal(intentGeneratePath[1], input.triggerMessageId, {
             expectedRunId: 'run-selection-active',
-            expectedBundleId: options.conversationSelectedWorkbenchTarget ? 'build-root-1' : 'build-1',
+            expectedBundleId: options.conversationSelectedWorkbenchTarget
+              ? fixtureId('build-root-1')
+              : primaryBuildManifestId,
             definitionVersionId: selectionWorkflowDefinition.versionId,
           }),
           status: 'pending' as 'pending' | 'accepted' | 'rejected',
@@ -2087,18 +2120,59 @@ async function handlePlatformRoute(
     state.run = {
       ...current,
       status: 'running' as const,
+      eventCursor: current.eventCursor + 1,
       nodes: current.nodes.map((node) => node.key === 'blueprint-edit'
-        ? { ...node, status: 'completed' as const, completedAt: now }
+        ? {
+            ...node,
+            status: 'completed' as const,
+            completedAt: now,
+            allowedActions: [],
+            blockingReasons: [],
+          }
         : node),
     } as MockPlatformState['run']
     await respond(undefined, 204)
     return
   }
   if (/\/workflow-runs\/[^/]+\/approve$/.test(path) && method === 'POST') {
+    if (state.run) {
+      const input = body as { nodeKey: string }
+      state.run = {
+        ...state.run,
+        status: 'running',
+        eventCursor: state.run.eventCursor + 1,
+        nodes: state.run.nodes.map((node) => node.key === input.nodeKey
+          ? {
+              ...node,
+              status: 'completed',
+              completedAt: now,
+              allowedActions: [],
+              blockingReasons: [],
+            }
+          : node),
+      } as MockPlatformState['run']
+    }
     await route.fulfill({ status: 204, headers: corsHeaders() })
     return
   }
   if (/\/workflow-runs\/[^/]+\/retry$/.test(path) && method === 'POST') {
+    if (state.run) {
+      const input = body as { nodeKey: string }
+      state.run = {
+        ...state.run,
+        status: 'running',
+        eventCursor: state.run.eventCursor + 1,
+        nodes: state.run.nodes.map((node) => node.key === input.nodeKey
+          ? {
+              ...node,
+              status: 'ready',
+              attempt: 0,
+              allowedActions: [],
+              blockingReasons: [],
+            }
+          : node),
+      } as MockPlatformState['run']
+    }
     await route.fulfill({ status: 204, headers: corsHeaders() })
     return
   }
@@ -2147,6 +2221,7 @@ async function handlePlatformRoute(
     state.sandboxCandidate = existing ?? freshCandidateWorkspace(input.buildManifestId)
     await respond({
       candidate: state.sandboxCandidate,
+      repositorySnapshotReceipt: await repositorySnapshotReceiptFor(state.sandboxCandidate),
       created: !existing,
       recovered: Boolean(existing),
       finalizationPending: false,
@@ -2203,7 +2278,7 @@ async function handlePlatformRoute(
     state.sandboxSession = {
       ...session,
       version: session.version + 1,
-      candidate: state.sandboxCandidate,
+      candidate: sandboxCandidateState(state.sandboxCandidate),
       updatedAt: now,
     }
     await respond(
@@ -2224,7 +2299,10 @@ async function handlePlatformRoute(
     await respond(
       { session, candidate, tree: candidate.currentTree },
       200,
-      sandboxFenceHeaders(session, candidate),
+      {
+        ...sandboxFenceHeaders(session, candidate),
+        'x-candidate-tree-etag': `"candidate-tree:${candidate.id}:${candidate.currentTree.treeHash}"`,
+      },
     )
     return
   }
@@ -2249,6 +2327,85 @@ async function handlePlatformRoute(
       },
       body: freshCandidateFile,
     })
+    return
+  }
+  if (sandboxFilePath && method === 'PUT') {
+    const session = state.sandboxSession
+    const candidate = state.sandboxCandidate
+    const requestedPath = sandboxFilePath[2].split('/').map(decodeURIComponent).join('/')
+    const currentFile = candidate?.currentTree.files.find((item) => item.path === requestedPath)
+    if (!session || !candidate || session.id !== sandboxFilePath[1] || !currentFile) {
+      await respond({ title: 'File not found', status: 404 }, 404)
+      return
+    }
+    const value = request.postData() ?? ''
+    const byteSize = new TextEncoder().encode(value).byteLength
+    const savedContentHash = contentHash(value)
+    const nextTreeHash = `sha256:${hash('b')}`
+    const nextVersion = candidate.version + 1
+    const nextSequence = candidate.journalSequence + 1
+    const nextFiles = candidate.currentTree.files.map((item) => item.path === requestedPath
+      ? { ...item, contentHash: savedContentHash, byteSize }
+      : item)
+    const nextCandidate = {
+      ...candidate,
+      currentTree: { ...candidate.currentTree, treeHash: nextTreeHash, files: nextFiles },
+      version: nextVersion,
+      journalSequence: nextSequence,
+      dirty: true,
+      updatedAt: now,
+    }
+    const nextSession = {
+      ...session,
+      version: session.version + 1,
+      candidate: sandboxCandidateState(nextCandidate),
+      updatedAt: now,
+    }
+    state.sandboxCandidate = nextCandidate
+    state.sandboxSession = nextSession
+    const pointer = (treeHash: string, contentObjectHash: string) => ({
+      store: 'content',
+      ref: `tree-${treeHash.slice(-12)}`,
+      ownerId: candidate.id,
+      treeHash,
+      fileCount: candidate.currentTree.files.length,
+      byteSize: candidate.currentTree.files.reduce((total, item) => total + item.byteSize, 0),
+      contentObjectHash,
+    })
+    await respond({
+      session: nextSession,
+      mutation: {
+        recovered: false,
+        finalizationPending: false,
+        beforeTree: pointer(candidate.currentTree.treeHash, `sha256:${hash('d')}`),
+        afterTree: {
+          ...pointer(nextTreeHash, `sha256:${hash('e')}`),
+          byteSize: nextFiles.reduce((total, item) => total + item.byteSize, 0),
+        },
+        entry: {
+          candidateId: candidate.id,
+          sequence: nextSequence,
+          candidateVersionFrom: candidate.version,
+          candidateVersionTo: nextVersion,
+          sessionEpoch: candidate.sessionEpoch,
+          leaseEpoch: candidate.writerLeaseEpoch,
+          actorId: user.id,
+          attribution: 'user',
+          operation: {
+            id: headers['idempotency-key'] ?? fixtureId('sandbox-autosave-operation'),
+            kind: 'file.upsert',
+            path: requestedPath,
+            expectedHash: currentFile.contentHash,
+            contentHash: savedContentHash,
+            byteSize,
+            mode: headers['x-file-mode'] ?? currentFile.mode,
+          },
+          beforeTreeHash: candidate.currentTree.treeHash,
+          afterTreeHash: nextTreeHash,
+          createdAt: now,
+        },
+      },
+    }, 200, sandboxFenceHeaders(nextSession, nextCandidate))
     return
   }
   const sandboxProcessListPath = path.match(/^\/v1\/sandbox-sessions\/([^/]+)\/processes$/)
@@ -2400,7 +2557,7 @@ async function handlePlatformRoute(
     const updated = {
       ...proposal,
       operations: proposal.operations.map((operation) => operation.id === input.operationId
-        ? { ...operation, decision: input.decision }
+        ? { ...operation, decision: input.decision, decidedBy: user.id }
         : operation),
       status: 'ready' as const,
       version: proposal.version + 1,
@@ -2414,7 +2571,7 @@ async function handlePlatformRoute(
   const multiApplyPath = path.match(/^\/v1\/implementation-proposals\/([^/]+)\/apply$/)
   if (multi && multiApplyPath && method === 'POST') {
     const proposal = multi.proposals[multiApplyPath[1]]
-    const isHome = proposal.id === 'proposal-home'
+    const isHome = proposal.id === fixtureId('proposal-home')
     const workspace = multiApplicationRevision(isHome ? 1 : 2)
     const applied = {
       ...proposal,
@@ -2424,6 +2581,7 @@ async function handlePlatformRoute(
       })),
       status: 'applied' as const,
       version: proposal.version + 1,
+      appliedAt: now,
     }
     multi.proposals[applied.id] = applied
     multi.currentWorkspaceRevision = workspace
@@ -2448,8 +2606,9 @@ async function handlePlatformRoute(
     state.run = {
       ...multiBundleWorkflowRun(),
       status: 'completed',
+      eventCursor: multiBundleWorkflowRun().eventCursor + 1,
       nodes: multiBundleWorkflowRun().nodes.map((node) => node.type === 'workbench_build'
-        ? { ...node, status: 'completed' }
+        ? { ...node, status: 'completed', allowedActions: [], blockingReasons: [] }
         : node),
     }
     await respond(undefined, 204)
@@ -2464,8 +2623,14 @@ async function handlePlatformRoute(
     const current = state.run as ReturnType<typeof multiGroupWorkflowRun>
     state.run = {
       ...current,
+      eventCursor: current.eventCursor + 1,
       nodes: current.nodes.map((node) => node.key === input.nodeKey
-        ? { ...node, status: 'completed' as const }
+        ? {
+            ...node,
+            status: 'completed' as const,
+            allowedActions: [],
+            blockingReasons: [],
+          }
         : node),
     } as unknown as MockPlatformState['run']
     await respond(undefined, 204)
@@ -2475,16 +2640,16 @@ async function handlePlatformRoute(
     await respond(state.workbenchBundle, 201)
     return
   }
-  if (path === '/v1/build-manifests/build-1' && method === 'GET') {
+  if (path === `/v1/build-manifests/${primaryBuildManifestId}` && method === 'GET') {
     await respond(state.workbenchBundle)
     return
   }
-  if (path === '/v1/implementation-proposals/implementation-1/decisions' && method === 'POST') {
+  if (path === `/v1/implementation-proposals/${primaryProposalId}/decisions` && method === 'POST') {
     state.proposal = implementationProposal('ready', 'accepted', 2)
     await respond(state.proposal, 200, { etag: '"implementation-proposal:implementation-1:2"' })
     return
   }
-  if (path === '/v1/implementation-proposals/implementation-1/apply' && method === 'POST') {
+  if (path === `/v1/implementation-proposals/${primaryProposalId}/apply` && method === 'POST') {
     state.workspaceRevision = applicationRevision()
     state.proposal = implementationProposal('applied', 'applied', 3)
     await respond(state.workspaceRevision)
@@ -2495,7 +2660,7 @@ async function handlePlatformRoute(
     await respond(state.proposal)
     return
   }
-  if (path === '/v1/implementation-proposals/implementation-1' && method === 'GET') {
+  if (path === `/v1/implementation-proposals/${primaryProposalId}` && method === 'GET') {
     await respond(state.proposal ?? implementationProposal('open'))
     return
   }
@@ -2513,7 +2678,7 @@ test('anonymous Workbench fails closed without browser generation fallback', asy
 
   await expect(page.getByText('Sign in to use the application Workbench')).toBeVisible()
   await expect(page.getByText('Workbench does not generate from browser mock data.')).toBeVisible()
-  await expect(page.getByRole('button', { name: 'Freeze build input' })).toBeDisabled()
+  await expect(page.getByRole('button', { name: 'Lock development input' })).toBeDisabled()
 })
 
 test('incomplete manual Proposal cannot expose review or Apply controls', async ({ page }) => {
@@ -2522,56 +2687,87 @@ test('incomplete manual Proposal cannot expose review or Apply controls', async 
     ...implementationProposal('open'),
     diagnostics: [{
       code: 'missing_contract',
+      path: 'backend/openapi.yaml',
       severity: 'blocker',
       message: 'API contract is absent.',
     }],
     unimplementedItems: ['Persistence is not implemented.'],
   }
 
-  await page.goto('/workbench/planning?view=code&proposalId=implementation-1')
+  await page.goto(`/workbench/planning?view=code&proposalId=${primaryProposalId}`)
 
   const blocker = page.getByRole('alert').filter({
-    hasText: 'This immutable manual Proposal contains 2 unimplemented or blocking diagnostic item(s).',
+    hasText: 'There are 2 required issue(s) left.',
   })
   await expect(blocker).toBeVisible()
   await expect(page.getByRole('button', { name: 'Accept pending' })).toBeDisabled()
   await expect(page.getByRole('button', { name: 'Reject pending' })).toBeDisabled()
-  await expect(page.getByRole('button', { name: 'Quarantine and open Candidate' })).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Discard and return to development' })).toBeVisible()
   await expect(page.getByRole('button', { name: 'Apply accepted operations' })).toBeDisabled()
 })
 
 test('pre-verification Candidate history can only be quarantined', async ({ page }) => {
   const state = await installPlatformMock(page, { authenticated: true })
+  const candidateId = fixtureId('historical-candidate')
+  const candidateSnapshotId = fixtureId('historical-checkpoint')
+  const baseTreeHash = `sha256:${hash('1')}`
+  const treeHash = `sha256:${hash('2')}`
   state.proposal = {
     ...implementationProposal('open'),
     executionSource: 'candidate_freeze',
+    baseWorkspaceRevision: {
+      artifactId: fixtureId('historical-workspace'),
+      revisionId: fixtureId('historical-workspace-revision'),
+      contentHash: `sha256:${hash('0')}`,
+    },
     candidateSource: {
-      freezeReceiptId: 'historical-freeze',
-      repositorySnapshotId: 'historical-repository-snapshot',
-      sessionId: 'historical-session',
-      candidateId: 'historical-candidate',
-      candidateSnapshotId: 'historical-checkpoint',
+      freezeReceiptId: fixtureId('historical-freeze'),
+      repositorySnapshotId: fixtureId('historical-repository-snapshot'),
+      sessionId: fixtureId('historical-session'),
+      candidateId,
+      candidateSnapshotId,
       candidateVersion: 2,
       journalSequence: 3,
       sessionEpoch: 1,
       writerLeaseEpoch: 1,
-      baseTreeHash: hash('1'),
-      treeHash: hash('2'),
-      fullStackTemplate: { id: 'historical-template', contentHash: hash('3') },
+      baseTreeHash,
+      treeHash,
+      fullStackTemplate: {
+        id: fixtureId('historical-template'),
+        contentHash: `sha256:${hash('3')}`,
+      },
       verificationReceipt: { id: '', contentHash: '' },
     },
+    operations: [{
+      id: 'candidate-00001-aaaaaaaaaaaa',
+      kind: 'file.upsert',
+      path: 'src/index.html',
+      content: '<!doctype html><html><body><h1>Historical Candidate</h1></body></html>',
+      language: 'html',
+      mode: '100644',
+      rationale: `Freeze exact CandidateSnapshot ${candidateSnapshotId}`,
+      traceSource: [`candidate-snapshot:${candidateSnapshotId}`],
+      decision: 'pending',
+    }],
+    traceLinks: [{
+      kind: 'candidate_snapshot',
+      candidateId,
+      candidateSnapshotId,
+      baseTreeHash,
+      treeHash,
+    }],
   }
 
-  await page.goto('/workbench/planning?view=code&proposalId=implementation-1')
+  await page.goto(`/workbench/planning?view=code&proposalId=${primaryProposalId}`)
 
   const blocker = page.getByRole('alert').filter({
-    hasText: 'This historical Candidate Proposal predates the exact VerificationReceipt gate.',
+    hasText: 'This historical change has not passed the current automated checks.',
   })
   await expect(blocker).toBeVisible()
-  await expect(page.getByText('Exact frozen Candidate')).toHaveCount(0)
+  await expect(page.getByText('Automated checks passed')).toHaveCount(0)
   await expect(page.getByRole('button', { name: 'Accept pending' })).toBeDisabled()
   await expect(page.getByRole('button', { name: 'Reject pending' })).toBeDisabled()
-  await expect(page.getByRole('button', { name: 'Quarantine and open Candidate' })).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Discard and return to development' })).toBeVisible()
   await expect(page.getByRole('button', { name: 'Apply accepted operations' })).toBeDisabled()
 })
 
@@ -2697,8 +2893,60 @@ test('Workflow approval remains blocked until the exact upstream revision has ca
   )).toBe(false)
 })
 
+test('a mutation refresh supersedes an older in-flight Workflow snapshot', async ({ page }) => {
+  const state = await installPlatformMock(page, {
+    authenticated: true,
+    soloReviewRun: true,
+  })
+  await page.goto('/workbench/planning?view=preview')
+  await page.getByRole('button', { name: /run-solo-review/ }).click()
+  await expect(page.getByTestId('workflow-review-approve-solo-review')).toBeVisible()
+
+  let delayNextLoad = true
+  let staleLoadStarted = false
+  let releaseStaleLoad: (() => void) | undefined
+  const staleLoadGate = new Promise<void>((resolve) => {
+    releaseStaleLoad = resolve
+  })
+  await page.route(
+    `**/v1/projects/${project.id}/workflow-runs/run-solo-review`,
+    async (route) => {
+      if (route.request().method() !== 'GET') {
+        await route.fallback()
+        return
+      }
+      const snapshot = structuredClone(state.run)
+      if (delayNextLoad) {
+        delayNextLoad = false
+        staleLoadStarted = true
+        await staleLoadGate
+      }
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        headers: corsHeaders(),
+        body: JSON.stringify(snapshot),
+      })
+    },
+  )
+
+  await expect.poll(() => staleLoadStarted, { timeout: 6_000 }).toBe(true)
+  await page.getByTestId('solo-review-confirm-solo-review').check()
+  await page.getByPlaceholder('Review reason / requested change').fill('Reviewed the exact result locally.')
+  await page.getByTestId('workflow-review-approve-solo-review').click()
+  await expect(page.getByTestId('workflow-review-approve-solo-review')).toHaveCount(0)
+
+  releaseStaleLoad?.()
+  await expect.poll(
+    () => page.getByTestId('workflow-review-approve-solo-review').count(),
+  ).toBe(0)
+})
+
 test('Workbench deep links reject bundles and proposals from another selected project', async ({ page }) => {
   const state = await installPlatformMock(page, { authenticated: true })
+  const foreignProjectId = fixtureId('foreign-project')
+  const foreignBuildId = fixtureId('foreign-build')
+  const foreignProposalId = fixtureId('foreign-proposal')
   let foreignBundleLoads = 0
   let foreignWorkspaceArtifactLoads = 0
   const foreignWorkspaceRevision = {
@@ -2711,7 +2959,7 @@ test('Workbench deep links reject bundles and proposals from another selected pr
     id: 'historical-workspace-r1',
     artifactId: 'historical-workspace',
   }
-  await page.route('**/v1/build-manifests/foreign-build', (route) => {
+  await page.route(`**/v1/build-manifests/${foreignBuildId}`, (route) => {
     foreignBundleLoads += 1
     return route.fulfill({
       status: 200,
@@ -2719,21 +2967,25 @@ test('Workbench deep links reject bundles and proposals from another selected pr
       headers: corsHeaders(),
       body: JSON.stringify({
         ...state.workbenchBundle,
-        id: 'foreign-build',
-        rootBuildManifestId: 'foreign-build',
-        projectId: 'foreign-project',
+        id: foreignBuildId,
+        rootBuildManifestId: foreignBuildId,
+        projectId: foreignProjectId,
       }),
     })
   })
-  await page.route('**/v1/implementation-proposals/foreign-proposal', (route) => route.fulfill({
+  await page.route(`**/v1/implementation-proposals/${foreignProposalId}`, (route) => route.fulfill({
     status: 200,
     contentType: 'application/json',
     headers: corsHeaders(),
     body: JSON.stringify({
       ...implementationProposal('ready', 'accepted', 2),
-      id: 'foreign-proposal',
-      projectId: 'foreign-project',
-      buildManifestId: 'foreign-build',
+      id: foreignProposalId,
+      projectId: foreignProjectId,
+      buildManifestId: foreignBuildId,
+      applicationBuildContract: {
+        id: fixtureId(`build-contract-${foreignBuildId}`),
+        contractHash: hash('b'),
+      },
     }),
   }))
   await page.route('**/v1/revisions/foreign-workspace-r1', (route) => route.fulfill({
@@ -2781,13 +3033,13 @@ test('Workbench deep links reject bundles and proposals from another selected pr
     }),
   }))
 
-  await page.goto('/workbench/planning?view=code&bundleId=foreign-build')
+  await page.goto(`/workbench/planning?view=code&bundleId=${foreignBuildId}`)
   await expect(page.getByRole('alert').filter({ hasText: 'Workbench bundle belongs to another project.' }))
     .toBeVisible()
   expect(foreignBundleLoads).toBe(1)
 
   foreignBundleLoads = 0
-  await page.goto('/workbench/planning?view=code&proposalId=foreign-proposal')
+  await page.goto(`/workbench/planning?view=code&proposalId=${foreignProposalId}`)
   await expect(page.getByRole('alert').filter({ hasText: 'Implementation proposal belongs to another project.' }))
     .toBeVisible()
   expect(foreignBundleLoads).toBe(0)
@@ -2969,13 +3221,15 @@ test('workflow authoring ignores an older definition-version response after a ne
 
 test('an older run lineage response cannot replace the current run Workbench bundle', async ({ page }) => {
   const state = await installPlatformMock(page, { authenticated: true })
-  const runA = selectionWorkflowRun('run-race-a', 'bundle-race-a')
-  const runB = selectionWorkflowRun('run-race-b', 'bundle-race-b')
+  const bundleAId = fixtureId('bundle-race-a')
+  const bundleBId = fixtureId('bundle-race-b')
+  const runA = selectionWorkflowRun('run-race-a', bundleAId)
+  const runB = selectionWorkflowRun('run-race-b', bundleBId)
   const bundleA = {
-    ...buildManifest(runA.id), id: 'bundle-race-a', contentHash: hash('a'),
+    ...buildManifest(runA.id), id: bundleAId, contentHash: hash('a'),
   }
   const bundleB = {
-    ...buildManifest(runB.id), id: 'bundle-race-b', contentHash: hash('b'),
+    ...buildManifest(runB.id), id: bundleBId, contentHash: hash('b'),
   }
   let resolveLineageAStarted!: () => void
   let releaseLineageA!: () => void
@@ -2997,13 +3251,13 @@ test('an older run lineage response cannot replace the current run Workbench bun
     respond(route, { items: [{ id: 'event-race-a', runId: runA.id, sequence: 1, type: 'run.created', createdAt: now }] }))
   await page.route(`**/v1/projects/${project.id}/workflow-runs/${runB.id}/events`, (route) =>
     respond(route, { items: [{ id: 'event-race-b', runId: runB.id, sequence: 1, type: 'run.created', createdAt: now }] }))
-  await page.route('**/v1/build-manifests/bundle-race-a/lineage-state', async (route) => {
+  await page.route(`**/v1/build-manifests/${bundleAId}/lineage-state`, async (route) => {
     resolveLineageAStarted()
     await lineageARelease
     await respond(route, { rootBundleId: bundleA.id, activeBundle: bundleA, lineage: [] })
     resolveLineageAFinished()
   })
-  await page.route('**/v1/build-manifests/bundle-race-b/lineage-state', (route) =>
+  await page.route(`**/v1/build-manifests/${bundleBId}/lineage-state`, (route) =>
     respond(route, { rootBundleId: bundleB.id, activeBundle: bundleB, lineage: [] }))
 
   await page.goto(`/workbench/planning?view=code&runId=${runA.id}`)
@@ -3052,7 +3306,9 @@ test('direct Bundle and Proposal URL hydration is latest-wins across delayed res
   const homeStarted = new Promise<void>((resolve) => { resolveHomeStarted = resolve })
   const homeRelease = new Promise<void>((resolve) => { releaseHome = resolve })
   const homeFinished = new Promise<void>((resolve) => { resolveHomeFinished = resolve })
-  await page.route('**/v1/build-manifests/bundle-home', async (route) => {
+  const homeBundleId = fixtureId('bundle-home')
+  const checkoutBundleId = fixtureId('bundle-checkout')
+  await page.route(`**/v1/build-manifests/${homeBundleId}`, async (route) => {
     resolveHomeStarted()
     await homeRelease
     await route.fallback()
@@ -3060,18 +3316,18 @@ test('direct Bundle and Proposal URL hydration is latest-wins across delayed res
   })
 
   await page.goto(
-    `/workbench/planning?view=code&bundleId=bundle-home&proposalId=${checkoutProposal.id}`,
+    `/workbench/planning?view=code&bundleId=${homeBundleId}&proposalId=${checkoutProposal.id}`,
   )
   await homeStarted
-  await expect(page).toHaveURL(/bundleId=bundle-checkout/)
+  await expect(page).toHaveURL(new RegExp(`bundleId=${checkoutBundleId}`))
   await expect(page).toHaveURL(new RegExp(`proposalId=${checkoutProposal.id}`))
-  await expect(page.getByText(new RegExp(`bundle-checkout ·`))).toBeVisible()
+  await expect(page.getByText('Development input locked')).toBeVisible()
   releaseHome()
   await homeFinished
 
-  await expect(page).toHaveURL(/bundleId=bundle-checkout/)
+  await expect(page).toHaveURL(new RegExp(`bundleId=${checkoutBundleId}`))
   await expect(page).toHaveURL(new RegExp(`proposalId=${checkoutProposal.id}`))
-  await expect(page.getByText(new RegExp(`bundle-home ·`))).toHaveCount(0)
+  await expect(page.getByText('Development input locked')).toBeVisible()
 })
 
 test('run hydration rejects a Workbench bundle whose canonical delivery slice drifts', async ({ page }) => {
@@ -3102,7 +3358,7 @@ test('run hydration rejects a Workbench bundle whose canonical delivery slice dr
   await expect(page.getByRole('alert').filter({ hasText: 'Workbench lineage state for' })).toContainText(
     'does not match its exact run, manifest group, ordinal, or delivery slice',
   )
-  await expect(page.getByRole('heading', { name: 'Frozen application build manifest' })).toHaveCount(0)
+  await expect(page.getByRole('heading', { name: 'Development input locked' })).toHaveCount(0)
 })
 
 test('direct workflow start checkpoints a newer Brief draft when approval is not required', async ({ page }) => {
@@ -3296,8 +3552,8 @@ test('Project Brief conversation switches from the open run to its authoritative
   expect(commandRequest?.body).toEqual({})
   expect(state.conversationCommand?.result).toMatchObject({
     runId: 'run-selection-active',
-    rootBundleId: 'build-1',
-    bundleId: 'build-1',
+    rootBundleId: primaryBuildManifestId,
+    bundleId: primaryBuildManifestId,
     implementationProposalId: '77777777-7777-4777-8777-777777777777',
   })
   expect(state.conversationCommand?.payload.definitionVersionId)
@@ -3331,7 +3587,8 @@ test('conversation sends the selected Workbench root as a hint and renders serve
   await page.goto('/workbench/planning?view=code&runId=run-selection-active')
   const panel = await openConversationPanel(page)
   await expect.poll(() => state.requests.some((item) =>
-    item.method === 'GET' && item.path === '/v1/build-manifests/build-root-1/lineage-state'),
+    item.method === 'GET'
+      && item.path === `/v1/build-manifests/${fixtureId('build-root-1')}/lineage-state`),
   ).toBe(true)
 
   await panel.getByPlaceholder('Describe requirements or a controlled next action…')
@@ -3346,7 +3603,7 @@ test('conversation sends the selected Workbench root as a hint and renders serve
   expect(generateRequest?.body).toMatchObject({
     workbenchTargetHint: {
       runId: 'run-selection-active',
-      rootBundleId: 'build-root-1',
+      rootBundleId: fixtureId('build-root-1'),
     },
   })
 })
@@ -3704,7 +3961,7 @@ test('conversation polling does not cancel execution before the legacy Proposal 
   )
   const proposal = workbenchIntentProposal(conversationId, trigger.id, {
     expectedRunId: '88888888-8888-4888-8888-888888888888',
-    expectedBundleId: 'build-1',
+    expectedBundleId: primaryBuildManifestId,
     definitionVersionId: selectionWorkflowDefinition.versionId,
   })
   state.conversationMessages = [trigger, conversationMessage(
@@ -3749,9 +4006,9 @@ test('conversation polling does not cancel execution before the legacy Proposal 
     item.method === 'GET'
       && item.path.endsWith(`/workflow-runs/${proposal.workbenchInstruction.expectedRunId}`))).toBe(true)
   await expect(page.getByText(proposal.workbenchInstruction.expectedRunId, { exact: true }).first()).toBeVisible()
-  await expect(page.getByRole('button', { name: 'Quarantine and open Candidate' })).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Discard and return to development' })).toBeVisible()
   await expect(page.getByRole('alert').filter({
-    hasText: 'This Proposal came from the retired direct-model path',
+    hasText: 'This change came from an older generation path',
   })).toBeVisible()
   await expect(page.getByRole('button', { name: 'Finish current review' })).toHaveCount(0)
 })
@@ -3771,7 +4028,7 @@ test('same-run polling coalesces with delayed receipt lineage hydration', async 
   )
   const proposal = workbenchIntentProposal(conversationId, trigger.id, {
     expectedRunId: '89898989-8989-4989-8989-898989898989',
-    expectedBundleId: 'build-1',
+    expectedBundleId: primaryBuildManifestId,
     definitionVersionId: selectionWorkflowDefinition.versionId,
   })
   state.conversationMessages = [trigger, conversationMessage(
@@ -3788,7 +4045,7 @@ test('same-run polling coalesces with delayed receipt lineage hydration', async 
   let releaseLineage!: () => void
   const lineageStarted = new Promise<void>((resolve) => { resolveLineageStarted = resolve })
   const lineageRelease = new Promise<void>((resolve) => { releaseLineage = resolve })
-  await page.route('**/v1/build-manifests/build-1/lineage-state', async (route) => {
+  await page.route(`**/v1/build-manifests/${primaryBuildManifestId}/lineage-state`, async (route) => {
     resolveLineageStarted()
     await lineageRelease
     await route.fallback()
@@ -3801,15 +4058,15 @@ test('same-run polling coalesces with delayed receipt lineage hydration', async 
   await page.waitForTimeout(3_600)
   releaseLineage()
 
-  await expect(page.getByRole('button', { name: 'Quarantine and open Candidate' })).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Discard and return to development' })).toBeVisible()
   await expect(page.getByRole('alert').filter({
-    hasText: 'This Proposal came from the retired direct-model path',
+    hasText: 'This change came from an older generation path',
   })).toBeVisible()
   await expect(page.getByRole('button', { name: 'Finish current review' })).toHaveCount(0)
   await expect(panel.getByRole('alert')).toHaveCount(0)
   expect(state.requests.filter((item) => (
     item.method === 'GET'
-    && item.path === '/v1/build-manifests/build-1/lineage-state'
+    && item.path === `/v1/build-manifests/${primaryBuildManifestId}/lineage-state`
   ))).toHaveLength(1)
 })
 
@@ -3828,7 +4085,7 @@ test('conversation receipt hydration rejects a bundle from the wrong reviewed sl
   )
   const proposal = workbenchIntentProposal(conversationId, trigger.id, {
     expectedRunId: '88888888-8888-4888-8888-888888888888',
-    expectedBundleId: 'build-1',
+    expectedBundleId: primaryBuildManifestId,
     definitionVersionId: selectionWorkflowDefinition.versionId,
   })
   state.conversationMessages = [trigger, conversationMessage(
@@ -3848,7 +4105,7 @@ test('conversation receipt hydration rejects a bundle from the wrong reviewed sl
       ? { ...state.workbenchBundle.workflowContext, deliverySliceId: 'page-wrong' }
       : undefined,
   }
-  await page.route('**/v1/build-manifests/build-1', (route) => route.fulfill({
+  await page.route(`**/v1/build-manifests/${primaryBuildManifestId}`, (route) => route.fulfill({
     status: 200,
     contentType: 'application/json',
     headers: corsHeaders(),
@@ -3879,7 +4136,7 @@ test('conversation receipt rejects a proposal manifest mismatch before hydrating
   )
   const proposal = workbenchIntentProposal(conversationId, trigger.id, {
     expectedRunId: '88888888-8888-4888-8888-888888888888',
-    expectedBundleId: 'build-1',
+    expectedBundleId: primaryBuildManifestId,
     definitionVersionId: selectionWorkflowDefinition.versionId,
   })
   state.conversationMessages = [trigger, conversationMessage(
@@ -3945,7 +4202,7 @@ test('conversation receipt rejects a proposal not bound to the executed command'
   )
   const proposal = workbenchIntentProposal(conversationId, trigger.id, {
     expectedRunId: '88888888-8888-4888-8888-888888888888',
-    expectedBundleId: 'build-1',
+    expectedBundleId: primaryBuildManifestId,
     definitionVersionId: selectionWorkflowDefinition.versionId,
   })
   state.conversationMessages = [trigger, conversationMessage(
@@ -3967,7 +4224,7 @@ test('conversation receipt rejects a proposal not bound to the executed command'
       body: JSON.stringify({
         ...implementationProposal('open'),
         id: state.conversationCommand!.id,
-        buildManifestId: 'build-1',
+        buildManifestId: primaryBuildManifestId,
         executionSource: 'conversation_command',
         conversationCommandId: 'unreviewed-command',
         instructionHash: hash('7'),
@@ -4026,7 +4283,7 @@ test('Workbench conversation commands decouple governance and run manifests whil
       && item.path.endsWith('/commands/77777777-7777-4777-8777-777777777777/execute'))
   expect(commandRequest?.body).toEqual({})
   expect(state.requests.some((item) =>
-    item.method === 'POST' && item.path.endsWith('/build-manifests/build-1/generate'),
+    item.method === 'POST' && item.path.endsWith(`/build-manifests/${primaryBuildManifestId}/generate`),
   )).toBe(false)
   expect(state.conversationCommand?.result).toMatchObject({
     runId: proposal.workbenchInstruction.expectedRunId,
@@ -4054,7 +4311,7 @@ test('Workbench conversation commands select their exact DAG group before genera
   )
   const proposal = workbenchIntentProposal(conversationId, trigger.id, {
     expectedRunId: 'run-groups',
-    expectedBundleId: 'bundle-group-b',
+    expectedBundleId: fixtureId('bundle-group-b'),
   })
   state.conversationMessages = [trigger, conversationMessage(
     proposal.assistantMessageId,
@@ -4067,8 +4324,8 @@ test('Workbench conversation commands select their exact DAG group before genera
   state.intentProposal = proposal
   state.conversationCommand = conversationCommand(proposal)
   if (!state.multiWorkbench) throw new Error('multi Workbench fixture is unavailable')
-  delete state.multiWorkbench.proposals['proposal-group-b']
-  state.multiWorkbench.currentProposalIds['bundle-group-b'] = undefined
+  delete state.multiWorkbench.proposals[fixtureId('proposal-group-b')]
+  state.multiWorkbench.currentProposalIds[fixtureId('bundle-group-b')] = undefined
 
   await page.goto('/workbench/complete?view=code&runId=run-groups')
   const panel = await openConversationPanel(page)
@@ -4085,8 +4342,8 @@ test('Workbench conversation commands select their exact DAG group before genera
   expect(commandRequest?.body).toEqual({})
   expect(state.conversationCommand?.result).toMatchObject({
     runId: 'run-groups',
-    rootBundleId: 'bundle-group-b',
-    bundleId: 'bundle-group-b',
+    rootBundleId: fixtureId('bundle-group-b'),
+    bundleId: fixtureId('bundle-group-b'),
     implementationProposalId: '77777777-7777-4777-8777-777777777777',
   })
 })
@@ -4135,7 +4392,7 @@ test('fresh frozen build input opens a template-backed Candidate without direct 
   const state = await installPlatformMock(page, { authenticated: true })
   await page.goto('/workbench/complete?view=code')
 
-  await page.getByRole('button', { name: 'Freeze build input' }).click()
+  await page.getByRole('button', { name: 'Lock development input' }).click()
   const openSandbox = page.getByRole('button', { name: 'Open development sandbox' })
   await expect(openSandbox).toBeVisible()
   await expect(page.getByText(
@@ -4154,11 +4411,70 @@ test('fresh frozen build input opens a template-backed Candidate without direct 
   const bootstrap = state.requests.find((item) =>
     item.method === 'POST'
       && item.path === `/v1/projects/${project.id}/repository-candidates`)
-  expect(bootstrap?.body).toEqual({ buildManifestId: 'build-1' })
+  expect(bootstrap?.body).toEqual({ buildManifestId: primaryBuildManifestId })
   expect(state.sandboxCandidate).not.toHaveProperty('baseWorkspaceRevision')
-  expect(state.requests.some((item) => item.path.endsWith('/build-manifests/build-1/generate'))).toBe(false)
-  expect(state.requests.some((item) => item.path.endsWith('/implementation-proposals/implementation-1/apply'))).toBe(false)
+  expect(state.requests.some((item) => item.path.endsWith(`/build-manifests/${primaryBuildManifestId}/generate`))).toBe(false)
+  expect(state.requests.some((item) => item.path.endsWith(`/implementation-proposals/${primaryProposalId}/apply`))).toBe(false)
   expect(state.requests.some((item) => item.path.includes('/api/generate'))).toBe(false)
+})
+
+test('development Preview keeps the primary path focused and separates production qualification', async ({ page }) => {
+  await installPlatformMock(page, { authenticated: true })
+  await page.goto('/workbench/complete?view=preview')
+
+  await page.getByRole('button', { name: 'Lock development input' }).click()
+  await page.getByRole('button', { name: 'Open development sandbox' }).click()
+
+  await expect(page.getByText('Development Preview', { exact: true })).toBeVisible()
+  await expect(page.getByText('Not a production release', { exact: true })).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Start preview' })).toBeVisible()
+  await expect(page.getByText('Start the development preview', { exact: true })).toBeVisible()
+  await expect(page.getByRole('region', { name: 'Candidate verification' })).toHaveCount(0)
+  await expect(page.getByRole('button', { name: 'Agent', exact: true })).toHaveCount(0)
+  await expect(page.getByRole('button', { name: 'Create Proposal' })).toHaveCount(0)
+})
+
+test('Candidate autosave preserves the mounted editor and does not reload governed Blueprint state', async ({ page }) => {
+  const state = await installPlatformMock(page, { authenticated: true })
+  let blueprintLoads = 0
+  let mainNavigations = 0
+  page.on('request', (request) => {
+    if (/\/blueprints(?:[/?]|$)/u.test(request.url())) blueprintLoads += 1
+  })
+  page.on('framenavigated', (frame) => {
+    if (frame === page.mainFrame()) mainNavigations += 1
+  })
+
+  await page.goto('/workbench/complete?view=code')
+  await page.getByRole('button', { name: 'Lock development input' }).click()
+  await page.getByRole('button', { name: 'Open development sandbox' }).click()
+  await expect(page.getByText('frontend/app/page.tsx', { exact: true }).first()).toBeVisible()
+  await page.getByRole('button', { name: 'frontend/app/page.tsx', exact: true }).click()
+
+  const editor = page.locator('.monaco-editor').first()
+  await expect(editor).toBeVisible()
+  const blueprintLoadsBeforeEdit = blueprintLoads
+  const navigationsBeforeEdit = mainNavigations
+  const candidateVersionBeforeEdit = state.sandboxCandidate?.version
+  const journalSequenceBeforeEdit = state.sandboxCandidate?.journalSequence
+  const workbenchURL = page.url()
+  const marker = 'CI_AUTOSAVE_PRESERVES_GOVERNED_CONTEXT'
+  await editor.locator('.view-lines').click({ position: { x: 24, y: 18 } })
+  await page.keyboard.press('Control+End')
+  await page.keyboard.insertText(`\n// ${marker}\n`)
+
+  await expect(page.locator('.monaco-editor .view-lines').first()).toContainText(marker)
+  await expect.poll(() => state.requests.filter((item) => (
+    item.method === 'PUT' && /\/sandbox-sessions\/[^/]+\/files\/frontend\/app\/page\.tsx$/u.test(item.path)
+  )).length).toBe(1)
+  await expect(page.getByText('Saved', { exact: true })).toBeVisible()
+  const save = state.requests.findLast((item) => item.method === 'PUT')
+  expect(save?.body).toContain(marker)
+  expect(state.sandboxCandidate?.version).toBe((candidateVersionBeforeEdit ?? 0) + 1)
+  expect(state.sandboxCandidate?.journalSequence).toBe((journalSequenceBeforeEdit ?? -1) + 1)
+  expect(page.url()).toBe(workbenchURL)
+  expect(mainNavigations).toBe(navigationsBeforeEdit)
+  expect(blueprintLoads).toBe(blueprintLoadsBeforeEdit)
 })
 
 test('Workbench renders production-shaped nullable build manifest collections', async ({ page }) => {
@@ -4174,11 +4490,11 @@ test('Workbench renders production-shaped nullable build manifest collections', 
   })
 
   await page.goto('/workbench/complete?view=code')
-  await page.getByRole('button', { name: 'Freeze build input' }).click()
+  await page.getByRole('button', { name: 'Lock development input' }).click()
 
   await expect(page.getByRole('button', { name: 'Open development sandbox' })).toBeVisible()
   await expect(page.getByRole('button', { name: 'Generate proposal' })).toHaveCount(0)
-  expect(state.requests.some((item) => item.path.endsWith('/build-manifests/build-1/generate'))).toBe(false)
+  expect(state.requests.some((item) => item.path.endsWith(`/build-manifests/${primaryBuildManifestId}/generate`))).toBe(false)
 })
 
 test('multi-bundle Workbench applies the existing proposal then hands the rebased bundle to Candidate', async ({ page }) => {
@@ -4190,7 +4506,8 @@ test('multi-bundle Workbench applies the existing proposal then hands the rebase
   const closeConversation = page.getByRole('button', { name: 'Close conversation panel' })
   if (await closeConversation.isVisible()) await closeConversation.click()
 
-  await expect(page.getByText('Frozen application build manifest')).toBeVisible()
+  await expect(page.getByText('Development input locked')).toBeVisible()
+  await page.getByRole('button', { name: 'Toggle manifest details' }).click()
   await expect(page.getByText('blueprint.selection · 2 sources')).toBeVisible()
   await page.getByText('Inspect frozen context evidence').click()
   await expect(page.getByText('blueprint_selection_node', { exact: false })).toBeVisible()
@@ -4198,7 +4515,9 @@ test('multi-bundle Workbench applies the existing proposal then hands the rebase
   await expect(page.getByText('page-home', { exact: true })).toBeVisible()
   await page.getByRole('button', { name: 'Accept pending' }).click()
   await page.getByRole('button', { name: 'Apply and continue' }).click()
-  const rebaseNext = page.getByRole('button', { name: 'Rebase next bundle' })
+  const checkoutRootId = fixtureId('bundle-checkout')
+  await expect(page).toHaveURL(new RegExp(`bundleId=${checkoutRootId}`))
+  const rebaseNext = page.getByRole('button', { name: 'Update to latest version' })
   await expect(rebaseNext).toBeEnabled()
   await rebaseNext.click()
   await expect(page.getByRole('button', { name: 'Open development sandbox' })).toBeVisible()
@@ -4206,12 +4525,19 @@ test('multi-bundle Workbench applies the existing proposal then hands the rebase
   await expect(page.getByRole('textbox', { name: 'Implementation instruction' })).toHaveCount(0)
   await expect(page.getByRole('button', { name: 'Generate proposal' })).toHaveCount(0)
 
+  const firstDerivedId = fixtureId(`${checkoutRootId}-w1`)
+  await expect.poll(() => state.requests
+    .filter((item) => item.method === 'POST' && item.path.endsWith('/rebase'))
+    .map((item) => item.path))
+    .toContain(`/v1/build-manifests/${checkoutRootId}/rebase`)
+  await expect.poll(() => state.multiWorkbench?.activeBundleIds[checkoutRootId])
+    .toBe(firstDerivedId)
   await page.reload()
   await expect(page.getByRole('button', { name: 'Open development sandbox' })).toBeVisible()
-  expect(state.multiWorkbench?.activeBundleIds['bundle-checkout']).toBe('bundle-checkout-w1')
+  expect(state.multiWorkbench?.activeBundleIds[checkoutRootId]).toBe(firstDerivedId)
 
   const rebaseRequest = state.requests.find((item) =>
-    item.method === 'POST' && item.path === '/v1/build-manifests/bundle-checkout/rebase')
+    item.method === 'POST' && item.path === `/v1/build-manifests/${checkoutRootId}/rebase`)
   expect(rebaseRequest?.body).toEqual({
     workspaceRevision: {
       artifactId: 'workspace-application',
@@ -4221,10 +4547,10 @@ test('multi-bundle Workbench applies the existing proposal then hands the rebase
   })
   expect(state.requests.some((item) =>
     item.method === 'POST'
-      && item.path === '/v1/build-manifests/bundle-checkout-w1/generate')).toBe(false)
+      && item.path === `/v1/build-manifests/${firstDerivedId}/generate`)).toBe(false)
   expect(state.requests.some((item) =>
     item.method === 'POST'
-      && item.path === '/v1/implementation-proposals/proposal-home/apply')).toBe(true)
+      && item.path === `/v1/implementation-proposals/${fixtureId('proposal-home')}/apply`)).toBe(true)
   expect(state.requests.some((item) =>
     item.method === 'POST'
       && item.path === `/v1/projects/${project.id}/workflow-runs/run-multi/resume`)).toBe(false)
@@ -4241,28 +4567,35 @@ test('Workbench rebases from the active derived leaf when the project workspace 
 
   await page.getByRole('button', { name: 'Accept pending' }).click()
   await page.getByRole('button', { name: 'Apply and continue' }).click()
-  await page.getByRole('button', { name: 'Rebase next bundle' }).click()
+  const checkoutRootId = fixtureId('bundle-checkout')
+  await expect(page).toHaveURL(new RegExp(`bundleId=${checkoutRootId}`))
+  await page.getByRole('button', { name: 'Update to latest version' }).click()
   await expect(page.getByRole('button', { name: 'Open development sandbox' })).toBeVisible()
-  expect(state.multiWorkbench?.activeBundleIds['bundle-checkout']).toBe('bundle-checkout-w1')
+  const firstDerivedId = fixtureId(`${checkoutRootId}-w1`)
+  await expect.poll(() => state.requests
+    .filter((item) => item.method === 'POST' && item.path.endsWith('/rebase'))
+    .map((item) => item.path))
+    .toContain(`/v1/build-manifests/${checkoutRootId}/rebase`)
+  await expect.poll(() => state.multiWorkbench?.activeBundleIds[checkoutRootId])
+    .toBe(firstDerivedId)
 
   if (!state.multiWorkbench) throw new Error('Expected multi-bundle mock state.')
   state.multiWorkbench.currentWorkspaceRevision = multiApplicationRevision(2)
   await page.reload()
-  await expect(page.getByText('Frozen application build manifest')).toBeVisible()
-  const rebaseStatus = page.getByRole('status').filter({ hasText: 'Rebase active page bundle' })
-  await expect(rebaseStatus).toContainText(
-    'active page bundle bundle-checkout-w1 (order root bundle-checkout)',
-  )
-  await expect(rebaseStatus).toContainText('workspace r2 (workspace-r2)')
-  await page.getByRole('button', { name: 'Rebase next bundle' }).click()
+  await expect(page.getByText('Development input locked')).toBeVisible()
+  const rebaseStatus = page.getByRole('status').filter({ hasText: 'The project has changed.' })
+  await expect(rebaseStatus).toContainText('Update this page to workspace r2 before development')
+  await page.getByRole('button', { name: 'Update to latest version' }).click()
   await expect(page.getByRole('button', { name: 'Open development sandbox' })).toBeVisible()
-  expect(state.multiWorkbench.activeBundleIds['bundle-checkout']).toBe('bundle-checkout-w2')
+  const secondDerivedId = fixtureId(`${checkoutRootId}-w2`)
+  await expect.poll(() => state.multiWorkbench?.activeBundleIds[checkoutRootId])
+    .toBe(secondDerivedId)
 
   const rebases = state.requests.filter((item) =>
     item.method === 'POST' && item.path.endsWith('/rebase'))
   expect(rebases.map((item) => item.path)).toEqual([
-    '/v1/build-manifests/bundle-checkout/rebase',
-    '/v1/build-manifests/bundle-checkout-w1/rebase',
+    `/v1/build-manifests/${checkoutRootId}/rebase`,
+    `/v1/build-manifests/${firstDerivedId}/rebase`,
   ])
   expect(rebases[1].body).toEqual({
     workspaceRevision: {
@@ -4285,21 +4618,30 @@ test('node-scoped Workbench groups hydrate independently and complete only the s
   await expect(page.getByRole('button', {
     name: 'Workbench group workbench-a, status waiting input',
   })).toBeVisible()
-  await expect(page.getByText(/bundle-group-a ·/)).toBeVisible()
+  await expect(page.getByRole('region', {
+    name: 'Application delivery progress',
+  })).toHaveCount(0)
+  await expect(page.getByText(
+    'The current version is ready to enter the release flow.',
+    { exact: true },
+  )).toHaveCount(0)
   expect(state.requests.some((item) =>
-    item.path === '/v1/build-manifests/bundle-group-a/lineage-state',
+    item.path === `/v1/build-manifests/${fixtureId('bundle-group-a')}/lineage-state`,
   )).toBe(true)
   expect(state.requests.some((item) =>
-    item.path === '/v1/build-manifests/bundle-group-b/lineage-state',
+    item.path === `/v1/build-manifests/${fixtureId('bundle-group-b')}/lineage-state`,
   )).toBe(false)
 
   await page.getByRole('button', {
     name: 'Workbench group workbench-b, status waiting input',
   }).click()
   await expect(page).toHaveURL(/workbenchNodeKey=workbench-b/)
-  await expect(page.getByText(/bundle-group-b ·/)).toBeVisible()
+  await expect(page.getByText(
+    'Review the file changes and decide whether to apply them.',
+    { exact: true },
+  )).toHaveCount(0)
   expect(state.requests.some((item) =>
-    item.path === '/v1/build-manifests/bundle-group-b/lineage-state',
+    item.path === `/v1/build-manifests/${fixtureId('bundle-group-b')}/lineage-state`,
   )).toBe(true)
 
   const reloadRequestIndex = state.requests.length
@@ -4307,20 +4649,26 @@ test('node-scoped Workbench groups hydrate independently and complete only the s
   await expect(page).toHaveURL(/workbenchNodeKey=workbench-b/)
   await expect.poll(() => state.requests.slice(reloadRequestIndex)
     .filter((item) => item.path.endsWith('/lineage-state'))
-    .map((item) => item.path)).toContain('/v1/build-manifests/bundle-group-b/lineage-state')
-  await expect(page.getByText(/bundle-group-b ·/)).toBeVisible()
+    .map((item) => item.path)).toContain(`/v1/build-manifests/${fixtureId('bundle-group-b')}/lineage-state`)
+  await expect(page.getByText(
+    'Review the file changes and decide whether to apply them.',
+    { exact: true },
+  )).toHaveCount(0)
   const reloadRequests = state.requests.slice(reloadRequestIndex)
   expect(reloadRequests.some((item) =>
-    item.path === '/v1/build-manifests/bundle-group-b/lineage-state',
+    item.path === `/v1/build-manifests/${fixtureId('bundle-group-b')}/lineage-state`,
   )).toBe(true)
   expect(reloadRequests.some((item) =>
-    item.path === '/v1/build-manifests/bundle-group-a/lineage-state',
+    item.path === `/v1/build-manifests/${fixtureId('bundle-group-a')}/lineage-state`,
   )).toBe(false)
 
   await page.getByRole('button', {
     name: 'Workbench group workbench-a, status waiting input',
   }).click()
-  await expect(page.getByText(/bundle-group-a ·/)).toBeVisible()
+  await expect(page.getByText(
+    'The current version is ready to enter the release flow.',
+    { exact: true },
+  )).toHaveCount(0)
   await page.getByRole('button', { name: 'Complete Workbench' }).click()
   await expect.poll(() => state.requests.some((item) =>
     item.method === 'POST'
@@ -4332,7 +4680,7 @@ test('node-scoped Workbench groups hydrate independently and complete only the s
   expect(completion?.body).toEqual({
     nodeKey: 'workbench-a',
     output: {
-      implementationProposalIds: ['proposal-group-a'],
+      implementationProposalIds: [fixtureId('proposal-group-a')],
       workspaceRevision: {
         artifactId: 'workspace-application',
         revisionId: 'workspace-r1',
@@ -4342,9 +4690,36 @@ test('node-scoped Workbench groups hydrate independently and complete only the s
   })
 })
 
+test('Workbench apply and completion fail closed without a server action projection', async ({ page }) => {
+  const state = await installPlatformMock(page, {
+    authenticated: true,
+    multiWorkbenchGroups: true,
+  })
+  const current = state.run as ReturnType<typeof multiGroupWorkflowRun>
+  state.run = {
+    ...current,
+    nodes: current.nodes.map((node) => ({
+      ...node,
+      allowedActions: undefined,
+      blockingReasons: undefined,
+    })),
+  } as unknown as MockPlatformState['run']
+
+  await page.goto('/workbench/complete?view=code&runId=run-groups')
+  const closeConversation = page.getByRole('button', { name: 'Close conversation panel' })
+  if (await closeConversation.isVisible()) await closeConversation.click()
+
+  const complete = page.getByRole('button', { name: 'Complete Workbench' })
+  await expect(complete).toHaveCount(0)
+  expect(state.requests.some((item) =>
+    item.method === 'POST'
+      && item.path === `/v1/projects/${project.id}/workflow-runs/run-groups/resume`,
+  )).toBe(false)
+})
+
 test('Design Import Center freezes an upload, requires an independent reviewer, and applies a Prototype revision', async ({ page }) => {
   const state = await installPlatformMock(page, { authenticated: true })
-  await page.goto(`/team/acme/project/${project.id}/imports`)
+  await page.goto(`/team/${project.id}/project/${project.id}/imports`)
 
   await expect(page.getByTestId('design-import-center')).toBeVisible()
   await expect(page.getByTestId('design-source-figma')).toContainText('Remote not configured')
@@ -4415,7 +4790,7 @@ test('Design Import Center keeps server-open state when approval CAS fails', asy
       contentHash: pageSpecRevision.contentHash,
     },
   }, reviewer.id)]
-  await page.goto(`/team/acme/project/${project.id}/imports`)
+  await page.goto(`/team/${project.id}/project/${project.id}/imports`)
   await page.getByTestId(`design-import-approve-${state.designImports[0].id}`).click()
   await expect(page.getByTestId('design-import-center').getByRole('alert')).toContainText('changed since it was loaded')
   await expect(page.getByTestId('design-import-list').getByText('Open', { exact: true })).toBeVisible()
@@ -4424,7 +4799,7 @@ test('Design Import Center keeps server-open state when approval CAS fails', asy
 
 test('Design Import Center retries a processing lease with the same command key', async ({ page }) => {
   const state = await installPlatformMock(page, { authenticated: true, designImportCreateProcessingOnce: true })
-  await page.goto(`/team/acme/project/${project.id}/imports`)
+  await page.goto(`/team/${project.id}/project/${project.id}/imports`)
   await page.getByTestId('design-import-file').setInputFiles({
     name: 'retry-design.json',
     mimeType: 'application/json',
@@ -4443,7 +4818,7 @@ test('Design Import Center retries a processing lease with the same command key'
 
 test('document dependency graph opens the exact document, PageSpec, and prototype workspaces', async ({ page }) => {
   await installPlatformMock(page, { authenticated: true })
-  const graphUrl = `/team/acme/project/${project.id}/graph`
+  const graphUrl = `/team/${project.id}/project/${project.id}/graph`
 
   await page.goto(graphUrl)
   await page.getByRole('button', { name: 'Open in workspace' }).click()
@@ -4467,7 +4842,7 @@ test('document dependency graph opens the exact document, PageSpec, and prototyp
 test('document graph reloads its server projection after a project WebSocket event', async ({ page }) => {
   const realtime = await installProjectWebSocketMock(page)
   const state = await installPlatformMock(page, { authenticated: true })
-  await page.goto(`/team/acme/project/${project.id}/graph`)
+  await page.goto(`/team/${project.id}/project/${project.id}/graph`)
   await expect(page.getByTestId('server-document-graph')).toContainText('Project Brief')
   const before = state.requests.filter((item) =>
     item.method === 'GET' && item.path === `/v1/projects/${project.id}/document-graph`).length
@@ -4486,7 +4861,7 @@ test('document graph reloads its server projection after a project WebSocket eve
 test('document bindings preserve local edits when a remote replacement event arrives', async ({ page }) => {
   const realtime = await installProjectWebSocketMock(page)
   const state = await installPlatformMock(page, { authenticated: true })
-  await page.goto(`/team/acme/project/${project.id}/editor?artifactId=${projectBrief.artifact.id}`)
+  await page.goto(`/team/${project.id}/project/${project.id}/editor?artifactId=${projectBrief.artifact.id}`)
   await page.getByRole('main').getByRole('button', { name: 'Collaboration 2', exact: true }).click()
   const panel = page.getByTestId('document-collaboration-panel')
   await expect(panel).toContainText('Flow Reviewer')
@@ -4510,7 +4885,7 @@ test('document bindings preserve local edits when a remote replacement event arr
 
 test('Prototype Studio creates from an approved PageSpec and persists an ETag draft', async ({ page }) => {
   const state = await installPlatformMock(page, { authenticated: true, prototypes: 'none' })
-  await page.goto(`/team/acme/project/${project.id}/prototype`)
+  await page.goto(`/team/${project.id}/project/${project.id}/prototype`)
 
   await expect(page.getByText('No prototype artifact yet.')).toBeVisible()
   await page.getByLabel('PageSpec source').selectOption(pageSpec.artifact.id)
@@ -4545,7 +4920,7 @@ test('Prototype Studio safely reads an exact historical PageSpec without dataBin
   }
   state.pageSpec = historical
 
-  await page.goto(`/team/acme/project/${project.id}/prototype`)
+  await page.goto(`/team/${project.id}/project/${project.id}/prototype`)
 
   await expect(page.getByTitle('Page')).toBeVisible()
   await expect(page.getByRole('button', { name: 'Revision + review' })).toBeEnabled()
@@ -4554,7 +4929,7 @@ test('Prototype Studio safely reads an exact historical PageSpec without dataBin
 
 test('formal Prototype state structure stays locked to its exact PageSpec authority', async ({ page }) => {
   await installPlatformMock(page, { authenticated: true })
-  await page.goto(`/team/acme/project/${project.id}/prototype`)
+  await page.goto(`/team/${project.id}/project/${project.id}/prototype`)
   await page.getByRole('button', { name: 'Manage states & breakpoints' }).click()
 
   await expect(page.getByText('Formal Prototype state IDs, keys, required flags, and membership')).toBeVisible()
@@ -4592,7 +4967,7 @@ test('Prototype Studio blocks cross-artifact switching and creation until the lo
   }
   state.prototypes = [current, second]
 
-  await page.goto(`/team/acme/project/${project.id}/prototype`)
+  await page.goto(`/team/${project.id}/project/${project.id}/prototype`)
   await page.getByRole('button', { name: 'Manage states & breakpoints' }).click()
   const titleInput = page.getByLabel('State title ready')
   await titleInput.fill('Newest local Ready')
@@ -4644,7 +5019,7 @@ test('Prototype Studio safely opens an incomplete workflow target and directs th
     },
   }]
 
-  await page.goto(`/team/acme/project/${project.id}/prototype`)
+  await page.goto(`/team/${project.id}/project/${project.id}/prototype`)
 
   await expect(page.getByText('AI prototype proposal is waiting')).toBeVisible()
   await expect(page.getByText('prototype-proposal-1', { exact: true })).toBeVisible()
@@ -4702,7 +5077,7 @@ test('Prototype Studio gives legacy semantic layers a visible fallback canvas la
   }
   state.prototypes = [{ ...current, draft: { ...current.draft, content } }]
 
-  await page.goto(`/team/acme/project/${project.id}/prototype`)
+  await page.goto(`/team/${project.id}/project/${project.id}/prototype`)
 
   const titleLayer = page.getByTitle('Legacy title')
   const inputLayer = page.getByTitle('Legacy input')
@@ -4758,7 +5133,7 @@ test('Prototype Studio uses visible viewport defaults, scene fallback layers, an
   } as unknown as PrototypeContentDto
   state.prototypes = [{ ...current, draft: { ...current.draft, content } }]
 
-  await page.goto(`/team/acme/project/${project.id}/prototype`)
+  await page.goto(`/team/${project.id}/project/${project.id}/prototype`)
 
   await expect(page.getByTitle('Custom carousel')).toBeVisible()
   await expect(page.getByLabel('Prototype breakpoint').locator('option')).toHaveText([
@@ -4781,7 +5156,7 @@ test('Prototype Studio preserves a tiny viewport while rendering a visible revie
   }
   state.prototypes = [{ ...current, draft: { ...current.draft, content } }]
 
-  await page.goto(`/team/acme/project/${project.id}/prototype`)
+  await page.goto(`/team/${project.id}/project/${project.id}/prototype`)
 
   await expect(page.getByLabel('Prototype breakpoint').locator('option').first()).toHaveText('Desktop · 0×1')
   const canvas = page.getByTestId('prototype-canvas')
@@ -4829,7 +5204,7 @@ test('Prototype Studio retains malformed collection diagnostics and blocks autos
   } as unknown as PrototypeContentDto
   state.prototypes = [{ ...current, draft: { ...current.draft, content } }]
 
-  await page.goto(`/team/acme/project/${project.id}/prototype`)
+  await page.goto(`/team/${project.id}/project/${project.id}/prototype`)
 
   await expect(page.getByText('Invalid layer 2', { exact: true }).first()).toBeVisible()
   await expect(page.getByText('Missing layer identity', { exact: true }).first()).toBeVisible()
@@ -4874,7 +5249,7 @@ test('Prototype Studio blocks every Proposal mutation after a failed local save 
   }
   state.prototypes = [malformed, second]
 
-  await page.goto(`/team/acme/project/${project.id}/prototype`)
+  await page.goto(`/team/${project.id}/project/${project.id}/prototype`)
   await page.getByRole('button', { name: 'Trace', exact: true }).click()
 
   const acceptOperation = page.getByRole('button', {
@@ -4934,7 +5309,7 @@ test('Prototype Studio serializes overlapping autosaves and keeps the newest loc
   const current = state.prototypes[0] as typeof approvedPrototype
   const draftPath = `/v1/prototypes/${current.artifact.id}/draft`
 
-  await page.goto(`/team/acme/project/${project.id}/prototype`)
+  await page.goto(`/team/${project.id}/project/${project.id}/prototype`)
   await page.getByRole('button', { name: 'Manage states & breakpoints' }).click()
   const titleInput = page.getByLabel('State title ready')
   await titleInput.fill('Ready edit A')
@@ -4974,7 +5349,7 @@ test('Prototype Studio locks every editor transition while prototype creation is
   )
   state.prototypes = [current, second]
 
-  await page.goto(`/team/acme/project/${project.id}/prototype`)
+  await page.goto(`/team/${project.id}/project/${project.id}/prototype`)
   await page.getByRole('button', { name: 'Manage states & breakpoints' }).click()
   const stateTitle = page.getByLabel('State title ready')
   const secondPrototype = page.getByRole('button', { name: /Creation-lock second Prototype/ })
@@ -5018,7 +5393,7 @@ test('Prototype Studio keeps a delayed Proposal apply exclusive at a nonzero edi
   state.prototypes = [current, second]
   state.prototypeProposal = artifactProposal('ready', ['accepted', 'accepted'], 3)
 
-  await page.goto(`/team/acme/project/${project.id}/prototype`)
+  await page.goto(`/team/${project.id}/project/${project.id}/prototype`)
   await page.getByRole('button', { name: 'Manage states & breakpoints' }).click()
   const stateTitle = page.getByLabel('State title ready')
   await stateTitle.fill('Ready before delayed apply')
@@ -5064,7 +5439,7 @@ test('Prototype Studio freezes the captured revision snapshot until revision and
   )
   state.prototypes = [current, second]
 
-  await page.goto(`/team/acme/project/${project.id}/prototype`)
+  await page.goto(`/team/${project.id}/project/${project.id}/prototype`)
   await page.getByRole('button', { name: 'Manage states & breakpoints' }).click()
   const stateTitle = page.getByLabel('State title ready')
   const capturedTitle = await stateTitle.inputValue()
@@ -5100,7 +5475,7 @@ test('Prototype Studio retries review for the same immutable revision after a 50
   const revisionPath = `/v1/prototypes/${approvedPrototype.artifact.id}/revisions`
   const reviewPath = `/v1/projects/${project.id}/reviews`
 
-  await page.goto(`/team/acme/project/${project.id}/prototype`)
+  await page.goto(`/team/${project.id}/project/${project.id}/prototype`)
   await page.getByRole('button', { name: 'Revision + review' }).click()
 
   await expect.poll(() => state.requests.filter((item) =>
@@ -5142,7 +5517,7 @@ test('Prototype Studio does not duplicate a review when requestReview returns fa
   const revisionPath = `/v1/prototypes/${approvedPrototype.artifact.id}/revisions`
   const reviewPath = `/v1/projects/${project.id}/reviews`
 
-  await page.goto(`/team/acme/project/${project.id}/prototype`)
+  await page.goto(`/team/${project.id}/project/${project.id}/prototype`)
   const revision = page.getByRole('button', { name: 'Revision + review' })
   await revision.click()
 
@@ -5191,7 +5566,7 @@ test('Prototype Studio keeps cyclic layer deletion bounded and exposes only froz
   }
   state.prototypes = [{ ...current, draft: { ...current.draft, content } }]
 
-  await page.goto(`/team/acme/project/${project.id}/prototype`)
+  await page.goto(`/team/${project.id}/project/${project.id}/prototype`)
   await page.getByTitle('Cycle child').click()
   await page.getByRole('button', { name: 'Delete', exact: true }).click()
   await expect(page.getByTitle('Cycle child')).toBeHidden()
@@ -5234,7 +5609,7 @@ test('Prototype Studio keeps duplicate array layers visible but blocks saving th
   } as unknown as PrototypeContentDto
   state.prototypes = [{ ...current, draft: { ...current.draft, content } }]
 
-  await page.goto(`/team/acme/project/${project.id}/prototype`)
+  await page.goto(`/team/${project.id}/project/${project.id}/prototype`)
 
   await expect(page.getByTitle('Duplicate layer', { exact: true })).toBeVisible()
   await expect(page.getByTitle('Duplicate layer copy', { exact: true })).toBeVisible()
@@ -5259,7 +5634,7 @@ test('Prototype Studio treats a frame with a missing root as repairable missing 
   }
   state.prototypes = [{ ...current, draft: { ...current.draft, content } }]
 
-  await page.goto(`/team/acme/project/${project.id}/prototype`)
+  await page.goto(`/team/${project.id}/project/${project.id}/prototype`)
 
   await expect(page.getByText('Missing Ready · Desktop frame')).toBeVisible()
   await page.getByRole('button', { name: 'Repair all frame coverage' }).click()
@@ -5272,7 +5647,7 @@ test('Prototype Studio decides and applies an AI proposal before freezing its at
     authenticated: true,
     prototypeProposal: true,
   })
-  await page.goto(`/team/acme/project/${project.id}/prototype`)
+  await page.goto(`/team/${project.id}/project/${project.id}/prototype`)
 
   await page.getByRole('button', { name: 'Trace', exact: true }).click()
   await expect(page.getByText('prototype-proposal-1', { exact: true })).toBeVisible()
@@ -5335,7 +5710,7 @@ test('Prototype Studio explicitly confirms before replacing unrevisioned draft c
   }]
   state.prototypeProposal = artifactProposal('ready', ['accepted', 'accepted'], 3)
 
-  await page.goto(`/team/acme/project/${project.id}/prototype`)
+  await page.goto(`/team/${project.id}/project/${project.id}/prototype`)
   await page.getByRole('button', { name: 'Trace', exact: true }).click()
   page.once('dialog', async (dialog) => {
     expect(dialog.message()).toContain('working draft contains changes that have not been revisioned')
@@ -5358,7 +5733,7 @@ test('Prototype Studio explicitly confirms before replacing unrevisioned draft c
 
 test('Blueprint PageSpec editor autosaves, versions, and requests exact revision review', async ({ page }) => {
   const state = await installPlatformMock(page, { authenticated: true })
-  await page.goto(`/team/acme/project/${project.id}/blueprint`)
+  await page.goto(`/team/${project.id}/project/${project.id}/blueprint`)
 
   await expect(page.getByText('Product Blueprint', { exact: true }).first()).toBeVisible()
   await page.getByRole('button', { name: 'PageSpecs (1)' }).click()
@@ -5406,7 +5781,7 @@ test('PageSpec workflow deep link prioritizes the exact Proposal and locks histo
   state.pageSpecProposals = [historicalProposal, linkedProposal]
 
   await page.goto(
-    `/team/acme/project/${project.id}/blueprint?artifactId=${pageSpec.artifact.id}&proposalId=${linkedProposal.id}`,
+    `/team/${project.id}/project/${project.id}/blueprint?artifactId=${pageSpec.artifact.id}&proposalId=${linkedProposal.id}`,
   )
 
   const guide = page.getByTestId('page-spec-workflow-proposal-guide')
@@ -5450,7 +5825,7 @@ test('PageSpec run link infers the exact typed-lineage Proposal and locks Review
   state.pageSpecProposals = [historicalProposal, linkedProposal]
 
   await page.goto(
-    `/team/acme/project/${project.id}/blueprint?runId=run-page-spec-human-edit&artifactId=${pageSpec.artifact.id}`,
+    `/team/${project.id}/project/${project.id}/blueprint?runId=run-page-spec-human-edit&artifactId=${pageSpec.artifact.id}`,
   )
 
   await expect(page).toHaveURL(new RegExp(`[?&]proposalId=${linkedProposal.id}(?:&|$)`))
@@ -5485,7 +5860,7 @@ test('PageSpec run link does not trust a Proposal ID outside the typed lineage',
   state.pageSpecProposals = [historicalProposal, linkedProposal]
 
   await page.goto(
-    `/team/acme/project/${project.id}/blueprint?runId=run-page-spec-human-edit&artifactId=${pageSpec.artifact.id}&proposalId=${historicalProposal.id}`,
+    `/team/${project.id}/project/${project.id}/blueprint?runId=run-page-spec-human-edit&artifactId=${pageSpec.artifact.id}&proposalId=${historicalProposal.id}`,
   )
 
   await expect(page).toHaveURL(new RegExp(`[?&]proposalId=${linkedProposal.id}(?:&|$)`))
@@ -5551,7 +5926,7 @@ test('PageSpec workflow can explicitly restore an exact Proposal base without no
   state.pageSpecProposals = [linkedProposal]
 
   await page.goto(
-    `/team/acme/project/${project.id}/blueprint?artifactId=${pageSpec.artifact.id}&proposalId=${linkedProposal.id}`,
+    `/team/${project.id}/project/${project.id}/blueprint?artifactId=${pageSpec.artifact.id}&proposalId=${linkedProposal.id}`,
   )
 
   const guide = page.getByTestId('page-spec-workflow-proposal-guide')
@@ -5602,7 +5977,7 @@ test('PageSpec workflow can explicitly restore an exact Proposal base without no
 
 test('Blueprint type selects persist canonical values instead of translated labels', async ({ page }) => {
   const state = await installPlatformMock(page, { authenticated: true })
-  await page.goto(`/team/acme/project/${project.id}/blueprint`)
+  await page.goto(`/team/${project.id}/project/${project.id}/blueprint`)
 
   const nodeKind = page.getByLabel('Kind')
   const edgeKind = page.getByLabel('Edge type')
@@ -5642,7 +6017,7 @@ test('Blueprint revision creation repairs a localized legacy edge before freezin
       etag: '"blueprint-draft:37"',
     },
   }
-  await page.goto(`/team/acme/project/${project.id}/blueprint`)
+  await page.goto(`/team/${project.id}/project/${project.id}/blueprint`)
 
   const nextStep = page.getByRole('status').filter({ hasText: /Proposal applied/i })
   const createRevision = nextStep.getByRole('button', { name: 'Create immutable revision', exact: true })
@@ -5671,7 +6046,7 @@ test('Blueprint autosave preserves newer input and background refresh keeps the 
   })
   const firstSaveGate = state.blueprintDraftSaveGate
   expect(firstSaveGate).not.toBeNull()
-  await page.goto(`/team/acme/project/${project.id}/blueprint`)
+  await page.goto(`/team/${project.id}/project/${project.id}/blueprint`)
 
   const editor = page.getByRole('main')
   const title = page.getByLabel('Node title')
@@ -5749,7 +6124,7 @@ test('Blueprint autosave cannot write one artifact content into another while sw
   })
   const firstSaveGate = state.blueprintDraftSaveGate
   expect(firstSaveGate).not.toBeNull()
-  await page.goto('/team/acme/project/' + project.id + '/blueprint')
+  await page.goto('/team/' + project.id + '/project/' + project.id + '/blueprint')
 
   const title = page.getByLabel('Node title')
   const secondary = page.getByRole('button', { name: /Billing Blueprint/ })
@@ -5805,7 +6180,7 @@ test('Blueprint actions lock editing and artifact switching until the server res
   })
   const applyGate = state.blueprintProposalApplyGate
   expect(applyGate).not.toBeNull()
-  await page.goto('/team/acme/project/' + project.id + '/blueprint')
+  await page.goto('/team/' + project.id + '/project/' + project.id + '/blueprint')
 
   await page.getByRole('button', { name: 'Proposals 1' }).click()
   await page.getByRole('button', { name: 'Apply accepted operations' }).click()
@@ -5830,7 +6205,7 @@ test('Blueprint 412 conflict remains blocking while newer local input is preserv
     authenticated: true,
     rejectFirstBlueprintDraftSave: true,
   })
-  await page.goto('/team/acme/project/' + project.id + '/blueprint')
+  await page.goto('/team/' + project.id + '/project/' + project.id + '/blueprint')
 
   const title = page.getByLabel('Node title')
   const draftPath = '/v1/blueprints/' + blueprint.artifact.id + '/draft'
@@ -5871,7 +6246,7 @@ test('applied Blueprint Proposal submits its exact immutable revision to the wai
     }
   }
   await page.goto(
-    '/team/acme/project/' + project.id
+    '/team/' + project.id + '/project/' + project.id
       + '/blueprint?runId=run-blueprint-human-edit&workbenchNodeKey=workbench-blueprint',
   )
   await expect.poll(currentFlowLocation).toEqual({
@@ -5961,7 +6336,7 @@ test('applied Blueprint Proposal submits its exact immutable revision to the wai
 
 test('Blueprint Composer inserts module packs, multi-selects them, and persists a capability group', async ({ page }) => {
   const state = await installPlatformMock(page, { authenticated: true })
-  await page.goto(`/team/acme/project/${project.id}/blueprint`)
+  await page.goto(`/team/${project.id}/project/${project.id}/blueprint`)
 
   await page.getByRole('button', { name: /feature\s+Order management/i }).click()
   await page.getByRole('button', { name: /page\s+Dashboard/i }).click({ modifiers: ['Meta'] })
@@ -5987,7 +6362,7 @@ test('Blueprint Composer inserts module packs, multi-selects them, and persists 
 
 test('Generate docs from selection creates an AI proposal without prototype or workflow side effects', async ({ page }) => {
   const state = await installPlatformMock(page, { authenticated: true })
-  await page.goto(`/team/acme/project/${project.id}/blueprint`)
+  await page.goto(`/team/${project.id}/project/${project.id}/blueprint`)
 
   await page.getByRole('button', { name: 'Generate documents for selection' }).click()
   await expect(page.getByText(/Created a document proposal for 1 selected nodes/)).toBeVisible()
@@ -6014,7 +6389,7 @@ test('Generate docs from selection creates an AI proposal without prototype or w
 
 test('Create prototypes from selection uses the exact approved PageSpec without starting Workbench', async ({ page }) => {
   const state = await installPlatformMock(page, { authenticated: true, prototypes: 'none' })
-  await page.goto(`/team/acme/project/${project.id}/blueprint`)
+  await page.goto(`/team/${project.id}/project/${project.id}/blueprint`)
 
   await page.getByRole('button', { name: /page\s+Dashboard/i }).click()
   await page.getByRole('button', { name: 'Create prototypes for selection' }).click()
@@ -6033,7 +6408,7 @@ test('Create prototypes from selection uses the exact approved PageSpec without 
 
 test('Use selection in workflow starts the selection DAG and does not create documents or prototypes', async ({ page }) => {
   const state = await installPlatformMock(page, { authenticated: true })
-  await page.goto(`/team/acme/project/${project.id}/blueprint`)
+  await page.goto(`/team/${project.id}/project/${project.id}/blueprint`)
 
   await page.getByRole('button', { name: /page\s+Dashboard/i }).click()
   await page.getByRole('button', { name: 'Use selection in Workbench' }).click()
@@ -6052,7 +6427,7 @@ test('Use selection in workflow starts the selection DAG and does not create doc
 
 test('Prototype revision requests canonical review from another project member', async ({ page }) => {
   const state = await installPlatformMock(page, { authenticated: true })
-  await page.goto(`/team/acme/project/${project.id}/prototype`)
+  await page.goto(`/team/${project.id}/project/${project.id}/prototype`)
 
   await page.getByRole('button', { name: 'Revision + review' }).click()
   await expect.poll(() => state.requests.some((item) =>
@@ -6075,7 +6450,23 @@ function corsHeaders() {
     'access-control-allow-credentials': 'true',
     'access-control-allow-headers': 'Content-Type, X-Request-ID, X-CSRF-Token, Idempotency-Key, If-Match',
     'access-control-allow-methods': 'GET, POST, PATCH, DELETE, OPTIONS',
-    'access-control-expose-headers': 'ETag, X-Request-ID, X-CSRF-Token, X-Command-ETag, X-Command-Location',
+    'access-control-expose-headers': [
+      'ETag',
+      'X-Request-ID',
+      'X-CSRF-Token',
+      'X-Command-ETag',
+      'X-Command-Location',
+      'X-Sandbox-Session-ETag',
+      'X-Sandbox-Session-Epoch',
+      'X-Candidate-Version',
+      'X-Candidate-ID',
+      'X-Candidate-Journal-Sequence',
+      'X-Writer-Lease-Epoch',
+      'X-Candidate-Tree-Hash',
+      'X-Candidate-Tree-ETag',
+      'X-Content-Hash',
+      'X-File-Mode',
+    ].join(', '),
   }
 }
 
@@ -6215,7 +6606,7 @@ function workbenchIntentProposal(
     readonly definitionVersionId?: string
   } = {
     expectedRunId: '88888888-8888-4888-8888-888888888888',
-    expectedBundleId: 'build-1',
+    expectedBundleId: primaryBuildManifestId,
   },
 ) {
   const generated = workflowIntentProposal(conversationId, {
@@ -6616,6 +7007,8 @@ function workflowRun(
 ) {
   const waitingReview = status === 'waiting_review'
   const failed = status === 'failed'
+  const canonicalReviewApproved = reviewRevision.id === briefRevision.id
+    && reviewRevision.contentHash === briefRevision.contentHash
   const reviewRef = exactRevision(
     reviewRevision.artifactId,
     reviewRevision.id,
@@ -6626,7 +7019,13 @@ function workflowRun(
     id,
     projectId: project.id,
     definitionVersionId: workflowDefinition.versionId,
-    definition: { id: workflowDefinition.id, version: 2, hash: workflowDefinition.contentHash },
+    definition: {
+      id: workflowDefinition.id,
+      version: 2,
+      hash: workflowDefinition.contentHash,
+      executionProfile: workflowExecutionProfile,
+    },
+    executionProfile: workflowExecutionProfile,
     inputManifest: { id: 'manifest-1', hash: hash('1') },
     governanceMode,
     status,
@@ -6669,6 +7068,18 @@ function workflowRun(
       status: waitingReview ? 'waiting_review' : failed ? 'failed' : 'waiting_input',
       attempt: waitingReview || failed ? 1 : 0,
       ...(failed ? { failure: { code: 'baseline.invalid_requirement_fact' } } : {}),
+      allowedActions: waitingReview
+        ? canonicalReviewApproved
+          ? ['approve_review', 'request_review_changes']
+          : ['request_review_changes']
+        : failed ? ['retry'] : [],
+      blockingReasons: waitingReview && !canonicalReviewApproved
+        ? [{
+            code: 'canonical_review_gate_blocked',
+            message: 'Approve the exact upstream revision in Review Center before approving this Workflow node.',
+            sourceRef: null,
+          }]
+        : [],
       availableAt: now,
       createdAt: now,
       updatedAt: now,
@@ -6685,7 +7096,7 @@ function blueprintHumanEditWorkflowRun() {
     producerDefinitionNodeId: 'blueprint-generate',
   }
   const workbenchInput = {
-    bundleIds: ['build-1'],
+    bundleIds: [primaryBuildManifestId],
     sliceIds: ['page-orders'],
     manifestGroupKey: 'run-blueprint-human-edit-workbench',
     hash: hash('w'),
@@ -6748,6 +7159,8 @@ function blueprintHumanEditWorkflowRun() {
       type: 'human_edit' as const,
       status: 'waiting_input' as const,
       attempt: 1,
+      allowedActions: ['submit_input'] as const,
+      blockingReasons: [],
       availableAt: now,
       createdAt: now,
       updatedAt: now,
@@ -6759,6 +7172,8 @@ function blueprintHumanEditWorkflowRun() {
       type: 'workbench_build' as const,
       status: 'pending' as const,
       attempt: 0,
+      allowedActions: [],
+      blockingReasons: [],
       availableAt: now,
       createdAt: now,
       updatedAt: now,
@@ -6834,6 +7249,8 @@ function pageSpecHumanEditWorkflowRun() {
       type: 'human_edit' as const,
       status: 'waiting_input' as const,
       attempt: 1,
+      allowedActions: ['submit_input'] as const,
+      blockingReasons: [],
       availableAt: now,
       createdAt: now,
       updatedAt: now,
@@ -6841,9 +7258,10 @@ function pageSpecHumanEditWorkflowRun() {
   }
 }
 
-function selectionWorkflowRun(id: string, rootBundleId = 'build-1') {
+function selectionWorkflowRun(id: string, rootBundleId = primaryBuildManifestId) {
+  const exactRootBundleId = fixtureId(rootBundleId)
   const applicationBuild = {
-    bundleIds: [rootBundleId],
+    bundleIds: [exactRootBundleId],
     sliceIds: ['page-orders'],
     manifestGroupKey: `${id}-manifest-group`,
     hash: hash('6'),
@@ -6856,7 +7274,9 @@ function selectionWorkflowRun(id: string, rootBundleId = 'build-1') {
       id: selectionWorkflowDefinition.id,
       version: selectionWorkflowDefinition.version,
       hash: selectionWorkflowDefinition.contentHash,
+      executionProfile: workflowExecutionProfile,
     },
+    executionProfile: workflowExecutionProfile,
     inputManifest: { id: 'selection-manifest-page-dashboard', hash: hash('8') },
     status: 'waiting_input' as const,
     scope: { blueprintSelection: { selectionId: `sha256:${hash('s')}` } },
@@ -6880,11 +7300,13 @@ function selectionWorkflowRun(id: string, rootBundleId = 'build-1') {
       {
         id: `${id}-selection`, runId: id, key: 'selection', definitionNodeId: 'selection',
         type: 'artifact_input', status: 'completed', attempt: 1,
+        allowedActions: [], blockingReasons: [],
         availableAt: now, createdAt: now, updatedAt: now, completedAt: now,
       },
       {
         id: `${id}-workbench`, runId: id, key: 'workbench', definitionNodeId: 'workbench',
         type: 'workbench_build', status: 'waiting_input', attempt: 1,
+        allowedActions: ['submit_input'], blockingReasons: [],
         availableAt: now, createdAt: now, updatedAt: now,
       },
     ],
@@ -6894,14 +7316,14 @@ function selectionWorkflowRun(id: string, rootBundleId = 'build-1') {
 function buildManifest(workflowRunId?: string, rootBuildManifestId?: string) {
   const anchoredBlueprint = { ...blueprintRevision, anchorId: 'page-orders' }
   return {
-    id: 'build-1',
+    id: primaryBuildManifestId,
     projectId: project.id,
     ...(workflowRunId ? {
       workflowRunId,
       manifestGroupKey: `${workflowRunId}-manifest-group`,
       deliverySliceId: 'page-orders',
     } : {}),
-    ...(rootBuildManifestId ? { rootBuildManifestId } : {}),
+    ...(rootBuildManifestId ? { rootBuildManifestId: fixtureId(rootBuildManifestId) } : {}),
     pageSpecRevision: exactRevision(pageSpecRevision.artifactId, pageSpecRevision.id, 2, pageSpecRevision.contentHash),
     prototypeRevision: exactRevision(approvedPrototypeRevision.artifactId, approvedPrototypeRevision.id, 2, approvedPrototypeRevision.contentHash),
     requirementRevisions: [exactRevision(briefRevision.artifactId, briefRevision.id, 3, briefRevision.contentHash)],
@@ -6970,16 +7392,16 @@ const freshCandidateFile = [
 ].join('\n')
 
 function freshCandidateWorkspace(buildManifestId: string) {
-  const treeHash = hash('8')
+  const treeHash = `sha256:${hash('8')}`
   return {
     schemaVersion: 'candidate-workspace/v1',
-    id: `candidate-${buildManifestId}`,
+    id: fixtureId(`candidate-${buildManifestId}`),
     projectId: project.id,
-    repositorySnapshotId: `repository-snapshot-${buildManifestId}`,
+    repositorySnapshotId: fixtureId(`repository-snapshot-${buildManifestId}`),
     status: 'active' as const,
     buildManifest: { id: buildManifestId, contentHash: hash('6') },
     buildContract: {
-      id: `build-contract-${buildManifestId}`,
+      id: fixtureId(`build-contract-${buildManifestId}`),
       contentHash: hash('a'),
     },
     fullStackTemplate: {
@@ -6989,14 +7411,13 @@ function freshCandidateWorkspace(buildManifestId: string) {
     // A fresh project is materialized directly from the qualified template.
     // It intentionally has no base WorkspaceRevision.
     baseTreeHash: treeHash,
-    treeHash,
     currentTree: {
       schemaVersion: 'repository-tree/v1',
       treeHash,
       files: [{
         path: 'frontend/app/page.tsx',
         mode: '100644',
-        contentHash: hash('9'),
+        contentHash: contentHash(freshCandidateFile),
         byteSize: freshCandidateFile.length,
       }],
     },
@@ -7019,18 +7440,89 @@ function freshCandidateWorkspace(buildManifestId: string) {
   }
 }
 
+async function repositorySnapshotReceiptFor(
+  candidate: ReturnType<typeof freshCandidateWorkspace>,
+) {
+  const snapshot: RepositorySnapshotDto = {
+    schemaVersion: REPOSITORY_SNAPSHOT_RECEIPT_SUBJECT_SCHEMA_VERSION,
+    id: candidate.repositorySnapshotId,
+    projectId: candidate.projectId,
+    buildManifest: candidate.buildManifest,
+    buildContract: candidate.buildContract,
+    fullStackTemplate: candidate.fullStackTemplate,
+    tree: {
+      schemaVersion: REPOSITORY_SNAPSHOT_TREE_COMMITMENT_SCHEMA_VERSION,
+      treeHash: candidate.baseTreeHash,
+      contentObjectHash: `sha256:${hash('5')}`,
+      fileCount: candidate.currentTree.files.length,
+      byteSize: candidate.currentTree.files.reduce((total, file) => total + file.byteSize, 0),
+    },
+    templateReleases: ['api', 'web'].map((role, index) => ({
+      role,
+      mountPath: role === 'api' ? 'backend' : 'frontend',
+      release: {
+        id: fixtureId(`snapshot-${role}-release`),
+        contentHash: `sha256:${hash(index === 0 ? '6' : '7')}`,
+        subjectHash: `sha256:${hash(index === 0 ? '8' : '9')}`,
+      },
+      source: {
+        repository: 'https://github.com/ai-worksflow/templates.git',
+        branch: 'main',
+        commit: String(index + 1).repeat(40),
+        treeHash: `sha256:${hash(index === 0 ? 'a' : 'b')}`,
+      },
+      sbomDigest: `sha256:${hash(index === 0 ? 'c' : 'd')}`,
+      signatureBundleDigest: `sha256:${hash(index === 0 ? 'e' : 'f')}`,
+      authorityReceipt: {
+        id: fixtureId(`snapshot-${role}-authority`),
+        contentHash: `sha256:${hash(index === 0 ? '1' : '2')}`,
+        policyHash: `sha256:${hash(index === 0 ? '3' : '4')}`,
+      },
+    })),
+    createdBy: candidate.createdBy,
+    createdAt: candidate.createdAt,
+  }
+  return {
+    schemaVersion: REPOSITORY_SNAPSHOT_RECEIPT_SCHEMA_VERSION,
+    contentHash: await computeRepositorySnapshotContentHash(snapshot),
+    snapshot,
+  }
+}
+
+function sandboxCandidateState(candidate: ReturnType<typeof freshCandidateWorkspace>) {
+  return {
+    id: candidate.id,
+    repositorySnapshotId: candidate.repositorySnapshotId,
+    status: candidate.status,
+    baseTreeHash: candidate.baseTreeHash,
+    treeHash: candidate.currentTree.treeHash,
+    version: candidate.version,
+    journalSequence: candidate.journalSequence,
+    sessionEpoch: candidate.sessionEpoch,
+    writerLeaseEpoch: candidate.writerLeaseEpoch,
+    dirty: candidate.dirty,
+    conflicted: candidate.conflicted,
+    stale: candidate.stale,
+    rebaseRequired: candidate.rebaseRequired,
+    updatedAt: candidate.updatedAt,
+  }
+}
+
 function readySandboxSession(candidate: ReturnType<typeof freshCandidateWorkspace>) {
   return {
     schemaVersion: 'sandbox-session/v1',
-    id: `sandbox-${candidate.buildManifest.id}`,
+    id: fixtureId(`sandbox-${candidate.buildManifest.id}`),
     projectId: project.id,
     actorId: user.id,
     buildManifest: candidate.buildManifest,
     buildContract: candidate.buildContract,
     fullStackTemplate: candidate.fullStackTemplate,
-    templateReleases: fullStackTemplateComponents.map((component) => component.release),
+    templateReleases: fullStackTemplateComponents.map((component) => ({
+      id: component.release.id,
+      contentHash: component.release.contentHash,
+    })),
     runnerImageDigest: `sha256:${hash('1')}`,
-    candidate,
+    candidate: sandboxCandidateState(candidate),
     sessionEpoch: candidate.sessionEpoch,
     state: 'ready' as const,
     version: 1,
@@ -7050,7 +7542,10 @@ function readySandboxSession(candidate: ReturnType<typeof freshCandidateWorkspac
       id: 'web',
       kind: 'web',
       profiles: ['dev'],
-      templateRelease: fullStackTemplateComponents[0].release,
+      templateRelease: {
+        id: fullStackTemplateComponents[0].release.id,
+        contentHash: fullStackTemplateComponents[0].release.contentHash,
+      },
     }],
     allowedPorts: [{ name: 'web', serviceId: 'web', number: 3000, protocol: 'http' }],
     allowedActions: [
@@ -7065,6 +7560,7 @@ function readySandboxSession(candidate: ReturnType<typeof freshCandidateWorkspac
       'terminate',
     ],
     blockingReasons: [],
+    lastTransition: { to: 'ready' as const, reason: 'Bootstrap complete', at: now },
     createdAt: now,
     updatedAt: now,
   }
@@ -7080,8 +7576,12 @@ function sandboxFenceHeaders(
     'x-sandbox-session-etag': `"sandbox:${session.id}:${session.version}"`,
     'x-sandbox-session-epoch': String(session.sessionEpoch),
     'x-candidate-version': String(current.version),
+    'x-candidate-id': current.id,
+    'x-candidate-journal-sequence': String(current.journalSequence),
     'x-writer-lease-epoch': String(current.writerLeaseEpoch),
-    'x-candidate-tree-hash': current.treeHash,
+    'x-candidate-tree-hash': candidate
+      ? candidate.currentTree.treeHash
+      : session.candidate.treeHash,
   }
 }
 
@@ -7091,9 +7591,19 @@ function implementationProposal(
   version = 1,
 ) {
   return {
-    id: 'implementation-1',
+    id: primaryProposalId,
     projectId: project.id,
-    buildManifestId: 'build-1',
+    buildManifestId: primaryBuildManifestId,
+    applicationBuildContract: {
+      id: fixtureId(`build-contract-${primaryBuildManifestId}`),
+      contractHash: hash('b'),
+    },
+    baseWorkspaceRevision: undefined as {
+      artifactId: string
+      revisionId: string
+      contentHash: string
+      anchorId?: string
+    } | undefined,
     executionSource: 'manual_submission' as 'manual_submission' | 'manual_generation' | 'workflow_runner' | 'conversation_command' | 'candidate_freeze',
     conversationCommandId: undefined as string | undefined,
     instructionHash: undefined as string | undefined,
@@ -7118,17 +7628,18 @@ function implementationProposal(
       path: 'src/index.html',
       content: '<!doctype html><html><body><h1>SERVER_APPLIED_APPLICATION</h1></body></html>',
       language: 'html',
-      dependsOn: [],
+      mode: '100644',
       rationale: 'Render the approved flow.',
       traceSource: [approvedPrototypeRevision.id],
       decision,
+      ...(decision !== 'pending' ? { decidedBy: user.id } : {}),
     }],
     routes: [],
     apis: [],
     migrations: [],
     tests: [],
     previews: [],
-    traceLinks: [],
+    traceLinks: [] as Array<Record<string, string>>,
     diagnostics: [] as Array<{
       code: string
       severity: 'info' | 'warning' | 'error' | 'blocker'
@@ -7143,6 +7654,7 @@ function implementationProposal(
     payloadHash: hash('4'),
     createdBy: user.id,
     createdAt: now,
+    ...(status === 'applied' ? { appliedAt: now } : {}),
   }
 }
 
@@ -7317,12 +7829,12 @@ function multiWorkbenchState(): MockMultiWorkbenchState {
     bundles: { [home.id]: home, [checkout.id]: checkout },
     proposals: { [proposal.id]: proposal },
     activeBundleIds: {
-      'bundle-home': home.id,
-      'bundle-checkout': checkout.id,
+      [home.id]: home.id,
+      [checkout.id]: checkout.id,
     },
     currentProposalIds: {
-      'bundle-home': proposal.id,
-      'bundle-checkout': undefined,
+      [home.id]: proposal.id,
+      [checkout.id]: undefined,
     },
   }
 }
@@ -7433,13 +7945,13 @@ function multiBuildManifest(
   const base = buildManifest('run-multi')
   return {
     ...base,
-    id,
+    id: fixtureId(id),
     deliverySliceId,
     workflowContext: base.workflowContext
       ? { ...base.workflowContext, deliverySliceId }
       : undefined,
-    ...(rootBuildManifestId ? { rootBuildManifestId } : {}),
-    ...(derivedFromBuildManifestId ? { derivedFromBuildManifestId } : {}),
+    ...(rootBuildManifestId ? { rootBuildManifestId: fixtureId(rootBuildManifestId) } : {}),
+    ...(derivedFromBuildManifestId ? { derivedFromBuildManifestId: fixtureId(derivedFromBuildManifestId) } : {}),
     ...(currentWorkspaceRevision ? { currentWorkspaceRevision } : {}),
     contentHash: id === 'bundle-checkout-w1' ? hash('7') : hash('6'),
   }
@@ -7456,8 +7968,12 @@ function multiImplementationProposal(
 ) {
   return {
     ...implementationProposal(status, decision === 'rejected' ? 'pending' : decision, version),
-    id,
-    buildManifestId,
+    id: fixtureId(id),
+    buildManifestId: fixtureId(buildManifestId),
+    applicationBuildContract: {
+      id: fixtureId(`build-contract-${fixtureId(buildManifestId)}`),
+      contractHash: hash('b'),
+    },
     operations: [{
       id: `${id}-operation`,
       kind: 'file.upsert' as const,
@@ -7467,12 +7983,13 @@ function multiImplementationProposal(
         : "export const currentPage = 'checkout'\n",
       language: 'typescript',
       ...(expectedHash ? { expectedHash } : {}),
-      dependsOn: [],
       rationale,
       traceSource: [approvedPrototypeRevision.id],
       decision,
+      ...(decision !== 'pending' ? { decidedBy: user.id } : {}),
     }],
     payloadHash: id === 'proposal-home' ? hash('4') : hash('5'),
+    ...(status === 'applied' ? { appliedAt: now } : {}),
   }
 }
 
@@ -7511,14 +8028,20 @@ function multiBundleWorkflowRun(status: 'waiting_input' | 'completed' = 'waiting
     id: 'run-multi',
     projectId: project.id,
     definitionVersionId: workflowDefinition.versionId,
-    definition: { id: workflowDefinition.id, version: 2, hash: workflowDefinition.contentHash },
+    definition: {
+      id: workflowDefinition.id,
+      version: 2,
+      hash: workflowDefinition.contentHash,
+      executionProfile: workflowExecutionProfile,
+    },
+    executionProfile: workflowExecutionProfile,
     inputManifest: { id: 'manifest-1', hash: hash('1') },
     status,
     scope: {},
     context: {
       values: {
         buildManifest: {
-          bundleIds: ['bundle-home', 'bundle-checkout'],
+          bundleIds: [fixtureId('bundle-home'), fixtureId('bundle-checkout')],
           sliceIds: ['page-home', 'page-checkout'],
         },
       },
@@ -7526,8 +8049,8 @@ function multiBundleWorkflowRun(status: 'waiting_input' | 'completed' = 'waiting
         workbench: {
           output: {
             implementationProposals: [{
-              bundleId: 'bundle-home',
-              proposalId: 'proposal-home',
+              bundleId: fixtureId('bundle-home'),
+              proposalId: fixtureId('proposal-home'),
               payloadHash: hash('4'),
             }],
           },
@@ -7547,6 +8070,8 @@ function multiBundleWorkflowRun(status: 'waiting_input' | 'completed' = 'waiting
       type: 'workbench_build',
       status,
       attempt: 0,
+      allowedActions: status === 'waiting_input' ? ['submit_input'] : [],
+      blockingReasons: [],
       availableAt: now,
       createdAt: now,
       updatedAt: now,
@@ -7556,13 +8081,13 @@ function multiBundleWorkflowRun(status: 'waiting_input' | 'completed' = 'waiting
 
 function multiGroupWorkflowRun() {
   const manifestA = {
-    bundleIds: ['bundle-group-a'],
+    bundleIds: [fixtureId('bundle-group-a')],
     sliceIds: ['slice-group-a'],
     manifestGroupKey: 'manifest-group-a',
     hash: hash('a'),
   }
   const manifestB = {
-    bundleIds: ['bundle-group-b'],
+    bundleIds: [fixtureId('bundle-group-b')],
     sliceIds: ['slice-group-b'],
     manifestGroupKey: 'manifest-group-b',
     hash: hash('b'),
@@ -7571,7 +8096,13 @@ function multiGroupWorkflowRun() {
     id: 'run-groups',
     projectId: project.id,
     definitionVersionId: workflowDefinition.versionId,
-    definition: { id: workflowDefinition.id, version: 2, hash: workflowDefinition.contentHash },
+    definition: {
+      id: workflowDefinition.id,
+      version: 2,
+      hash: workflowDefinition.contentHash,
+      executionProfile: workflowExecutionProfile,
+    },
+    executionProfile: workflowExecutionProfile,
     inputManifest: { id: 'manifest-1', hash: hash('1') },
     status: 'waiting_input' as const,
     scope: {},
@@ -7585,8 +8116,8 @@ function multiGroupWorkflowRun() {
           input: { bindings: [{ value: manifestA, output: manifestA }] },
           output: {
             implementationProposals: [{
-              bundleId: 'bundle-group-a',
-              proposalId: 'proposal-group-a',
+              bundleId: fixtureId('bundle-group-a'),
+              proposalId: fixtureId('proposal-group-a'),
             }],
           },
         },
@@ -7597,8 +8128,8 @@ function multiGroupWorkflowRun() {
           input: { bindings: [{ value: manifestB, output: manifestB }] },
           output: {
             implementationProposals: [{
-              bundleId: 'bundle-group-b',
-              proposalId: 'proposal-group-b',
+              bundleId: fixtureId('bundle-group-b'),
+              proposalId: fixtureId('proposal-group-b'),
             }],
           },
         },
@@ -7618,6 +8149,8 @@ function multiGroupWorkflowRun() {
         type: 'workbench_build' as const,
         status: 'waiting_input' as const,
         attempt: 0,
+        allowedActions: ['submit_input'] as const,
+        blockingReasons: [],
         availableAt: now,
         createdAt: now,
         updatedAt: now,
@@ -7630,6 +8163,8 @@ function multiGroupWorkflowRun() {
         type: 'workbench_build' as const,
         status: 'waiting_input' as const,
         attempt: 0,
+        allowedActions: ['submit_input'] as const,
+        blockingReasons: [],
         availableAt: now,
         createdAt: now,
         updatedAt: now,

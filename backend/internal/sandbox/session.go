@@ -268,6 +268,27 @@ func (session SandboxSession) BindResumedCandidate(
 }
 
 func (session SandboxSession) BeginTerminate(expectedVersion, sessionEpoch uint64, reason string, now time.Time) (SandboxSession, error) {
+	return session.beginTerminate(expectedVersion, sessionEpoch, reason, now, true)
+}
+
+// beginTerminateDeadline models the operator-only absolute-TTL path. The
+// Candidate tree is already durable outside the disposable runtime, so this
+// exact Session transition does not require the user to hold an editor lease
+// long enough to create another checkpoint.
+func (session SandboxSession) beginTerminateDeadline(
+	expectedVersion, sessionEpoch uint64,
+	reason string,
+	now time.Time,
+) (SandboxSession, error) {
+	return session.beginTerminate(expectedVersion, sessionEpoch, reason, now, false)
+}
+
+func (session SandboxSession) beginTerminate(
+	expectedVersion, sessionEpoch uint64,
+	reason string,
+	now time.Time,
+	requireCheckpoint bool,
+) (SandboxSession, error) {
 	reason = strings.TrimSpace(reason)
 	if reason == "" || len(reason) > 1000 {
 		return SandboxSession{}, fmt.Errorf("%w: termination reason is required and bounded", ErrInvalidSession)
@@ -278,7 +299,7 @@ func (session SandboxSession) BeginTerminate(expectedVersion, sessionEpoch uint6
 	if session.document.State != StateReady && session.document.State != StateSuspended && session.document.State != StateFailed {
 		return SandboxSession{}, invalidTransition(session.document.State, StateTerminating)
 	}
-	if session.document.Candidate.Status == repository.CandidateActive &&
+	if requireCheckpoint && session.document.Candidate.Status == repository.CandidateActive &&
 		session.document.Candidate.Dirty && !hasExactCheckpoint(session.document) {
 		return SandboxSession{}, ErrCheckpointRequired
 	}

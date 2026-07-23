@@ -279,31 +279,81 @@ type ArtifactHealthModel struct {
 func (ArtifactHealthModel) TableName() string { return "artifact_health" }
 
 type ReviewRequestModel struct {
-	ID          uuid.UUID       `gorm:"type:uuid;primaryKey"`
-	ProjectID   uuid.UUID       `gorm:"type:uuid;not null;index"`
-	ArtifactID  uuid.UUID       `gorm:"type:uuid;not null"`
-	RevisionID  uuid.UUID       `gorm:"type:uuid;not null"`
-	ContentHash string          `gorm:"not null"`
-	Status      string          `gorm:"not null"`
-	Policy      json.RawMessage `gorm:"type:jsonb;not null"`
-	RequestedBy uuid.UUID       `gorm:"type:uuid;not null"`
-	RequestedAt time.Time
-	ClosedAt    *time.Time
+	ID                     uuid.UUID       `gorm:"type:uuid;primaryKey"`
+	ProjectID              uuid.UUID       `gorm:"type:uuid;not null;index"`
+	ArtifactID             uuid.UUID       `gorm:"type:uuid;not null"`
+	RevisionID             uuid.UUID       `gorm:"type:uuid;not null"`
+	ContentHash            string          `gorm:"not null"`
+	Status                 string          `gorm:"not null"`
+	Policy                 json.RawMessage `gorm:"type:jsonb;not null"`
+	RequestedBy            uuid.UUID       `gorm:"type:uuid;not null"`
+	RequestedAt            time.Time
+	ClosedAt               *time.Time
+	ReviewAuthorityVersion int16      `gorm:"not null"`
+	ClosedByDecisionID     *uuid.UUID `gorm:"type:uuid"`
 }
 
 func (ReviewRequestModel) TableName() string { return "review_requests" }
 
 type ReviewDecisionModel struct {
-	ID              uuid.UUID `gorm:"type:uuid;primaryKey"`
-	ReviewRequestID uuid.UUID `gorm:"type:uuid;not null;index"`
-	ReviewerID      uuid.UUID `gorm:"type:uuid;not null"`
-	Decision        string    `gorm:"not null"`
-	Summary         string    `gorm:"not null"`
-	SoloSelfReview  bool      `gorm:"not null"`
-	CreatedAt       time.Time
+	ID                       uuid.UUID `gorm:"type:uuid;primaryKey"`
+	ReviewRequestID          uuid.UUID `gorm:"type:uuid;not null;index"`
+	ReviewerID               uuid.UUID `gorm:"type:uuid;not null"`
+	Decision                 string    `gorm:"not null"`
+	Summary                  string    `gorm:"not null"`
+	SoloSelfReview           bool      `gorm:"not null"`
+	CreatedAt                time.Time
+	ReviewAuthorityVersion   int16   `gorm:"not null"`
+	ReviewerRoleAtDecision   *string `gorm:"column:reviewer_role_at_decision"`
+	GovernanceModeAtDecision *string
+	OwnerCountAtDecision     *int
+	SoleOwnerIDAtDecision    *uuid.UUID `gorm:"type:uuid"`
+	SoloReviewConfirmed      *bool
+	PreconditionETag         *string `gorm:"column:precondition_etag"`
 }
 
 func (ReviewDecisionModel) TableName() string { return "review_decisions" }
+
+type CanonicalReviewApprovalReceiptModel struct {
+	ReviewRequestID               uuid.UUID       `gorm:"type:uuid;primaryKey"`
+	ReceiptHash                   string          `gorm:"not null;unique"`
+	ReceiptBytes                  []byte          `gorm:"not null"`
+	ReceiptDocument               json.RawMessage `gorm:"type:jsonb;not null"`
+	ReviewRequestSnapshotHash     string          `gorm:"not null"`
+	ReviewRequestSnapshotBytes    []byte          `gorm:"not null"`
+	ReviewRequestSnapshotDocument json.RawMessage `gorm:"type:jsonb;not null"`
+	RevisionSnapshotHash          string          `gorm:"not null"`
+	RevisionSnapshotBytes         []byte          `gorm:"not null"`
+	RevisionSnapshotDocument      json.RawMessage `gorm:"type:jsonb;not null"`
+	PolicySnapshotHash            string          `gorm:"not null"`
+	PolicySnapshotBytes           []byte          `gorm:"not null"`
+	PolicySnapshotDocument        json.RawMessage `gorm:"type:jsonb;not null"`
+	DecisionsSnapshotHash         string          `gorm:"not null"`
+	DecisionsSnapshotBytes        []byte          `gorm:"not null"`
+	DecisionsSnapshotDocument     json.RawMessage `gorm:"type:jsonb;not null"`
+	GovernanceSnapshotHash        string          `gorm:"not null"`
+	GovernanceSnapshotBytes       []byte          `gorm:"not null"`
+	GovernanceSnapshotDocument    json.RawMessage `gorm:"type:jsonb;not null"`
+	ApprovalSnapshotHash          string          `gorm:"not null"`
+	ApprovalSnapshotBytes         []byte          `gorm:"not null"`
+	ApprovalSnapshotDocument      json.RawMessage `gorm:"type:jsonb;not null"`
+	ProjectID                     uuid.UUID       `gorm:"type:uuid;not null"`
+	ArtifactID                    uuid.UUID       `gorm:"type:uuid;not null"`
+	RevisionID                    uuid.UUID       `gorm:"type:uuid;not null;unique"`
+	RevisionContentHash           string          `gorm:"not null"`
+	ClosedByDecisionID            uuid.UUID       `gorm:"type:uuid;not null"`
+	ApprovalCount                 int             `gorm:"not null"`
+	MinimumApprovals              int             `gorm:"not null"`
+	GovernanceMode                string          `gorm:"not null"`
+	OwnerCount                    int             `gorm:"not null"`
+	SoloSelfReview                bool            `gorm:"not null"`
+	SoleOwnerID                   *uuid.UUID      `gorm:"type:uuid"`
+	IssuedAt                      time.Time
+}
+
+func (CanonicalReviewApprovalReceiptModel) TableName() string {
+	return "canonical_review_approval_receipts"
+}
 
 type CommentThreadModel struct {
 	ID         uuid.UUID       `gorm:"type:uuid;primaryKey"`

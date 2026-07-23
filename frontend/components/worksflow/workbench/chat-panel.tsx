@@ -16,8 +16,15 @@ import { Check, ChevronsLeft, ChevronsRight, FileSearch, Loader2, RotateCcw, Spa
 import { useCollaboration } from '@/lib/collaboration/provider'
 
 export function ChatPanel() {
-  const { phase, versions, followUps, toggleVersionStar, startBuild, resetWorkbench } =
-    useWorksflow()
+  const {
+    phase,
+    versions,
+    followUps,
+    generationPlan,
+    toggleVersionStar,
+    startBuild,
+    resetWorkbench,
+  } = useWorksflow()
   const { session, can, authorize } = useCollaboration()
   const { t } = useI18n()
   const [collapsed, setCollapsed] = useState(false)
@@ -74,22 +81,24 @@ export function ChatPanel() {
       ) : (
         <>
           <div className="flex-1 space-y-4 overflow-y-auto scrollbar-thin p-4">
-        {/* User prompt bubble */}
-        <UserPrompt />
-
-        {/* Assistant intro */}
         <AssistantHeader />
 
         <BlueprintContextCard />
 
         {phase === 'planning' && <PlanningState />}
 
-        {(phase === 'planReady' ||
+        {generationPlan && (phase === 'planReady' ||
           phase === 'building' ||
           phase === 'complete' ||
           phase === 'error') && <PlanBlock />}
 
-        {phase === 'planReady' && (
+        {phase === 'planReady' && !generationPlan && (
+          <p className="rounded-lg border border-dashed border-border bg-card/50 px-4 py-6 text-center text-[12px] leading-relaxed text-muted-foreground">
+            {t('chat.notConfigured')}
+          </p>
+        )}
+
+        {phase === 'planReady' && generationPlan && (
           <button
             type="button"
             onClick={async () => {
@@ -103,7 +112,7 @@ export function ChatPanel() {
           </button>
         )}
 
-        {phase === 'planReady' && (
+        {phase === 'planReady' && generationPlan && versions[0] && (
           <VersionCard
             version={versions[0]}
             onToggleStar={(versionId) => {
@@ -175,17 +184,6 @@ function FollowUpList() {
   )
 }
 
-function UserPrompt() {
-  const { t } = useI18n()
-  return (
-    <div className="flex justify-end">
-      <div className="max-w-[85%] rounded-lg rounded-tr-sm bg-secondary px-3.5 py-2.5 text-[13px] leading-relaxed text-foreground">
-        {t('chat.demo.userPrompt')}
-      </div>
-    </div>
-  )
-}
-
 function AssistantHeader() {
   return (
     <div className="flex items-center gap-2">
@@ -229,6 +227,8 @@ function PlanningState() {
 function PlanBlock() {
   const { generationPlan, workspace } = useWorksflow()
   const { t } = useI18n()
+  if (!generationPlan) return null
+
   return (
     <div className="space-y-3">
       <div className="flex items-center gap-2 rounded-md border border-border bg-card px-3 py-1.5 text-[11px] text-muted-foreground">
@@ -239,17 +239,14 @@ function PlanBlock() {
       </div>
 
       <h3 className="text-[15px] font-semibold text-foreground text-balance">
-        {generationPlan?.title ?? t('chat.demo.planTitle')}
+        {generationPlan.title}
       </h3>
 
       <ol className="space-y-3">
-        {(generationPlan
-          ? generationPlan.tasks.map((task) => ({
-              title: task.title,
-              items: [task.description],
-            }))
-          : demoPlanGroups(t)
-        ).map((group, i) => (
+        {generationPlan.tasks.map((task) => ({
+          title: task.title,
+          items: [task.description],
+        })).map((group, i) => (
           <li key={group.title}>
             <div className="flex items-center gap-2">
               <span className="flex h-5 w-5 items-center justify-center rounded-full bg-white/5 text-[11px] font-semibold text-muted-foreground">
@@ -272,7 +269,7 @@ function PlanBlock() {
       </ol>
 
       <p className="text-[12px] leading-relaxed text-muted-foreground">
-        {generationPlan?.summary ?? t('chat.demo.planSummary')}
+        {generationPlan.summary}
       </p>
       <ResponseActions />
     </div>
@@ -428,12 +425,12 @@ function BuildBlock() {
       {phase === 'complete' && (
         <div className="space-y-3">
           <p className="text-[13px] leading-relaxed text-foreground">
-            {generationSummary || t('chat.demo.buildSummary')}
+            {generationSummary || t('chat.notConfigured')}
           </p>
           <div>
             <p className="mb-1.5 text-[12px] font-medium text-foreground">{t('chat.whatWasBuilt')}</p>
             <ul className="space-y-1">
-              {(generationPlan?.tasks.map((task) => task.title) ?? demoBuiltItems(t)).map((item) => (
+              {(generationPlan?.tasks.map((task) => task.title) ?? []).map((item) => (
                 <li key={item} className="flex items-center gap-2 text-[12px] text-muted-foreground">
                   <Check className="h-3.5 w-3.5 text-success" />
                   {item}
@@ -449,45 +446,6 @@ function BuildBlock() {
       )}
     </div>
   )
-}
-
-function demoPlanGroups(t: ReturnType<typeof useI18n>['t']) {
-  return [
-    {
-      title: t('chat.demo.plan.1.title'),
-      items: [
-        t('chat.demo.plan.1.item1'),
-        t('chat.demo.plan.1.item2'),
-        t('chat.demo.plan.1.item3'),
-      ],
-    },
-    {
-      title: t('chat.demo.plan.2.title'),
-      items: [t('chat.demo.plan.2.item1'), t('chat.demo.plan.2.item2')],
-    },
-    {
-      title: t('chat.demo.plan.3.title'),
-      items: [t('chat.demo.plan.3.item1'), t('chat.demo.plan.3.item2')],
-    },
-    {
-      title: t('chat.demo.plan.4.title'),
-      items: [t('chat.demo.plan.4.item1'), t('chat.demo.plan.4.item2')],
-    },
-    {
-      title: t('chat.demo.plan.5.title'),
-      items: [t('chat.demo.plan.5.item1'), t('chat.demo.plan.5.item2')],
-    },
-  ]
-}
-
-function demoBuiltItems(t: ReturnType<typeof useI18n>['t']) {
-  return [
-    t('chat.demo.built.topNav'),
-    t('chat.demo.built.taskInput'),
-    t('chat.demo.built.taskList'),
-    t('chat.demo.built.filters'),
-    t('chat.demo.built.emptyStates'),
-  ]
 }
 
 function generationRecoveryHint(

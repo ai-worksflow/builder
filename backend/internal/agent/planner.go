@@ -63,6 +63,10 @@ type TaskPlanner interface {
 	Plan(context.Context, PlanTaskInput) (TaskPlan, error)
 }
 
+type TaskGraphPlanner interface {
+	PlanTaskGraph(context.Context, string, string) (TaskGraph, error)
+}
+
 // DeterministicPlanner seals authoritative source facts into immutable domain
 // objects. It performs no model call: planning identity remains stable across
 // model providers, retries, and process restarts.
@@ -153,4 +157,27 @@ func (planner *DeterministicPlanner) Plan(
 	return TaskPlan{ContextPack: pack, TaskCapsule: capsule}, nil
 }
 
+func (planner *DeterministicPlanner) PlanTaskGraph(
+	ctx context.Context,
+	projectID, sandboxSessionID string,
+) (TaskGraph, error) {
+	if planner == nil || ctx == nil || !validUUIDs(projectID, sandboxSessionID) {
+		return TaskGraph{}, fmt.Errorf("%w: task graph identity", ErrTaskGraphBlocked)
+	}
+	source, ok := planner.source.(TaskGraphPlanningSource)
+	if !ok {
+		return TaskGraph{}, fmt.Errorf("%w: planning source does not provide a task graph", ErrTaskGraphBlocked)
+	}
+	graph, err := source.LoadTaskGraph(ctx, projectID, sandboxSessionID)
+	if err != nil {
+		return TaskGraph{}, err
+	}
+	if graph.ProjectID != projectID || graph.SandboxSessionID != sandboxSessionID ||
+		graph.SchemaVersion != TaskGraphSchemaVersion || len(graph.Tasks) == 0 {
+		return TaskGraph{}, fmt.Errorf("%w: planning source returned a different or empty task graph", ErrPlanningDrift)
+	}
+	return graph, nil
+}
+
 var _ TaskPlanner = (*DeterministicPlanner)(nil)
+var _ TaskGraphPlanner = (*DeterministicPlanner)(nil)

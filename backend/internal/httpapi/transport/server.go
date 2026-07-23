@@ -69,10 +69,7 @@ type TraceService interface {
 type ReviewService interface {
 	Submit(context.Context, string, string, string, core.SubmitReviewInput) (core.ReviewRequest, error)
 	List(context.Context, string, string) ([]core.ReviewRequest, error)
-	Decide(context.Context, string, string, core.DecideReviewInput) (core.ReviewRequest, error)
-}
-
-type ConditionalReviewService interface {
+	Get(context.Context, string, string, string) (core.ReviewRequest, error)
 	DecideIfMatch(context.Context, string, string, string, core.DecideReviewInput) (core.ReviewRequest, error)
 }
 

@@ -19,6 +19,7 @@ const sandboxResumeLeaseTTL = 5 * time.Minute
 type ControlSessionStore interface {
 	Get(context.Context, string, string) (SandboxSession, error)
 	Transition(context.Context, string, string, uint64, uint64, State, string, string, string) (SandboxSession, error)
+	TransitionDeadline(context.Context, string, string, uint64, uint64, State, string, string) (SandboxSession, error)
 	SyncCandidate(context.Context, string, string, uint64, uint64, string) (SandboxSession, error)
 	AttachCheckpoint(context.Context, string, string, uint64, uint64, string, string) (SandboxSession, error)
 	AbandonCandidate(
@@ -416,7 +417,7 @@ func (service *ControlService) Terminate(ctx context.Context, input TerminateSes
 	if err := service.access.RequireSandboxControl(ctx, input.ProjectID, input.ActorID); err != nil {
 		return SessionView{}, fmt.Errorf("authorize sandbox terminate: %w", err)
 	}
-	return service.terminate(ctx, input)
+	return service.terminate(ctx, input, true)
 }
 
 // AbandonCandidate is a destructive, exact-lineage operation. PostgreSQL
@@ -647,10 +648,14 @@ func (service *ControlService) terminateDeadline(
 	if err := service.validate(ctx, input.SessionControlInput); err != nil {
 		return SessionView{}, err
 	}
-	return service.terminate(ctx, input)
+	return service.terminate(ctx, input, false)
 }
 
-func (service *ControlService) terminate(ctx context.Context, input TerminateSessionInput) (SessionView, error) {
+func (service *ControlService) terminate(
+	ctx context.Context,
+	input TerminateSessionInput,
+	requireAllowedAction bool,
+) (SessionView, error) {
 	session, err := service.sessions.Get(ctx, input.ProjectID, input.SessionID)
 	if err != nil {
 		return SessionView{}, err
@@ -662,17 +667,29 @@ func (service *ControlService) terminate(ctx context.Context, input TerminateSes
 	retrying := view.State == StateTerminating && view.SessionEpoch == input.ExpectedSessionEpoch &&
 		view.Version == input.ExpectedSessionVersion+1 && view.LastTransition.Reason == input.Reason
 	if !retrying {
-		if err := session.Authorize(ActionTerminate, input.ExpectedSessionVersion, input.ExpectedSessionEpoch); err != nil {
-			return SessionView{}, err
+		if requireAllowedAction {
+			if err := session.Authorize(ActionTerminate, input.ExpectedSessionVersion, input.ExpectedSessionEpoch); err != nil {
+				return SessionView{}, err
+			}
+		} else {
+			// Absolute TTL is an operator-owned resource boundary. It still
+			// honors exact Session CAS and lifecycle state, but it intentionally
+			// bypasses the user-action rule that asks for a fresh Candidate
+			// checkpoint. Candidate persistence is independent of runtime cleanup.
+			if err := session.guard(input.ExpectedSessionVersion, input.ExpectedSessionEpoch); err != nil {
+				return SessionView{}, err
+			}
+			if view.State != StateReady && view.State != StateSuspended && view.State != StateFailed {
+				return SessionView{}, invalidTransition(view.State, StateTerminating)
+			}
 		}
-		transitioned, err := service.sessions.Transition(
-			ctx, view.ProjectID, view.ID, view.Version, view.SessionEpoch,
-			StateTerminating, input.ActorID, input.Reason, "",
+		transitioned, err := service.transitionTerminationOrCurrent(
+			ctx, view, input.ActorID, StateTerminating, input.Reason, !requireAllowedAction,
 		)
 		if err != nil {
 			return SessionView{}, err
 		}
-		view = transitioned.Snapshot()
+		view = transitioned
 		service.publishState(ctx, view)
 	}
 	durable, cancel := service.durableContext(ctx)
@@ -700,14 +717,49 @@ func (service *ControlService) terminate(ctx context.Context, input TerminateSes
 			return view, err
 		}
 	}
-	terminated, err := service.transitionOrCurrent(
-		durable, view, input.ActorID, StateTerminated, "runtime terminated", nil,
+	terminated, err := service.transitionTerminationOrCurrent(
+		durable, view, input.ActorID, StateTerminated, "runtime terminated", !requireAllowedAction,
 	)
 	if err != nil {
 		return view, err
 	}
 	service.publishState(durable, terminated)
 	return terminated, nil
+}
+
+func (service *ControlService) transitionTerminationOrCurrent(
+	ctx context.Context,
+	view SessionView,
+	actorID string,
+	target State,
+	reason string,
+	absoluteTTL bool,
+) (SessionView, error) {
+	var transitioned SandboxSession
+	var err error
+	if absoluteTTL {
+		transitioned, err = service.sessions.TransitionDeadline(
+			ctx, view.ProjectID, view.ID, view.Version, view.SessionEpoch,
+			target, actorID, reason,
+		)
+	} else {
+		transitioned, err = service.sessions.Transition(
+			ctx, view.ProjectID, view.ID, view.Version, view.SessionEpoch,
+			target, actorID, reason, "",
+		)
+	}
+	if err == nil {
+		return transitioned.Snapshot(), nil
+	}
+	current, loadErr := service.sessions.Get(ctx, view.ProjectID, view.ID)
+	if loadErr == nil {
+		currentView := current.Snapshot()
+		if currentView.State == target && currentView.SessionEpoch == view.SessionEpoch &&
+			currentView.Version == view.Version+1 {
+			return currentView, nil
+		}
+	}
+	return view, errors.Join(err, loadErr)
 }
 
 func (service *ControlService) validate(ctx context.Context, input SessionControlInput) error {

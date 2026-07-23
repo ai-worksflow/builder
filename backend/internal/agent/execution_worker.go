@@ -291,7 +291,24 @@ func (worker *ExecutionWorker) executeRunner(
 		capsule.Budgets.MaxPatchBytes,
 	)
 	if err != nil {
-		return attempt, err
+		if failErr := worker.failClaim(ctx, principal, attempt, &result, err); failErr != nil {
+			return attempt, failErr
+		}
+		terminal, loadErr := worker.queue.GetAttempt(context.WithoutCancel(ctx), attempt.ProjectID, attempt.ID)
+		if loadErr != nil {
+			return attempt, loadErr
+		}
+		return terminal, nil
+	}
+	if err := validateRunnerResultClosure(capsule, captured, result.StructuredResult); err != nil {
+		if failErr := worker.failClaim(ctx, principal, attempt, &result, err); failErr != nil {
+			return attempt, failErr
+		}
+		terminal, loadErr := worker.queue.GetAttempt(context.WithoutCancel(ctx), attempt.ProjectID, attempt.ID)
+		if loadErr != nil {
+			return attempt, loadErr
+		}
+		return terminal, nil
 	}
 	if err := worker.registerPatchFiles(ctx, attempt, captured); err != nil {
 		return attempt, err
@@ -595,7 +612,7 @@ func (worker *ExecutionWorker) failClaim(
 	evidence := AttemptEvidence{}
 	pending := []pendingAttemptEvidence{}
 	if result != nil {
-		for _, value := range []struct {
+		values := []struct {
 			kind      EvidenceKind
 			mediaType string
 			value     []byte
@@ -603,7 +620,16 @@ func (worker *ExecutionWorker) failClaim(
 		}{
 			{EvidenceStdout, "application/x-ndjson", truncateLogEvidence(result.Events), &evidence.Stdout},
 			{EvidenceStderr, "text/plain; charset=utf-8", truncateLogEvidence(result.Stderr), &evidence.Stderr},
-		} {
+		}
+		if result.Record.ResultValidJSON && json.Valid(result.StructuredResult) {
+			values = append(values, struct {
+				kind      EvidenceKind
+				mediaType string
+				value     []byte
+				target    **BlobReference
+			}{EvidenceStructuredResult, "application/json", result.StructuredResult, &evidence.StructuredResult})
+		}
+		for _, value := range values {
 			reference, putErr := worker.evidence.PutPending(
 				context.WithoutCancel(ctx), attempt, value.kind, value.mediaType, value.value,
 			)

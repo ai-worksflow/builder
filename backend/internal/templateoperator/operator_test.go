@@ -123,6 +123,65 @@ func TestAdmissionRequestExposesOnlyCallerSafeFields(t *testing.T) {
 	}
 }
 
+func TestDecodeFullStackRegistrationRequestRejectsNonStrictJSON(t *testing.T) {
+	valid := []byte(`{"schemaVersion":"template-artifact-authority-full-stack-registration/v1"}`)
+	if _, err := DecodeFullStackRegistrationRequest(valid); err != nil {
+		t.Fatalf("decode minimal valid full-stack registration request: %v", err)
+	}
+
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{
+			name:  "duplicate component release hash",
+			input: `{"schemaVersion":"template-artifact-authority-full-stack-registration/v1","components":[{"release":{"contentHash":"first","contentHash":"second"}}]}`,
+			want:  `duplicate JSON object key "contentHash"`,
+		},
+		{
+			name:  "unknown authority controlled creation time",
+			input: `{"schemaVersion":"template-artifact-authority-full-stack-registration/v1","createdAt":"2026-07-20T00:00:00Z"}`,
+			want:  `unknown field "createdAt"`,
+		},
+		{
+			name:  "unknown derived content hash",
+			input: `{"schemaVersion":"template-artifact-authority-full-stack-registration/v1","contentHash":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`,
+			want:  `unknown field "contentHash"`,
+		},
+		{
+			name:  "wrong schema",
+			input: `{"schemaVersion":"full-stack-template/v1"}`,
+			want:  `schemaVersion must equal "template-artifact-authority-full-stack-registration/v1"`,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := DecodeFullStackRegistrationRequest([]byte(test.input))
+			testRequireErrorContains(t, err, test.want)
+		})
+	}
+}
+
+func TestFullStackRegistrationRequestExposesOnlyCallerSafeFields(t *testing.T) {
+	typeOfRequest := reflect.TypeOf(FullStackRegistrationRequest{})
+	got := make([]string, 0, typeOfRequest.NumField())
+	for index := 0; index < typeOfRequest.NumField(); index++ {
+		field := typeOfRequest.Field(index)
+		jsonName := strings.Split(field.Tag.Get("json"), ",")[0]
+		if jsonName == "" || jsonName == "-" {
+			t.Fatalf("FullStackRegistrationRequest field %s has unsafe JSON tag %q", field.Name, field.Tag.Get("json"))
+		}
+		got = append(got, jsonName)
+	}
+	slices.Sort(got)
+	want := []string{"components", "createdBy", "id", "layout", "schemaVersion", "templateId", "version"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("FullStackRegistrationRequest JSON fields = %#v, want only %#v", got, want)
+	}
+}
+
 func TestNewFailsClosed(t *testing.T) {
 	config := testConfigWithExpectedCommitments(t)
 	presentLookup := func(string) (string, bool) { return "Bearer test-token", true }

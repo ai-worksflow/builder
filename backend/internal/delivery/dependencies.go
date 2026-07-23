@@ -34,6 +34,70 @@ type DependencyPreparer interface {
 	PrepareDependencies(context.Context, string, DependencyPreparationRequest) (SandboxResult, error)
 }
 
+// PreparedDependencyCache is an isolated, validated dependency projection.
+// Call Cleanup after the cache has been consumed. The resolver sees only the
+// manifest and lock files materialized in Directory, never application source.
+type PreparedDependencyCache struct {
+	Directory string
+	Ecosystem string
+	cleanup   func()
+}
+
+func (cache PreparedDependencyCache) Cleanup() {
+	if cache.cleanup != nil {
+		cache.cleanup()
+	}
+}
+
+// PrepareDependencyCache applies the same fixed resolver policy used by the
+// quality pipeline, but exposes the resulting cache to another trusted backend
+// boundary such as an interactive Sandbox workspace.
+func PrepareDependencyCache(
+	ctx context.Context,
+	baseDirectory string,
+	files []WorkspaceFile,
+	preparer DependencyPreparer,
+) (PreparedDependencyCache, error) {
+	if ctx == nil || preparer == nil {
+		return PreparedDependencyCache{}, Invalid("dependencies", "dependency resolver is required")
+	}
+	policy := DependencyPolicy{NPMRegistry: defaultNPMRegistry, GoProxy: defaultGoProxy, GoSumDB: defaultGoSumDB}
+	if provider, ok := preparer.(dependencyPolicyProvider); ok {
+		policy = provider.DependencyPolicy()
+	}
+	plan, diagnostics := validateDependencyWorkspace(files, policy)
+	if plan.ecosystem == "" {
+		return PreparedDependencyCache{}, Invalid("dependencies", "no supported dependency manifest was present")
+	}
+	if hasErrorDiagnostic(diagnostics) {
+		codes := make([]string, 0, len(diagnostics))
+		for _, diagnostic := range diagnostics {
+			if diagnostic.Severity == SeverityError {
+				codes = append(codes, diagnostic.Code)
+			}
+		}
+		return PreparedDependencyCache{}, Invalid("dependencies", "dependency policy rejected the lock files: "+strings.Join(codes, ", "))
+	}
+	directory, cleanup, err := materializeDependencyPlan(baseDirectory, plan)
+	if err != nil {
+		return PreparedDependencyCache{}, err
+	}
+	prepared, err := preparer.PrepareDependencies(ctx, directory, DependencyPreparationRequest{Ecosystem: plan.ecosystem})
+	if err != nil {
+		cleanup()
+		return PreparedDependencyCache{}, err
+	}
+	if prepared.ExitCode != 0 {
+		cleanup()
+		return PreparedDependencyCache{}, Invalid("dependencies", "fixed dependency preparation failed")
+	}
+	if err := ensurePreparedDependencyLayout(directory, plan.ecosystem); err != nil {
+		cleanup()
+		return PreparedDependencyCache{}, err
+	}
+	return PreparedDependencyCache{Directory: directory, Ecosystem: plan.ecosystem, cleanup: cleanup}, nil
+}
+
 type dependencyPolicyProvider interface {
 	DependencyPolicy() DependencyPolicy
 }
@@ -275,7 +339,15 @@ func materializeDependencyPlan(baseDirectory string, plan dependencyPlan) (strin
 	if err != nil {
 		return "", nil, wrapInternal("create isolated dependency directory", err)
 	}
-	cleanup := func() { _ = os.RemoveAll(directory) }
+	cleanup := func() {
+		_ = filepath.WalkDir(directory, func(path string, entry os.DirEntry, walkErr error) error {
+			if walkErr == nil && entry.IsDir() {
+				_ = os.Chmod(path, 0o700)
+			}
+			return nil
+		})
+		_ = os.RemoveAll(directory)
+	}
 	if err := os.Chmod(directory, 0o700); err != nil {
 		cleanup()
 		return "", nil, wrapInternal("protect isolated dependency directory", err)

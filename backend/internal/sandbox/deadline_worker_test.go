@@ -60,13 +60,33 @@ type deadlineSessionStoreFake struct {
 	session    SandboxSession
 	candidates *deadlineCandidateStoreFake
 	attached   int
+	synced     int
 }
 
 func (store *deadlineSessionStoreFake) Get(context.Context, string, string) (SandboxSession, error) {
 	return store.session, nil
 }
-func (store *deadlineSessionStoreFake) SyncCandidate(context.Context, string, string, uint64, uint64, string) (SandboxSession, error) {
-	return store.session, nil
+func (store *deadlineSessionStoreFake) SyncCandidate(
+	_ context.Context,
+	_, _ string,
+	expectedVersion, expectedEpoch uint64,
+	_ string,
+) (SandboxSession, error) {
+	view := store.session.Snapshot()
+	candidate := store.candidates.record.Candidate
+	now := view.UpdatedAt.Add(time.Second)
+	if candidate.UpdatedAt.After(now) {
+		now = candidate.UpdatedAt.Add(time.Second)
+	}
+	next, err := store.session.UpdateCandidate(
+		expectedVersion, expectedEpoch, view.Candidate.Version, candidate, now,
+	)
+	if err != nil {
+		return SandboxSession{}, err
+	}
+	store.session = next
+	store.synced++
+	return next.Clone(), nil
 }
 func (store *deadlineSessionStoreFake) AttachCheckpoint(
 	_ context.Context,
@@ -117,7 +137,7 @@ func (controller *deadlineControllerFake) completeAbandonDeadline(
 	return SessionView{}, nil
 }
 
-func TestDeadlineWorkerCheckpointsDirtyCandidateBeforeSuspend(t *testing.T) {
+func TestDeadlineWorkerSuspendsDirtyCandidateWithoutTakingEditorLease(t *testing.T) {
 	dirty, _ := dirtyCandidate(t, cleanCandidate(t), sandboxBaseTime.Add(time.Second))
 	ready := readyTestSession(t, dirty, sandboxBaseTime.Add(3*time.Second))
 	view := ready.Snapshot()
@@ -145,18 +165,17 @@ func TestDeadlineWorkerCheckpointsDirtyCandidateBeforeSuspend(t *testing.T) {
 	if err != nil {
 		t.Fatalf("run dirty Candidate deadline: %v", err)
 	}
-	if !processed || leaseStore.completed != 1 || leaseStore.retried != 0 || sessions.attached != 1 ||
-		candidates.createdBy != SandboxLifecycleWorkerActorID || len(controller.suspended) != 1 ||
+	if !processed || leaseStore.completed != 1 || leaseStore.retried != 0 || sessions.attached != 0 ||
+		candidates.createdBy != "" || len(controller.suspended) != 1 ||
 		len(controller.terminated) != 0 {
-		t.Fatalf("deadline worker did not checkpoint then suspend exactly once: lease=%#v sessions=%#v controller=%#v", leaseStore, sessions, controller)
+		t.Fatalf("deadline worker did not suspend without mutating Candidate exactly once: lease=%#v sessions=%#v controller=%#v", leaseStore, sessions, controller)
 	}
 	control := controller.suspended[0]
-	checkpointed := sessions.session.Snapshot()
+	current := sessions.session.Snapshot()
 	if control.ActorID != SandboxLifecycleWorkerActorID ||
-		control.ExpectedSessionVersion != checkpointed.Version ||
-		control.ExpectedSessionEpoch != checkpointed.SessionEpoch ||
-		!exactCheckpointForView(checkpointed) {
-		t.Fatalf("deadline control did not bind the exact checkpointed Session: input=%#v view=%#v", control, checkpointed)
+		control.ExpectedSessionVersion != current.Version ||
+		control.ExpectedSessionEpoch != current.SessionEpoch {
+		t.Fatalf("deadline control did not bind the exact Session: input=%#v view=%#v", control, current)
 	}
 }
 
@@ -197,6 +216,87 @@ func TestDeadlineActionAbsoluteTTLOverridesIdle(t *testing.T) {
 	}
 	if _, due := deadlineActionAt(view, view.TTL.IdleDeadline.Add(-time.Nanosecond)); due {
 		t.Fatal("deadline worker acted before the exact idle deadline")
+	}
+}
+
+func TestDeadlineWorkerTerminatesAtAbsoluteTTLWithoutMutatingCandidate(t *testing.T) {
+	candidate := cleanCandidate(t)
+	ready := readyTestSession(t, candidate, sandboxBaseTime)
+	view := ready.Snapshot()
+	advanced, _, err := candidate.AcquireLease(
+		candidate.Version, testActorID, time.Minute, view.UpdatedAt.Add(time.Second),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leaseStore := &deadlineLeaseStoreFake{lease: &DeadlineLease{
+		SessionID: view.ID, ProjectID: view.ProjectID, Action: DeadlineTerminate,
+		Owner: "deadline-worker", LeaseEpoch: 1, ObservedAt: view.TTL.ExpiresAt,
+	}}
+	candidates := &deadlineCandidateStoreFake{
+		record: repository.CandidateMutationRecord{Candidate: advanced},
+	}
+	sessions := &deadlineSessionStoreFake{session: ready, candidates: candidates}
+	controller := &deadlineControllerFake{}
+	worker, err := newDeadlineWorker(
+		leaseStore, sessions, candidates, controller,
+		DeadlineWorkerConfig{WorkerID: "deadline-worker", LeaseDuration: time.Minute, RetryDelay: time.Second},
+		func() string { return testCheckpoint },
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	processed, err := worker.RunOnce(context.Background())
+	if err != nil || !processed || sessions.synced != 0 || leaseStore.completed != 1 ||
+		leaseStore.retried != 0 || len(controller.terminated) != 1 || len(controller.suspended) != 0 {
+		t.Fatalf("absolute TTL did not terminate without Candidate mutation exactly once: processed=%v err=%v sessions=%#v lease=%#v controller=%#v", processed, err, sessions, leaseStore, controller)
+	}
+	input := controller.terminated[0]
+	if input.ExpectedSessionVersion != view.Version || input.ExpectedSessionEpoch != view.SessionEpoch ||
+		input.Reason != "SandboxSession absolute TTL elapsed; the durable Candidate is retained independently" {
+		t.Fatalf("termination did not bind the exact expired Session boundary: input=%#v view=%#v", input, view)
+	}
+}
+
+func TestDeadlineWorkerTerminatesSuspendedSessionWithStaleCandidateProjection(t *testing.T) {
+	candidate := cleanCandidate(t)
+	ready := readyTestSession(t, candidate, sandboxBaseTime)
+	view := ready.Snapshot()
+	suspending, err := ready.BeginSuspend(view.Version, view.SessionEpoch, view.UpdatedAt.Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	view = suspending.Snapshot()
+	suspended, err := suspending.MarkSuspended(view.Version, view.SessionEpoch, view.UpdatedAt.Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	view = suspended.Snapshot()
+	advanced, _, err := candidate.AcquireLease(
+		candidate.Version, testActorID, time.Minute, view.UpdatedAt.Add(time.Second),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leaseStore := &deadlineLeaseStoreFake{lease: &DeadlineLease{
+		SessionID: view.ID, ProjectID: view.ProjectID, Action: DeadlineTerminate,
+		Owner: "deadline-worker", LeaseEpoch: 1, ObservedAt: view.TTL.ExpiresAt,
+	}}
+	candidates := &deadlineCandidateStoreFake{record: repository.CandidateMutationRecord{Candidate: advanced}}
+	sessions := &deadlineSessionStoreFake{session: suspended, candidates: candidates}
+	controller := &deadlineControllerFake{}
+	worker, err := newDeadlineWorker(
+		leaseStore, sessions, candidates, controller,
+		DeadlineWorkerConfig{WorkerID: "deadline-worker", LeaseDuration: time.Minute, RetryDelay: time.Second},
+		func() string { return testCheckpoint },
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	processed, err := worker.RunOnce(context.Background())
+	if err != nil || !processed || sessions.synced != 0 || leaseStore.completed != 1 ||
+		leaseStore.retried != 0 || len(controller.terminated) != 1 {
+		t.Fatalf("stale suspended Session was not terminated at absolute TTL: processed=%v err=%v sessions=%#v lease=%#v controller=%#v", processed, err, sessions, leaseStore, controller)
 	}
 }
 

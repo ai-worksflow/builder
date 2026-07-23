@@ -1,0 +1,4 @@
+interface:
+  display_name: "Frontend Resource Graph"
+  short_description: "Plan and implement production frontend assets"
+  default_prompt: "Use $frontend-resource-graph to derive and implement the exact frontend asset graph."

@@ -1,0 +1,81 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: route-probe, namespace: wf-p-a7f3c2}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: route-probe}
+  template:
+    metadata:
+      labels: {app: route-probe, worksflow.dev/exposed: "true", worksflow.dev/project-key: a7f3c2}
+    spec:
+      serviceAccountName: project-runtime
+      automountServiceAccountToken: false
+      securityContext: &podSecurity
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: app
+          image: worksflow/k8s-route-probe:local
+          imagePullPolicy: IfNotPresent
+          env: [{name: PROJECT_ID, value: project-a}]
+          ports: [{name: http, containerPort: 8080}]
+          readinessProbe: {httpGet: {path: /healthz, port: http}}
+          resources:
+            requests: {cpu: 25m, memory: 16Mi}
+            limits: {cpu: 100m, memory: 64Mi}
+          securityContext: &containerSecurity
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: route-probe, namespace: wf-p-a7f3c2}
+spec:
+  type: ClusterIP
+  selector: {app: route-probe}
+  ports: [{name: http, port: 8080, targetPort: http}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: route-probe, namespace: wf-p-b9d4e1}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: route-probe}
+  template:
+    metadata:
+      labels: {app: route-probe, worksflow.dev/exposed: "true", worksflow.dev/project-key: b9d4e1}
+    spec:
+      serviceAccountName: project-runtime
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: app
+          image: worksflow/k8s-route-probe:local
+          imagePullPolicy: IfNotPresent
+          env: [{name: PROJECT_ID, value: project-b}]
+          ports: [{name: http, containerPort: 8080}]
+          readinessProbe: {httpGet: {path: /healthz, port: http}}
+          resources:
+            requests: {cpu: 25m, memory: 16Mi}
+            limits: {cpu: 100m, memory: 64Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: route-probe, namespace: wf-p-b9d4e1}
+spec:
+  type: ClusterIP
+  selector: {app: route-probe}
+  ports: [{name: http, port: 8080, targetPort: http}]

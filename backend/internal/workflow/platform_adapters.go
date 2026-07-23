@@ -27,23 +27,25 @@ type PlatformDependencies struct {
 		ArtifactProposalGenerator
 		ImplementationGenerator
 	}
-	Workbench           CoreWorkbenchAPI
-	ArtifactInputs      ArtifactInputValidator
-	HumanEditOutput     HumanEditOutputValidator
-	TargetArtifacts     TargetArtifactInitializer
-	RequirementBaseline RequirementBaselineCompiler
-	WorkbenchCompletion WorkbenchCompletionValidator
-	ReviewGate          ReviewGateVerifier
-	Access              PublishAuthorizer
-	FanOut              FanOutResolver
-	BlueprintPages      FanOutResolver
-	Quality             QualityEvaluator
-	QualityManifest     QualityManifestResolver
-	Publisher           Publisher
-	DefaultModel        string
-	BuildInstruction    string
-	Clock               Clock
-	IDs                 IDGenerator
+	Workbench                  CoreWorkbenchAPI
+	ArtifactInputs             ArtifactInputValidator
+	HumanEditOutput            HumanEditOutputValidator
+	TargetArtifacts            TargetArtifactInitializer
+	RequirementBaseline        RequirementBaselineCompiler
+	WorkbenchCompletion        WorkbenchCompletionValidator
+	ReviewGate                 ReviewGateVerifier
+	Access                     PublishAuthorizer
+	FanOut                     FanOutResolver
+	BlueprintPages             FanOutResolver
+	Quality                    QualityEvaluator
+	QualityManifest            QualityManifestResolver
+	Publisher                  Publisher
+	ProfileV3Enabled           bool
+	QualifiedReleaseController WorkerRunner
+	DefaultModel               string
+	BuildInstruction           string
+	Clock                      Clock
+	IDs                        IDGenerator
 }
 
 // NewPlatformEngine exposes a single bootstrap seam without coupling app.go or
@@ -121,6 +123,23 @@ func NewPlatformEngine(dependencies PlatformDependencies) (*Engine, error) {
 	// execution profile snapshot. SealProductionExecutionProfiles fails closed if
 	// the factory grows before a separately versioned profile is introduced.
 	engine.Capabilities = PlatformWorkflowCapabilities(true, true)
+	if dependencies.ProfileV3Enabled {
+		if dependencies.QualifiedReleaseController == nil {
+			return nil, fmt.Errorf("workflow-engine/v3 requires the qualified Release Controller runtime binding")
+		}
+		if err := engine.ExecutionProfiles.Register(workflowExecutionProfileV3Bundle()); err != nil {
+			return nil, err
+		}
+		v3Runtime := engine.captureExecutionRuntime()
+		v3Runtime.runners[domain.NodePublish] = dependencies.QualifiedReleaseController
+		if err := engine.ExecutionProfiles.SealProfile(
+			WorkflowExecutionProfileV3Ref(), WorkflowExecutionProfileV3Descriptor().Components, v3Runtime,
+		); err != nil {
+			return nil, err
+		}
+	} else if dependencies.QualifiedReleaseController != nil {
+		return nil, fmt.Errorf("qualified Release Controller runtime binding requires workflow-engine/v3")
+	}
 	if err := engine.SealProductionExecutionProfiles(); err != nil {
 		return nil, err
 	}
@@ -1527,7 +1546,11 @@ func (i CoreTargetArtifactInitializer) targetArtifactInput(
 			return core.CreateArtifactInput{}, fmt.Errorf("PageSpec target requires an anchored Blueprint Page revision")
 		}
 		pageNodeID := strings.TrimSpace(*source.Ref.AnchorID)
-		input.Content, err = pageSpecTargetContent(execution, pageNodeID, title)
+		semanticTitle := title
+		if slice, ok := targetExecutionSlice(execution); ok && strings.TrimSpace(slice.Title) != "" {
+			semanticTitle = strings.TrimSpace(slice.Title)
+		}
+		input.Content, err = pageSpecTargetContent(execution, pageNodeID, semanticTitle)
 		if err != nil {
 			return core.CreateArtifactInput{}, err
 		}

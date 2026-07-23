@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"sort"
 	"strconv"
 
 	"github.com/gin-gonic/gin"
@@ -36,6 +37,16 @@ type WorkflowAPI interface {
 
 type workflowCapabilityAPI interface {
 	WorkflowCapabilities(context.Context, string, string) (runtime.WorkflowCapabilities, error)
+}
+
+type workflowNodeActionProjectionAPI interface {
+	ProjectRunNodeActions(
+		context.Context,
+		string,
+		string,
+		string,
+		uint64,
+	) (map[string]runtime.WorkflowNodeActionProjection, error)
 }
 
 type WorkflowDependencies struct {
@@ -232,7 +243,7 @@ func (h *WorkflowHandler) start(c *gin.Context) {
 		return
 	}
 	c.Header("Location", "/v1/projects/"+c.Param("projectId")+"/workflow-runs/"+run.ID)
-	c.JSON(http.StatusCreated, runResponse(run))
+	c.JSON(http.StatusCreated, runResponse(run, nil))
 }
 func (h *WorkflowHandler) getRun(c *gin.Context) {
 	actor, ok := workflowActor(c)
@@ -244,8 +255,22 @@ func (h *WorkflowHandler) getRun(c *gin.Context) {
 		writeWorkflowError(c, err)
 		return
 	}
+	var actions map[string]runtime.WorkflowNodeActionProjection
+	if projector, ok := h.facade.(workflowNodeActionProjectionAPI); ok {
+		actions, err = projector.ProjectRunNodeActions(
+			c.Request.Context(),
+			c.Param("projectId"),
+			c.Param("runId"),
+			actor,
+			run.EventCursor,
+		)
+		if err != nil {
+			writeWorkflowError(c, err)
+			return
+		}
+	}
 	c.Header("ETag", `"workflow-run:`+run.ID+`:`+strconv.FormatUint(run.EventCursor, 10)+`"`)
-	c.JSON(http.StatusOK, runResponse(run))
+	c.JSON(http.StatusOK, runResponse(run, actions))
 }
 func (h *WorkflowHandler) listRuns(c *gin.Context) {
 	if !allowWorkflowQuery(c, "status", "limit", "cursor") {
@@ -399,10 +424,41 @@ func allowWorkflowQuery(c *gin.Context, allowed ...string) bool {
 func definitionResponse(record runtime.DefinitionRecord) gin.H {
 	return gin.H{"id": record.Definition.ID, "versionId": record.VersionID, "projectId": record.ProjectID, "key": record.Key, "title": record.Title, "description": record.Description, "published": record.Published, "version": record.Definition.Version, "contentHash": record.Definition.Hash, "executionProfile": record.ExecutionProfile, "definition": record.Definition}
 }
-func runResponse(run *runtime.RunRecord) gin.H {
-	nodes := make([]*runtime.NodeRecord, 0, len(run.Nodes))
-	for _, node := range run.Nodes {
-		nodes = append(nodes, node)
+
+type workflowNodeRunResponse struct {
+	*runtime.NodeRecord
+	AllowedActions  []runtime.WorkflowNodeAction           `json:"allowedActions"`
+	BlockingReasons []runtime.WorkflowActionBlockingReason `json:"blockingReasons"`
+}
+
+func runResponse(
+	run *runtime.RunRecord,
+	actions map[string]runtime.WorkflowNodeActionProjection,
+) gin.H {
+	nodes := make([]workflowNodeRunResponse, 0, len(run.Nodes))
+	keys := make([]string, 0, len(run.Nodes))
+	for key := range run.Nodes {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		node := run.Nodes[key]
+		projection, exists := actions[key]
+		if !exists {
+			projection = runtime.WorkflowNodeActionProjection{
+				AllowedActions: []runtime.WorkflowNodeAction{},
+				BlockingReasons: []runtime.WorkflowActionBlockingReason{{
+					Code:      "workflow_action_projection_unavailable",
+					Message:   "Server-authoritative Workflow actions require a refreshed run projection.",
+					SourceRef: nil,
+				}},
+			}
+		}
+		nodes = append(nodes, workflowNodeRunResponse{
+			NodeRecord:      node,
+			AllowedActions:  projection.AllowedActions,
+			BlockingReasons: projection.BlockingReasons,
+		})
 	}
 	return gin.H{"id": run.ID, "projectId": run.ProjectID, "definitionVersionId": run.DefinitionVersionID, "definition": run.Definition, "executionProfile": run.ExecutionProfile, "inputManifest": run.InputManifest, "status": run.Status, "governanceMode": run.GovernanceMode, "scope": run.Scope, "context": run.Context, "eventCursor": run.EventCursor, "startedBy": run.StartedBy, "startedAt": run.StartedAt, "completedAt": run.CompletedAt, "cancelledAt": run.CancelledAt, "failure": run.Failure, "createdAt": run.CreatedAt, "updatedAt": run.UpdatedAt, "nodes": nodes}
 }

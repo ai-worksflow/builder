@@ -5,6 +5,7 @@ import {
   type ExactWorkspaceRevisionRefDto,
   type RepositoryTreeFileDto,
 } from './sandbox-contract'
+import { sha256Bytes, sha256DigestString } from './sha256'
 
 export const REPOSITORY_SNAPSHOT_RECEIPT_SCHEMA_VERSION = 'repository-snapshot-receipt/v1'
 export const REPOSITORY_SNAPSHOT_RECEIPT_SUBJECT_SCHEMA_VERSION = 'repository-snapshot-receipt-subject/v1'
@@ -478,14 +479,9 @@ function canonicalRepositorySnapshotJSON(value: unknown): string {
 }
 
 async function hashCanonicalRepositorySnapshot(value: unknown) {
-  const subtle = globalThis.crypto?.subtle
-  if (!subtle) return malformedRepositorySnapshot('SHA-256 verification is unavailable')
   try {
-    const digest = new Uint8Array(await subtle.digest(
-      'SHA-256',
-      repositorySnapshotEncoder.encode(canonicalRepositorySnapshotJSON(value)),
-    ))
-    return `sha256:${Array.from(digest, (entry) => entry.toString(16).padStart(2, '0')).join('')}`
+    const digest = await sha256Bytes(repositorySnapshotEncoder.encode(canonicalRepositorySnapshotJSON(value)))
+    return sha256DigestString(digest)
   } catch {
     return malformedRepositorySnapshot('SHA-256 verification failed')
   }

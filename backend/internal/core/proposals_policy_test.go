@@ -58,6 +58,34 @@ func TestProposalPatchedContentMustPassArtifactValidationBeforeApply(t *testing.
 	}
 }
 
+func TestProposalApplyDefersHumanAnswerGatesUntilRevisionReview(t *testing.T) {
+	t.Parallel()
+	projectBrief := json.RawMessage(`{
+  "kind":"projectBrief",
+  "summary":"Build the reviewed application.",
+  "blocks":[
+    {"id":"goal-1","type":"goal","text":"Deliver a measurable application outcome."},
+    {"id":"question-1","type":"openQuestion","text":"Who is the primary user?","blocking":true,"status":"open"}
+  ],
+  "requirements":[],"acceptanceCriteria":[],"openQuestions":[],"assumptions":[]
+}`)
+	if err := validateProposalPatchedContent("project_brief", projectBrief); err != nil {
+		t.Fatalf("editable Project Brief Proposal was blocked before its human-edit node: %v", err)
+	}
+
+	invalid := json.RawMessage(`{
+  "kind":"projectBrief",
+  "summary":"",
+  "blocks":[{"id":"question-1","type":"openQuestion","text":"Who?","blocking":true,"status":"open"}],
+  "requirements":[],"acceptanceCriteria":[],"openQuestions":[],"assumptions":[]
+}`)
+	err := validateProposalPatchedContent("project_brief", invalid)
+	if !errors.Is(err, ErrBlockingGate) || !strings.Contains(err.Error(), "brief.summary_required") ||
+		!strings.Contains(err.Error(), "brief.goal_required") {
+		t.Fatalf("structurally invalid Project Brief Proposal did not stay blocked: %v", err)
+	}
+}
+
 func TestPrototypeProposalCanonicalizationDoesNotInventSemanticContent(t *testing.T) {
 	t.Parallel()
 	payload := json.RawMessage(`{

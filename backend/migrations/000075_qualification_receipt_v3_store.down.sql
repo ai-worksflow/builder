@@ -1,3 +1,9 @@
+-- Promotion v2 takes the shared side before project/Evidence/Plan/Receipt
+-- composition. Rollback takes the exclusive side before its first relation.
+SELECT pg_catalog.pg_advisory_xact_lock(
+  pg_catalog.hashtextextended('worksflow:workflow-input-authority-migration:v1', 0)
+);
+
 DO $qualification_receipt_v3_down_guard$
 BEGIN
   -- Fence every supported writer in the same global order before deciding

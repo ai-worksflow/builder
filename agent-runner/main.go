@@ -15,6 +15,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -239,13 +240,21 @@ func run() error {
 }
 
 func codexArguments(request runnerRequest) []string {
+	gatewayURL := strings.TrimRight(strings.TrimSpace(os.Getenv("OPENAI_BASE_URL")), "/")
 	return []string{
+		"--ask-for-approval", "never",
 		"exec",
 		"--ephemeral",
 		"--sandbox", "workspace-write",
 		"--strict-config",
 		"--ignore-user-config",
 		"--ignore-rules",
+		"--config", `model_provider="worksflow_gateway"`,
+		"--config", `model_providers.worksflow_gateway.name="Worksflow Agent Model Gateway"`,
+		"--config", "model_providers.worksflow_gateway.base_url=" + strconv.Quote(gatewayURL),
+		"--config", `model_providers.worksflow_gateway.env_key="OPENAI_API_KEY"`,
+		"--config", `model_providers.worksflow_gateway.wire_api="responses"`,
+		"--config", "model_providers.worksflow_gateway.supports_websockets=false",
 		"--config", `shell_environment_policy.include_only=["PATH","HOME"]`,
 		"--config", "allow_login_shell=false",
 		"--json",

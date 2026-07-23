@@ -662,6 +662,24 @@ func TestDockerCandidateExecutorResolvesOnlyPinnedManifestsAndMountsReadOnlyCach
 	}
 }
 
+func TestValidHashLockedGoSum(t *testing.T) {
+	valid := []byte("github.com/google/uuid v1.6.0 h1:NIvaJDMOsjHA8rEtSDVpk7EE4dBeE7mybJP0UuF4dO8=\n" +
+		"github.com/google/uuid v1.6.0/go.mod h1:TIyPZe4Mgqvfe9pImFwG2Rd0Vz9SFlf86jG1GtPaR2s=\n")
+	if !validHashLockedGoSum(valid) {
+		t.Fatal("valid Go checksum lock was rejected")
+	}
+	for _, invalid := range [][]byte{
+		{},
+		[]byte("github.com/google/uuid v1.6.0\n"),
+		[]byte("https://example.test/module v1.0.0 h1:NIvaJDMOsjHA8rEtSDVpk7EE4dBeE7mybJP0UuF4dO8=\n"),
+		[]byte("github.com/google/uuid v1.6.0 sha256:bad\n"),
+	} {
+		if validHashLockedGoSum(invalid) {
+			t.Fatalf("invalid Go checksum lock was accepted: %q", invalid)
+		}
+	}
+}
+
 func containsArgumentSequence(arguments, expected []string) bool {
 	for start := 0; start+len(expected) <= len(arguments); start++ {
 		match := true

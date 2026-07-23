@@ -254,6 +254,12 @@ upstream state in the same consumption transaction. It creates only a pending
 immutable-revision handoff; it neither reseals the evidence nor embeds a
 post-Receipt authority back into the signed snapshot.
 
+The new consumer is specified separately in
+`docs/qualification-promotion-v2.md`. In particular, that contract preserves
+the historical `000071` ledger, defines the project-first atomic composition,
+and explains why the current unsigned, multi-snapshot PostgreSQL posture
+diagnostic cannot be relabeled as an independent promotion authority.
+
 ## 5. Trust policy
 
 The root-owned trust policy contains:
@@ -364,13 +370,18 @@ immutable source/evidence checks, artifact closure, DSSE threshold verifier,
 KMS and credential evidence verification, exact Golden fault
 authority/consume-receipt/run-ledger closure, and external-only CLI projection.
 It also contains an independent fail-closed production PostgreSQL posture
-checker for four distinct LOGINs: application, migrator, catalog-only auditor,
-and qualification-promotion operator. The checker enforces a five-group
-`NOLOGIN` boundary and the promotion identity's exact two-table `SELECT` plus
-one-routine `EXECUTE` closure. Its four catalog queries use separate PostgreSQL
-snapshots within one bounded check window, so its safe JSON is not an atomic
-cross-identity Receipt and explicitly excludes qualification, promotion and
-GC-scheduler claims. These are repository-internal implementation facts.
+checker for five distinct LOGINs: application, migrator, catalog-only auditor,
+qualification-promotion operator, and qualification-policy operator. The
+checker enforces a six-group `NOLOGIN` boundary. After the Promotion-v2 schema
+migration, the promotion identity has no table or column access and exactly the
+Promotion-v2 consume, operation-inspect, and historical-v1-inspect executions;
+handoff resolve/assert remains outside that identity. Its five catalog queries
+use separate PostgreSQL snapshots within one bounded check window, so its safe
+JSON is not an atomic cross-identity Receipt and explicitly excludes
+qualification, promotion and GC-scheduler claims. It additionally requires a
+direct or session-pool Promotion affinity declaration and the fail-closed
+`disabled-pending-input-precommit-authority-canary` runtime gate. These are
+repository-internal implementation facts and do not enable a worker.
 
 The following external facts are still absent:
 

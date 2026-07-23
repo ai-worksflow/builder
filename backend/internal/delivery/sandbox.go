@@ -341,7 +341,8 @@ func (s *ContainerSandbox) dependencyRunArgs(name, directory, ecosystem, image s
 		args = append(args,
 			"--env", "GOPROXY="+s.resolverPolicy.GoProxy, "--env", "GOSUMDB="+s.resolverPolicy.GoSumDB,
 			"--env", "GONOSUMDB=", "--env", "GONOPROXY=", "--env", "GOPRIVATE=",
-			"--env", "GOTOOLCHAIN=local", "--env", "GOMODCACHE=/resolver/pkg/mod",
+			"--env", "GOTOOLCHAIN=local", "--env", "GOPATH=/resolver/.gopath",
+			"--env", "GOMODCACHE=/resolver/pkg/mod",
 			"--env", "GOCACHE=/tmp/go-build", "--env", "GOFLAGS=-mod=readonly",
 		)
 	}

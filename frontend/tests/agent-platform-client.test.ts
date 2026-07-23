@@ -6,6 +6,7 @@ import { PlatformHttpError, PlatformProtocolError, type FetchLike } from '../lib
 const digestA = `sha256:${'a'.repeat(64)}`
 const digestB = `sha256:${'b'.repeat(64)}`
 const digestC = `sha256:${'c'.repeat(64)}`
+const rawBuildContractHash = 'b'.repeat(64)
 const attemptId = 'attempt/one'
 const proposedFileBytes = new TextEncoder().encode('new')
 const proposedFileHash = `sha256:${createHash('sha256').update(proposedFileBytes).digest('hex')}`
@@ -23,7 +24,7 @@ const attempt = {
   taskCapsule: { id: 'capsule-1', contentHash: digestC },
   contextPack: { id: 'context-1', contentHash: digestB },
   baseCandidateTreeHash: digestA,
-  buildContractHash: digestB,
+  buildContractHash: rawBuildContractHash,
   templateReleaseHashes: [],
   executor: {
     adapter: 'codex', provider: 'openai', model: 'qualified-model',
@@ -48,7 +49,15 @@ const taskResult = {
   contextPack: {
     schemaVersion: 'agent-context-pack/v1', id: 'context-1', projectId: 'project-1',
     candidateId: 'candidate-1', baseCandidateTreeHash: digestA,
-    buildContract: { id: 'contract-1', contentHash: digestB }, items: [],
+    buildContract: { id: 'contract-1', contentHash: rawBuildContractHash },
+    items: [{
+      key: 'build-contract', kind: 'build_contract', required: true,
+      source: { id: 'contract-1', contentHash: rawBuildContractHash },
+      content: {
+        store: 'content', ownerId: 'contract-1', ref: 'contract-content',
+        contentHash: digestB, byteSize: 123,
+      },
+    }],
     contentHash: digestB, createdBy: 'actor-1', createdAt: '2026-07-17T00:00:00Z',
   },
   taskCapsule: {
@@ -56,7 +65,7 @@ const taskResult = {
     projectId: 'project-1', sandboxSessionId: 'session/one', candidateId: 'candidate-1',
     candidateVersion: 8, candidateSessionEpoch: 2, candidateWriterLeaseEpoch: 4,
     baseCandidateTreeHash: digestA, objective: 'Implement the approved page.',
-    buildContract: { id: 'contract-1', contentHash: digestB },
+    buildContract: { id: 'contract-1', contentHash: rawBuildContractHash },
     templateReleases: [], contextPack: { id: 'context-1', contentHash: digestB },
     obligationIds: [], acceptanceCriterionIds: [], readSet: [], writeSet: [],
     protectedPaths: [], preconditions: [], postconditions: [],
@@ -72,6 +81,26 @@ const taskResult = {
   },
   attempt,
   replayed: false,
+}
+
+const taskGraph = {
+  schemaVersion: 'agent-task-graph/v1',
+  projectId: 'project-1',
+  sandboxSessionId: 'session/one',
+  buildContract: { id: 'contract-1', contentHash: rawBuildContractHash },
+  state: 'ready',
+  tasks: [{
+    key: 'obligation/OBL-1',
+    title: 'Implement the approved page',
+    obligationIds: ['OBL-1'],
+    acceptanceCriterionIds: ['AC-1'],
+    verificationCommandIds: ['typecheck'],
+    dependsOn: [],
+    state: 'pending',
+  }],
+  nextTaskKey: 'obligation/OBL-1',
+  completedCount: 0,
+  totalCount: 1,
 }
 
 const mergePlan = {
@@ -107,7 +136,22 @@ const patchEvidence = {
 const structuredEvidence = {
   summary: 'Implemented the requested file.',
   changedPaths: ['src/app.ts'],
+  obligations: [{ id: 'OBL-1', status: 'satisfied', note: 'Implemented.' }],
+  acceptanceCriteria: [{ id: 'AC-1', status: 'satisfied', note: 'Satisfied.' }],
   verification: [{ commandId: 'typecheck', status: 'passed', note: 'Passed.' }],
+  resourceGraph: {
+    applicable: true,
+    nodes: [{
+      id: 'resource.search-icon', kind: 'icon', purpose: 'Open search',
+      requirementIds: ['AC-1'], consumers: ['src/app.ts#SearchButton'],
+      source: 'icon_library', reference: 'lucide-react:Search',
+      accessibility: 'Decorative; the button supplies the accessible name.', status: 'resolved',
+    }],
+    edges: [
+      { from: 'AC-1', to: 'resource.search-icon', relation: 'supports' },
+      { from: 'resource.search-icon', to: 'src/app.ts#SearchButton', relation: 'consumed_by' },
+    ],
+  },
   blockers: [],
 }
 
@@ -241,6 +285,30 @@ async function main() {
         retryReason: 'Retry after correcting constraints.',
       },
     }, 201)
+    if (url.pathname.endsWith('/agent-task-graph') && method === 'GET') return json(taskGraph)
+    if (url.pathname.endsWith('/agent-task-graph/advance') && method === 'POST') return json({
+      graph: {
+        ...taskGraph,
+        state: 'awaiting_review',
+        tasks: [{
+          ...taskGraph.tasks[0], state: 'review_ready',
+          latestAttemptId: attemptId, latestAttemptState: 'review_ready',
+        }],
+        nextTaskKey: undefined,
+      },
+      attempt: {
+        ...taskResult,
+        taskCapsule: {
+          ...taskResult.taskCapsule,
+          taskKey: 'obligation/OBL-1',
+          obligationIds: ['OBL-1'],
+          acceptanceCriterionIds: ['AC-1'],
+          verificationCommandIds: ['typecheck'],
+        },
+      },
+      disposition: 'started',
+      replayed: false,
+    }, 201)
     if (url.pathname.includes('/events')) return json({ events: [], afterSequence: 0, lastSequence: 0 })
     if (url.pathname.endsWith('/agent-attempts') && method === 'GET') return json({ attempts: [] })
     return json(taskResult, method === 'POST' ? 201 : 200, {
@@ -258,7 +326,17 @@ async function main() {
   assert.equal(created.data.attempt.state, 'review_ready')
   assert.deepEqual(created.data.attempt.templateReleaseHashes, [])
   assert.deepEqual(created.data.taskCapsule.acceptanceCriterionIds, [])
-  assert.equal(created.data.contextPack.itemCount, 0)
+  assert.equal(created.data.contextPack.itemCount, 1)
+
+  const graph = await client.agent.getTaskGraph('session/one')
+  assert.equal(graph.data.nextTaskKey, 'obligation/OBL-1')
+  const advanced = await client.agent.advanceTaskGraph('session/one', {
+    instruction: 'Implement the complete approved scope.',
+    executorProfile: 'codex-qualified',
+  }, { idempotencyKey: 'advance-task-graph-1' })
+  assert.equal(advanced.data.disposition, 'started')
+  assert.equal(advanced.data.attempt?.taskCapsule.taskKey, 'obligation/OBL-1')
+  assert.equal(advanced.data.graph.state, 'awaiting_review')
 
   assert.deepEqual((await client.agent.listAttempts('session/one')).data, [])
   assert.deepEqual((await client.agent.listEvents(attemptId)).data.events, [])

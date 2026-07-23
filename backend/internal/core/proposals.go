@@ -1204,11 +1204,40 @@ func (s *ProposalService) Apply(ctx context.Context, proposalID, actorID string,
 
 func validateProposalPatchedContent(kind string, payload json.RawMessage) error {
 	report := ValidateArtifactContent(kind, payload)
-	if report.Valid {
+	blocking := proposalApplyBlockingFindings(kind, report.Findings)
+	if len(blocking) == 0 {
 		return nil
 	}
-	encoded, _ := json.Marshal(report.Findings)
+	encoded, _ := json.Marshal(blocking)
 	return fmt.Errorf("%w: validation findings %s", ErrBlockingGate, encoded)
+}
+
+// Proposal application creates an editable draft, not an approvable revision.
+// Project Brief and requirements workflows intentionally preserve unanswered
+// blocking questions for the following human-edit node. Rejecting those
+// questions here makes the generated Proposal impossible to apply: resolving
+// them first changes the immutable base and makes the Proposal stale. Keep all
+// structural and lineage validation fail-closed, but defer only the explicit
+// human-answer gates until revision creation/review.
+func proposalApplyBlockingFindings(kind string, findings []ValidationFinding) []ValidationFinding {
+	deferred := map[string]struct{}{}
+	switch kind {
+	case "project_brief":
+		deferred["brief.blocking_question"] = struct{}{}
+	case "product_requirements":
+		deferred["requirements.blocking_question"] = struct{}{}
+	}
+	blocking := make([]ValidationFinding, 0, len(findings))
+	for _, finding := range findings {
+		if finding.Severity != "blocker" {
+			continue
+		}
+		if _, ok := deferred[finding.Code]; ok {
+			continue
+		}
+		blocking = append(blocking, finding)
+	}
+	return blocking
 }
 
 func (s *ProposalService) loadManifest(ctx context.Context, manifestID string) (domain.InputManifest, storage.InputManifestModel, error) {

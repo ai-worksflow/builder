@@ -20,6 +20,7 @@ import {
   agentAttemptEtag,
   agentMergeEtag,
   type AgentClient,
+  type AgentAdvanceTaskGraphInput,
   type AgentCreateAttemptInput,
   type AgentPatchFileResult,
 } from '@/lib/platform/agent-client'
@@ -33,6 +34,8 @@ import type {
   AgentPlatformPatchDto,
   AgentStructuredResultDto,
   AgentTaskAttemptResultDto,
+  AgentTaskGraphAdvanceResultDto,
+  AgentTaskGraphDto,
 } from '@/lib/platform/agent-contract'
 import { normalizeAgentAttemptEvent } from '@/lib/platform/agent-contract'
 import type { SandboxClient } from '@/lib/platform/sandbox-client'
@@ -77,6 +80,9 @@ export interface AgentPanelProps {
   readonly sessionId: string
   readonly canEdit: boolean
   readonly workspaceBusy: boolean
+  readonly onAdvance: (
+    input: AgentAdvanceTaskGraphInput,
+  ) => Promise<HttpResult<AgentTaskGraphAdvanceResultDto>>
   readonly onCreate: (
     input: AgentCreateAttemptInput,
   ) => Promise<HttpResult<AgentTaskAttemptResultDto>>
@@ -178,6 +184,7 @@ export function AgentPanel({
   sessionId,
   canEdit,
   workspaceBusy,
+  onAdvance,
   onCreate,
   onMerge,
   onUndo,
@@ -188,6 +195,7 @@ export function AgentPanel({
   const [executorProfile, setExecutorProfile] = useState('codex-default')
   const [reason, setReason] = useState('')
   const [attempts, setAttempts] = useState<readonly AgentAttemptDto[]>([])
+  const [taskGraph, setTaskGraph] = useState<AgentTaskGraphDto | null>(null)
   const [selectedId, setSelectedId] = useState('')
   const [selected, setSelected] = useState<AgentTaskAttemptResultDto | null>(null)
   const [attemptEtag, setAttemptEtag] = useState('')
@@ -216,12 +224,20 @@ export function AgentPanel({
   const eventCursorRef = useRef({ attemptId: '', sequence: 0 })
 
   const refreshAttempts = useCallback(async (signal?: AbortSignal) => {
-    const result = await client.listAttempts(sessionId, 50, { signal })
-    setAttempts(result.data)
+    const [attemptOutcome, graphOutcome] = await Promise.allSettled([
+      client.listAttempts(sessionId, 50, { signal }),
+      client.getTaskGraph(sessionId, { signal }),
+    ])
+    if (attemptOutcome.status === 'rejected') throw attemptOutcome.reason
+    const attemptResult = attemptOutcome.value
+    setAttempts(attemptResult.data)
+    if (graphOutcome.status === 'fulfilled') setTaskGraph(graphOutcome.value.data)
+    else setTaskGraph(null)
     setSelectedId((current) => {
-      if (current && result.data.some((attempt) => attempt.id === current)) return current
-      return result.data[0]?.id ?? ''
+      if (current && attemptResult.data.some((attempt) => attempt.id === current)) return current
+      return attemptResult.data[0]?.id ?? ''
     })
+    if (graphOutcome.status === 'rejected') throw graphOutcome.reason
   }, [client, sessionId])
 
   useEffect(() => {
@@ -486,6 +502,27 @@ export function AgentPanel({
     setInstruction('')
   })
 
+  const advanceTaskGraph = () => void runAction(async () => {
+    const normalizedInstruction = instruction.trim()
+    const normalizedProfile = executorProfile.trim()
+    if (!normalizedInstruction || !normalizedProfile) {
+      throw new Error('An implementation instruction and qualified executor profile are required.')
+    }
+    const result = await onAdvance({
+      instruction: normalizedInstruction,
+      executorProfile: normalizedProfile,
+    })
+    setTaskGraph(result.data.graph)
+    if (result.data.attempt) {
+      setSelectedId(result.data.attempt.attempt.id)
+      setAttempts((current) => [
+        result.data.attempt!.attempt,
+        ...current.filter((attempt) => attempt.id !== result.data.attempt!.attempt.id),
+      ])
+    }
+    setRefreshVersion((value) => value + 1)
+  })
+
   const cancelAttempt = () => void runAction(async () => {
     if (!selected || !attemptEtag || !reason.trim()) {
       throw new Error('A cancellation reason is required.')
@@ -605,6 +642,7 @@ export function AgentPanel({
       }
       setMergeReceipt(receipt)
     }
+    setRefreshVersion((value) => value + 1)
   })
 
   const undoPatch = () => void runAction(async () => {
@@ -618,6 +656,7 @@ export function AgentPanel({
       }
       setMergeReceipt(receipt)
     }
+    setRefreshVersion((value) => value + 1)
   })
 
   const current = selected?.attempt
@@ -650,26 +689,58 @@ export function AgentPanel({
 
       <div className="min-h-0 flex-1 overflow-y-auto">
         <section className="space-y-2 border-b border-border p-3">
-          <div className="text-[9px] font-semibold uppercase tracking-wide text-muted-foreground">New exact task</div>
-          <div className="grid grid-cols-2 gap-2">
-            <label className="space-y-1 text-[8px] text-faint-foreground">
-              Stable task key
-              <input value={taskKey} onChange={(event) => setTaskKey(event.target.value)} className="h-7 w-full rounded border border-border bg-background px-2 font-mono text-[9px] text-foreground" />
-            </label>
-            <label className="space-y-1 text-[8px] text-faint-foreground">
-              Qualified profile
-              <input value={executorProfile} onChange={(event) => setExecutorProfile(event.target.value)} className="h-7 w-full rounded border border-border bg-background px-2 font-mono text-[9px] text-foreground" />
-            </label>
+          <div className="flex items-center justify-between text-[9px] font-semibold uppercase tracking-wide text-muted-foreground">
+            <span>Complete implementation</span>
+            {taskGraph && <span className="font-mono normal-case">{taskGraph.completedCount}/{taskGraph.totalCount} · {taskGraph.state}</span>}
           </div>
+          {taskGraph && (
+            <div className="space-y-1.5 rounded border border-border bg-background p-2">
+              <div className="h-1.5 overflow-hidden rounded bg-muted">
+                <div className="h-full bg-success transition-[width]" style={{ width: `${taskGraph.totalCount === 0 ? 0 : (taskGraph.completedCount / taskGraph.totalCount) * 100}%` }} />
+              </div>
+              <div className="space-y-1">
+                {taskGraph.tasks.map((task, index) => (
+                  <div key={task.key} className="flex items-start gap-1.5 text-[8px] leading-3">
+                    <span className={cn(
+                      'mt-0.5 size-2 shrink-0 rounded-full border',
+                      task.state === 'completed' ? 'border-success bg-success' :
+                        task.state === 'failed' ? 'border-destructive bg-destructive' :
+                          task.state === 'running' || task.state === 'review_ready' ? 'border-primary bg-primary' :
+                            'border-border bg-muted',
+                    )} />
+                    <span className="font-mono text-faint-foreground">{index + 1}</span>
+                    <span className="min-w-0 flex-1 text-muted-foreground" title={task.key}>{task.title}</span>
+                    <span className="font-mono text-faint-foreground">{task.state}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
           <label className="block space-y-1 text-[8px] text-faint-foreground">
-            Instruction
-            <textarea value={instruction} onChange={(event) => setInstruction(event.target.value)} rows={3} placeholder="Describe the implementation intent. Approved artifacts and exact constraints remain authoritative." className="w-full resize-y rounded border border-border bg-background px-2 py-1.5 text-[9px] leading-4 text-foreground" />
+            Qualified profile
+            <input value={executorProfile} onChange={(event) => setExecutorProfile(event.target.value)} className="h-7 w-full rounded border border-border bg-background px-2 font-mono text-[9px] text-foreground" />
           </label>
-          <button type="button" onClick={createAttempt} disabled={!canEdit || workspaceBusy || actionBusy || !taskKey.trim() || !instruction.trim() || !executorProfile.trim()} className="inline-flex h-7 w-full items-center justify-center gap-1.5 rounded bg-primary px-2 text-[9px] font-semibold text-primary-foreground disabled:opacity-40">
+          <label className="block space-y-1 text-[8px] text-faint-foreground">
+            Overall implementation intent
+            <textarea value={instruction} onChange={(event) => setInstruction(event.target.value)} rows={3} placeholder="Describe the complete implementation intent. The server binds each step to exact obligations and acceptance criteria." className="w-full resize-y rounded border border-border bg-background px-2 py-1.5 text-[9px] leading-4 text-foreground" />
+          </label>
+          <button type="button" onClick={advanceTaskGraph} disabled={!canEdit || workspaceBusy || actionBusy || !taskGraph?.nextTaskKey || !instruction.trim() || !executorProfile.trim()} className="inline-flex h-7 w-full items-center justify-center gap-1.5 rounded bg-primary px-2 text-[9px] font-semibold text-primary-foreground disabled:opacity-40">
             {actionBusy ? <LoaderCircle className="size-3 animate-spin" /> : <Send className="size-3" />}
-            Save Candidate and start Agent
+            {taskGraph?.state === 'failed' ? 'Retry failed implementation task' : taskGraph?.state === 'completed' ? 'Complete implementation finished' : taskGraph?.state === 'awaiting_review' ? 'Review and merge before continuing' : 'Save Candidate and run next task'}
           </button>
-          <p className="text-[8px] leading-3 text-faint-foreground">Starting an Agent never approves a workflow node. The server first freezes a TaskCapsule and ContextPack from the exact Candidate and approved upstream revisions.</p>
+          <p className="text-[8px] leading-3 text-faint-foreground">The server derives this ordered task graph from every executable Must obligation. Each step receives only its bound acceptance criteria; the next step opens after the reviewed merge is applied.</p>
+          <details className="rounded border border-border bg-background p-2 text-[8px] text-faint-foreground">
+            <summary className="cursor-pointer">Advanced: start a manual exact task</summary>
+            <div className="mt-2 space-y-2">
+              <label className="block space-y-1">
+                Stable task key
+                <input value={taskKey} onChange={(event) => setTaskKey(event.target.value)} className="h-7 w-full rounded border border-border bg-background px-2 font-mono text-[9px] text-foreground" />
+              </label>
+              <button type="button" onClick={createAttempt} disabled={!canEdit || workspaceBusy || actionBusy || !taskKey.trim() || !instruction.trim() || !executorProfile.trim()} className="inline-flex h-7 w-full items-center justify-center gap-1.5 rounded border border-border px-2 text-[9px] text-muted-foreground disabled:opacity-40">
+                Start manual TaskCapsule
+              </button>
+            </div>
+          </details>
         </section>
 
         {error && (
@@ -951,9 +1022,67 @@ function StructuredReview({ result }: { readonly result: AgentStructuredResultDt
   return (
     <div className="space-y-2 text-[8px] leading-4">
       <div className="rounded border border-border bg-background p-2 text-muted-foreground">{result.summary || 'No summary was supplied.'}</div>
+      <CoverageReview title="Obligations" items={result.obligations} />
+      <CoverageReview title="Acceptance criteria" items={result.acceptanceCriteria} />
+      <ResourceGraphReview graph={result.resourceGraph} />
       {result.verification.map((check) => <div key={check.commandId} className="flex gap-2 rounded border border-border p-2"><span className={check.status === 'passed' ? 'text-success' : check.status === 'failed' ? 'text-destructive' : 'text-muted-foreground'}>{check.status}</span><span className="font-mono">{check.commandId}</span><span className="ml-auto text-faint-foreground">{check.note}</span></div>)}
       {result.blockers.map((blocker, index) => <div key={`${index}:${blocker}`} className="flex gap-2 rounded border border-destructive/30 bg-destructive/10 p-2 text-destructive"><AlertTriangle className="mt-0.5 size-3 shrink-0" />{blocker}</div>)}
       {result.changedPaths.length > 0 && <div className="text-faint-foreground">Changed paths: {result.changedPaths.join(', ')}</div>}
+    </div>
+  )
+}
+
+function ResourceGraphReview({
+  graph,
+}: {
+  readonly graph: AgentStructuredResultDto['resourceGraph']
+}) {
+  return (
+    <div className="space-y-1">
+      <div className="flex items-center font-semibold uppercase tracking-wide text-faint-foreground">
+        <span>Frontend resource graph</span>
+        <span className="ml-auto font-mono normal-case">
+          {graph.applicable ? `${graph.nodes.length} resources · ${graph.edges.length} edges` : 'not applicable'}
+        </span>
+      </div>
+      {graph.nodes.map((node) => (
+        <div key={node.id} className="rounded border border-border bg-background p-2">
+          <div className="flex items-center gap-2">
+            <span className={node.status === 'resolved' ? 'text-success' : 'text-destructive'}>{node.status}</span>
+            <span className="font-mono text-foreground">{node.id}</span>
+            <span className="ml-auto text-faint-foreground">{node.kind} · {node.source}</span>
+          </div>
+          <div className="mt-1 text-muted-foreground">{node.purpose}</div>
+          <div className="mt-1 break-all font-mono text-faint-foreground">{node.reference}</div>
+          <div className="mt-1 text-faint-foreground">Used by: {node.consumers.join(', ')}</div>
+        </div>
+      ))}
+      {graph.applicable && graph.nodes.length === 0 && (
+        <div className="rounded border border-border p-2 text-faint-foreground">
+          The exact frontend task did not require an icon, image, illustration, logo, font, or media resource.
+        </div>
+      )}
+    </div>
+  )
+}
+
+function CoverageReview({
+  title,
+  items,
+}: {
+  readonly title: string
+  readonly items: readonly { readonly id: string; readonly status: 'satisfied' | 'blocked'; readonly note: string }[]
+}) {
+  return (
+    <div className="space-y-1">
+      <div className="font-semibold uppercase tracking-wide text-faint-foreground">{title}</div>
+      {items.map((item) => (
+        <div key={item.id} className="flex gap-2 rounded border border-border p-2">
+          <span className={item.status === 'satisfied' ? 'text-success' : 'text-destructive'}>{item.status}</span>
+          <span className="font-mono">{item.id}</span>
+          <span className="ml-auto text-right text-faint-foreground">{item.note}</span>
+        </div>
+      ))}
     </div>
   )
 }

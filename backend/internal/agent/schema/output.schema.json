@@ -1,9 +1,9 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "urn:worksflow:agent-result:v1",
+  "$id": "urn:worksflow:agent-result:v3",
   "type": "object",
   "additionalProperties": false,
-  "required": ["summary", "changedPaths", "verification", "blockers"],
+  "required": ["summary", "changedPaths", "obligations", "acceptanceCriteria", "verification", "resourceGraph", "blockers"],
   "properties": {
     "summary": {
       "type": "string",
@@ -19,8 +19,39 @@
         "maxLength": 512
       }
     },
+    "obligations": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 2048,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "status", "note"],
+        "properties": {
+          "id": {"type": "string", "minLength": 1, "maxLength": 160},
+          "status": {"enum": ["satisfied", "blocked"]},
+          "note": {"type": "string", "minLength": 1, "maxLength": 2000}
+        }
+      }
+    },
+    "acceptanceCriteria": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 2048,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "status", "note"],
+        "properties": {
+          "id": {"type": "string", "minLength": 1, "maxLength": 160},
+          "status": {"enum": ["satisfied", "blocked"]},
+          "note": {"type": "string", "minLength": 1, "maxLength": 2000}
+        }
+      }
+    },
     "verification": {
       "type": "array",
+      "minItems": 1,
       "maxItems": 128,
       "items": {
         "type": "object",
@@ -30,6 +61,57 @@
           "commandId": {"type": "string", "minLength": 1, "maxLength": 160},
           "status": {"enum": ["not_run", "passed", "failed"]},
           "note": {"type": "string", "maxLength": 2000}
+        }
+      }
+    },
+    "resourceGraph": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["applicable", "nodes", "edges"],
+      "properties": {
+        "applicable": {"type": "boolean"},
+        "nodes": {
+          "type": "array",
+          "maxItems": 512,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["id", "kind", "purpose", "requirementIds", "consumers", "source", "reference", "accessibility", "status"],
+            "properties": {
+              "id": {"type": "string", "minLength": 1, "maxLength": 160},
+              "kind": {"enum": ["icon", "image", "illustration", "logo", "font", "video", "animation", "pattern"]},
+              "purpose": {"type": "string", "minLength": 1, "maxLength": 1000},
+              "requirementIds": {
+                "type": "array",
+                "maxItems": 128,
+                "items": {"type": "string", "minLength": 1, "maxLength": 160}
+              },
+              "consumers": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 128,
+                "items": {"type": "string", "minLength": 1, "maxLength": 512}
+              },
+              "source": {"enum": ["authoritative_input", "existing_asset", "icon_library", "css_primitive", "generated_svg", "generated_raster"]},
+              "reference": {"type": "string", "minLength": 1, "maxLength": 512},
+              "accessibility": {"type": "string", "minLength": 1, "maxLength": 1000},
+              "status": {"enum": ["resolved", "blocked"]}
+            }
+          }
+        },
+        "edges": {
+          "type": "array",
+          "maxItems": 2048,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["from", "to", "relation"],
+            "properties": {
+              "from": {"type": "string", "minLength": 1, "maxLength": 160},
+              "to": {"type": "string", "minLength": 1, "maxLength": 512},
+              "relation": {"enum": ["supports", "consumed_by", "variant_of"]}
+            }
+          }
         }
       }
     },

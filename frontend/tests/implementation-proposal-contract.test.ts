@@ -148,6 +148,13 @@ const candidate = normalizeImplementationProposal(candidateProposal())
 assert.equal(candidate.executionSource, 'candidate_freeze')
 assert.equal(candidate.candidateSource?.candidateVersion, 3)
 
+const legacyCandidate = candidateProposal()
+legacyCandidate.candidateSource.verificationReceipt = { id: '', contentHash: '' }
+legacyCandidate.traceLinks = legacyCandidate.traceLinks.slice(0, 1)
+const parsedLegacyCandidate = normalizeImplementationProposal(legacyCandidate)
+assert.equal(parsedLegacyCandidate.candidateSource?.verificationReceipt.id, '')
+assert.equal(parsedLegacyCandidate.traceLinks.length, 1)
+
 const conversation = manualProposal()
 conversation.executionSource = 'conversation_command'
 Object.assign(conversation, {

@@ -9,6 +9,18 @@ export type ProjectBriefEntryAction =
   | 'blocked_unapproved_changes'
   | 'missing_revision'
 
+export function workflowDefinitionAcceptsProjectBriefStart(definition?: {
+  readonly inputContract?: {
+    readonly manifestJobTypes?: readonly string[]
+    readonly artifactKinds?: readonly string[]
+  }
+}) {
+  return Boolean(
+    definition?.inputContract?.manifestJobTypes?.includes('workflow_start')
+    && definition.inputContract.artifactKinds?.includes('project_brief'),
+  )
+}
+
 export function projectBriefEntryAction(input: {
   readonly requireApproved: boolean
   readonly approvedRevision?: { readonly id: string; readonly contentHash: string }

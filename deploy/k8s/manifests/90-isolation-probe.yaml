@@ -1,0 +1,29 @@
+apiVersion: batch/v1
+kind: Job
+metadata: {name: cross-namespace-denied, namespace: wf-p-a7f3c2}
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels: {worksflow.dev/probe: cross-namespace-denied}
+    spec:
+      restartPolicy: Never
+      serviceAccountName: project-runtime
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: probe
+          image: worksflow/k8s-route-probe:local
+          imagePullPolicy: IfNotPresent
+          args: [probe-denied, route-probe.wf-p-b9d4e1.svc.cluster.local:8080]
+          resources:
+            requests: {cpu: 10m, memory: 8Mi}
+            limits: {cpu: 50m, memory: 32Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}

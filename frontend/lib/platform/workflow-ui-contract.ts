@@ -15,6 +15,7 @@ import type {
   WorkflowCapabilitiesDto,
   WorkflowDefinitionDto,
   WorkflowEdgeDto,
+  WorkflowExternalQualificationGateConfigDto,
   WorkflowInputContractDto,
   WorkflowNodeDefinitionDto,
   WorkflowNodeRunDto,
@@ -46,6 +47,22 @@ export interface WorkflowAuthoringAnalysisLimits {
   readonly maximumConditionExpressionBytes?: number
 }
 
+/**
+ * The v3 Publish node is owned by the qualified Release Controller. The legacy
+ * workflow authorization command must never be exposed or invoked for it.
+ * This is a client-side fail-closed compatibility fence; the server remains
+ * authoritative and will eventually project the dedicated allowed action.
+ */
+export function canUseGenericWorkflowExecutionAuthorization(
+  run: Pick<WorkflowRunDto, 'executionProfile'> | null | undefined,
+  node: Pick<WorkflowNodeRunDto, 'status' | 'type' | 'allowedActions'>,
+) {
+  if (!run || node.status !== 'waiting_input'
+    || !node.allowedActions?.includes('authorize_execution')) return false
+  if (node.type === 'quality_gate') return true
+  return node.type === 'publish' && run.executionProfile.version !== 'workflow-engine/v3'
+}
+
 type ConditionChoiceAssignment = Record<string, string>
 
 export interface WorkflowArtifactSnapshot {
@@ -73,6 +90,24 @@ export interface WorkflowRevisionCandidateResolution {
     readonly proposalStatus: ProposalDto['status']
   }
   readonly error?: string
+}
+
+/**
+ * Preserve an exact proposal deep link after its workflow edit node has been
+ * submitted. While the node is active, a conflicting query pin is rejected.
+ * Once it is complete, the explicit pin is the only exact proposal reference
+ * available to the canonical review surface.
+ */
+export function resolveWorkflowProposalReference(
+  runId: string,
+  explicitProposalId: string,
+  inferredProposalId: string,
+) {
+  if (!runId) return explicitProposalId
+  if (inferredProposalId && explicitProposalId && explicitProposalId !== inferredProposalId) {
+    return ''
+  }
+  return inferredProposalId || explicitProposalId
 }
 
 export function workflowEditorTargetForArtifact(
@@ -138,6 +173,7 @@ const WORKFLOW_NODE_TYPES: readonly WorkflowNodeType[] = [
   'manifest_compiler',
   'workbench_build',
   'quality_gate',
+  'external_qualification_gate',
   'publish',
   'transform',
 ]
@@ -636,7 +672,7 @@ export function validateWorkflowNode(value: unknown, path = 'node'): string | un
   }
   const configKeys = [
     'artifactInput', 'aiTransform', 'humanEdit', 'reviewGate', 'condition', 'fanOut',
-    'merge', 'qualityGate', 'manifestCompiler', 'workbenchBuild', 'publish',
+    'merge', 'qualityGate', 'externalQualificationGate', 'manifestCompiler', 'workbenchBuild', 'publish',
     'ai', 'humanTask', 'approval', 'transform', 'delivery',
   ] as const
   const configs = configKeys.filter((key) => value[key] !== undefined)
@@ -646,6 +682,7 @@ export function validateWorkflowNode(value: unknown, path = 'node'): string | un
     artifact_input: 'artifactInput', ai_transform: 'aiTransform', human_edit: 'humanEdit',
     review_gate: 'reviewGate', condition: 'condition', fan_out: 'fanOut', merge: 'merge',
     quality_gate: 'qualityGate', manifest_compiler: 'manifestCompiler',
+    external_qualification_gate: 'externalQualificationGate',
     workbench_build: 'workbenchBuild', publish: 'publish',
     transform: 'transform',
   }
@@ -726,6 +763,8 @@ function validateRegisteredCapabilities(
       if (!positiveInteger(limit) || !positiveInteger(node.fanOut?.maxItems) || Number(node.fanOut?.maxItems) > limit) return `Node ${node.id} fan-out maxItems exceeds the registered resolver limit.`
     }
     if (node.qualityGate && !capabilities.qualityGates.includes(node.qualityGate.gateName)) return `Node ${node.id} uses an unregistered quality gate.`
+    if (node.externalQualificationGate && node.id !== 'external-qualification') return `Node ${node.id} must use the dedicated external-qualification identity.`
+    if (node.externalQualificationGate && !workflowExternalQualificationCapability(capabilities)) return `Node ${node.id} uses an unregistered external qualification gate.`
     if (node.publish && !capabilities.publishEnvironments.includes(node.publish.environment)) return `Node ${node.id} uses an unregistered publish environment.`
     if (node.workbenchBuild && !capabilities.workbenchSchemaVersions.includes(node.workbenchBuild.buildManifestSchemaVersion)) return `Node ${node.id} uses an unregistered Workbench schema.`
   }
@@ -775,6 +814,9 @@ function validateNodeConfig(type: WorkflowNodeType, config: Record<string, unkno
     case 'quality_gate':
       if (!nonEmpty(config.gateName) || typeof config.blocking !== 'boolean' || (config.requiredRole !== undefined && !validRole(config.requiredRole))) return `${path}.qualityGate is malformed.`
       break
+    case 'external_qualification_gate':
+      if (!exactExternalQualificationConfig(config)) return `${path}.externalQualificationGate is malformed.`
+      break
     case 'manifest_compiler':
       if (!nonEmpty(config.manifestKind) || !positiveInteger(config.schemaVersion) || !nonEmpty(config.hook)) return `${path}.manifestCompiler is malformed.`
       break
@@ -789,6 +831,37 @@ function validateNodeConfig(type: WorkflowNodeType, config: Record<string, unkno
       break
   }
   return undefined
+}
+
+const EXTERNAL_QUALIFICATION_CONFIG_KEYS = [
+  'blocking',
+  'gateName',
+  'inputAuthoritySchema',
+  'promotionProtocol',
+  'receiptSchema',
+  'waiverPolicy',
+] as const
+
+function exactExternalQualificationConfig(value: unknown): value is WorkflowExternalQualificationGateConfigDto {
+  if (!object(value)) return false
+  const keys = Object.keys(value)
+  return keys.length === EXTERNAL_QUALIFICATION_CONFIG_KEYS.length
+    && keys.every((key) => EXTERNAL_QUALIFICATION_CONFIG_KEYS.includes(key as (typeof EXTERNAL_QUALIFICATION_CONFIG_KEYS)[number]))
+    && value.blocking === true
+    && value.gateName === 'external-qualification'
+    && value.inputAuthoritySchema === 'worksflow-workflow-input-authority/v1'
+    && value.promotionProtocol === 'worksflow-qualification-promotion-consume/v2'
+    && value.receiptSchema === 'worksflow-qualification-receipt/v3'
+    && value.waiverPolicy === 'never'
+}
+
+export function workflowExternalQualificationCapability(
+  capabilities?: WorkflowCapabilitiesDto | null,
+): WorkflowExternalQualificationGateConfigDto | undefined {
+  if (capabilities?.version !== 5 || !capabilities.nodeTypes.includes('external_qualification_gate')) return undefined
+  return exactExternalQualificationConfig(capabilities.externalQualificationGate)
+    ? capabilities.externalQualificationGate
+    : undefined
 }
 
 export function resolvedPortNames(node: WorkflowNodeDefinitionDto | undefined, direction: 'input' | 'output') {
@@ -1293,7 +1366,8 @@ function validArtifactKind(value: unknown): boolean {
     'reference_source', 'change_request', 'requirement_baseline', 'blueprint',
     'page_spec', 'prototype', 'prototype_flow', 'fixture_bundle', 'design_system',
     'token_set', 'component_registry', 'api_contract', 'data_contract',
-    'permission_contract', 'workspace', 'test_report', 'quality_report',
+    'permission_contract', 'ai_runtime_contract', 'deployment_contract',
+    'verification_contract', 'workspace', 'test_report', 'quality_report',
   ].includes(value)
 }
 

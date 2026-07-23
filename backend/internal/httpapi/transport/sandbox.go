@@ -1069,9 +1069,11 @@ func writeSandboxProblem(c *gin.Context, err error) {
 		details := problem.New(http.StatusConflict, "sandbox_action_blocked", "Sandbox action is blocked", actionError.Error())
 		details.Extensions = map[string]interface{}{"action": actionError.Action, "blockingReasons": actionError.Reasons}
 		problem.Write(c, details)
+	case errors.Is(err, sandbox.ErrRuntimeConflict):
+		problem.Write(c, problem.New(http.StatusConflict, "sandbox_runtime_stale", "Sandbox runtime is stale", "Open a fresh SandboxSession before retrying this operation."))
 	case errors.Is(err, sandbox.ErrSessionProjectionStale), errors.Is(err, repository.ErrCandidateTreeDrift),
 		errors.Is(err, repository.ErrPathPolicyDrift), errors.Is(err, sandbox.ErrWorkspaceConflict),
-		errors.Is(err, sandbox.ErrRuntimeConflict), errors.Is(err, sandbox.ErrProcessStoreIntegrity), errors.Is(err, sandbox.ErrTerminalStoreIntegrity):
+		errors.Is(err, sandbox.ErrProcessStoreIntegrity), errors.Is(err, sandbox.ErrTerminalStoreIntegrity):
 		problem.Write(c, problem.New(http.StatusConflict, "sandbox_projection_stale", "Sandbox projection is stale", "Refresh the SandboxSession before retrying this operation."))
 	case errors.Is(err, core.ErrBlockingGate):
 		problem.Write(c, problem.New(http.StatusConflict, "candidate_freeze_blocked", "Candidate freeze is blocked", err.Error()))

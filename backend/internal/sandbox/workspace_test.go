@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/worksflow/builder/backend/internal/repository"
 )
@@ -81,6 +82,68 @@ func TestWorkspaceMaterializerPublishesExactCandidateAtomically(t *testing.T) {
 	second, err := materializer.Materialize(context.Background(), view, candidate)
 	if err != nil || second != mount || resolver.calls != firstCalls {
 		t.Fatalf("exact projection was not idempotent: mount=%#v calls=%d err=%v", second, resolver.calls, err)
+	}
+}
+
+func TestWorkspaceMaterializerSeparatesRuntimeProductsFromCandidateSource(t *testing.T) {
+	root := t.TempDir()
+	candidate, byHash := workspaceCandidate(t, map[string][]byte{
+		"apps/web/src/main.ts": []byte("export const ready = true\n"),
+		"services/api/main.go": []byte("package main\n"),
+		"tools/bin/source.go":  []byte("package bin\n"),
+	})
+	materializer, err := NewWorkspaceMaterializer(root, &workspaceResolverFake{values: byHash})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := newTestSession(t, candidate, sandboxBaseTime)
+	view := session.Snapshot()
+	mount, err := materializer.Materialize(context.Background(), view, candidate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for path, value := range map[string][]byte{
+		"apps/web/node_modules/react/index.js":          []byte("module.exports = {}\n"),
+		"apps/web/dist/index.html":                      []byte("<main>ready</main>\n"),
+		"services/api/bin/server":                       []byte("binary\n"),
+		".worksflow/dependencies/go/pkg/mod/cache.lock": []byte("exact cache\n"),
+	} {
+		target := filepath.Join(mount.Workspace, filepath.FromSlash(path))
+		if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(target, value, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	next, _, err := candidate.AcquireLease(
+		candidate.Version, testActorID, 5*time.Minute, sandboxBaseTime.Add(time.Second),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	advanced := view
+	advanced.Version++
+	advanced.Candidate = candidateState(next)
+	advanced.UpdatedAt = sandboxBaseTime.Add(2 * time.Second)
+	if _, err := materializer.Materialize(context.Background(), advanced, next); err != nil {
+		t.Fatalf("lease-only Candidate advance invalidated runtime products: %v", err)
+	}
+	projection, err := loadWorkspaceProjection(mount)
+	if err != nil || projection.CandidateVersion != next.Version {
+		t.Fatalf("workspace fence was not refreshed: projection=%#v err=%v", projection, err)
+	}
+	if _, err := materializer.Materialize(context.Background(), view, candidate); err != nil {
+		if !errors.Is(err, ErrWorkspaceConflict) {
+			t.Fatalf("older Candidate fence returned an unexpected error: %v", err)
+		}
+	}
+
+	if err := os.WriteFile(filepath.Join(mount.Workspace, "untracked.txt"), []byte("drift\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := materializer.Materialize(context.Background(), advanced, next); !errors.Is(err, ErrWorkspaceConflict) {
+		t.Fatalf("untracked source drift was accepted: %v", err)
 	}
 }
 

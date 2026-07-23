@@ -147,6 +147,9 @@ export type ArtifactKind =
   | 'api_contract'
   | 'data_contract'
   | 'permission_contract'
+  | 'ai_runtime_contract'
+  | 'deployment_contract'
+  | 'verification_contract'
   | 'workspace'
   | 'test_report'
   | 'quality_report'
@@ -650,6 +653,7 @@ export interface PrototypeComponentBindingDto {
 
 export interface PrototypeContentDto {
   readonly pageSpecRevision: VersionRefDto
+  readonly machineContractSet?: JsonObject
   readonly exploratory: boolean
   readonly states: readonly PrototypeStateDto[]
   readonly breakpoints: readonly PrototypeBreakpointDto[]
@@ -688,6 +692,8 @@ export interface ReviewDto {
   readonly revisionId: EntityId
   readonly contentHash: ContentHash
   readonly status: ReviewDecision
+  readonly reviewAuthorityVersion: number
+  readonly authorityState: 'current' | 'legacy' | 'invalid'
   readonly policy: {
     readonly reviewerIds: readonly EntityId[]
     readonly minimumApprovals: number
@@ -1147,6 +1153,9 @@ export type DownstreamDocumentKind =
   | 'api_contract'
   | 'data_contract'
   | 'permission_contract'
+  | 'ai_runtime_contract'
+  | 'deployment_contract'
+  | 'verification_contract'
 
 export interface GenerateDownstreamDocumentInputDto {
   readonly sourceRevision: VersionRefDto

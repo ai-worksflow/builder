@@ -3,6 +3,7 @@ package transport_test
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -348,6 +349,112 @@ func TestCanonicalAndAggregateReviewRoutesCallSameService(t *testing.T) {
 	}
 }
 
+func TestReviewSubmissionRejectsContradictoryExplicitAndTargetIdentities(t *testing.T) {
+	artifactID := uuid.NewString()
+	revisionID := uuid.NewString()
+	artifacts := &fakeArtifactService{
+		getRevision: core.ArtifactRevision{ID: revisionID, ArtifactID: artifactID},
+		getArtifact: core.VersionedArtifact{Artifact: core.Artifact{ID: artifactID, ProjectID: testProjectID}},
+	}
+	tests := []struct {
+		name string
+		path string
+		body map[string]any
+	}{
+		{
+			name: "project route artifact mismatch",
+			path: "/v1/projects/" + testProjectID + "/reviews",
+			body: map[string]any{
+				"artifactId": artifactID, "revisionId": revisionID,
+				"target": map[string]any{"artifactId": uuid.NewString(), "revisionId": revisionID},
+			},
+		},
+		{
+			name: "revision route revision mismatch",
+			path: "/v1/revisions/" + revisionID + "/reviews",
+			body: map[string]any{
+				"revisionId": revisionID,
+				"target":     map[string]any{"artifactId": artifactID, "revisionId": uuid.NewString()},
+			},
+		},
+	}
+	for index, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			reviews := &fakeReviewService{}
+			router := newBusinessRouter(t, transport.Services{Artifacts: artifacts, Reviews: reviews})
+			headers := authenticatedHeaders(true)
+			headers.Set("Content-Type", "application/json")
+			headers.Set("Idempotency-Key", fmt.Sprintf("review-contradictory-%d", index))
+			body, err := json.Marshal(test.body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			response := performRequest(router, http.MethodPost, test.path, body, headers)
+			assertProblem(t, response, http.StatusUnprocessableEntity, "invalid_input")
+			if reviews.submitCalls != 0 {
+				t.Fatal("contradictory review target reached the service")
+			}
+		})
+	}
+}
+
+func TestReviewSubmissionRejectsContradictoryReviewerAliases(t *testing.T) {
+	artifactID := uuid.NewString()
+	revisionID := uuid.NewString()
+	artifacts := &fakeArtifactService{
+		getRevision: core.ArtifactRevision{ID: revisionID, ArtifactID: artifactID},
+		getArtifact: core.VersionedArtifact{Artifact: core.Artifact{ID: artifactID, ProjectID: testProjectID}},
+	}
+	reviews := &fakeReviewService{}
+	router := newBusinessRouter(t, transport.Services{Artifacts: artifacts, Reviews: reviews})
+	headers := authenticatedHeaders(true)
+	headers.Set("Content-Type", "application/json")
+	headers.Set("Idempotency-Key", "review-contradictory-reviewers")
+	body, err := json.Marshal(map[string]any{
+		"reviewerIds":         []string{uuid.NewString()},
+		"requiredReviewerIds": []string{uuid.NewString()},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := performRequest(router, http.MethodPost, "/v1/revisions/"+revisionID+"/reviews", body, headers)
+	assertProblem(t, response, http.StatusUnprocessableEntity, "invalid_input")
+	if reviews.submitCalls != 0 {
+		t.Fatal("contradictory reviewer aliases reached the service")
+	}
+}
+
+func TestReviewDecisionForwardsOriginalIfMatchForExactClosedReconciliation(t *testing.T) {
+	reviewID := uuid.NewString()
+	originalETag := `"review:original:open:0:0"`
+	service := &fakeConditionalReviewService{current: core.ReviewRequest{
+		ID: reviewID, ProjectID: testProjectID, Status: "approved", ETag: `"review:current:approved:1:1"`,
+	}}
+	router := newBusinessRouter(t, transport.Services{Reviews: service})
+	headers := authenticatedHeaders(true)
+	headers.Set("Content-Type", "application/json")
+	headers.Set("Idempotency-Key", "review-exact-reconcile-1")
+	headers.Set("If-Match", originalETag)
+	response := performRequest(
+		router,
+		http.MethodPost,
+		"/v1/projects/"+testProjectID+"/reviews/"+reviewID+"/decisions",
+		[]byte(`{"decision":"approve","summary":"exact retry"}`),
+		headers,
+	)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+	}
+	if service.expectedETag != originalETag || service.calls != 1 {
+		t.Fatalf("conditional review expected ETag = %q calls=%d, want %q/1", service.expectedETag, service.calls, originalETag)
+	}
+	if service.getCalls != 1 || service.listCalls != 0 || service.projectID != testProjectID ||
+		service.reviewID != reviewID || service.actorID != testUserID {
+		t.Fatalf("conditional review lookup get=%d list=%d project=%q review=%q actor=%q",
+			service.getCalls, service.listCalls, service.projectID, service.reviewID, service.actorID)
+	}
+}
+
 func TestListArtifactsAppliesOpaquePagination(t *testing.T) {
 	artifacts := &fakeArtifactService{listed: []core.Artifact{{ID: "a"}, {ID: "b"}, {ID: "c"}}}
 	router := newBusinessRouter(t, transport.Services{Artifacts: artifacts})
@@ -614,6 +721,49 @@ type fakeReviewService struct {
 	input       core.SubmitReviewInput
 }
 
+type fakeConditionalReviewService struct {
+	current      core.ReviewRequest
+	expectedETag string
+	calls        int
+	getCalls     int
+	listCalls    int
+	projectID    string
+	reviewID     string
+	actorID      string
+}
+
+func (*fakeConditionalReviewService) Submit(context.Context, string, string, string, core.SubmitReviewInput) (core.ReviewRequest, error) {
+	return core.ReviewRequest{}, nil
+}
+
+func (f *fakeConditionalReviewService) List(context.Context, string, string) ([]core.ReviewRequest, error) {
+	f.listCalls++
+	return []core.ReviewRequest{f.current}, nil
+}
+
+func (f *fakeConditionalReviewService) Get(_ context.Context, projectID, reviewID, actorID string) (core.ReviewRequest, error) {
+	f.getCalls++
+	f.projectID = projectID
+	f.reviewID = reviewID
+	f.actorID = actorID
+	return f.current, nil
+}
+
+func (f *fakeConditionalReviewService) Decide(context.Context, string, string, core.DecideReviewInput) (core.ReviewRequest, error) {
+	return f.current, nil
+}
+
+func (f *fakeConditionalReviewService) DecideIfMatch(
+	_ context.Context,
+	_, _ string,
+	expectedETag string,
+	_ core.DecideReviewInput,
+) (core.ReviewRequest, error) {
+	f.calls++
+	f.expectedETag = expectedETag
+	return f.current, nil
+}
+
 func (f *fakeReviewService) Submit(_ context.Context, projectID, artifactID, _ string, input core.SubmitReviewInput) (core.ReviewRequest, error) {
 	f.submitCalls++
 	f.projectID = projectID
@@ -626,7 +776,11 @@ func (*fakeReviewService) List(context.Context, string, string) ([]core.ReviewRe
 	return nil, nil
 }
 
-func (*fakeReviewService) Decide(context.Context, string, string, core.DecideReviewInput) (core.ReviewRequest, error) {
+func (*fakeReviewService) Get(context.Context, string, string, string) (core.ReviewRequest, error) {
+	return core.ReviewRequest{}, core.ErrNotFound
+}
+
+func (*fakeReviewService) DecideIfMatch(context.Context, string, string, string, core.DecideReviewInput) (core.ReviewRequest, error) {
 	return core.ReviewRequest{}, nil
 }
 
